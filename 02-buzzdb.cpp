@@ -45,21 +45,15 @@ public:
 int main() {
     BuzzDB db;
 
-    int number_of_sales = 1000;
-
     std::ifstream inputFile("output.txt");
+
     if (!inputFile) {
         std::cerr << "Unable to open file" << std::endl;
         return 1;
     }
 
-    for (int i = 0; i < number_of_sales; ++i) {
-        int field1, field2;
-        if (!(inputFile >> field1 >> field2)) {
-            std::cerr << "Error reading line " << (i+1) << std::endl;
-            return 1;
-        }
-
+    int field1, field2;
+    while (inputFile >> field1 >> field2) {
         db.insert(field1, field2);
     }
     

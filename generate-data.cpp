@@ -9,7 +9,7 @@ int main() {
     std::uniform_int_distribution<> dis1(1, 9); 
     std::poisson_distribution<> dis2(100);
 
-    int number_of_sales = 1000;
+    int number_of_sales = 10000000;
 
     std::ofstream outputFile("output.txt");
     if (outputFile.is_open()) {
