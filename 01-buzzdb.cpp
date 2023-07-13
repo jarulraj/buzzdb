@@ -9,10 +9,12 @@ struct Row {
 
 class ToyDatabase {
 private:
-    std::map<int, std::vector<int>> index; // a map is an ordered key-value container, acting as a B+ tree
+    // a map is an ordered key-value container
+    std::map<int, std::vector<int>> index;
 
 public:
-    std::vector<Row> table; // a vector of Row structs acting as a table
+    // a vector of Row structs acting as a table
+    std::vector<Row> table; 
 
     // insert function
     void insert(int key, int value) {
