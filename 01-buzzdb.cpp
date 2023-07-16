@@ -6,7 +6,7 @@
 // It is a blueprint for creating objects of a particular type, 
 // providing initial values for state (member variables or fields), 
 // and implementations of behavior (member functions or methods)
-class Row {
+class Tuple {
 public:
     int key;
     int value;
@@ -18,13 +18,13 @@ private:
     std::map<int, std::vector<int>> index;
 
 public:
-    // a vector of Row structs acting as a table
-    std::vector<Row> table; 
+    // a vector of Tuple structs acting as a table
+    std::vector<Tuple> table; 
 
     // insert function
     void insert(int key, int value) {
-        Row newRow = {key, value};
-        table.push_back(newRow);
+        Tuple newTuple = {key, value};
+        table.push_back(newTuple);
         index[key].push_back(value);
     }
 
