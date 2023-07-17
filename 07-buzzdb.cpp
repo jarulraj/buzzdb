@@ -17,69 +17,60 @@ class Field {
 public:
     FieldType type;
 
-    int data_i;
-    float data_f;
-    std::unique_ptr<char[]> data_s;
-    size_t data_s_length;
+    std::unique_ptr<char[]> data;
+    size_t data_length;
 
 public:
-    Field(int i) : type(INT) { data_i = i; }
-    Field(float f) : type(FLOAT) { data_f = f; }
-    Field(const std::string& s) : type(STRING) {
-        data_s_length = s.size() + 1;
-        data_s = std::make_unique<char[]>(data_s_length);
-        strcpy(data_s.get(), s.c_str());
+    Field(int i) : type(INT) { 
+        data_length = sizeof(int);
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), &i, data_length);
     }
 
-    // Copy assignment operator
+    Field(float f) : type(FLOAT) { 
+        data_length = sizeof(float);
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), &f, data_length);
+    }
+
+    Field(const std::string& s) : type(STRING) {
+        data_length = s.size() + 1;  // include null-terminator
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), s.c_str(), data_length);
+    }
+
     Field& operator=(const Field& other) {
         if (&other == this) {
             return *this;
         }
         type = other.type;
-
-        switch(type){
-            case INT: 
-                data_i = other.data_i; break;
-            case FLOAT: 
-                data_f = other.data_f; break;
-            case STRING:
-                data_s_length = other.data_s_length;
-                data_s = std::make_unique<char[]>(data_s_length);
-                strcpy(data_s.get(), other.data_s.get());
-                break;
-        }
-
+        data_length = other.data_length;
+        std::memcpy(data.get(), other.data.get(), data_length);
         return *this;
     }
 
-    // Copy constructor
     Field(Field&& other){
         type = other.type;
-
-        switch(type){
-            case INT: 
-                data_i = other.data_i; break;
-            case FLOAT: 
-                data_f = other.data_f; break;
-            case STRING:
-                data_s_length = other.data_s_length;
-                data_s = std::make_unique<char[]>(data_s_length);
-                strcpy(data_s.get(), other.data_s.get());
-                break;
-        }
+        data_length = other.data_length;
+        std::memcpy(data.get(), other.data.get(), data_length);
     }
 
     FieldType getType() const { return type; }
-    int asInt() const { return data_i; }
-    float asFloat() const { return data_f; }
-    std::string asString() const { return std::string(data_s.get()); }
+    int asInt() const { 
+        return *reinterpret_cast<int*>(data.get());
+    }
+    float asFloat() const { 
+        return *reinterpret_cast<float*>(data.get());
+    }
+    std::string asString() const { 
+        return std::string(data.get());
+    }
 
     void print() const{
         switch(getType()){
-            case INT: std::cout << data_i; break;
-            case FLOAT: std::cout << data_f; break;
-            case STRING: std::cout << std::string(data_s.get()); break;
+            case INT: std::cout << asInt(); break;
+            case FLOAT: std::cout << asFloat(); break;
+            case STRING: std::cout << asString(); break;
         }
     }
 };
