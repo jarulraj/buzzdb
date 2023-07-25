@@ -237,7 +237,7 @@ private:
     std::map<int, std::vector<int>> index;
 
 public:
-    size_t max_number_of_tuples = 20;
+    size_t max_number_of_tuples = 200;
     size_t currently_added_tuples = 0;
 
     // a vector of Tuple unique pointers acting as a table
