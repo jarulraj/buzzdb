@@ -305,6 +305,12 @@ int main() {
     // Deserialize from disk
     auto loadedPage = Page::deserialize(filename);
 
+    // PROBLEM: Deletion only in memory, not on disk
+    loadedPage->deleteTuple(0);
+
+    // Deserialize again from disk -- page unchanged
+    auto loadedPage2 = Page::deserialize(filename);
+
     // Get the end time
     auto end = std::chrono::high_resolution_clock::now();
 
