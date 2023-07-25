@@ -9,6 +9,7 @@
 #include <map>
 #include <string>
 #include <memory>
+#include <sstream>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -65,6 +66,40 @@ public:
         return std::string(data.get());
     }
 
+    std::string serialize() {
+        std::stringstream buffer;
+        buffer << type << ' ' << data_length << ' ';
+        if (type == STRING) {
+            buffer << data.get() << ' ';
+        } else if (type == INT) {
+            buffer << *reinterpret_cast<int*>(data.get()) << ' ';
+        } else if (type == FLOAT) {
+            buffer << *reinterpret_cast<float*>(data.get()) << ' ';
+        }
+        return buffer.str();
+    }
+
+    void serialize(std::ofstream& out) {
+        std::string serializedData = this->serialize();
+        out << serializedData;
+    }
+
+    static std::unique_ptr<Field> deserialize(std::istream& in) {
+        int type; in >> type;
+        size_t length; in >> length;
+        if (type == STRING) {
+            std::string val; in >> val;
+            return std::make_unique<Field>(val);
+        } else if (type == INT) {
+            int val; in >> val;
+            return std::make_unique<Field>(val);
+        } else if (type == FLOAT) {
+            float val; in >> val;
+            return std::make_unique<Field>(val);
+        }
+        return nullptr;
+    }
+
     void print() const{
         switch(getType()){
             case INT: std::cout << asInt(); break;
@@ -90,6 +125,29 @@ public:
         return size;
     }
 
+    std::string serialize() {
+        std::stringstream buffer;
+        buffer << fields.size() << ' ';
+        for (const auto& field : fields) {
+            buffer << field->serialize();
+        }
+        return buffer.str();
+    }
+
+    void serialize(std::ofstream& out) {
+        std::string serializedData = this->serialize();
+        out << serializedData;
+    }
+
+    static std::unique_ptr<Tuple> deserialize(std::istream& in) {
+        auto tuple = std::make_unique<Tuple>();
+        size_t fieldCount; in >> fieldCount;
+        for (size_t i = 0; i < fieldCount; ++i) {
+            tuple->addField(Field::deserialize(in));
+        }
+        return tuple;
+    }
+
     void print() const {
         for (const auto& field : fields) {
             field->print();
@@ -101,11 +159,18 @@ public:
 
 const int PAGE_SIZE = 4096;
 
-// Page class
-class Page {
+struct Slot {
+    size_t offset;  // Offset of the tuple within the page
+    size_t length;  // Length of the tuple
+};
+
+// Slotted Page class
+class SlottedPage {
 public:
     size_t used_size = 0;
     std::vector<std::unique_ptr<Tuple>> tuples;
+    std::vector<Slot> slots;
+    std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
 
     // Add a tuple, returns true if it fits, false otherwise.
     bool addTuple(std::unique_ptr<Tuple> tuple) {
@@ -113,11 +178,6 @@ public:
         size_t tuple_size = 0;
         for (const auto& field : tuple->fields) {
             tuple_size += field->data_length;
-        }
-
-        if (used_size + tuple_size > PAGE_SIZE) {
-            // If not enough space, run garbage collection and compaction first
-            //garbageCollect();
         }
 
         // If there is still not enough space, reject the operation
@@ -132,99 +192,51 @@ public:
         return true;
     }
 
+    void deleteTuple(size_t index) {
+        if (index >= tuples.size()) {
+            std::cout << "Tuple index out of range. " << index << " not within " << tuples.size() << " tuples. \n";
+            return;
+        }
+
+        // Update used_size
+        auto& tuple = tuples[index];
+        used_size -= tuple->getSize();
+
+        // Remove tuple from page
+        auto it = tuples.begin();
+        tuples.erase(it + index);
+    }
+
     // Write this page to a file.
     void write(const std::string& filename) const {
         std::ofstream out(filename);
         // First write the number of tuples.
-        size_t numTuples = tuples.size();
-        out.write(reinterpret_cast<const char*>(&numTuples), sizeof(numTuples));
-
+        out << tuples.size() << '\n';
         // Then write each tuple.
-        for (const auto& tuple : tuples) {
-            // Write the number of fields in the tuple.
-            size_t numFields = tuple->fields.size();
-            out.write(reinterpret_cast<const char*>(&numFields), sizeof(numFields));
-
-            // Then write each field.
-            for (const auto& field : tuple->fields) {
-                // Write the type of the field.
-                out.write(reinterpret_cast<const char*>(&field->type), sizeof(field->type));
-                // Write the length of the field.
-                out.write(reinterpret_cast<const char*>(&field->data_length), sizeof(field->data_length));
-                // Then write the field data.
-                out.write(field->data.get(), field->data_length);
-            }
-
+        for (auto& tuple : tuples) {
+            tuple->serialize(out);
+            out << '\n';
         }
-
         out.close();
     }
 
     // Read this page from a file.
-    void read(const std::string& filename) {
+    static std::unique_ptr<SlottedPage> deserialize(const std::string& filename) {
         std::ifstream in(filename);
+        auto page = std::make_unique<SlottedPage>();
 
         // First read the number of tuples.
-        size_t numTuples;
-        in.read(reinterpret_cast<char*>(&numTuples), sizeof(numTuples));
-
-        std::cout << "Num Tuples: " << numTuples << "\n";
-
+        size_t tupleCount; in >> tupleCount;
+        std::cout << "Num Tuples: " << tupleCount << "\n";
         // Then read each tuple.
-        for (size_t i = 0; i < numTuples; ++i) {
-            auto tuple = std::make_unique<Tuple>();
-
-            // Read the number of fields in the tuple.
-            size_t numFields;
-            in.read(reinterpret_cast<char*>(&numFields), sizeof(numFields));
-
-            // Then read each field.
-            for (size_t j = 0; j < numFields; ++j) {
-                // Read the type of the field.
-                FieldType type;
-                in.read(reinterpret_cast<char*>(&type), sizeof(type));
-                // Read the length of the field.
-                size_t data_length;
-                in.read(reinterpret_cast<char*>(&data_length), sizeof(data_length));
-                // Then read the field data.
-                std::unique_ptr<char[]> data(new char[data_length]);
-                in.read(data.get(), data_length);
-
-                // Add the field to the tuple.
-                switch(type){
-                    case INT:
-                    {
-                        int val = *reinterpret_cast<int*>(data.get());
-                        auto field = std::make_unique<Field>(val);
-                        tuple->addField(std::move(field));
-                        break;
-                    }
-                    case FLOAT:
-                    {
-                        float val = *reinterpret_cast<float*>(data.get());
-                        auto field = std::make_unique<Field>(val);
-                        tuple->addField(std::move(field));
-                        break;
-                    }
-                    case STRING: 
-                    {
-                        char* val = reinterpret_cast<char*>(data.get());
-                        auto field = std::make_unique<Field>(std::string(val, data_length));
-                        tuple->addField(std::move(field));
-                        break;
-                    }
-                }
-
-            }
-
-            std::cout << "Tuple " << (i+1) << " :: "; 
-            tuple->print();
-
-            // Add the tuple to the page.
-            //addTuple(std::move(tuple));
+        for (size_t i = 0; i < tupleCount; ++i) {
+            auto loadedTuple = Tuple::deserialize(in);
+            std::cout << "Tuple " << (i+1) << " :: ";
+            loadedTuple->print();
+            page->addTuple(std::move(loadedTuple));
         }
-
         in.close();
+        return page;
     }
 
 };
@@ -237,18 +249,16 @@ private:
 
 public:
     size_t max_number_of_tuples = 500;
-    size_t currently_added_tuples = 0;
+    size_t tuple_insertion_attempt_counter = 0;
 
     // a vector of Tuple unique pointers acting as a table
     std::vector<std::unique_ptr<Tuple>> table;
 
-    Page page;
+    SlottedPage page;
 
     // insert function
     void insert(int key, int value) {
-        if (currently_added_tuples == max_number_of_tuples)
-        return;
-
+        tuple_insertion_attempt_counter += 1;
         auto newTuple = std::make_unique<Tuple>();
 
         auto key_field = std::make_unique<Field>(key);
@@ -265,7 +275,11 @@ public:
         //newTuple->print();
 
         page.addTuple(std::move(newTuple));
-        currently_added_tuples += 1;
+
+        // Skip deleting tuples only once every hundred tuples
+        if (tuple_insertion_attempt_counter % 100000 != 0){
+            page.deleteTuple(0);
+        }
 
         //table.push_back(std::move(newTuple));
         index[key].push_back(value);
@@ -309,8 +323,13 @@ int main() {
     db.page.write(filename);
 
     // Deserialize from disk
-    Page page2;
-    page2.read(filename);
+    auto loadedPage = SlottedPage::deserialize(filename);
+
+    // PROBLEM: Deletion only in memory, not on disk
+    //loadedPage->deleteTuple(0);
+
+    // Deserialize again from disk -- page unchanged
+    //auto loadedPage2 = SlottedPage::deserialize(filename);
 
     // Get the end time
     auto end = std::chrono::high_resolution_clock::now();

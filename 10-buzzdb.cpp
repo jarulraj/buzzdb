@@ -147,7 +147,6 @@ const int PAGE_SIZE = 4096;
 // Page class
 class Page {
 public:
-    char data[PAGE_SIZE];
     size_t used_size = 0;
     std::vector<std::unique_ptr<Tuple>> tuples;
 
