@@ -123,7 +123,8 @@ public:
 
         // If there is still not enough space, reject the operation
         if (used_size + tuple_size > PAGE_SIZE) {
-            // Page is full. Cannot add more tuples.
+            std::cout << "Page is full. Cannot add more tuples. ";
+            std::cout << "Page contains: " << tuples.size() << " tuples. \n";
             return false;
         }
 
@@ -155,8 +156,9 @@ public:
                 out.write(field->data.get(), field->data_length);
             }
 
-            out.close();
         }
+
+        out.close();
     }
 
     // Read this page from a file.
@@ -166,6 +168,8 @@ public:
         // First read the number of tuples.
         size_t numTuples;
         in.read(reinterpret_cast<char*>(&numTuples), sizeof(numTuples));
+
+        std::cout << "Num Tuples: " << numTuples << "\n";
 
         // Then read each tuple.
         for (size_t i = 0; i < numTuples; ++i) {
@@ -214,8 +218,11 @@ public:
 
             }
 
+            std::cout << "Tuple " << (i+1) << " :: "; 
+            tuple->print();
+
             // Add the tuple to the page.
-            addTuple(std::move(tuple));
+            //addTuple(std::move(tuple));
         }
 
         in.close();
@@ -230,7 +237,7 @@ private:
     std::map<int, std::vector<int>> index;
 
 public:
-    size_t max_number_of_tuples = 4;
+    size_t max_number_of_tuples = 20;
     size_t currently_added_tuples = 0;
 
     // a vector of Tuple unique pointers acting as a table
@@ -297,15 +304,14 @@ int main() {
     
     db.selectGroupBySum();
 
-    auto page = db.page;
     std::string filename = "page.dat";
 
     // Serialize to disk
-    page.write(filename);
+    db.page.write(filename);
 
     // Deserialize from disk
-    //SlottedPage page2;
-    //page2.read(filename);
+    SlottedPage page2;
+    page2.read(filename);
 
     // Get the end time
     auto end = std::chrono::high_resolution_clock::now();

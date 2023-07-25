@@ -8,7 +8,7 @@ cpp_files = glob.glob('*.cpp')
 
 def compile_cpp(file):
     # Define the command to compile the C++ file
-    command = f"g++ -fdiagnostics-color -std=c++11 -O3 -Wall -Werror -Wextra {file} -o {file.split('.')[0]}.out"
+    command = f"g++ -fdiagnostics-color -std=c++11 -std=c++14 -O3 -Wall -Werror -Wextra {file} -o {file.split('.')[0]}.out"
     
     # Run the command
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
