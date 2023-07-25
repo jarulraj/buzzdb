@@ -101,8 +101,8 @@ public:
 
 const int PAGE_SIZE = 4096;
 
-// Slotted Page class
-class SlottedPage {
+// Page class
+class Page {
 public:
     char data[PAGE_SIZE];
     size_t used_size = 0;
@@ -243,7 +243,7 @@ public:
     // a vector of Tuple unique pointers acting as a table
     std::vector<std::unique_ptr<Tuple>> table;
 
-    SlottedPage page;
+    Page page;
 
     // insert function
     void insert(int key, int value) {
@@ -310,7 +310,7 @@ int main() {
     db.page.write(filename);
 
     // Deserialize from disk
-    SlottedPage page2;
+    Page page2;
     page2.read(filename);
 
     // Get the end time

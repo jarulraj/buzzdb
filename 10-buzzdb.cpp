@@ -144,8 +144,8 @@ public:
 
 const int PAGE_SIZE = 4096;
 
-// Slotted Page class
-class SlottedPage {
+// Page class
+class Page {
 public:
     char data[PAGE_SIZE];
     size_t used_size = 0;
@@ -201,9 +201,9 @@ public:
     }
 
     // Read this page from a file.
-    static std::unique_ptr<SlottedPage> deserialize(const std::string& filename) {
+    static std::unique_ptr<Page> deserialize(const std::string& filename) {
         std::ifstream in(filename);
-        auto page = std::make_unique<SlottedPage>();
+        auto page = std::make_unique<Page>();
 
         // First read the number of tuples.
         size_t tupleCount; in >> tupleCount;
@@ -234,7 +234,7 @@ public:
     // a vector of Tuple unique pointers acting as a table
     std::vector<std::unique_ptr<Tuple>> table;
 
-    SlottedPage page;
+    Page page;
 
     // insert function
     void insert(int key, int value) {
@@ -303,7 +303,7 @@ int main() {
     db.page.write(filename);
 
     // Deserialize from disk
-    auto loadedPage = SlottedPage::deserialize(filename);
+    auto loadedPage = Page::deserialize(filename);
 
     // Get the end time
     auto end = std::chrono::high_resolution_clock::now();
