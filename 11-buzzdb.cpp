@@ -11,6 +11,7 @@
 #include <memory>
 #include <sstream>
 #include <limits>
+#include <thread> // For std::this_thread::sleep_for
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -160,12 +161,12 @@ public:
 
 static constexpr size_t PAGE_SIZE = 4096;  // Fixed page size
 static constexpr size_t MAX_SLOTS = 200;   // Fixed number of slots
-uint8_t INVALID_VALUE = std::numeric_limits<uint8_t>::max(); // Sentinel value
+uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
 
 struct Slot {
     bool empty = true;                 // Is the slot empty?    
-    uint8_t offset = INVALID_VALUE;    // Offset of the slot within the page
-    uint8_t length = INVALID_VALUE;    // Length of the slot
+    uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
+    uint16_t length = INVALID_VALUE;    // Length of the slot
 };
 
 // Slotted Page class
@@ -173,9 +174,9 @@ class SlottedPage {
 public:
     std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
     size_t used_size = 0;
+    size_t metadata_size = sizeof(Slot) * MAX_SLOTS;
 
     SlottedPage(){
-        size_t metadata_size = sizeof(Slot) * MAX_SLOTS;
         used_size = metadata_size;
         std::cout << "Used size: " << used_size << " bytes \n";
 
@@ -186,7 +187,7 @@ public:
             slot_array[slot_itr].empty = true;
             slot_array[slot_itr].offset = INVALID_VALUE;
             slot_array[slot_itr].length = INVALID_VALUE;
-        }        
+        }
     }
 
     // Add a tuple, returns true if it fits, false otherwise.
@@ -196,7 +197,8 @@ public:
         auto serializedTuple = tuple->serialize();
         size_t tuple_size = serializedTuple.size();
 
-        std::cout << "Tuple size: " << tuple_size << " bytes\n";
+        //std::cout << "Tuple size: " << tuple_size << " bytes\n";
+        assert(tuple_size == 38);
 
         // If there is still not enough space, reject the operation
         if (used_size + tuple_size > PAGE_SIZE) {
@@ -221,11 +223,28 @@ public:
 
         // Identify the offset where the tuple will be placed in the page
         // Update slot meta-data if needed
-        size_t offset = slot_array[slot_itr].offset;
+        slot_array[slot_itr].empty = false;
+        size_t offset = INVALID_VALUE;
         if (slot_array[slot_itr].offset == INVALID_VALUE){
-            offset = used_size;
+            if(slot_itr != 0){
+                auto prev_slot_offset = slot_array[slot_itr - 1].offset;
+                auto prev_slot_length = slot_array[slot_itr - 1].length;
+                offset = prev_slot_offset + prev_slot_length;
+            }
+            else{
+                offset = used_size;
+            }
+
             slot_array[slot_itr].offset = offset;
         }
+        else{
+            offset = slot_array[slot_itr].offset;
+        }
+
+        assert(offset != INVALID_VALUE);
+        assert(offset >= metadata_size);
+        assert(offset < PAGE_SIZE);
+
         if (slot_array[slot_itr].length == INVALID_VALUE){
             slot_array[slot_itr].length = tuple_size;
         }
@@ -242,15 +261,26 @@ public:
     }
 
     void deleteTuple(size_t index) {
-        if(index == 2){
-            return;
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        size_t slot_itr = 0;
+        for (; slot_itr < MAX_SLOTS; slot_itr++) {
+            if(slot_itr == index and
+               slot_array[slot_itr].empty == false){
+                slot_array[slot_itr].empty = true;
+
+                // Update page's used size
+                used_size -= slot_array[slot_itr].length;
+                break;
+               }
         }
+
+        //std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     // Write this page to a file.
     void write(const std::string& filename) const {
         std::ofstream out(filename);
-        out << page_data;
+        out.write(page_data.get(), PAGE_SIZE);
         out.close();
     }
 
@@ -259,20 +289,32 @@ public:
         std::ifstream in(filename);
         auto page = std::make_unique<SlottedPage>();
 
-        // First read the number of tuples.
-        size_t tupleCount; in >> tupleCount;
-        std::cout << "Num Tuples: " << tupleCount << "\n";
-        // Then read each tuple.
-        for (size_t i = 0; i < tupleCount; ++i) {
-            auto loadedTuple = Tuple::deserialize(in);
-            std::cout << "Tuple " << (i+1) << " :: ";
-            loadedTuple->print();
-            page->addTuple(std::move(loadedTuple));
+        // Read the content of the file into the new unique_ptr
+        if (in.read(page->page_data.get(), PAGE_SIZE)) {
+            std::cout << "Page read successfully from file." << std::endl;
+        } else {
+            std::cerr << "Error: Unable to read data from the file." << std::endl;
         }
+
         in.close();
         return page;
     }
 
+    void print() const{
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+            if (slot_array[slot_itr].empty == false){
+                assert(slot_array[slot_itr].offset != INVALID_VALUE);
+                const char* tuple_data = page_data.get() + slot_array[slot_itr].offset;
+                std::istringstream iss(tuple_data);
+                auto loadedTuple = Tuple::deserialize(iss);
+                std::cout << "Slot " << slot_itr << " : [";
+                std::cout << (uint16_t)(slot_array[slot_itr].offset) << "] :: ";
+                loadedTuple->print();
+            }
+        }
+        std::cout << "\n";
+    }
 };
 
 
@@ -282,7 +324,7 @@ private:
     std::map<int, std::vector<int>> index;
 
 public:
-    size_t max_number_of_tuples = 10;
+    size_t max_number_of_tuples = 5000;
     size_t tuple_insertion_attempt_counter = 0;
 
     // a vector of Tuple unique pointers acting as a table
@@ -294,8 +336,7 @@ public:
     void insert(int key, int value) {
         tuple_insertion_attempt_counter += 1;
 
-        std::cout << tuple_insertion_attempt_counter << "\n";
-        if(tuple_insertion_attempt_counter == max_number_of_tuples){
+        if(tuple_insertion_attempt_counter >= max_number_of_tuples){
             return;
         }
 
@@ -314,9 +355,11 @@ public:
 
         //newTuple->print();
 
-        auto status = page.addTuple(std::move(newTuple));
-        if (status == false){
-            exit(0);
+        page.addTuple(std::move(newTuple));
+
+        // Skip deleting tuples only once every hundred tuples
+        if (tuple_insertion_attempt_counter % 100 != 0){
+            page.deleteTuple(0);
         }
 
         //table.push_back(std::move(newTuple));
@@ -357,17 +400,26 @@ int main() {
 
     std::string filename = "page.dat";
 
+    db.page.print();
+
     // Serialize to disk
     db.page.write(filename);
 
     // Deserialize from disk
-    //auto loadedPage = SlottedPage::deserialize(filename);
+    auto loadedPage = SlottedPage::deserialize(filename);
 
-    // PROBLEM: Deletion only in memory, not on disk
-    //loadedPage->deleteTuple(0);
+    loadedPage->print();
 
-    // Deserialize again from disk -- page unchanged
-    //auto loadedPage2 = SlottedPage::deserialize(filename);
+    std::cout << "Deleting slots 0 and 7 \n";
+    loadedPage->deleteTuple(0);
+    loadedPage->deleteTuple(7);
+
+    loadedPage->write(filename);
+
+    // Deserialize again from disk -- page is updated this time
+    auto loadedPage2 = SlottedPage::deserialize(filename);
+
+    loadedPage2->print();
 
     // Get the end time
     auto end = std::chrono::high_resolution_clock::now();

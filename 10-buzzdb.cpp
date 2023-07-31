@@ -256,7 +256,7 @@ public:
         page.addTuple(std::move(newTuple));
 
         // Skip deleting tuples only once every hundred tuples
-        if (tuple_insertion_attempt_counter % 100000 != 0){
+        if (tuple_insertion_attempt_counter % 100 != 0){
             page.deleteTuple(0);
         }
 
