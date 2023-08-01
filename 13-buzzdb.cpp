@@ -205,10 +205,10 @@ public:
             }
         }
         if (slot_itr == MAX_SLOTS){
-            std::cout << "Page does not contain an empty slot with sufficient space to store the tuple.";
+            //std::cout << "Page does not contain an empty slot with sufficient space to store the tuple.";
             return false;
         }
-        
+
         // Identify the offset where the tuple will be placed in the page
         // Update slot meta-data if needed
         slot_array[slot_itr].empty = false;
@@ -295,13 +295,12 @@ public:
         Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
         for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
             if (slot_array[slot_itr].empty == false){
-                std::cout << "Slot " << slot_itr << " : [";
-                std::cout << (uint16_t)(slot_array[slot_itr].offset) << "] :: ";
                 assert(slot_array[slot_itr].offset != INVALID_VALUE);
                 const char* tuple_data = page_data.get() + slot_array[slot_itr].offset;
                 std::istringstream iss(tuple_data);
-                assert(iss.str().size() != 0);
                 auto loadedTuple = Tuple::deserialize(iss);
+                std::cout << "Slot " << slot_itr << " : [";
+                std::cout << (uint16_t)(slot_array[slot_itr].offset) << "] :: ";
                 loadedTuple->print();
             }
         }
@@ -424,9 +423,30 @@ public:
             pages[0]->deleteTuple(0);
             pages[0]->flush(file, 0);
         }
+    }
 
-        //table.push_back(std::move(newTuple));
-        index[key].push_back(value);
+    void scanTableToBuildIndex(){
+
+        std::cout << "Scanning table to build index \n";
+
+        for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
+            char* page_buffer = pages[page_itr]->page_data.get();
+            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+                if (slot_array[slot_itr].empty == false){
+                    assert(slot_array[slot_itr].offset != INVALID_VALUE);
+                    const char* tuple_data = page_buffer + slot_array[slot_itr].offset;
+                    std::istringstream iss(tuple_data);
+                    auto loadedTuple = Tuple::deserialize(iss);
+                    int key = loadedTuple->fields[0]->asInt();
+                    int value = loadedTuple->fields[1]->asInt();
+
+                    // Build index
+                    index[key].push_back(value);
+                }
+            }
+        }
+
     }
 
     // perform a SELECT ... GROUP BY ... SUM query
@@ -459,6 +479,8 @@ int main() {
         db.insert(field1, field2);
     }
 
+    db.scanTableToBuildIndex();
+    
     db.selectGroupBySum();
 
     std::cout << "Num Pages: " << db.num_pages << "\n";
