@@ -10,7 +10,7 @@ int main() {
     std::uniform_int_distribution<int> amountDistribution(101, 999);
     std::discrete_distribution<int> customerDistribution({40, 20, 10, 10, 5, 5, 5, 3, 2});
 
-    int number_of_sales = 1000;
+    int number_of_sales = 10 * 1000 * 1000;
 
     std::ofstream outputFile("output.txt");
     if (outputFile.is_open()) {
