@@ -383,7 +383,7 @@ public:
         queue.push(page_id);
     }
 
-    uint16_t evict() override {
+    PageID evict() override {
         // Dequeue the oldest page and return its ID
         PageID evictedPageId = INVALID_VALUE;
         if(queue.size() != 0){
@@ -433,11 +433,9 @@ constexpr size_t MAX_PAGES_IN_MEMORY = 5;
 
 class BufferManager {
 private:
-    using PageList = std::list<std::pair<PageID, std::unique_ptr<SlottedPage>>>;
-    using PageMap = std::unordered_map<PageID, typename PageList::iterator>;
+    using PageMap = std::unordered_map<PageID, std::unique_ptr<SlottedPage>>;
 
     StorageManager storage_manager;
-    PageList lruList;
     PageMap pageMap;
     std::unique_ptr<Policy> policy;
 
@@ -448,29 +446,27 @@ public:
         auto it = pageMap.find(page_id);
         if (it != pageMap.end()) {
             policy->touch(page_id);
-            return it->second->second;
+            return pageMap.find(page_id)->second;
         }
 
-        if (lruList.size() >= MAX_PAGES_IN_MEMORY) {
+        if (pageMap.size() >= MAX_PAGES_IN_MEMORY) {
             auto evictedPageId = policy->evict();
             if(evictedPageId != INVALID_VALUE){
                 std::cout << "Evicting page " << evictedPageId << "\n";
                 storage_manager.flush(evictedPageId, 
-                                      pageMap[evictedPageId]->second);
+                                      pageMap[evictedPageId]);
             }
         }
 
         auto page = storage_manager.load(page_id);
         std::cout << "Loading page: " << page_id << "\n";
-        lruList.emplace_front(page_id, std::move(page));
-        pageMap[page_id] = lruList.begin();
-
-        return lruList.begin()->second;
+        pageMap[page_id] = std::move(page);
+        return pageMap[page_id];
     }
 
     void flushPage(int page_id) {
         //std::cout << "Flush page " << page_id << "\n";
-        storage_manager.flush(page_id, pageMap[page_id]->second);
+        storage_manager.flush(page_id, pageMap[page_id]);
     }
 
     void extend(){
