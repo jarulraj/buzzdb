@@ -5,13 +5,15 @@
 #include <iostream>
 #include <chrono>
 
+#include <list>
+#include <unordered_map>
 #include <iostream>
 #include <map>
 #include <string>
 #include <memory>
 #include <sstream>
 #include <limits>
-#include <thread> // For std::this_thread::sleep_for
+#include <thread>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -289,9 +291,6 @@ public:
     std::fstream fileStream;
     size_t num_pages = 0;
 
-    // a vector of Slotted Pages acting as a table
-    std::vector<std::unique_ptr<SlottedPage>> pages;
-
 public:
     StorageManager(){
         fileStream.open(database_filename, std::ios::in | std::ios::out);
@@ -306,18 +305,9 @@ public:
         fileStream.seekg(0, std::ios::end);
         num_pages = fileStream.tellg() / PAGE_SIZE;
 
-        std::cout << "Num pages: " << num_pages << "\n";
-
+        std::cout << "Storage Manager :: Num pages: " << num_pages << "\n";        
         if(num_pages == 0){
             extend();
-        }
-        else{
-            std::cout << "Loading " << num_pages << " pages \n";
-
-            for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
-                auto page(load(page_itr));
-                pages.push_back(std::move(page));
-            }
         }
 
     }
@@ -344,18 +334,18 @@ public:
     }
 
     // Write a page to disk
-    void flush(uint16_t page_id) {
+    void flush(uint16_t page_id, const std::unique_ptr<SlottedPage>& page) {
         size_t page_offset = page_id * PAGE_SIZE;        
 
         // Move the write pointer
         fileStream.seekp(page_offset, std::ios::beg);
-        fileStream.write(pages[page_id]->page_data.get(), PAGE_SIZE);        
+        fileStream.write(page->page_data.get(), PAGE_SIZE);        
         fileStream.flush();
     }
 
     // Extend database file by one page
     void extend() {
-        //std::cout << "Extending database file \n";
+        std::cout << "Extending database file \n";
 
         // Create a slotted page
         auto empty_slotted_page = std::make_unique<SlottedPage>();
@@ -369,13 +359,73 @@ public:
 
         // Update number of pages
         num_pages += 1;
+    }
 
-        std::cout << "Loading page \n";
+};
 
-        // Load page into memory
-        auto page_itr = num_pages - 1;
-        auto page(load(page_itr));
-        pages.push_back(std::move(page));
+constexpr size_t MAX_PAGES_IN_MEMORY = 5;
+
+class BufferManager {
+private:
+    using PageID = uint16_t;
+    using PageList = std::list<std::pair<PageID, std::unique_ptr<SlottedPage>>>;
+    using PageMap = std::unordered_map<PageID, typename PageList::iterator>;
+
+    StorageManager storage_manager;
+    PageList lruList;
+    PageMap pageMap;
+
+    void touch(typename PageList::iterator it) {
+        // Move page to front of list
+        //std::cout << "Moving page " << it->first << " to front of list \n";
+        lruList.splice(lruList.begin(), lruList, it); 
+    }
+
+    void evict() {
+        auto last = lruList.end();
+        last--;
+        int evictedPageId = last->first;
+        std::cout << "Evicting page " << evictedPageId << "\n";
+
+        storage_manager.flush(evictedPageId, pageMap[evictedPageId]->second);
+
+        pageMap.erase(evictedPageId);
+        lruList.pop_back();
+    }
+
+public:
+    BufferManager() {}
+
+    std::unique_ptr<SlottedPage>& getPage(int page_id) {
+        auto it = pageMap.find(page_id);
+        if (it != pageMap.end()) {
+            touch(it->second);
+            return it->second->second;
+        }
+
+        if (lruList.size() >= MAX_PAGES_IN_MEMORY) {
+            evict();
+        }
+
+        auto page = storage_manager.load(page_id);
+        std::cout << "Loading page: " << page_id << "\n";
+        lruList.emplace_front(page_id, std::move(page));
+        pageMap[page_id] = lruList.begin();
+
+        return lruList.begin()->second;
+    }
+
+    void flushPage(int page_id) {
+        //std::cout << "Flush page " << page_id << "\n";
+        storage_manager.flush(page_id, pageMap[page_id]->second);
+    }
+
+    void extend(){
+        storage_manager.extend();
+    }
+    
+    size_t getNumPages(){
+        return storage_manager.num_pages;
     }
 
 };
@@ -385,8 +435,7 @@ public:
     // a map is an ordered key-value container
     std::map<int, std::vector<int>> index;
 
-    // Storage manager
-    StorageManager sm;
+    BufferManager buffer_manager;
 
 public:
     size_t max_number_of_tuples = 5000;
@@ -398,7 +447,8 @@ public:
 
     bool try_to_insert(int key, int value){
         bool status = false;
-        for (size_t page_itr = 0; page_itr < sm.num_pages; page_itr++) {
+        auto num_pages = buffer_manager.getNumPages();
+        for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
 
             auto newTuple = std::make_unique<Tuple>();
 
@@ -413,10 +463,12 @@ public:
             newTuple->addField(std::move(float_field));
             newTuple->addField(std::move(string_field));
 
-            status = sm.pages[page_itr]->addTuple(std::move(newTuple));
+            auto& page = buffer_manager.getPage(page_itr);
+
+            status = page->addTuple(std::move(newTuple));
             if (status == true){
                 //std::cout << "Inserted into page: " << page_itr << "\n";
-                sm.flush(page_itr);
+                buffer_manager.flushPage(page_itr);
                 break;
             }
         }
@@ -436,7 +488,7 @@ public:
 
         // Try again after extending the database file
         if(status == false){
-            sm.extend();
+            buffer_manager.extend();
             bool status2 = try_to_insert(key, value);
             assert(status2 == true);
         }
@@ -445,8 +497,9 @@ public:
 
         // Skip deleting tuples only once every hundred tuples
         if (tuple_insertion_attempt_counter % 100 != 0){
-            sm.pages[0]->deleteTuple(0);
-            sm.flush(0);
+            auto& page = buffer_manager.getPage(0);
+            page->deleteTuple(0);
+            buffer_manager.flushPage(0);
         }
     }
 
@@ -454,8 +507,11 @@ public:
 
         std::cout << "Scanning table to build index \n";
 
-        for (size_t page_itr = 0; page_itr < sm.num_pages; page_itr++) {
-            char* page_buffer = sm.pages[page_itr]->page_data.get();
+        auto num_pages = buffer_manager.getNumPages();
+
+        for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
+            auto& page = buffer_manager.getPage(page_itr);
+            char* page_buffer = page->page_data.get();
             Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
             for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
                 if (slot_array[slot_itr].empty == false){
@@ -508,7 +564,7 @@ int main() {
     
     db.selectGroupBySum();
 
-    std::cout << "Num Pages: " << db.sm.num_pages << "\n";
+    std::cout << "Num Pages: " << db.buffer_manager.getNumPages() << "\n";
 
     // Get the end time
     auto end = std::chrono::high_resolution_clock::now();
