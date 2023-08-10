@@ -377,10 +377,17 @@ class FifoPolicy : public Policy {
 private:
     std::queue<PageID> queue;
 
+    size_t cacheSize;
+
 public:
+
+    FifoPolicy(size_t cacheSize) : cacheSize(cacheSize) {}
+
     void touch(PageID page_id) override {
-        // For FIFO, we simply enqueue a newly touched page
-        queue.push(page_id);
+        if(queue.size() < cacheSize){
+            // For FIFO, we simply enqueue a newly touched page
+            queue.push(page_id);
+        }
     }
 
     PageID evict() override {
@@ -403,7 +410,12 @@ private:
     // Map to find a page's iterator in the list efficiently
     std::unordered_map<PageID, std::list<PageID>::iterator> map;
 
+    size_t cacheSize;
+
 public:
+
+    LruPolicy(size_t cacheSize) : cacheSize(cacheSize) {}
+
     void touch(PageID page_id) override {
         // If page already in the list, remove it
         if (map.find(page_id) != map.end()) {
@@ -411,9 +423,11 @@ public:
             map.erase(page_id);
         }
 
-        // Add the page to the front of the list
-        lruList.emplace_front(page_id);
-        map[page_id] = lruList.begin();
+        if(lruList.size() < cacheSize){
+            // Add the page to the front of the list
+            lruList.emplace_front(page_id);
+            map[page_id] = lruList.begin();
+        }
     }
 
     PageID evict() override {
@@ -429,6 +443,80 @@ public:
 
 };
 
+
+class TwoQPolicy : public Policy {
+private:
+    size_t cacheSize;
+
+    std::list<PageID> FIFO; // Read-once pages (FIFO)
+    std::list<PageID> LRU;  // Hot pages (LRU)
+
+    std::unordered_map<PageID, std::list<PageID>::iterator> pageMap;
+
+public:
+    TwoQPolicy(size_t cache_size) : cacheSize(cache_size) {}
+
+    void touch(PageID page_id) {
+        printList("FIFO", FIFO);
+        printList("LRU", LRU);
+
+        // Check if page is already in cache
+        if (pageMap.find(page_id) != pageMap.end()) {
+            auto it = pageMap[page_id];
+
+            // If it's in FIFO, move to LRU
+            if (std::find(FIFO.begin(), FIFO.end(), page_id) != FIFO.end()) {
+                FIFO.erase(it);
+                LRU.push_front(page_id);
+                pageMap[page_id] = LRU.begin();
+            } else {
+                // If it's in LRU, move to the front
+                LRU.erase(it);
+                LRU.push_front(page_id);
+                pageMap[page_id] = LRU.begin();
+            }
+        } else {
+            // If cache is full, evict
+            if (FIFO.size() + LRU.size() >= cacheSize) {
+                evict();
+            }
+
+            // Add page to FIFO
+            FIFO.push_back(page_id);
+            pageMap[page_id] = std::prev(FIFO.end());
+        }
+    }
+
+    PageID evict() {
+        printList("FIFO", FIFO);
+        printList("LRU", LRU);
+
+        PageID evictedPageId = INVALID_VALUE;
+        if (!FIFO.empty()) {
+            evictedPageId = FIFO.front();
+            std::cout << "FIFO:: Evicting page " << evictedPageId << "\n";
+            FIFO.pop_front();
+            pageMap.erase(evictedPageId);
+        } else {
+            evictedPageId = LRU.back();
+            std::cout << "LRU:: Evicting page " << evictedPageId << "\n";
+
+            LRU.pop_back();
+            pageMap.erase(evictedPageId);
+        }
+        return evictedPageId;
+    }
+
+    void printList(std::string list_name, const std::list<PageID>& myList) {
+        std::cout << list_name << " :: ";
+        for (const PageID& value : myList) {
+            std::cout << value << ' ';
+        }
+        std::cout << '\n';
+    }
+
+};
+
 constexpr size_t MAX_PAGES_IN_MEMORY = 5;
 
 class BufferManager {
@@ -440,7 +528,8 @@ private:
     std::unique_ptr<Policy> policy;
 
 public:
-    BufferManager(): policy(std::make_unique<FifoPolicy>()) {}
+    BufferManager(): 
+    policy(std::make_unique<TwoQPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
     std::unique_ptr<SlottedPage>& getPage(int page_id) {
         auto it = pageMap.find(page_id);
