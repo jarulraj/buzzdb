@@ -689,6 +689,8 @@ public:
                 char* tuple_data = page->page_data.get() + slot_array[slot_itr].offset; 
 
                 // skip the first 6 bytes
+                // 4 (field_count) | space | 0 (first field type) | space 
+                // | 4 (first field length) | space
                 uint8_t ascii_key = *reinterpret_cast<uint8_t*>(tuple_data + 6);
                 int int_key = static_cast<int>(ascii_key) - '0';
 
