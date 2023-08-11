@@ -686,34 +686,13 @@ public:
                 }
 
                 // Get the pointer to the tuple data
-                char* tuple_data = page->page_data.get() + slot_array[slot_itr].offset;
-                std::istringstream iss(tuple_data);
-                auto loadedTuple = Tuple::deserialize(iss);
-                //int key = loadedTuple->fields[0]->asInt();
+                char* tuple_data = page->page_data.get() + slot_array[slot_itr].offset; 
 
-                //printf("tuple_data: %s\n", tuple_data);
+                // skip the first 6 bytes
+                uint8_t ascii_key = *reinterpret_cast<uint8_t*>(tuple_data + 6);
+                int int_key = static_cast<int>(ascii_key) - '0';
 
-                //std::cout << "original key: " << key2 << " :: ";
- 
-                char key_buffer[4]; // Buffer to hold the first 4 bytes
-
-                // skip the tuple field count (size_t)
-                // skip the field type (int) and field data length (size_t)
-                // Copy the first 4 bytes
-                std::memcpy(key_buffer, 
-                            tuple_data + 6, 
-                            1);
-
-                //printf("key_buffer: %s\n", tuple_data + 6);
-                //printf("key_buffer: %s\n", key_buffer);
-
-                // Interpret the next 4 bytes as an integer (32-bit)
-                uint8_t key2 = *reinterpret_cast<uint8_t*>(key_buffer);
-                int key3 = static_cast<int>(key2);
-
-                std::cout << key2 << " ";
-
-                if (key3 == 5) {
+                if (int_key == 5) {
                     tuple_count++;
                 }
             }

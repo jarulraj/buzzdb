@@ -740,8 +740,8 @@ int main() {
     auto start_filter_time = std::chrono::high_resolution_clock::now();
     db.filter_tuples_with_key_5();
     auto end_filter_time = std::chrono::high_resolution_clock::now();
-    elapsed = end_filter_time - start_filter_time;
-    std::cout << "Filter Elapsed time: " << elapsed.count() << " seconds" << std::endl;
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_filter_time - start_filter_time);
+    std::cout << "Filter time: " << duration.count() << " microseconds" <<  std::endl;
     
     return 0;
 }
