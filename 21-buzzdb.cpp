@@ -166,7 +166,7 @@ public:
 };
 
 static constexpr size_t PAGE_SIZE = 1024;  // Fixed page size
-static constexpr size_t MAX_SLOTS = 100;   // Fixed number of slots
+static constexpr size_t MAX_SLOTS = 128;   // Fixed number of slots
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
 
 struct Slot {
@@ -669,41 +669,6 @@ public:
         }
     }
 
-    void filter_tuples_with_key_5_with_stringstream() {
-        std::cout << "Counting tuples with key 5 \n";
-        uint32_t tuple_count = 0;
-
-        auto num_pages = buffer_manager.getNumPages();
-
-        for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
-            auto& page = buffer_manager.getPage(page_itr);
-            Slot* slot_array = reinterpret_cast<Slot*>(page->page_data.get());
-            std::vector<size_t> result_indices;
-
-            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
-                if (slot_array[slot_itr].empty) {
-                    continue;
-                }
-
-                // Get the pointer to the tuple data
-                char* tuple_data = page->page_data.get() + slot_array[slot_itr].offset;
-
-                // Interpret the first 4 bytes as an integer (32-bit)
-                std::istringstream iss(tuple_data);
-                auto loadedTuple = Tuple::deserialize(iss);
-                int key = loadedTuple->fields[0]->asInt();
-
-                //std::cout << "key: " << key << "\n";
-
-                if (key == 5) {
-                    tuple_count++;
-                }
-            }
-        }
-
-        std::cout << "Tuple count: " << tuple_count << "\n";
-    }    
-
     void filter_tuples_with_key_5() {
         std::cout << "Counting tuples with key 5 \n";
         uint32_t tuple_count = 0;
@@ -713,7 +678,6 @@ public:
         for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
             auto& page = buffer_manager.getPage(page_itr);
             Slot* slot_array = reinterpret_cast<Slot*>(page->page_data.get());
-            std::vector<size_t> result_indices;
 
             for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
                 if (slot_array[slot_itr].empty) {
@@ -747,7 +711,6 @@ public:
         for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
             auto& page = buffer_manager.getPage(page_itr);
             Slot* slot_array = reinterpret_cast<Slot*>(page->page_data.get());
-            std::vector<size_t> result_indices;
 
             // Create a constant vector with the value 5
             uint8x16_t key_to_match_vec = vdupq_n_u8('5');
@@ -755,25 +718,11 @@ public:
             uint8_t INVALID_UINT8_T_VALUE =std::numeric_limits<uint8_t>::max(); // Sentinel value
 
             for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr += 16) { 
-                // Process 8 slots at a time
-                uint8_t keys[16] = {
-                    slot_array[slot_itr + 0].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 0].offset + 6),
-                    slot_array[slot_itr + 1].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 1].offset + 6),
-                    slot_array[slot_itr + 2].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 2].offset + 6),
-                    slot_array[slot_itr + 3].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 3].offset + 6),
-                    slot_array[slot_itr + 4].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 4].offset + 6),
-                    slot_array[slot_itr + 5].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 5].offset + 6),
-                    slot_array[slot_itr + 6].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 6].offset + 6),
-                    slot_array[slot_itr + 7].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 7].offset + 6),
-                    slot_array[slot_itr + 8].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 8].offset + 6),
-                    slot_array[slot_itr + 9].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 9].offset + 6),
-                    slot_array[slot_itr + 10].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 10].offset + 6),
-                    slot_array[slot_itr + 11].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 11].offset + 6),
-                    slot_array[slot_itr + 12].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 12].offset + 6),
-                    slot_array[slot_itr + 13].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 13].offset + 6),
-                    slot_array[slot_itr + 14].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 14].offset + 6),
-                    slot_array[slot_itr + 15].empty ? INVALID_UINT8_T_VALUE : *reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + 15].offset + 6),
-                };
+                // Process 16 slots at a time
+                uint8_t keys[16];
+                for (size_t i = 0; i < 16; ++i) {
+                    keys[i] = slot_array[slot_itr + i].empty ? INVALID_UINT8_T_VALUE : *(reinterpret_cast<uint8_t*>(page->page_data.get() + slot_array[slot_itr + i].offset + 6));
+                }
 
                 // Load 16 8-bit keys into a NEON 128-bit integer vector
                 uint8x16_t keys_vec = vld1q_u8(keys);
@@ -829,12 +778,6 @@ int main() {
     // Calculate and print the elapsed time
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
-
-    auto start_filter_with_stringstream_time = std::chrono::high_resolution_clock::now();
-    db.filter_tuples_with_key_5_with_stringstream();
-    auto end_filter_with_stringstream_time = std::chrono::high_resolution_clock::now();
-    auto duration_with_stringstream = std::chrono::duration_cast<std::chrono::microseconds>(end_filter_with_stringstream_time - start_filter_with_stringstream_time);
-    std::cout << "Filter time (With stringstream): " << duration_with_stringstream.count() << " microseconds" << std::endl;
 
     auto start_filter_time = std::chrono::high_resolution_clock::now();
     db.filter_tuples_with_key_5();

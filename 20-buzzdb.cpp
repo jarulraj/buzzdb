@@ -669,6 +669,42 @@ public:
         }
     }
 
+    void filter_tuples_with_key_5_with_stringstream() {
+        std::cout << "Counting tuples with key 5 \n";
+        uint32_t tuple_count = 0;
+
+        auto num_pages = buffer_manager.getNumPages();
+
+        for (size_t page_itr = 0; page_itr < num_pages; page_itr++) {
+            auto& page = buffer_manager.getPage(page_itr);
+            Slot* slot_array = reinterpret_cast<Slot*>(page->page_data.get());
+            std::vector<size_t> result_indices;
+
+            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+                if (slot_array[slot_itr].empty) {
+                    continue;
+                }
+
+                // Get the pointer to the tuple data
+                char* tuple_data = page->page_data.get() + slot_array[slot_itr].offset;
+
+                // Interpret the first 4 bytes as an integer (32-bit)
+                std::istringstream iss(tuple_data);
+                auto loadedTuple = Tuple::deserialize(iss);
+                int key = loadedTuple->fields[0]->asInt();
+
+                //std::cout << "key: " << key << "\n";
+
+                if (key == 5) {
+                    tuple_count++;
+                }
+            }
+        }
+
+        std::cout << "Tuple count: " << tuple_count << "\n";
+    }
+
+
     void filter_tuples_with_key_5() {
         std::cout << "Counting tuples with key 5 \n";
         uint32_t tuple_count = 0;
@@ -735,6 +771,13 @@ int main() {
     // Calculate and print the elapsed time
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
+
+    auto start_filter_with_stringstream_time = std::chrono::high_resolution_clock::now();
+    db.filter_tuples_with_key_5_with_stringstream();
+    auto end_filter_with_stringstream_time = std::chrono::high_resolution_clock::now();
+    auto duration_with_stringstream = std::chrono::duration_cast<std::chrono::microseconds>(end_filter_with_stringstream_time - start_filter_with_stringstream_time);
+    std::cout << "Filter time (With stringstream): " << duration_with_stringstream.count() << " microseconds" << std::endl;
+
 
     auto start_filter_time = std::chrono::high_resolution_clock::now();
     db.filter_tuples_with_key_5();
