@@ -496,12 +496,15 @@ private:
         int value;
         bool exists; // Flag to check if entry exists
 
+        // Default constructor
+        HashEntry() : key(0), value(0), exists(false) {}
+
         // Constructor for initializing with key, value, and exists flag
         HashEntry(int k, int v, bool e) : key(k), value(v), exists(e) {}
     };
 
-    std::vector<std::optional<HashEntry>> hashTable;
     static const size_t capacity = 100; // Hard-coded capacity
+    HashEntry hashTable[capacity]; // Static-sized array
 
     size_t hashFunction(int key) const {
         return key % capacity; // Simple modulo hash function
@@ -509,7 +512,10 @@ private:
 
 public:
     HashIndex() {
-        hashTable.resize(capacity);
+        // Initialize all entries as non-existing by default
+        for (size_t i = 0; i < capacity; ++i) {
+            hashTable[i] = HashEntry();
+        }
     }
 
     void insertOrUpdate(int key, int value) {
@@ -518,32 +524,33 @@ public:
         bool inserted = false;
 
         do {
-            if (!hashTable[index] || !hashTable[index]->exists) {
-                hashTable[index] = HashEntry{key, value, true};
+            if (!hashTable[index].exists) {
+                hashTable[index] = HashEntry(key, value, true);
                 inserted = true;
                 break;
-            } else if (hashTable[index]->key == key) {
-                hashTable[index]->value += value;
+            } else if (hashTable[index].key == key) {
+                hashTable[index].value += value;
                 inserted = true;
                 break;
             }
             index = (index + 1) % capacity;
-        } while (index != originalIndex);
+        } while (index != originalIndex && !inserted);
 
         if (!inserted) {
             std::cerr << "HashTable is full or cannot insert key: " << key << std::endl;
         }
     }
 
-    int getValue(int key) const {
+   int getValue(int key) const {
         size_t index = hashFunction(key);
         size_t originalIndex = index;
 
         do {
-            if (hashTable[index] && hashTable[index]->exists && hashTable[index]->key == key) {
-                return hashTable[index]->value;
-            } else if (!hashTable[index]) {
-                break; // Stop if we hit an empty slot
+            if (hashTable[index].exists && hashTable[index].key == key) {
+                return hashTable[index].value;
+            }
+            if (!hashTable[index].exists) {
+                break; // Stop if we find a slot that has never been used
             }
             index = (index + 1) % capacity;
         } while (index != originalIndex);
@@ -552,9 +559,9 @@ public:
     }
 
     void print() const {
-        for (const auto& entry : hashTable) {
-            if (entry && entry->exists) {
-                std::cout << "key: " << entry->key << ", sum: " << entry->value << '\n';
+        for (size_t i = 0; i < capacity; ++i) {
+            if (hashTable[i].exists) {
+                std::cout << "Key: " << hashTable[i].key << ", Value: " << hashTable[i].value << std::endl;
             }
         }
     }
