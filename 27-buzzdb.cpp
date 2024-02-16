@@ -501,7 +501,7 @@ private:
         HashEntry() : key(0), value(0), position(-1), exists(false) {}
 
         // Constructor for initializing with key, value, and exists flag
-        HashEntry(int k, int v, int pos) : key(k), value(v), position(pos), exists(true) {}
+        HashEntry(int k, int v, int pos) : key(k), value(v), position(pos), exists(true) {}    
     };
 
     static const size_t capacity = 100; // Hard-coded capacity
@@ -523,6 +523,7 @@ public:
         size_t index = hashFunction(key);
         size_t originalIndex = index;
         bool inserted = false;
+        int i = 0; // Attempt counter
 
         do {
             if (!hashTable[index].exists) {
@@ -536,7 +537,8 @@ public:
                 inserted = true;
                 break;
             }
-            index = (index + 1) % capacity;
+            i++;
+            index = (originalIndex + i*i) % capacity; // Quadratic probing
         } while (index != originalIndex && !inserted);
 
         if (!inserted) {
@@ -567,7 +569,6 @@ public:
                 std::cout << "Position: " << hashTable[i].position << 
                 ", Key: " << hashTable[i].key << 
                 ", Value: " << hashTable[i].value << std::endl;
-                std::cout << "Key: " << hashTable[i].key << ", Value: " << hashTable[i].value << std::endl;
             }
         }
     }
