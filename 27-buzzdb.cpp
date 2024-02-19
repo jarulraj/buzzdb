@@ -15,6 +15,7 @@
 #include <limits>
 #include <thread>
 #include <queue>
+#include <optional>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -484,10 +485,6 @@ public:
     }
 
 };
-
-#include <iostream>
-#include <vector>
-#include <optional>
 
 class HashIndex {
 private:
