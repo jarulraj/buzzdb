@@ -708,17 +708,32 @@ public:
         }
     }
 
-
 private:
     size_t maxKeys;
     std::shared_ptr<Node> root;
+
+    void printNode(const std::shared_ptr<Node>& node) const {
+        if (!node) {
+            std::cout << "Empty Node";
+            return;
+        }
+
+        if (node->isLeaf) {
+            std::cout << "Leaf Node: ";
+            for (const auto& key : node->keys) std::cout << key << " ";
+            std::cout << "\n";
+        } else {
+            std::cout << "Internal Node: ";
+            for (const auto& key : node->keys) std::cout << key << " ";
+            std::cout << "\n";
+        }
+    }
 
     void splitNode(std::vector<std::shared_ptr<Node>> path, std::shared_ptr<Node> node) {
         auto newNode = std::make_shared<Node>(node->isLeaf);
         size_t mid = node->keys.size() / 2;
         Key midKey = node->keys[mid];
 
-        // Distribute keys and values/children to the new node
         if (node->isLeaf) {
             // Move second half of keys and values to the new node
             std::move(node->keys.begin() + mid, node->keys.end(), std::back_inserter(newNode->keys));
@@ -752,22 +767,28 @@ private:
             auto it = std::lower_bound(parent->keys.begin(), parent->keys.end(), midKey);
             size_t pos = it - parent->keys.begin();
 
-            // Check if the middle key already exists in the parent
-            if (it != parent->keys.end() && *it == midKey) {
-                // Insert new node in parent without inserting the middle key again
-                parent->children.insert(parent->children.begin() + pos + 1, newNode);
-            } else {
+            // Check if midKey is already present in the parent node
+            if (it == parent->keys.end() || *it != midKey) {
                 // Insert midKey and new node in parent
                 parent->keys.insert(parent->keys.begin() + pos, midKey);
                 parent->children.insert(parent->children.begin() + pos + 1, newNode);
+            } else {
+                // If midKey is already present, update the next pointer of the existing node
+                auto existingNode = std::find_if(parent->children.begin(), parent->children.end(),
+                    [&](const auto& child) { return child->keys.front() == midKey; });
+                if (existingNode != parent->children.end()) {
+                    (*existingNode)->next = newNode;
+                }
             }
 
             // Check if the parent node needs to be split
             if (parent->keys.size() > maxKeys) {
-                splitNode(std::vector<std::shared_ptr<Node>>(path.begin(), path.end() - 1), parent);
+                splitNode(path, parent);
             }
         }
     }
+
+
 
 };
 
@@ -892,7 +913,9 @@ public:
 
                     // Build indexes
                     hash_index.insertOrUpdate(key, value);
+
                     ordered_index.insertOrUpdate(key, value);
+                    ordered_index.print();
                 }
             }
         }
