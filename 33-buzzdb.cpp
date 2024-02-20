@@ -567,8 +567,6 @@ public:
         std::vector<int> values;
         for (size_t i = 0; i < capacity; ++i) {
             if (hashTable[i].exists && hashTable[i].key >= lowerBound && hashTable[i].key <= upperBound) {
-                std::cout << "Key: " << hashTable[i].key << 
-                ", Value: " << hashTable[i].value << std::endl;
                 values.push_back(hashTable[i].value);
             }
         }
@@ -586,171 +584,37 @@ public:
     }
 };
 
-template <typename Key, typename Value>
-class BPlusTree {
-    struct Node;
-    using NodePtr = std::unique_ptr<Node>;
-
-    struct Entry {
-        Key key;
-        Value value;
-        NodePtr next;
-
-        Entry(Key k, Value v) : key(k), value(v), next(nullptr) {}
-    };
-
-    struct Node {
-        bool isLeaf;
-        std::vector<Entry> entries;
-        NodePtr next;
-
-        Node(bool leaf) : isLeaf(leaf), next(nullptr) {}
-
-        bool isFull(size_t order) {
-            return entries.size() >= order;
-        }
-    };
-
-    NodePtr root;
-    size_t order;
-
-public:
-    BPlusTree(size_t order = 4) : root(new Node(true)), order(order) {}
-
-    void insertOrUpdate(const Key& key, const Value& value) {
-        insertOrUpdateInternal(key, value, root);
-    }
-
-    int getValue(const Key& key) const {
-        const Node* currentNode = root.get();
-
-        while (!currentNode->isLeaf) {
-            const Node* nextNode = nullptr;
-            for (const auto& entry : currentNode->entries) {
-                if (key < entry.key) {
-                    nextNode = entry.next.get();
-                    break;
-                }
-            }
-            if (!nextNode) {
-                nextNode = currentNode->entries.back().next.get();
-            }
-            currentNode = nextNode;
-        }
-
-        for (const auto& entry : currentNode->entries) {
-            if (entry.key == key) {
-                return entry.value;
-            }
-        }
-
-        return -1; // Key not found
-    }
-
-    std::vector<Value> rangeQuery(const Key& lowerBound, const Key& upperBound) const {
-        std::vector<Value> result;
-        const Node* currentNode = root.get();
-
-        while (!currentNode->isLeaf) {
-            currentNode = currentNode->entries.front().next.get();
-        }
-
-        while (currentNode != nullptr) {
-            for (const auto& entry : currentNode->entries) {
-                if (entry.key >= lowerBound && entry.key <= upperBound) {
-                    std::cout << "Key: " << entry.key << ", Value: " << entry.value << std::endl;
-                    result.push_back(entry.value);
-                }
-            }
-            currentNode = currentNode->next.get();
-        }
-
-        return result;
-    }
-
-    void print() const {
-        const Node* currentNode = root.get();
-
-        while (!currentNode->isLeaf) {
-            currentNode = currentNode->entries.front().next.get();
-        }
-
-        while (currentNode != nullptr) {
-            for (const auto& entry : currentNode->entries) {
-                std::cout << "Key: " << entry.key << ", Value: " << entry.value << std::endl;
-            }
-            currentNode = currentNode->next.get();
-        }
-    }
-
-private:
-    
-    void insertOrUpdateInternal(const Key& key, const Value& value, NodePtr& node) {
-    if (node->isLeaf) {
-        // Search for the key in the leaf node
-        auto it = std::find_if(node->entries.begin(), node->entries.end(),
-                               [&](const Entry& entry) { return entry.key == key; });
-
-        if (it != node->entries.end()) {
-            // Key found, update value
-            it->value += value;
-            return; // Early return to avoid further processing
-        }
-
-        // Key not found, proceed to insert
-        auto comp = [](const Entry& entry, const Key& k) { return entry.key < k; };
-        it = std::lower_bound(node->entries.begin(), node->entries.end(), key, comp);
-        node->entries.insert(it, Entry(key, value));
-
-        // Handle node splitting if necessary (Placeholder for future implementation)
-    } else {
-        // Internal node, find the correct child to descend
-        // Adjusted to ensure proper comparison and handling for internal nodes
-        bool found = false;
-        for (auto it = node->entries.begin(); it != node->entries.end(); ++it) {
-            if (key < it->key) {
-                insertOrUpdateInternal(key, value, it->next);
-                found = true;
-                break;
-            } else if (key == it->key) {
-                // Conceptual: Update value if keys match. Actual B+ trees usually don't store values in internal nodes.
-                found = true;
-                break; // Break early since we found the position but don't actually update internal nodes in B+ trees
-            }
-        }
-        // If not found in any child, insert in the last child
-        if (!found) {
-            insertOrUpdateInternal(key, value, node->entries.back().next);
-        }
-    }
-
-    // Node splitting logic for non-leaf nodes would be required here
-}
-
-
-};
-
 class OrderedIndex {
 private:
-    BPlusTree<int, int> bptree;
+    std::map<int, int> index; // Directly map key to value for simplicity
 
 public:
     OrderedIndex() = default;
 
     void insertOrUpdate(int key, int value) {
-        bptree.insertOrUpdate(key, value);
+        index[key] = value; // std::map::operator[] will insert or update the key-value pair
     }
 
     int getValue(int key) const {
-        return bptree.getValue(key);
+        auto it = index.find(key);
+        if (it != index.end()) {
+            return it->second; // Return the value if key is found
+        }
+        return -1; // Return -1 if key not found, indicating absence
     }
 
     std::vector<int> rangeQuery(int lowerBound, int upperBound) const {
-        return bptree.rangeQuery(lowerBound, upperBound);
+        std::vector<int> values;
+        for (auto it = index.lower_bound(lowerBound); it != index.upper_bound(upperBound) && it != index.end(); ++it) {
+            values.push_back(it->second); // Collect values within the range
+        }
+        return values;
     }
 
     void print() const {
-        bptree.print();
+        for (const auto& [key, value] : index) {
+            std::cout << "Key: " << key << ", Value: " << value << std::endl;
+        }
     }
 };
 
