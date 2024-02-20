@@ -697,7 +697,7 @@ private:
             return; // Early return to avoid further processing
         }
 
-        // Key not found, proceed to insert
+        // Key not found, proceed to insert in sorted order
         auto comp = [](const Entry& entry, const Key& k) { return entry.key < k; };
         it = std::lower_bound(node->entries.begin(), node->entries.end(), key, comp);
         node->entries.insert(it, Entry(key, value));

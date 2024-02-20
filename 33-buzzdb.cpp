@@ -567,6 +567,8 @@ public:
         std::vector<int> values;
         for (size_t i = 0; i < capacity; ++i) {
             if (hashTable[i].exists && hashTable[i].key >= lowerBound && hashTable[i].key <= upperBound) {
+                std::cout << "Key: " << hashTable[i].key << 
+                ", Value: " << hashTable[i].value << std::endl;
                 values.push_back(hashTable[i].value);
             }
         }
@@ -584,37 +586,214 @@ public:
     }
 };
 
-class OrderedIndex {
-private:
-    std::map<int, int> index; // Directly map key to value for simplicity
-
+template <typename Key, typename Value>
+class BPlusTree {
 public:
-    OrderedIndex() = default;
+    struct Node {
+        std::vector<Key> keys;
+        std::vector<Value> values; // Only used in leaf nodes
+        std::vector<std::shared_ptr<Node>> children; // Only used in internal nodes
+        std::shared_ptr<Node> next = nullptr; // Next leaf node
+        bool isLeaf = false;
 
-    void insertOrUpdate(int key, int value) {
-        index[key] = value; // std::map::operator[] will insert or update the key-value pair
+        Node(bool leaf) : isLeaf(leaf) {}
+    };
+
+     int getValue(const Key& key) const {
+        auto node = root;
+        while (node != nullptr) {
+            auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
+            if (node->isLeaf) {
+                if (it != node->keys.end() && *it == key) { // Key found in leaf
+                    auto index = std::distance(node->keys.begin(), it);
+                    return node->values[index];
+                }
+                break; // Key not found
+            } else {
+                node = (it == node->keys.begin()) ? node->children[0] :
+                    node->children[std::distance(node->keys.begin(), it)];
+            }
+        }
+        return -1; // Indicate key not found
     }
 
-    int getValue(int key) const {
-        auto it = index.find(key);
-        if (it != index.end()) {
-            return it->second; // Return the value if key is found
-        }
-        return -1; // Return -1 if key not found, indicating absence
-    }
+    std::vector<Value> rangeQuery(const Key& lowerBound, const Key& upperBound) const {
+        std::vector<Value> result;
+        auto node = root;
 
-    std::vector<int> rangeQuery(int lowerBound, int upperBound) const {
-        std::vector<int> values;
-        for (auto it = index.lower_bound(lowerBound); it != index.upper_bound(upperBound) && it != index.end(); ++it) {
-            values.push_back(it->second); // Collect values within the range
+        // Traverse to the leaf node containing the lowerBound
+        while (node && !node->isLeaf) {
+            size_t i = 0;
+            while (i < node->keys.size() && lowerBound > node->keys[i]) {
+                ++i;
+            }
+            node = node->children[i];
         }
-        return values;
+
+        // Perform leaf-level traversal using `next`
+        while (node) {
+            for (size_t i = 0; i < node->keys.size(); ++i) {
+                if (node->keys[i] > upperBound) return result;
+                if (node->keys[i] >= lowerBound) {
+                    std::cout << node->values[i] << " ";
+                    result.push_back(node->values[i]);
+                }
+            }
+            node = node->next;
+        }
+
+        return result;
     }
 
     void print() const {
-        for (const auto& [key, value] : index) {
-            std::cout << "Key: " << key << ", Value: " << value << std::endl;
+        printRecursive(root, 0);
+        std::cout << std::endl;
+    }
+
+    void printRecursive(std::shared_ptr<Node> node, int level) const {
+        if (!node) return;
+
+        // Indentation for readability, based on the level
+        std::string indent(level * 2, ' ');
+
+        // Distinguish between internal and leaf nodes
+        std::string nodeType = node->isLeaf ? "Leaf" : "Internal";
+
+        // Print the node type and its keys
+        std::cout << indent << nodeType << " Node: ";
+        for (const auto& key : node->keys) {
+            std::cout << key << " ";
         }
+        std::cout << "\n";
+
+        // If it's not a leaf node, recursively print its children
+        if (!node->isLeaf) {
+            for (const auto& child : node->children) {
+                printRecursive(child, level + 1);
+            }
+        }
+    }
+
+
+    BPlusTree(size_t order) : maxKeys(order), root(std::make_shared<Node>(true)) {}
+
+    void insertOrUpdate(const Key& key, const Value& value) {
+        auto node = root;
+        std::vector<std::shared_ptr<Node>> path; // Track the path for backtracking
+
+        // Traverse to find the correct leaf node for the key
+        while (!node->isLeaf) {
+            path.push_back(node);
+            auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
+            size_t index = it - node->keys.begin();
+            node = node->children[index];
+        }
+
+        // Attempt to find the key in the leaf node
+        auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
+        if (it != node->keys.end() && *it == key) {
+            // Key found, update its value
+            size_t pos = std::distance(node->keys.begin(), it);
+            node->values[pos] += value;
+        } else {
+            // Key not found, insert new key-value pair
+            size_t pos = it - node->keys.begin();
+            node->keys.insert(node->keys.begin() + pos, key);
+            node->values.insert(node->values.begin() + pos, value);
+
+            // Check for node overflow and split if necessary
+            if (node->keys.size() > maxKeys) {
+                splitNode(path, node);
+            }
+        }
+    }
+
+
+private:
+    size_t maxKeys;
+    std::shared_ptr<Node> root;
+
+    void splitNode(std::vector<std::shared_ptr<Node>> path, std::shared_ptr<Node> node) {
+        auto newNode = std::make_shared<Node>(node->isLeaf);
+        size_t mid = node->keys.size() / 2;
+        Key midKey = node->keys[mid];
+
+        // Distribute keys and values/children to the new node
+        if (node->isLeaf) {
+            // Move second half of keys and values to the new node
+            std::move(node->keys.begin() + mid, node->keys.end(), std::back_inserter(newNode->keys));
+            std::move(node->values.begin() + mid, node->values.end(), std::back_inserter(newNode->values));
+
+            // Update next pointers to maintain the linked list of leaf nodes
+            newNode->next = node->next;
+            node->next = newNode;
+
+            // Trim original node's keys and values to reflect the split
+            node->keys.resize(mid);
+            node->values.resize(mid);
+        } else {
+            // For internal nodes, distribute keys and children to the new node
+            std::move(node->keys.begin() + mid + 1, node->keys.end(), std::back_inserter(newNode->keys));
+            std::move(node->children.begin() + mid + 1, node->children.end(), std::back_inserter(newNode->children));
+
+            // Trim original node's keys and children
+            node->keys.resize(mid);
+            node->children.resize(mid + 1);
+        }
+
+        // Update parent or create a new root if necessary
+        if (path.empty()) {
+            auto newRoot = std::make_shared<Node>(false);
+            newRoot->keys.push_back(midKey);
+            newRoot->children = {node, newNode};
+            root = newRoot;
+        } else {
+            auto parent = path.back();
+            auto it = std::lower_bound(parent->keys.begin(), parent->keys.end(), midKey);
+            size_t pos = it - parent->keys.begin();
+
+            // Check if the middle key already exists in the parent
+            if (it != parent->keys.end() && *it == midKey) {
+                // Insert new node in parent without inserting the middle key again
+                parent->children.insert(parent->children.begin() + pos + 1, newNode);
+            } else {
+                // Insert midKey and new node in parent
+                parent->keys.insert(parent->keys.begin() + pos, midKey);
+                parent->children.insert(parent->children.begin() + pos + 1, newNode);
+            }
+
+            // Check if the parent node needs to be split
+            if (parent->keys.size() > maxKeys) {
+                splitNode(std::vector<std::shared_ptr<Node>>(path.begin(), path.end() - 1), parent);
+            }
+        }
+    }
+
+};
+
+class OrderedIndex {
+private:
+    BPlusTree<int, int> bptree;
+
+public:
+
+    OrderedIndex() : bptree(4) { 
+    }
+
+    void insertOrUpdate(int key, int value) {
+        bptree.insertOrUpdate(key, value);
+    }
+
+    int getValue(int key) const {
+        return bptree.getValue(key);
+    }
+
+    std::vector<int> rangeQuery(int lowerBound, int upperBound) const {
+        return bptree.rangeQuery(lowerBound, upperBound);
+    }
+
+    void print() const {
+        bptree.print();
     }
 };
 
@@ -768,7 +947,7 @@ int main() {
     
     db.selectGroupBySum();
 
-    int lowerBound = 5;
+    int lowerBound = 2;
     int upperBound = 7;
     db.performRangeQueryWithHashIndex(lowerBound, upperBound);
 
@@ -782,6 +961,8 @@ int main() {
     // Calculate and print the elapsed time
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
+
+    db.ordered_index.print();
 
     return 0;
 }
