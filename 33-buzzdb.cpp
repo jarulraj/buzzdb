@@ -666,11 +666,9 @@ public:
         }
         std::cout << "\n";
 
-        // If it's not a leaf node, recursively print its children
-        if (!node->isLeaf) {
-            for (const auto& child : node->children) {
-                printRecursive(child, level + 1);
-            }
+        // If it's not a leaf node, recursively print its children and their values
+        for (const auto& child : node->children) {
+            printRecursive(child, level + 1);
         }
     }
 
@@ -684,7 +682,7 @@ public:
         // Traverse to find the correct leaf node for the key
         while (!node->isLeaf) {
             path.push_back(node);
-            auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
+            auto it = std::upper_bound(node->keys.begin(), node->keys.end(), key);
             size_t index = it - node->keys.begin();
             node = node->children[index];
         }
@@ -695,9 +693,17 @@ public:
             // Key found, update its value
             size_t pos = std::distance(node->keys.begin(), it);
             node->values[pos] += value;
+            std::cout << "Updating key " << key << " in node with first key " << node->keys.front() << std::endl;
         } else {
             // Key not found, insert new key-value pair
             size_t pos = it - node->keys.begin();
+            std::cout << "Inserting key " << key << " into node with first key ";
+            if (node->keys.empty()) {
+                std::cout << "N/A (empty node)";
+            } else {
+                std::cout << node->keys.front();
+            }
+            std::cout << std::endl;
             node->keys.insert(node->keys.begin() + pos, key);
             node->values.insert(node->values.begin() + pos, value);
 
@@ -746,6 +752,12 @@ private:
             // Trim original node's keys and values to reflect the split
             node->keys.resize(mid);
             node->values.resize(mid);
+
+            std::cout << "----------- \n";
+            std::cout << "LEAF SPLIT \n";
+            printNode(node);
+            printNode(newNode);
+            std::cout << "----------- \n";
         } else {
             // For internal nodes, distribute keys and children to the new node
             std::move(node->keys.begin() + mid + 1, node->keys.end(), std::back_inserter(newNode->keys));
@@ -754,10 +766,17 @@ private:
             // Trim original node's keys and children
             node->keys.resize(mid);
             node->children.resize(mid + 1);
+
+            std::cout << "----------- \n";
+            std::cout << "INNER SPLIT \n";
+            printNode(node);
+            printNode(newNode);
+            std::cout << "----------- \n";
         }
 
         // Update parent or create a new root if necessary
         if (path.empty()) {
+            std::cout << "NEW ROOT WITH KEY " << midKey << "\n";
             auto newRoot = std::make_shared<Node>(false);
             newRoot->keys.push_back(midKey);
             newRoot->children = {node, newNode};
@@ -769,11 +788,13 @@ private:
 
             // Check if midKey is already present in the parent node
             if (it == parent->keys.end() || *it != midKey) {
+                std::cout << "INSERT MIDKEY \n";
                 // Insert midKey and new node in parent
                 parent->keys.insert(parent->keys.begin() + pos, midKey);
                 parent->children.insert(parent->children.begin() + pos + 1, newNode);
             } else {
                 // If midKey is already present, update the next pointer of the existing node
+                std::cout << "UPDATE NEXT POINTER \n";
                 auto existingNode = std::find_if(parent->children.begin(), parent->children.end(),
                     [&](const auto& child) { return child->keys.front() == midKey; });
                 if (existingNode != parent->children.end()) {
@@ -798,7 +819,7 @@ private:
 
 public:
 
-    OrderedIndex() : bptree(4) { 
+    OrderedIndex() : bptree(3) { 
     }
 
     void insertOrUpdate(int key, int value) {
@@ -915,7 +936,7 @@ public:
                     hash_index.insertOrUpdate(key, value);
 
                     ordered_index.insertOrUpdate(key, value);
-                    ordered_index.print();
+                    //ordered_index.print();
                 }
             }
         }
