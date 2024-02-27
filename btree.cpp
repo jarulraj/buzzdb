@@ -35,7 +35,6 @@ public:
      int getValue(const Key& key) const {
         auto node = root;
         while (node != nullptr) {
-            printNode(node);
             if (node->isLeaf) {
                 auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
                 if (it != node->keys.end() && *it == key) { // Key found in leaf
@@ -80,8 +79,13 @@ public:
         return result;
     }
 
+    // Function to get a shared_ptr to the root node
+    std::shared_ptr<Node> getRoot() const {
+        return root;
+    }
+
     void print() const {
-        printRecursive(root, 1);
+        printRecursive(root, 0);
         std::cout << std::endl;
     }
 
@@ -91,30 +95,18 @@ public:
         // Indentation for readability, based on the level
         std::string indent(level * 2, ' ');
 
-        // Distinguish between internal and leaf nodes
-        std::string nodeType = node->isLeaf ? "Leaf" : "Internal";
+        std::cout << indent << "(L" << level << ") ";
 
-        // Print the node type and its keys
-        std::cout << indent << nodeType << " Node: ";
+        // Print the node keys
         for (const auto& key : node->keys) {
             std::cout << key << " ";
         }
         std::cout << "\n";
 
+ 
         // If it's not a leaf node, recursively print its children and their values
-        // If it's a leaf node, also print the values
-        if (node->isLeaf) {
-            std::cout << indent << "Values: ";
-            for (const auto& value : node->values) {
-                std::cout << value << " ";
-            }
-            std::cout << "\n";
-        }
-        else {
-            // If it's not a leaf node, recursively print its children and their values
-            for (const auto& child : node->children) {
-                printRecursive(child, level + 1);
-            }
+        for (const auto& child : node->children) {
+            printRecursive(child, level + 1);
         }
 
     }
@@ -211,37 +203,27 @@ private:
 
         // Update parent or create a new root if necessary
         if (path.empty()) {
-            std::cout << "NEW ROOT WITH KEY " << midKey << "\n";
+            // Create a new root if necessary
             auto newRoot = std::make_shared<Node>(false);
             newRoot->keys.push_back(midKey);
-            newRoot->children = {node, newNode};
+            newRoot->children.push_back(node);
+            newRoot->children.push_back(newNode);
             root = newRoot;
         } else {
             auto parent = path.back();
-            auto it = std::lower_bound(parent->keys.begin(), parent->keys.end(), midKey);
-            size_t pos = it - parent->keys.begin();
+            path.pop_back(); // Remove the last element as we're going to handle it
 
-            // Check if midKey is already present in the parent node
-            if (it == parent->keys.end() || *it != midKey) {
-                std::cout << "INSERT MIDKEY \n";
-                // Insert midKey and new node in parent
-                parent->keys.insert(parent->keys.begin() + pos, midKey);
-                parent->children.insert(parent->children.begin() + pos + 1, newNode);
-            } else {
-                // If midKey is already present, update the next pointer of the existing node
-                std::cout << "UPDATE NEXT POINTER \n";
-                auto existingNode = std::find_if(parent->children.begin(), parent->children.end(),
-                    [&](const auto& child) { return child->keys.front() == midKey; });
-                if (existingNode != parent->children.end()) {
-                    (*existingNode)->next = newNode;
-                }
-            }
+            // Position to insert the new child in the parent node
+            size_t pos = std::distance(parent->keys.begin(), std::lower_bound(parent->keys.begin(), parent->keys.end(), midKey));
+            parent->keys.insert(parent->keys.begin() + pos, midKey);
+            parent->children.insert(parent->children.begin() + pos + 1, newNode);
 
             // Check if the parent node needs to be split
             if (parent->keys.size() > maxKeys) {
                 splitNode(path, parent);
             }
         }
+
     }
 
 
@@ -280,7 +262,7 @@ int main() {
     int t = 4; // Just an example, choose an appropriate value for your B+Tree
     BPlusTree<int, int> tree(t);
 
-    int num_keys = 100;
+    int num_keys = 600;
 
    // Generate a vector of keys
     std::vector<int> keys(num_keys);
@@ -319,6 +301,23 @@ int main() {
     } else {
         std::cout << "There was an error in inserting or finding elements." << std::endl;
     }
+
+    // Now, traverse the leaf nodes using the `next` pointer and print the keys
+    auto node = tree.getRoot(); // Assuming getRoot() provides access to the root node
+    // Traverse down to the first leaf
+    while (node && !node->isLeaf) {
+        node = node->children.front();
+    }
+
+    // Now traverse through the leaf nodes using the next pointer
+    std::cout << "Traversing leaf nodes: ";
+    while (node != nullptr) {
+        for (const auto& key : node->keys) {
+            std::cout << key << " ";
+        }
+        node = node->next;
+    }
+    std::cout << std::endl;
 
     return 0;
 }

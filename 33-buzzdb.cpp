@@ -602,14 +602,15 @@ public:
      int getValue(const Key& key) const {
         auto node = root;
         while (node != nullptr) {
-            auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
             if (node->isLeaf) {
+                auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
                 if (it != node->keys.end() && *it == key) { // Key found in leaf
                     auto index = std::distance(node->keys.begin(), it);
                     return node->values[index];
                 }
                 break; // Key not found
             } else {
+                auto it = std::upper_bound(node->keys.begin(), node->keys.end(), key);
                 node = (it == node->keys.begin()) ? node->children[0] :
                     node->children[std::distance(node->keys.begin(), it)];
             }
@@ -645,6 +646,11 @@ public:
         return result;
     }
 
+    // Function to get a shared_ptr to the root node
+    std::shared_ptr<Node> getRoot() const {
+        return root;
+    }
+
     void print() const {
         printRecursive(root, 0);
         std::cout << std::endl;
@@ -656,20 +662,20 @@ public:
         // Indentation for readability, based on the level
         std::string indent(level * 2, ' ');
 
-        // Distinguish between internal and leaf nodes
-        std::string nodeType = node->isLeaf ? "Leaf" : "Internal";
+        std::cout << indent << "(L" << level << ") ";
 
-        // Print the node type and its keys
-        std::cout << indent << nodeType << " Node: ";
+        // Print the node keys
         for (const auto& key : node->keys) {
             std::cout << key << " ";
         }
         std::cout << "\n";
 
+ 
         // If it's not a leaf node, recursively print its children and their values
         for (const auto& child : node->children) {
             printRecursive(child, level + 1);
         }
+
     }
 
 
@@ -752,12 +758,6 @@ private:
             // Trim original node's keys and values to reflect the split
             node->keys.resize(mid);
             node->values.resize(mid);
-
-            std::cout << "----------- \n";
-            std::cout << "LEAF SPLIT \n";
-            printNode(node);
-            printNode(newNode);
-            std::cout << "----------- \n";
         } else {
             // For internal nodes, distribute keys and children to the new node
             std::move(node->keys.begin() + mid + 1, node->keys.end(), std::back_inserter(newNode->keys));
@@ -766,47 +766,31 @@ private:
             // Trim original node's keys and children
             node->keys.resize(mid);
             node->children.resize(mid + 1);
-
-            std::cout << "----------- \n";
-            std::cout << "INNER SPLIT \n";
-            printNode(node);
-            printNode(newNode);
-            std::cout << "----------- \n";
         }
 
         // Update parent or create a new root if necessary
         if (path.empty()) {
-            std::cout << "NEW ROOT WITH KEY " << midKey << "\n";
+            // Create a new root if necessary
             auto newRoot = std::make_shared<Node>(false);
             newRoot->keys.push_back(midKey);
-            newRoot->children = {node, newNode};
+            newRoot->children.push_back(node);
+            newRoot->children.push_back(newNode);
             root = newRoot;
         } else {
             auto parent = path.back();
-            auto it = std::lower_bound(parent->keys.begin(), parent->keys.end(), midKey);
-            size_t pos = it - parent->keys.begin();
+            path.pop_back(); // Remove the last element as we're going to handle it
 
-            // Check if midKey is already present in the parent node
-            if (it == parent->keys.end() || *it != midKey) {
-                std::cout << "INSERT MIDKEY \n";
-                // Insert midKey and new node in parent
-                parent->keys.insert(parent->keys.begin() + pos, midKey);
-                parent->children.insert(parent->children.begin() + pos + 1, newNode);
-            } else {
-                // If midKey is already present, update the next pointer of the existing node
-                std::cout << "UPDATE NEXT POINTER \n";
-                auto existingNode = std::find_if(parent->children.begin(), parent->children.end(),
-                    [&](const auto& child) { return child->keys.front() == midKey; });
-                if (existingNode != parent->children.end()) {
-                    (*existingNode)->next = newNode;
-                }
-            }
+            // Position to insert the new child in the parent node
+            size_t pos = std::distance(parent->keys.begin(), std::lower_bound(parent->keys.begin(), parent->keys.end(), midKey));
+            parent->keys.insert(parent->keys.begin() + pos, midKey);
+            parent->children.insert(parent->children.begin() + pos + 1, newNode);
 
             // Check if the parent node needs to be split
             if (parent->keys.size() > maxKeys) {
                 splitNode(path, parent);
             }
         }
+
     }
 
 
