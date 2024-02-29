@@ -1207,6 +1207,80 @@ void prettyPrint(const QueryComponents& components) {
     std::cout << std::endl;
 }
 
+void executeQuery(const QueryComponents& components, 
+                  BufferManager& buffer_manager) {
+    std::unique_ptr<Operator> rootOp;
+
+    // Create ScanOperator
+    std::unique_ptr<ScanOperator> scanOp = std::make_unique<ScanOperator>(buffer_manager);
+    rootOp = std::move(scanOp);
+
+    // Apply WHERE conditions
+    if (components.whereAttributeIndex != -1) {
+        std::unique_ptr<SimplePredicate> predicate1 = std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(components.whereAttributeIndex),
+            SimplePredicate::Operand(std::make_unique<Field>(components.lowerBound)),
+            SimplePredicate::ComparisonOperator::GT
+        );
+
+        std::unique_ptr<SimplePredicate> predicate2 = std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(components.whereAttributeIndex),
+            SimplePredicate::Operand(std::make_unique<Field>(components.upperBound)),
+            SimplePredicate::ComparisonOperator::LT
+        );
+
+        std::unique_ptr<ComplexPredicate> complexPredicate = std::make_unique<ComplexPredicate>(
+            ComplexPredicate::LogicOperator::AND
+        );
+        complexPredicate->addPredicate(std::move(predicate1));
+        complexPredicate->addPredicate(std::move(predicate2));
+
+        std::unique_ptr<SelectOperator> selectOp = std::make_unique<SelectOperator>(*rootOp, std::move(complexPredicate));
+        rootOp = std::move(selectOp);
+    }
+
+    // Apply SUM operation
+    if (components.sumOperation) {
+        std::vector<AggrFunc> aggrFuncs{
+            {AggrFuncType::SUM, static_cast<size_t>(components.sumAttributeIndex)}
+        };
+        std::vector<size_t> groupByAttrs; // No group by in this case
+
+        std::unique_ptr<HashAggregationOperator> hashAggOp = std::make_unique<HashAggregationOperator>(
+            *rootOp, groupByAttrs, aggrFuncs
+        );
+        rootOp = std::move(hashAggOp);
+    }
+
+    // Apply GROUP BY operation
+    if (components.groupBy) {
+        std::vector<size_t> groupByAttrs{static_cast<size_t>(components.groupByAttributeIndex)};
+        std::vector<AggrFunc> aggrFuncs{
+            {AggrFuncType::SUM, static_cast<size_t>(components.sumAttributeIndex)}
+        };
+
+        std::unique_ptr<HashAggregationOperator> hashAggOp = std::make_unique<HashAggregationOperator>(
+            *rootOp, groupByAttrs, aggrFuncs
+        );
+        rootOp = std::move(hashAggOp);
+    }
+
+    // Execute the Root Operator 
+
+    rootOp->open();
+    while (rootOp->next()) {
+        // Retrieve and print the current tuple
+        const auto& output = rootOp->getOutput();
+        for (const auto& field : output) {
+            field->print(); 
+            std::cout << " ";
+        }
+        std::cout << std::endl;
+    }
+    rootOp->close();
+    
+}
+
 
 class BuzzDB {
 public:
@@ -1279,7 +1353,7 @@ public:
         }
     }
 
-    void executeQuery() {
+    void executeQueries() {
 
         std::vector<std::string> test_queries = {
             "{2}, {3}",
@@ -1291,6 +1365,7 @@ public:
         for (const auto& query : test_queries) {
             auto components = parseQuery(query);
             prettyPrint(components);
+            executeQuery(components, buffer_manager);
         }
 
     }
@@ -1316,7 +1391,7 @@ int main() {
         db.insert(field1, field2);
     }
 
-    db.executeQuery();
+    db.executeQueries();
 
     // Get the end time
     auto end = std::chrono::high_resolution_clock::now();
