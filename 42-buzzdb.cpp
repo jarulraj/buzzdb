@@ -657,8 +657,6 @@ class ScanOperator : public Operator {
 private:
     BufferManager& bufferManager;
     size_t currentPageIndex = 0;
-    // Pointer to unique_ptr
-    std::unique_ptr<SlottedPage>* currentPage = nullptr; 
     size_t currentSlotIndex = 0;
     std::unique_ptr<Tuple> currentTuple;
     size_t tuple_count = 0;
@@ -669,12 +667,12 @@ public:
     void open() override {
         currentPageIndex = 0;
         currentSlotIndex = 0;
-        currentPage = nullptr; // Ensure currentPage is initially null
+        currentTuple.reset(); // Ensure currentTuple is reset
         loadNextTuple();
     }
 
     bool next() override {
-        if (!currentPage) return false; // No more pages
+        if (!currentTuple) return false; // No more tuples available
 
         loadNextTuple();
         return currentTuple != nullptr;
@@ -689,31 +687,27 @@ public:
 
     std::vector<std::unique_ptr<Field>> getOutput() override {
         if (currentTuple) {
-            // Move the vector of fields out of the currentTuple
             return std::move(currentTuple->fields);
         }
         return {}; // Return an empty vector if no tuple is available
     }
 
-
 private:
     void loadNextTuple() {
         while (currentPageIndex < bufferManager.getNumPages()) {
-            // Load the current page if not already loaded or if moving to a new page
-            auto& page = bufferManager.getPage(currentPageIndex);
+            auto& currentPage = bufferManager.getPage(currentPageIndex);
             if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
-                currentPage = &page;
                 currentSlotIndex = 0; // Reset slot index when moving to a new page
             }
 
-            char* page_buffer = currentPage->get()->page_data.get();
+            char* page_buffer = currentPage->page_data.get();
             Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
 
             while (currentSlotIndex < MAX_SLOTS) {
                 if (!slot_array[currentSlotIndex].empty) {
                     assert(slot_array[currentSlotIndex].offset != INVALID_VALUE);
                     const char* tuple_data = page_buffer + slot_array[currentSlotIndex].offset;
-                    std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length)); // Ensure correct string construction
+                    std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length));
                     currentTuple = Tuple::deserialize(iss);
                     currentSlotIndex++; // Move to the next slot for the next call
                     tuple_count++;
@@ -724,14 +718,13 @@ private:
 
             // Increment page index after exhausting current page
             currentPageIndex++;
-            // Note: currentPage will be updated at the start of the loop when needed
         }
 
         // No more tuples are available
         currentTuple.reset();
     }
-
 };
+
 
 class IPredicate {
 public:

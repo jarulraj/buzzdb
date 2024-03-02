@@ -659,8 +659,6 @@ class ScanOperator : public Operator {
 private:
     BufferManager& bufferManager;
     size_t currentPageIndex = 0;
-    // Pointer to unique_ptr
-    std::unique_ptr<SlottedPage>* currentPage = nullptr; 
     size_t currentSlotIndex = 0;
     std::unique_ptr<Tuple> currentTuple;
     size_t tuple_count = 0;
@@ -671,12 +669,12 @@ public:
     void open() override {
         currentPageIndex = 0;
         currentSlotIndex = 0;
-        currentPage = nullptr; // Ensure currentPage is initially null
+        currentTuple.reset(); // Ensure currentTuple is reset
         loadNextTuple();
     }
 
     bool next() override {
-        if (!currentPage) return false; // No more pages
+        if (!currentTuple) return false; // No more tuples available
 
         loadNextTuple();
         return currentTuple != nullptr;
@@ -691,31 +689,27 @@ public:
 
     std::vector<std::unique_ptr<Field>> getOutput() override {
         if (currentTuple) {
-            // Move the vector of fields out of the currentTuple
             return std::move(currentTuple->fields);
         }
         return {}; // Return an empty vector if no tuple is available
     }
 
-
 private:
     void loadNextTuple() {
         while (currentPageIndex < bufferManager.getNumPages()) {
-            // Load the current page if not already loaded or if moving to a new page
-            auto& page = bufferManager.getPage(currentPageIndex);
+            auto& currentPage = bufferManager.getPage(currentPageIndex);
             if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
-                currentPage = &page;
                 currentSlotIndex = 0; // Reset slot index when moving to a new page
             }
 
-            char* page_buffer = currentPage->get()->page_data.get();
+            char* page_buffer = currentPage->page_data.get();
             Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
 
             while (currentSlotIndex < MAX_SLOTS) {
                 if (!slot_array[currentSlotIndex].empty) {
                     assert(slot_array[currentSlotIndex].offset != INVALID_VALUE);
                     const char* tuple_data = page_buffer + slot_array[currentSlotIndex].offset;
-                    std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length)); // Ensure correct string construction
+                    std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length));
                     currentTuple = Tuple::deserialize(iss);
                     currentSlotIndex++; // Move to the next slot for the next call
                     tuple_count++;
@@ -726,13 +720,11 @@ private:
 
             // Increment page index after exhausting current page
             currentPageIndex++;
-            // Note: currentPage will be updated at the start of the loop when needed
         }
 
         // No more tuples are available
         currentTuple.reset();
     }
-
 };
 
 class IPredicate {
@@ -1209,76 +1201,68 @@ void prettyPrint(const QueryComponents& components) {
 
 void executeQuery(const QueryComponents& components, 
                   BufferManager& buffer_manager) {
-    std::unique_ptr<Operator> rootOp;
+    // Stack allocation of ScanOperator
+    ScanOperator scanOp(buffer_manager);
 
-    // Create ScanOperator
-    std::unique_ptr<ScanOperator> scanOp = std::make_unique<ScanOperator>(buffer_manager);
-    rootOp = std::move(scanOp);
+    // Using a pointer to Operator to handle polymorphism
+    Operator* rootOp = &scanOp;
+
+    // Buffer for optional operators to ensure lifetime
+    std::optional<SelectOperator> selectOpBuffer;
+    std::optional<HashAggregationOperator> hashAggOpBuffer;
 
     // Apply WHERE conditions
     if (components.whereAttributeIndex != -1) {
-        std::unique_ptr<SimplePredicate> predicate1 = std::make_unique<SimplePredicate>(
+        // Create simple predicates with comparison operators
+        auto predicate1 = std::make_unique<SimplePredicate>(
             SimplePredicate::Operand(components.whereAttributeIndex),
             SimplePredicate::Operand(std::make_unique<Field>(components.lowerBound)),
             SimplePredicate::ComparisonOperator::GT
         );
 
-        std::unique_ptr<SimplePredicate> predicate2 = std::make_unique<SimplePredicate>(
+        auto predicate2 = std::make_unique<SimplePredicate>(
             SimplePredicate::Operand(components.whereAttributeIndex),
             SimplePredicate::Operand(std::make_unique<Field>(components.upperBound)),
             SimplePredicate::ComparisonOperator::LT
         );
 
-        std::unique_ptr<ComplexPredicate> complexPredicate = std::make_unique<ComplexPredicate>(
-            ComplexPredicate::LogicOperator::AND
-        );
+        // Combine simple predicates into a complex predicate with logical AND operator
+        auto complexPredicate = std::make_unique<ComplexPredicate>(ComplexPredicate::LogicOperator::AND);
         complexPredicate->addPredicate(std::move(predicate1));
         complexPredicate->addPredicate(std::move(predicate2));
 
-        std::unique_ptr<SelectOperator> selectOp = std::make_unique<SelectOperator>(*rootOp, std::move(complexPredicate));
-        rootOp = std::move(selectOp);
+        // Using std::optional to manage the lifetime of SelectOperator
+        selectOpBuffer.emplace(*rootOp, std::move(complexPredicate));
+        rootOp = &*selectOpBuffer;
     }
 
-    // Apply SUM operation
-    if (components.sumOperation) {
-        std::vector<AggrFunc> aggrFuncs{
-            {AggrFuncType::SUM, static_cast<size_t>(components.sumAttributeIndex)}
-        };
-        std::vector<size_t> groupByAttrs; // No group by in this case
-
-        std::unique_ptr<HashAggregationOperator> hashAggOp = std::make_unique<HashAggregationOperator>(
-            *rootOp, groupByAttrs, aggrFuncs
-        );
-        rootOp = std::move(hashAggOp);
-    }
-
-    // Apply GROUP BY operation
-    if (components.groupBy) {
-        std::vector<size_t> groupByAttrs{static_cast<size_t>(components.groupByAttributeIndex)};
+    // Apply SUM or GROUP BY operation
+    if (components.sumOperation || components.groupBy) {
+        std::vector<size_t> groupByAttrs;
+        if (components.groupBy) {
+            groupByAttrs.push_back(static_cast<size_t>(components.groupByAttributeIndex));
+        }
         std::vector<AggrFunc> aggrFuncs{
             {AggrFuncType::SUM, static_cast<size_t>(components.sumAttributeIndex)}
         };
 
-        std::unique_ptr<HashAggregationOperator> hashAggOp = std::make_unique<HashAggregationOperator>(
-            *rootOp, groupByAttrs, aggrFuncs
-        );
-        rootOp = std::move(hashAggOp);
+        // Using std::optional to manage the lifetime of HashAggregationOperator
+        hashAggOpBuffer.emplace(*rootOp, groupByAttrs, aggrFuncs);
+        rootOp = &*hashAggOpBuffer;
     }
 
-    // Execute the Root Operator 
-
+    // Execute the Root Operator
     rootOp->open();
     while (rootOp->next()) {
         // Retrieve and print the current tuple
         const auto& output = rootOp->getOutput();
         for (const auto& field : output) {
-            field->print(); 
+            field->print();
             std::cout << " ";
         }
         std::cout << std::endl;
     }
     rootOp->close();
-    
 }
 
 
@@ -1356,10 +1340,10 @@ public:
     void executeQueries() {
 
         std::vector<std::string> test_queries = {
+            "{1} WHERE {1} > 2 and {1} < 6",
             "{2}, {3}",
-            "{2} WHERE {1} > 2 and {1} < 6",
-            "SUM{2} WHERE {1} > 2 and {1} < 6",
-            "SUM{2} GROUP BY {1} WHERE {1} > 2 and {1} < 6"
+            "SUM{1} WHERE {1} > 2 and {1} < 6",
+            "SUM{1} GROUP BY {1} WHERE {1} > 2 and {1} < 6"
         };
 
         for (const auto& query : test_queries) {
