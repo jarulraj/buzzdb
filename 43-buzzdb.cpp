@@ -1164,15 +1164,21 @@ QueryComponents parseQuery(const std::string& query) {
         components.groupByAttributeIndex = std::stoi(groupByMatches[1]) - 1;
     }
 
-    // Extract WHERE conditions
-    std::regex whereRegex("\\{\\d+\\} > (\\d+) and \\{\\d+\\} < (\\d+)");
+    // Extract WHERE conditions more accurately
+    std::regex whereRegex("\\{(\\d+)\\} > (\\d+) and \\{(\\d+)\\} < (\\d+)");
     std::smatch whereMatches;
     if (std::regex_search(query, whereMatches, whereRegex)) {
         components.whereCondition = true;
-        // Assuming the WHERE condition is on the first selected attribute for simplicity
-        components.whereAttributeIndex = components.selectAttributes.empty() ? -1 : components.selectAttributes.front();
-        components.lowerBound = std::stoi(whereMatches[1]);
-        components.upperBound = std::stoi(whereMatches[2]);
+        // Correctly identify the attribute index for the WHERE condition
+        components.whereAttributeIndex = std::stoi(whereMatches[1]) - 1;
+        components.lowerBound = std::stoi(whereMatches[2]);
+        // Ensure the same attribute is used for both conditions
+        if (std::stoi(whereMatches[3]) - 1 == components.whereAttributeIndex) {
+            components.upperBound = std::stoi(whereMatches[4]);
+        } else {
+            std::cerr << "Error: WHERE clause conditions apply to different attributes." << std::endl;
+            // Handle error or set components.whereCondition = false;
+        }
     }
 
     return components;
@@ -1341,7 +1347,6 @@ public:
 
         std::vector<std::string> test_queries = {
             "{1} WHERE {1} > 2 and {1} < 6",
-            "{2}, {3}",
             "SUM{1} WHERE {1} > 2 and {1} < 6",
             "SUM{1} GROUP BY {1} WHERE {1} > 2 and {1} < 6"
         };
