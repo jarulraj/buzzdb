@@ -14,7 +14,7 @@ const int PAGE_SIZE = 4096;  // PAGE_SIZE in bytes
 const int BITS_PER_BYTE = 8; 
 const int START_TIMESTAMP = 1609459200; // Starting timestamp (e.g., 2021-01-01 00:00:00)
 const double QUERY_START_OFFSET = 0.6;
-const double QUERY_END_OFFSET = 0.7;
+const double QUERY_END_OFFSET = 0.8;
 const int TEMPERATURE_BIT_WIDTH = 4;
 
 void generateData(std::vector<std::vector<int>>& data) {
