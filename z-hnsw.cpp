@@ -16,6 +16,8 @@ struct Point {
 
     Point(std::initializer_list<float> coords, std::string lbl) : coordinates(coords), label(lbl) {}
 
+    Point(const std::vector<float>& coords, const std::string& lbl) : coordinates(coords), label(lbl) {}
+
     // Custom comparator for sorting points based on coordinates
     bool operator<(const Point& other) const {
         return std::lexicographical_compare(coordinates.begin(), coordinates.end(),
@@ -252,28 +254,14 @@ bool verifyNearestNeighbors(const Point& queryPoint, std::vector<Point>& results
     for (const auto& pair : expectedResults) {
         const Point& point = pair.second;
         std::cout << point.label << " (";
-        for (size_t i = 0; i < point.coordinates.size(); ++i) {
+        for (size_t i = 0; i < 10; ++i) {
             std::cout << point.coordinates[i];
             if (i < point.coordinates.size() - 1) {
                 std::cout << ", ";
             }
         }
-        std::cout << ") Distance: " << pair.first << "\n";
-    }
-
-    std::cout << "Actual results:\n";
-    for (const auto& pair : actualResults) {
-        const Point& point = pair.second;
-        std::cout << point.label << " (";
-        for (size_t i = 0; i < point.coordinates.size(); ++i) {
-            std::cout << point.coordinates[i];
-            if (i < point.coordinates.size() - 1) {
-                std::cout << ", ";
-            }
-        }
-        std::cout << ") Distance: " << pair.first << "\n";
-    }
-    
+        std::cout << "...) Distance: " << pair.first << "\n";
+    }    
 
     return isCorrect;
 }
@@ -281,47 +269,60 @@ bool verifyNearestNeighbors(const Point& queryPoint, std::vector<Point>& results
 int main() {
     HNSW hnsw(4, 200, 1.0f);
 
-    // Insert some points with 4 coordinates and labels
-    std::vector<Point> points = {
-        {{1.0, 2.0, 3.0, 4.0}, "A"},
-        {{5.0, 6.0, 7.0, 8.0}, "B"},
-        {{9.0, 10.0, 11.0, 12.0}, "C"},
-        {{13.0, 14.0, 15.0, 21.0}, "D"},
-        {{17.0, 18.0, 19.0, 20.0}, "E"},
-        {{21.0, 22.0, 23.0, 32.0}, "F"},
-        {{25.0, 26.0, 27.0, 28.0}, "G"},
-        {{29.0, 30.0, 31.0, 32.0}, "H"},
-        {{33.0, 34.0, 35.0, 36.0}, "I"},
-        {{37.0, 38.0, 39.0, 40.0}, "J"}
-    };
+    std::mt19937 gen(42);  // Fixed seed for reproducibility
+    std::uniform_real_distribution<float> dis(0.0, 1.0);
 
+    // Generate clustered 100 128-dimensional feature vectors
+    std::vector<Point> points;
+    for (int cluster = 0; cluster < 10; ++cluster) {
+        std::vector<float> center(128);
+        for (float &val : center) {
+            val = dis(gen) * 100;  // Center of the cluster
+        }
+
+        for (int i = 0; i < 10; ++i) {
+            std::vector<float> coordinates(128);
+            for (int j = 0; j < 128; ++j) {
+                coordinates[j] = center[j] + dis(gen) * 10;  // Points around the center
+            }
+            points.emplace_back(coordinates, "Point_" + std::to_string(cluster * 10 + i));
+        }
+    }
+
+    // Insert points into HNSW
     for (const Point& point : points) {
         hnsw.insert(point);
     }
 
-    hnsw.printIndex();
+    //hnsw.printIndex();
 
-    // Query for the nearest neighbors
-    Point queryPoint = {{15.0, 16.0, 17.0, 18.0}, "Query"};
+    // Select a random point from the generated points as the query point
+    //std::uniform_int_distribution<int> pointDis(0, points.size() - 1);
+    const int pointID = 66;
+    Point queryPoint = points[pointID];
+
+    // Find the nearest neighbors
+    int k = 3;    
     std::vector<Point> results = hnsw.search(queryPoint, 3);
 
-    std::cout << "Nearest neighbors to (" << queryPoint.label << ": ";
-    for (size_t i = 0; i < queryPoint.coordinates.size(); ++i) {
+    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << ": ";
+    for (size_t i = 0; i < 10; ++i) {
         std::cout << queryPoint.coordinates[i];
         if (i < queryPoint.coordinates.size() - 1) {
             std::cout << ", ";
         }
     }
-    std::cout << "):" << std::endl;
+    std::cout << "...):" << std::endl;
+
     for (const Point& result : results) {
         std::cout << result.label << " (";
-        for (size_t i = 0; i < result.coordinates.size(); ++i) {
+        for (size_t i = 0; i < 10; ++i) {
             std::cout << result.coordinates[i];
             if (i < result.coordinates.size() - 1) {
                 std::cout << ", ";
             }
         }
-        std::cout << ")" << std::endl;
+        std::cout << "...)" << std::endl;
     }
 
     // Verify the nearest neighbors

@@ -468,17 +468,24 @@ int main() {
 
     // Select a random point from the generated points as the query point
     //std::uniform_int_distribution<int> pointDis(0, points.size() - 1);
-    const int pointID = 5;
+    const int pointID = 66;
     Point queryPoint = points[pointID];
 
     // Find the nearest neighbors
     int k = 3;
     std::vector<Point> nearestNeighbors = tree.nearestNeighbor(queryPoint, k);
 
-    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.coordinates[0] << ", " 
-              << queryPoint.coordinates[1] << ", ...) are:" << std::endl;
+    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << ": ";
+    for (size_t i = 0; i < 10; ++i) {
+        std::cout << queryPoint.coordinates[i];
+        if (i < queryPoint.coordinates.size() - 1) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << "...):" << std::endl;
+
     for (const Point& p : nearestNeighbors) {
-        std::cout << "(";
+        std::cout << p.label << " (";
         for (size_t i = 0; i < 10; ++i) {
             std::cout << p.coordinates[i];
             if (i < p.coordinates.size() - 1) {
