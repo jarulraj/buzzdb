@@ -4,12 +4,17 @@
 #include <cmath>
 #include <queue>
 #include <cassert>
+#include <random>
 
 // Define a point in N-dimensional space
 struct Point {
     std::vector<float> coordinates;
+    std::string label;
+
     Point() {}
     Point(const std::vector<float>& coords) : coordinates(coords) {}
+
+    Point(const std::vector<float>& coords, const std::string& lbl) : coordinates(coords), label(lbl) {}
 
     bool operator<(const Point& other) const {
         return coordinates < other.coordinates;
@@ -362,11 +367,6 @@ public:
     void insert(const Point& point) {
         Rectangle rect(point.coordinates, point.coordinates);
         insert(root, point, rect);
-        std::cout << "Inserted point (";
-        for (size_t i = 0; i < point.coordinates.size(); ++i) {
-            std::cout << point.coordinates[i] << (i < point.coordinates.size() - 1 ? ", " : "");
-        }
-        std::cout << ")" << std::endl;
     }
 
     std::vector<Point> query(const Rectangle& rect) {
@@ -434,72 +434,60 @@ private:
     }
 };
 
+
 int main() {
     RTree tree;
 
-    // Insert some points with 4 coordinates
-    std::vector<Point> points = {
-        Point({1.0, 2.0, 3.0, 4.0}), 
-        Point({5.0, 6.0, 7.0, 8.0}),
-        Point({9.0, 10.0, 11.0, 12.0}),
-        Point({13.0, 14.0, 15.0, 21.0}),
-        Point({17.0, 18.0, 19.0, 20.0}),
-        Point({21.0, 22.0, 23.0, 32.0}),
-        Point({25.0, 26.0, 27.0, 28.0}),
-        Point({29.0, 30.0, 31.0, 32.0}),
-        Point({33.0, 34.0, 35.0, 36.0}),
-        Point({37.0, 38.0, 39.0, 40.0})
-    };
+    std::mt19937 gen(42);  // Fixed seed for reproducibility
+    std::uniform_real_distribution<float> dis(0.0, 1.0);
 
-    for (const Point& p : points) {
-        tree.insert(p);
-    }
-
-    tree.print();
-
-    // Define three rectangular zones for queries
-    std::vector<Rectangle> queryRects = {
-        Rectangle({0.0, 0.0, 0.0, 0.0}, {20.0, 20.0, 20.0, 20.0}),
-        Rectangle({15.0, 15.0, 15.0, 15.0}, {25.0, 25.0, 25.0, 25.0}),
-        Rectangle({30.0, 30.0, 30.0, 30.0}, {40.0, 40.0, 40.0, 40.0})
-    };
-
-    for (const Rectangle& rect : queryRects) {
-        std::vector<Point> results = tree.query(rect);
-        std::cout << "Points within the rectangle (";
-        for (size_t i = 0; i < rect.minCoords.size(); ++i) {
-            std::cout << rect.minCoords[i] << ", ";
+    // Generate clustered 100 128-dimensional feature vectors
+    std::vector<Point> points;
+    for (int cluster = 0; cluster < 10; ++cluster) {
+        std::vector<float> center(128);
+        for (float &val : center) {
+            val = dis(gen) * 100;  // Center of the cluster
         }
-        for (size_t i = 0; i < rect.maxCoords.size(); ++i) {
-            std::cout << rect.maxCoords[i] << (i < rect.maxCoords.size() - 1 ? ", " : ")");
-        }
-        std::cout << ":" << std::endl;
-        for (const Point& p : results) {
-            for (size_t i = 0; i < p.coordinates.size(); ++i) {
-                std::cout << p.coordinates[i] << (i < p.coordinates.size() - 1 ? ", " : ")");
+
+        for (int i = 0; i < 10; ++i) {
+            std::vector<float> coordinates(128);
+            for (int j = 0; j < 128; ++j) {
+                coordinates[j] = center[j] + dis(gen) * 10;  // Points around the center
             }
-            std::cout << std::endl;
+            points.emplace_back(
+                coordinates, 
+                "Point_" + std::to_string(cluster * 10 + i)
+            );
         }
     }
 
-    // Define a query point
-    Point queryPoint({15.0, 16.0, 17.0, 18.0});
+    // Insert points into RTree
+    for (const Point& point : points) {
+        tree.insert(point);
+    }
+
+    // Select a random point from the generated points as the query point
+    //std::uniform_int_distribution<int> pointDis(0, points.size() - 1);
+    const int pointID = 5;
+    Point queryPoint = points[pointID];
 
     // Find the nearest neighbors
     int k = 3;
     std::vector<Point> nearestNeighbors = tree.nearestNeighbor(queryPoint, k);
 
-    std::cout << "The " << k << " nearest neighbors to (";
-    for (size_t i = 0; i < queryPoint.coordinates.size(); ++i) {
-        std::cout << queryPoint.coordinates[i] << (i < queryPoint.coordinates.size() - 1 ? ", " : ")");
-    }
-    std::cout << " are:" << std::endl;
+    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.coordinates[0] << ", " 
+              << queryPoint.coordinates[1] << ", ...) are:" << std::endl;
     for (const Point& p : nearestNeighbors) {
-        for (size_t i = 0; i < p.coordinates.size(); ++i) {
-            std::cout << p.coordinates[i] << (i < p.coordinates.size() - 1 ? ", " : ")");
+        std::cout << "(";
+        for (size_t i = 0; i < 10; ++i) {
+            std::cout << p.coordinates[i];
+            if (i < p.coordinates.size() - 1) {
+                std::cout << ", ";
+            }
         }
-        std::cout << std::endl;
+        std::cout << ".. )" << std::endl;
     }
 
     return 0;
 }
+
