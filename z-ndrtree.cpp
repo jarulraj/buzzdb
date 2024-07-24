@@ -6,6 +6,8 @@
 #include <cassert>
 #include <random>
 
+#define POINT_COORDINATES 512
+
 // Define a point in N-dimensional space
 struct Point {
     std::vector<float> coordinates;
@@ -459,14 +461,14 @@ int main() {
     // Generate clustered 100 128-dimensional feature vectors
     std::vector<Point> points;
     for (int cluster = 0; cluster < 10; ++cluster) {
-        std::vector<float> center(128);
+        std::vector<float> center(POINT_COORDINATES);
         for (float &val : center) {
             val = dis(gen) * 100;  // Center of the cluster
         }
 
         for (int i = 0; i < 10; ++i) {
-            std::vector<float> coordinates(128);
-            for (int j = 0; j < 128; ++j) {
+            std::vector<float> coordinates(POINT_COORDINATES);
+            for (int j = 0; j < POINT_COORDINATES; ++j) {
                 coordinates[j] = center[j] + dis(gen) * 10;  // Points around the center
             }
             points.emplace_back(

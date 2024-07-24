@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cassert>
 
-#define PRINT_POINT_COORDINATES 10
+#define POINT_COORDINATES 512
 
 // Define the Point structure with better constructors
 struct Point {
@@ -41,7 +41,7 @@ void printPoint(const Point& p) {
     if (numCoordinates > 10) {
         std::cout << ", ...";
     }
-    std::cout << ")\n";
+    std::cout << ")";
 }
 
 // Calculate the Euclidean distance between two points
@@ -240,14 +240,14 @@ bool verifyNearestNeighbors(const Point& queryPoint, std::vector<Point>& results
     // Verify that the actual results match the expected results
     bool isCorrect = (expectedResults == actualResults);
 
-    std::cout << "Expected results:\n";
+    std::cout << "Optimal neighbors:\n";
     for (const auto& pair : expectedResults) {
         const Point& point = pair.second;
         printPoint(point);
         std::cout << " Distance: " << pair.first << "\n";
     }
 
-    std::cout << "Actual results:\n";
+    std::cout << "HNSW neighbors:\n";
     for (const auto& pair : actualResults) {
         const Point& point = pair.second;
         printPoint(point);
@@ -265,14 +265,14 @@ int main() {
 
     std::vector<Point> points;
     for (int cluster = 0; cluster < 10; ++cluster) {
-        std::vector<float> center(128);
+        std::vector<float> center(POINT_COORDINATES);
         for (float &val : center) {
             val = dis(gen) * 100;
         }
 
         for (int i = 0; i < 10; ++i) {
-            std::vector<float> coordinates(128);
-            for (int j = 0; j < 128; ++j) {
+            std::vector<float> coordinates(POINT_COORDINATES);
+            for (int j = 0; j < POINT_COORDINATES; ++j) {
                 coordinates[j] = center[j] + dis(gen) * 10;
             }
             points.emplace_back(coordinates, "Point_" + std::to_string(cluster * 10 + i));
@@ -290,14 +290,14 @@ int main() {
     std::vector<Point> results = hnsw.search(queryPoint, k);
 
     std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << "):" << std::endl;
-    printPoint(queryPoint);
+    std::cout << "\n";
     for (const Point& result : results) {
         printPoint(result);
+        std::cout << "\n";
     }
 
     // Verify the nearest neighbors
-    bool isCorrect = verifyNearestNeighbors(queryPoint, results, points, k);
-    std::cout << "Verification result: " << (isCorrect ? "Correct" : "Incorrect") << std::endl;
+    verifyNearestNeighbors(queryPoint, results, points, k);
 
     return 0;
 }
