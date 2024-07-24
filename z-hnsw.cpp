@@ -9,50 +9,71 @@
 #include <algorithm>
 #include <cassert>
 
-// Define the Point structure
+#define PRINT_POINT_COORDINATES 10
+
+// Define the Point structure with better constructors
 struct Point {
     std::vector<float> coordinates;
     std::string label;
 
-    Point(std::initializer_list<float> coords, std::string lbl) : coordinates(coords), label(lbl) {}
-
-    Point(const std::vector<float>& coords, const std::string& lbl) : coordinates(coords), label(lbl) {}
+    // Use explicit constructors to avoid unexpected conversions
+    explicit Point(const std::vector<float>& coords, const std::string& lbl) 
+        : coordinates(coords), label(lbl) {}
 
     bool operator<(const Point& other) const {
         return coordinates < other.coordinates;
     }
 
     bool operator==(const Point& other) const {
-        return coordinates == other.coordinates;
+        return coordinates == other.coordinates && label == other.label;
     }
 };
+
+void printPoint(const Point& p) {
+    std::cout << p.label << " (";
+    size_t numCoordinates = p.coordinates.size();
+    for (size_t i = 0; i < std::min(numCoordinates, size_t(10)); ++i) {
+        std::cout << p.coordinates[i];
+        if (i < std::min(numCoordinates, size_t(10)) - 1) {
+            std::cout << ", ";
+        }
+    }
+    if (numCoordinates > 10) {
+        std::cout << ", ...";
+    }
+    std::cout << ")\n";
+}
 
 // Calculate the Euclidean distance between two points
 float euclideanDistance(const Point& p1, const Point& p2) {
     float distance = 0.0f;
-    for (size_t i = 0; i < p1.coordinates.size(); ++i) {
-        distance += (p1.coordinates[i] - p2.coordinates[i]) * (p1.coordinates[i] - p2.coordinates[i]);
+    for (size_t i = 0; i < std::min(p1.coordinates.size(), p2.coordinates.size()); ++i) {
+        distance += pow(p1.coordinates[i] - p2.coordinates[i], 2);
     }
-    return std::sqrt(distance);
+    return sqrt(distance);
 }
 
 // Define the Node structure
 struct Node {
     Point point;
-    std::vector<std::vector<Node*>> neighbors;  // Neighbors at different levels
+    std::vector<std::vector<Node*>> neighbors;
 
-    Node(const Point& pt, int maxLevel) : point(pt), neighbors(maxLevel + 1) {}
+    explicit Node(const Point& pt, int maxLevel) 
+        : point(pt), neighbors(maxLevel + 1) {}
 };
 
 // Define the Graph structure
 class Graph {
 public:
     std::vector<Node*> nodes;
+    Node* entrance;
 
+    Graph() : entrance(nullptr) {}
     ~Graph() {
         for (Node* node : nodes) {
             delete node;
         }
+        nodes.clear();
     }
 };
 
@@ -61,8 +82,8 @@ class HNSW {
 private:
     Graph graph;
     int maxLevel;
-    int maxNeighbors; // Maximum number of neighbors
-    int efConstruction;  // Size of dynamic list for construction
+    int maxNeighbors;
+    int efConstruction;
     float levelMult;
     std::default_random_engine generator;
 
@@ -72,36 +93,32 @@ private:
         return static_cast<int>(-std::log(r) * levelMult);
     }
 
-    void insertNode(Node* newNode) {        
+    void insertNode(Node* newNode) {
         if (graph.nodes.empty()) {
             graph.nodes.push_back(newNode);
+            graph.entrance = newNode;
             return;
         }
 
-        Node* enterPoint = graph.nodes[0];
+        Node* enterPoint = graph.entrance;
         int level = maxLevel;
 
-        // Search for the closest neighbor at the top level
-        while (level > static_cast<int>(newNode->neighbors.size()) - 1) {
-            enterPoint = searchLayer(newNode->point, enterPoint, level, 1).top().second;
-            --level;
+        // Ensure layer access is within bounds
+        int effectiveLevel = std::min(static_cast<int>(newNode->neighbors.size()) - 1, level);
+        for (int lc = level; lc > effectiveLevel; --lc) {
+            enterPoint = searchLayer(enterPoint, newNode->point, lc, 1).top().second;
         }
 
-        // Insert the new node at each level
-        for (int l = level; l >= 0; --l) {
-            auto topCandidates = searchLayer(newNode->point, enterPoint, l, efConstruction);
-            selectNeighbors(newNode, topCandidates, l);
+        for (int lc = effectiveLevel; lc >= 0; --lc) {
+            auto topCandidates = searchLayer(enterPoint, newNode->point, lc, efConstruction);
+            selectNeighbors(newNode, topCandidates, lc);
         }
 
-        // Update maxLevel if necessary
-        if (static_cast<int>(newNode->neighbors.size()) - 1 > maxLevel) {
-            maxLevel = static_cast<int>(newNode->neighbors.size()) - 1;
-        }
-
+        maxLevel = std::max(maxLevel, effectiveLevel);
         graph.nodes.push_back(newNode);
     }
 
-    std::priority_queue<std::pair<float, Node*>> searchLayer(const Point& point, Node* enterPoint, int level, int ef) {
+    std::priority_queue<std::pair<float, Node*>> searchLayer(Node* enterPoint, const Point& point, int level, int ef) {
         std::priority_queue<std::pair<float, Node*>> topCandidates;
         std::priority_queue<std::pair<float, Node*>, std::vector<std::pair<float, Node*>>, std::greater<>> candidates;
         std::unordered_map<Node*, bool> visited;
@@ -144,9 +161,8 @@ private:
         while (!topCandidates.empty() && neighbors.size() < static_cast<size_t>(maxNeighbors)) {
             Node* neighbor = topCandidates.top().second;
             topCandidates.pop();
-            if (selected.find(neighbor) == selected.end()) {
+            if (selected.insert(neighbor).second) {
                 neighbors.push_back(neighbor);
-                selected.insert(neighbor);
             }
         }
         for (Node* neighbor : neighbors) {
@@ -155,33 +171,30 @@ private:
         }
     }
 
-
-
 public:
     HNSW(int maxNeighbors, int efConstr, float mult) 
         : maxLevel(0), maxNeighbors(maxNeighbors), efConstruction(efConstr), levelMult(mult) {}
 
     void insert(const Point& point) {
-        int level = getRandomLevel();
-        Node* newNode = new Node(point, level);
+        Node* newNode = new Node(point, getRandomLevel());
         insertNode(newNode);
     }
 
     std::vector<Point> search(const Point& query, int k) {
         if (graph.nodes.empty()) return {};
 
-        Node* enterPoint = graph.nodes[0];
+        Node* enterPoint = graph.entrance;
         int level = maxLevel;
 
-        // Search at the top level
         while (level > 0) {
-            enterPoint = searchLayer(query, enterPoint, level, 1).top().second;
+            auto searchResults = searchLayer(enterPoint, query, level, 1);
+            if (!searchResults.empty()) {
+                enterPoint = searchResults.top().second;
+            }
             --level;
         }
 
-        // Search at the lowest level
-        auto topCandidates = searchLayer(query, enterPoint, 0, k);
-
+        auto topCandidates = searchLayer(enterPoint, query, 0, k);
         std::vector<Point> results;
         while (!topCandidates.empty()) {
             results.push_back(topCandidates.top().second->point);
@@ -189,20 +202,6 @@ public:
         }
 
         return results;
-    }
-
-    void printIndex() const {
-        for (const Node* node : graph.nodes) {
-            std::cout << "Node(" << node->point.label << ": ";            
-            std::cout << ") -> Levels: " << node->neighbors.size() - 1 << "\n";
-            for (size_t level = 0; level < node->neighbors.size(); ++level) {
-                std::cout << "  Level " << level << " neighbors: ";
-                for (const Node* neighbor : node->neighbors[level]) {
-                    std::cout << neighbor->point.label << " ";
-                }
-                std::cout << "\n";
-            }
-        }
     }
 };
 
@@ -244,15 +243,16 @@ bool verifyNearestNeighbors(const Point& queryPoint, std::vector<Point>& results
     std::cout << "Expected results:\n";
     for (const auto& pair : expectedResults) {
         const Point& point = pair.second;
-        std::cout << point.label << " (";
-        for (size_t i = 0; i < 10; ++i) {
-            std::cout << point.coordinates[i];
-            if (i < point.coordinates.size() - 1) {
-                std::cout << ", ";
-            }
-        }
-        std::cout << "...) Distance: " << pair.first << "\n";
-    }    
+        printPoint(point);
+        std::cout << " Distance: " << pair.first << "\n";
+    }
+
+    std::cout << "Actual results:\n";
+    for (const auto& pair : actualResults) {
+        const Point& point = pair.second;
+        printPoint(point);
+        std::cout << " Distance: " << pair.first << "\n";
+    }
 
     return isCorrect;
 }
@@ -260,59 +260,39 @@ bool verifyNearestNeighbors(const Point& queryPoint, std::vector<Point>& results
 int main() {
     HNSW hnsw(4, 200, 1.0f);
 
-    std::mt19937 gen(42);  // Fixed seed for reproducibility
+    std::mt19937 gen(42);
     std::uniform_real_distribution<float> dis(0.0, 1.0);
 
-    // Generate clustered 100 128-dimensional feature vectors
     std::vector<Point> points;
-    for (int cluster = 0; cluster < 2; ++cluster) {
+    for (int cluster = 0; cluster < 10; ++cluster) {
         std::vector<float> center(128);
         for (float &val : center) {
-            val = dis(gen) * 100;  // Center of the cluster
+            val = dis(gen) * 100;
         }
 
         for (int i = 0; i < 10; ++i) {
             std::vector<float> coordinates(128);
             for (int j = 0; j < 128; ++j) {
-                coordinates[j] = center[j] + dis(gen) * 10;  // Points around the center
+                coordinates[j] = center[j] + dis(gen) * 10;
             }
             points.emplace_back(coordinates, "Point_" + std::to_string(cluster * 10 + i));
         }
     }
 
-    // Insert points into HNSW
     for (const Point& point : points) {
         hnsw.insert(point);
     }
 
-    //hnsw.printIndex();
-
-    // Select a specific point from the generated points as the query point
-    const int pointID = 16;
+    const int pointID = 66;  // Selecting a specific point for consistent results
     Point queryPoint = points[pointID];
 
-    // Find the nearest neighbors
-    int k = 3;    
+    int k = 3;  // Number of nearest neighbors to find
     std::vector<Point> results = hnsw.search(queryPoint, k);
 
-    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << ": ";
-    for (size_t i = 0; i < 10; ++i) {
-        std::cout << queryPoint.coordinates[i];
-        if (i < queryPoint.coordinates.size() - 1) {
-            std::cout << ", ";
-        }
-    }
-    std::cout << "...):" << std::endl;
-
+    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << "):" << std::endl;
+    printPoint(queryPoint);
     for (const Point& result : results) {
-        std::cout << result.label << " (";
-        for (size_t i = 0; i < 10; ++i) {
-            std::cout << result.coordinates[i];
-            if (i < result.coordinates.size() - 1) {
-                std::cout << ", ";
-            }
-        }
-        std::cout << "...)" << std::endl;
+        printPoint(result);
     }
 
     // Verify the nearest neighbors

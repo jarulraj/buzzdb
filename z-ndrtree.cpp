@@ -25,6 +25,21 @@ struct Point {
     }
 };
 
+void printPoint(const Point& p) {
+    std::cout << p.label << " (";
+    size_t numCoordinates = p.coordinates.size();
+    for (size_t i = 0; i < std::min(numCoordinates, size_t(10)); ++i) {
+        std::cout << p.coordinates[i];
+        if (i < std::min(numCoordinates, size_t(10)) - 1) {
+            std::cout << ", ";
+        }
+    }
+    if (numCoordinates > 10) {
+        std::cout << ", ...";
+    }
+    std::cout << ")\n";
+}
+
 // Define a rectangle in N-dimensional space
 struct Rectangle {
     std::vector<float> minCoords, maxCoords;
@@ -475,24 +490,10 @@ int main() {
     int k = 3;
     std::vector<Point> nearestNeighbors = tree.nearestNeighbor(queryPoint, k);
 
-    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << ": ";
-    for (size_t i = 0; i < 10; ++i) {
-        std::cout << queryPoint.coordinates[i];
-        if (i < queryPoint.coordinates.size() - 1) {
-            std::cout << ", ";
-        }
-    }
-    std::cout << "...):" << std::endl;
-
+    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << "):" << std::endl;
+    printPoint(queryPoint);
     for (const Point& p : nearestNeighbors) {
-        std::cout << p.label << " (";
-        for (size_t i = 0; i < 10; ++i) {
-            std::cout << p.coordinates[i];
-            if (i < p.coordinates.size() - 1) {
-                std::cout << ", ";
-            }
-        }
-        std::cout << ".. )" << std::endl;
+        printPoint(p);
     }
 
     return 0;
