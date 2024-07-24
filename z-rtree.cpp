@@ -2,12 +2,17 @@
 #include <vector>
 #include <limits>
 #include <cmath>
+#include <queue>
 
 // Define a point in 2D space
 struct Point {
     float x, y;
     Point() : x(0), y(0) {}
     Point(float x, float y) : x(x), y(y) {}
+
+    bool operator<(const Point& other) const {
+        return x < other.x || (x == other.x && y < other.y);
+    }
 };
 
 // Define a rectangle in 2D space
@@ -44,6 +49,12 @@ struct Rectangle {
 
     void print() const {
         std::cout << "[" << minX << ", " << minY << ", " << maxX << ", " << maxY << "]";
+    }
+
+    float minDistance(const Point& p) const {
+        float dx = std::max({minX - p.x, 0.0f, p.x - maxX});
+        float dy = std::max({minY - p.y, 0.0f, p.y - maxY});
+        return std::sqrt(dx * dx + dy * dy);
     }
 };
 
@@ -319,6 +330,61 @@ public:
         query(root, rect, results);
         return results;
     }
+
+    // Define the nearest neighbor search function for the R-tree
+    void nearestNeighbor(RTreeNode* node, const Point& queryPoint, int k, 
+        std::priority_queue<std::pair<float, Point>, std::vector<std::pair<float, Point>>, std::less<>>& pq) {
+        // If the current node is a leaf node
+        if (node->isLeaf) {
+            // Iterate through all points in the leaf node
+            for (const Point& p : node->points) {
+                // Calculate the Euclidean distance from the query point to the current point
+                float distance = std::sqrt(std::pow(p.x - queryPoint.x, 2) + std::pow(p.y - queryPoint.y, 2));
+                // Add the distance and point to the priority queue
+                pq.push(std::make_pair(distance, p));
+                // If the size of the priority queue exceeds k, remove the farthest point
+                if (pq.size() > static_cast<size_t>(k)) {
+                    pq.pop();
+                }
+            }
+        } else { // If the current node is an internal node
+            // Create a vector to store the distances from the query point to each child rectangle and the corresponding child nodes
+            std::vector<std::pair<float, RTreeNode*>> childDistances;
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                // Calculate the minimum distance from the query point to the current child rectangle
+                float distance = node->childrenRectangles[i].minDistance(queryPoint);
+                // Add the distance and child node to the vector
+                childDistances.push_back(std::make_pair(distance, node->children[i]));
+            }
+            // Sort the vector in ascending order based on distance
+            std::sort(childDistances.begin(), childDistances.end());
+
+            // Recursively call the nearest neighbor function for each child node in order of increasing distance
+            for (const auto& child : childDistances) {
+                nearestNeighbor(child.second, queryPoint, k, pq);
+            }
+        }
+    }
+
+    // Function to perform nearest neighbor search
+    std::vector<Point> nearestNeighbor(const Point& queryPoint, int k) {
+        // Create a priority queue to store the k nearest neighbors
+        std::priority_queue<std::pair<float, Point>, 
+        std::vector<std::pair<float, Point>>, std::less<>> pq;
+        // Call the recursive nearest neighbor search function starting from the root node
+        nearestNeighbor(root, queryPoint, k, pq);
+
+        // Create a vector to store the results
+        std::vector<Point> results;
+        // Retrieve the k nearest neighbors from the priority queue
+        while (!pq.empty()) {
+            results.push_back(pq.top().second);
+            pq.pop();
+        }
+
+        return results;
+    }
+
 };
 
 // Main function demonstrating the use case
@@ -350,6 +416,18 @@ int main() {
             std::cout << "(" << p.x << ", " << p.y << ")" << std::endl;
             assert(rect.contains(p) && "Point is outside the query rectangle");
         }
+    }
+
+    // Define a query point
+    Point queryPoint(9.0, 8.0);
+
+    // Find the nearest neighbors
+    int k = 3;
+    std::vector<Point> nearestNeighbors = tree.nearestNeighbor(queryPoint, k);
+
+    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.x << ", " << queryPoint.y << ") are:" << std::endl;
+    for (const Point& p : nearestNeighbors) {
+        std::cout << "(" << p.x << ", " << p.y << ")" << std::endl;
     }
 
     return 0;

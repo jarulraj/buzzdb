@@ -18,15 +18,12 @@ struct Point {
 
     Point(const std::vector<float>& coords, const std::string& lbl) : coordinates(coords), label(lbl) {}
 
-    // Custom comparator for sorting points based on coordinates
     bool operator<(const Point& other) const {
-        return std::lexicographical_compare(coordinates.begin(), coordinates.end(),
-                                            other.coordinates.begin(), other.coordinates.end());
+        return coordinates < other.coordinates;
     }
 
-    // Equality operator to compare two points
     bool operator==(const Point& other) const {
-        return coordinates == other.coordinates && label == other.label;
+        return coordinates == other.coordinates;
     }
 };
 
@@ -75,7 +72,7 @@ private:
         return static_cast<int>(-std::log(r) * levelMult);
     }
 
-    void insertNode(Node* newNode) {
+    void insertNode(Node* newNode) {        
         if (graph.nodes.empty()) {
             graph.nodes.push_back(newNode);
             return;
@@ -103,7 +100,6 @@ private:
 
         graph.nodes.push_back(newNode);
     }
-
 
     std::priority_queue<std::pair<float, Node*>> searchLayer(const Point& point, Node* enterPoint, int level, int ef) {
         std::priority_queue<std::pair<float, Node*>> topCandidates;
@@ -160,6 +156,7 @@ private:
     }
 
 
+
 public:
     HNSW(int maxNeighbors, int efConstr, float mult) 
         : maxLevel(0), maxNeighbors(maxNeighbors), efConstruction(efConstr), levelMult(mult) {}
@@ -196,13 +193,7 @@ public:
 
     void printIndex() const {
         for (const Node* node : graph.nodes) {
-            std::cout << "Node(" << node->point.label << ": ";
-            for (size_t i = 0; i < node->point.coordinates.size(); ++i) {
-                std::cout << node->point.coordinates[i];
-                if (i < node->point.coordinates.size() - 1) {
-                    std::cout << ", ";
-                }
-            }
+            std::cout << "Node(" << node->point.label << ": ";            
             std::cout << ") -> Levels: " << node->neighbors.size() - 1 << "\n";
             for (size_t level = 0; level < node->neighbors.size(); ++level) {
                 std::cout << "  Level " << level << " neighbors: ";
@@ -274,7 +265,7 @@ int main() {
 
     // Generate clustered 100 128-dimensional feature vectors
     std::vector<Point> points;
-    for (int cluster = 0; cluster < 10; ++cluster) {
+    for (int cluster = 0; cluster < 2; ++cluster) {
         std::vector<float> center(128);
         for (float &val : center) {
             val = dis(gen) * 100;  // Center of the cluster
@@ -296,14 +287,13 @@ int main() {
 
     //hnsw.printIndex();
 
-    // Select a random point from the generated points as the query point
-    //std::uniform_int_distribution<int> pointDis(0, points.size() - 1);
-    const int pointID = 66;
+    // Select a specific point from the generated points as the query point
+    const int pointID = 16;
     Point queryPoint = points[pointID];
 
     // Find the nearest neighbors
     int k = 3;    
-    std::vector<Point> results = hnsw.search(queryPoint, 3);
+    std::vector<Point> results = hnsw.search(queryPoint, k);
 
     std::cout << "The " << k << " nearest neighbors to (" << queryPoint.label << ": ";
     for (size_t i = 0; i < 10; ++i) {
@@ -326,7 +316,7 @@ int main() {
     }
 
     // Verify the nearest neighbors
-    bool isCorrect = verifyNearestNeighbors(queryPoint, results, points, 3);
+    bool isCorrect = verifyNearestNeighbors(queryPoint, results, points, k);
     std::cout << "Verification result: " << (isCorrect ? "Correct" : "Incorrect") << std::endl;
 
     return 0;
