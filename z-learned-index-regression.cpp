@@ -94,7 +94,7 @@ struct RMI {
         pos = std::min(pos, leaves[sub_model_idx].size() - 1);  // Bound check within leaf
 
         // Check a neighborhood around the predicted position
-        int search_radius = 3; // Check some positions around the predicted position
+        int search_radius = 5; // Check some positions around the predicted position
         int start = std::max(0, int(pos) - search_radius);
         int end = std::min(int(leaves[sub_model_idx].size() - 1), 
                         int(pos) + search_radius);
