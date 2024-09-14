@@ -1407,14 +1407,15 @@ public:
         if (!tupleToInsert) return false; // No tuple to insert
         std::cout << "Inside concurrency method of insert" << "\n";
         for (size_t pageId = 0; pageId < bufferManager.getNumPages(); ++pageId) {
-            auto& page = bufferManager.getPage(pageId);
             // Check if the transaction is in growing phase and only then allow acquisition of lock
             if(t.getTxnPhase() == Phase::GROWING) {
+                std::cout << "Inside my locking method with page number" << pageId << "\n";
                 // Attempt to insert the tuple
                 // try to get a lock on this page
                 lockManager.acquireLock(pageId, LockType::EXCLUSIVE);
                 // now record this lock in the transactionManager
                 txnManager.addTransactionLock(t.getTxnId(), pageId);
+                auto& page = bufferManager.getPage(pageId);
                 if (page->addTuple(tupleToInsert->clone())) { 
                     // Flush the page to disk after insertion
                     bufferManager.flushPage(pageId); 
@@ -1552,7 +1553,7 @@ int main() {
     BuzzDB db;
     std::vector<std::thread> threads;
 
-    for (int i = 0; i < 1; ++i) {
+    for (int i = 0; i < 2; ++i) {
         threads.push_back(std::thread([&db, i]() {
             Transaction t(i, Phase::GROWING, db.txnManager, db.lockManager);
             db.insert(10, 15, t);
