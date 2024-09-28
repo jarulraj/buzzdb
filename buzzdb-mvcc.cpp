@@ -68,6 +68,7 @@ public:
     }
 
     FieldType getType() const { return type; }
+
     int asInt() const { 
         return *reinterpret_cast<int*>(data.get());
     }
@@ -145,13 +146,25 @@ bool operator==(const Field& lhs, const Field& rhs) {
 class Tuple {
 public:
     std::vector<std::unique_ptr<Field>> fields;
+    int version_id;
+    int begin_ts;
+    int end_ts;
+    int read_ts;
+
+    Tuple() = default;
+
+    Tuple(int versionId): version_id(versionId) {
+        begin_ts = versionId;
+        end_ts = 1000000000;
+        read_ts = version_id;
+    }
 
     void addField(std::unique_ptr<Field> field) {
         fields.push_back(std::move(field));
     }
 
     size_t getSize() const {
-        size_t size = 0;
+        size_t size = sizeof(version_id) + sizeof(begin_ts) + sizeof(end_ts) + sizeof(read_ts);
         for (const auto& field : fields) {
             size += field->data_length;
         }
@@ -161,6 +174,7 @@ public:
     std::string serialize() {
         std::stringstream buffer;
         buffer << fields.size() << ' ';
+        buffer << version_id << ' ' << begin_ts << ' ' << end_ts << ' ' << read_ts << ' ';
         for (const auto& field : fields) {
             buffer << field->serialize();
         }
@@ -174,7 +188,8 @@ public:
 
     static std::unique_ptr<Tuple> deserialize(std::istream& in) {
         auto tuple = std::make_unique<Tuple>();
-        size_t fieldCount; in >> fieldCount;
+        size_t fieldCount;
+        in >> fieldCount >> tuple->version_id >> tuple->begin_ts >> tuple->end_ts >> tuple->read_ts;
         for (size_t i = 0; i < fieldCount; ++i) {
             tuple->addField(Field::deserialize(in));
         }
@@ -183,7 +198,7 @@ public:
 
     // Clone method
     std::unique_ptr<Tuple> clone() const {
-        auto clonedTuple = std::make_unique<Tuple>();
+        auto clonedTuple = std::make_unique<Tuple>(version_id);
         for (const auto& field : fields) {
             clonedTuple->addField(field->clone());
         }
@@ -191,6 +206,11 @@ public:
     }
 
     void print() const {
+        std::cout << "Version ID: " << version_id 
+                  << ", Begin TS: " << begin_ts 
+                  << ", End TS: " << end_ts 
+                  << ", Read TS: " << read_ts 
+                  << "\nFields: ";
         for (const auto& field : fields) {
             field->print();
             std::cout << " ";
@@ -714,6 +734,10 @@ public:
             return std::move(currentTuple->fields);
         }
         return {}; // Return an empty vector if no tuple is available
+    }
+
+    std::unique_ptr<Tuple> getCurrentTuple() {
+        return currentTuple->clone();
     }
 
 private:
@@ -1460,12 +1484,12 @@ public:
     }
 
     // insert function
-    void insert(int key, int value) {
+    void insert(int key, int value, int transaction_id) {
         tuple_insertion_attempt_counter += 1;
 
         // Create a new tuple with the given key and value
         // assume key is the column and the value is the actual value
-        auto newTuple = std::make_unique<Tuple>();
+        auto newTuple = std::make_unique<Tuple>(transaction_id);
         auto key_field = std::make_unique<Field>(key);
         auto value_field = std::make_unique<Field>(value);
         newTuple->addField(std::move(key_field));
@@ -1485,21 +1509,26 @@ public:
         // }
     }
 
-    void printTuples() {
-        // Stack allocation of ScanOperator
+    void printTuples(int key) {
+        // Treating printing tuples as reading operation
         ScanOperator scanOp(buffer_manager);
         scanOp.open();
-        const auto& output = scanOp.getOutput();
-        printTuple(output);
+        const auto& tuple = scanOp.getCurrentTuple();
+        // Making sure we access the right version of the tuple
+        if(tuple->begin_ts < key && tuple->end_ts > key){
+            printTuple(tuple->fields);
+        }
         while (scanOp.next()) {
-            const auto& output = scanOp.getOutput();
-            printTuple(output);
+            const auto& tuple = scanOp.getCurrentTuple();
+            if(tuple->begin_ts < key && tuple->end_ts > key){
+                printTuple(tuple->fields);
+            }
         }
         scanOp.close();
     }
 
     void updateTuples(int key, int value) {
-        // Create a new tuple with the given key and value
+        // update the tuple with the key with the given value
         auto newTuple = std::make_unique<Tuple>();
         auto key_field = std::make_unique<Field>(key);
         auto value_field = std::make_unique<Field>(value);
@@ -1541,12 +1570,12 @@ int main() {
 
     BuzzDB db;
 
+    //start the transaction
     auto start = std::chrono::high_resolution_clock::now();
-
-    // db.insert(1, 10);
-    db.printTuples();
-    db.updateTuples(1,100);
-    db.printTuples();
+    auto millies = start.time_since_epoch();
+    auto txnStartTime = std::chrono::duration_cast<std::chrono::milliseconds>(millies).count();
+    // db.insert(6, 93, txnStartTime);
+    db.printTuples(txnStartTime);
     // db.executeQueries();
 
     auto end = std::chrono::high_resolution_clock::now();
