@@ -18,6 +18,7 @@
 #include <optional>
 #include <regex>
 #include <stdexcept>
+#include <deque>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -229,13 +230,14 @@ struct Slot {
     uint16_t length = INVALID_VALUE;    // Length of the slot
 };
 
+
 // Slotted Page class
 class SlottedPage {
 public:
     std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
     size_t metadata_size = sizeof(Slot) * MAX_SLOTS;
 
-    SlottedPage(){
+    SlottedPage() {
         // Empty page -> initialize slot array inside page
         Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
         for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
@@ -246,7 +248,7 @@ public:
     }
 
     // Add a tuple, returns true if it fits, false otherwise.
-    bool addTuple(std::unique_ptr<Tuple> tuple) {
+    bool addTuple(std::unique_ptr<Tuple> tuple, int pageId, TupleManager& tupleManager) {
 
         // Serialize the tuple into a char array
         auto serializedTuple = tuple->serialize();
@@ -307,6 +309,9 @@ public:
                     serializedTuple.c_str(), 
                     tuple_size);
 
+        // record creation of tuple in the tuple manager
+        tupleManager.addTuple(tuple->version_id, pageId, offset, tuple_size, tuple->begin_ts);
+
         return true;
     }
 
@@ -358,13 +363,15 @@ public:
 
 const std::string database_filename = "buzzdb.dat";
 
+using PageID = uint16_t;
+
 class StorageManager {
 public:    
     std::fstream fileStream;
     size_t num_pages = 0;
 
 public:
-    StorageManager(){
+    StorageManager() {
         fileStream.open(database_filename, std::ios::in | std::ios::out);
         if (!fileStream) {
             // If file does not exist, create it
@@ -391,9 +398,9 @@ public:
     }
 
     // Read a page from disk
-    std::unique_ptr<SlottedPage> load(uint16_t page_id) {
+    std::unique_ptr<SlottedPage> load(uint16_t page_id, TupleManager& tupleManager) {
         fileStream.seekg(page_id * PAGE_SIZE, std::ios::beg);
-        auto page = std::make_unique<SlottedPage>();
+        auto page = std::make_unique<SlottedPage>(tupleManager);
         // Read the content of the file into the page
         if(fileStream.read(page->page_data.get(), PAGE_SIZE)){
             //std::cout << "Page read successfully from file." << std::endl;
@@ -434,8 +441,6 @@ public:
     }
 
 };
-
-using PageID = uint16_t;
 
 class Policy {
 public:
@@ -515,10 +520,10 @@ private:
     std::unique_ptr<Policy> policy;
 
 public:
-    BufferManager(): 
+    BufferManager():
     policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
-    std::unique_ptr<SlottedPage>& getPage(int page_id) {
+    std::unique_ptr<SlottedPage>& getPage(int page_id, TupleManager& tupleManager) {
         auto it = pageMap.find(page_id);
         if (it != pageMap.end()) {
             policy->touch(page_id);
@@ -534,7 +539,7 @@ public:
             }
         }
 
-        auto page = storage_manager.load(page_id);
+        auto page = storage_manager.load(page_id, tupleManager);
         policy->touch(page_id);
         std::cout << "Loading page: " << page_id << "\n";
         pageMap[page_id] = std::move(page);
@@ -554,6 +559,94 @@ public:
         return storage_manager.num_pages;
     }
 
+};
+
+class TupleManager {
+private:
+    BufferManager& bufferManager;
+public:
+    TupleManager(BufferManager& bufferManager): bufferManager(bufferManager) {}
+    // store key -> deque<[pageId, offset]>
+    std::unordered_map<int, std::deque<std::vector<int>>> tupleManager;
+
+    void addTuple(int key, int pageId, int offset, int tuple_size, int txnId) {
+        if (tupleManager.find(key) == tupleManager.end()) {
+            std::vector<int> pageMetadata;
+            pageMetadata.push_back(pageId);
+            pageMetadata.push_back(offset);
+            pageMetadata.push_back(tuple_size);
+            std::deque<std::vector<int>> pageQueue;
+            pageQueue.push_back(pageMetadata);
+            tupleManager[key] = pageQueue;
+            std::cout << "Added tuple to tuple manager\n";
+        }
+        else {
+            //retrieve the latest version and set it's end_ts to the current transaction Id.
+            std::deque<std::vector<int>> pageQueue = tupleManager[key];
+            std::vector<int> pageMetadata = pageQueue.back();
+            int pageId = pageMetadata[0];
+            int offset = pageMetadata[1];
+            int tuple_size = pageMetadata[2];
+            auto& currentPage = bufferManager.getPage(pageId);
+            char* page_buffer = currentPage->page_data.get();
+            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+            const char* tuple_data = page_buffer + offset;
+            std::istringstream iss(std::string(tuple_data, tuple_size));
+            std::unique_ptr<Tuple> currentTuple = Tuple::deserialize(iss);
+            currentTuple->end_ts = txnId;
+            bufferManager.flushPage(pageId);
+            //add the new tuple to the tuple manager
+            std::vector<int> pageMetadata;
+            pageMetadata.push_back(pageId);
+            pageMetadata.push_back(offset);
+            pageMetadata.push_back(tuple_size);
+            std::deque<std::vector<int>> pageQueue = tupleManager[key];
+            pageQueue.push_back(pageMetadata);
+            tupleManager[key] = pageQueue;
+            std::cout << "Added tuple to tuple manager\n";
+        }
+    }
+
+    std::vector<std::unique_ptr<Field>> findTupleForReading(int key, int txnId) {
+        if (tupleManager.find(key) == tupleManager.end()) {
+            return {};
+        }
+        std::deque<std::vector<int>> pageQueue = tupleManager[key];
+        std::vector<int> pageMetadata = pageQueue.back();
+        int pageId = pageMetadata[0];
+        int offset = pageMetadata[1];
+        int tuple_size = pageMetadata[2];
+        //read the tuple metadata to verify if this is the right tuple to read
+        auto& currentPage = bufferManager.getPage(pageId, *this);
+        char* page_buffer = currentPage->page_data.get();
+        Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+        const char* tuple_data = page_buffer + offset;
+        std::istringstream iss(std::string(tuple_data, tuple_size));
+        std::unique_ptr<Tuple> currentTuple = Tuple::deserialize(iss);
+        if(currentTuple->begin_ts <= txnId && currentTuple->end_ts > txnId && currentTuple->read_ts <= txnId){
+            currentTuple->read_ts = txnId;
+            return std::move(currentTuple->fields);
+        }
+        else{
+            //find an older version of the tuple
+            for (int i = pageQueue.size() - 2; i >= 0; i--) {
+                pageMetadata = pageQueue[i];
+                pageId = pageMetadata[0];
+                offset = pageMetadata[1];
+                tuple_size = pageMetadata[2];
+                auto& currentPage = bufferManager.getPage(pageId, *this);
+                char* page_buffer = currentPage->page_data.get();
+                Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+                const char* tuple_data = page_buffer + offset;
+                std::istringstream iss(std::string(tuple_data, tuple_size));
+                std::unique_ptr<Tuple> currentTuple = Tuple::deserialize(iss);
+                if(currentTuple->begin_ts <= txnId && currentTuple->end_ts > txnId && currentTuple->read_ts <= txnId){
+                    currentTuple->read_ts = txnId;
+                    return std::move(currentTuple->fields);
+                }
+            }
+        }
+    }
 };
 
 class HashIndex {
@@ -701,13 +794,14 @@ class BinaryOperator : public Operator {
 class ScanOperator : public Operator {
 private:
     BufferManager& bufferManager;
+    TupleManager& tupleManager;
     size_t currentPageIndex = 0;
     size_t currentSlotIndex = 0;
     std::unique_ptr<Tuple> currentTuple;
     size_t tuple_count = 0;
 
 public:
-    ScanOperator(BufferManager& manager) : bufferManager(manager) {}
+    ScanOperator(BufferManager& manager, TupleManager& tupleManager) : bufferManager(manager), tupleManager(tupleManager) {}
 
     void open() override {
         currentPageIndex = 0;
@@ -743,7 +837,7 @@ public:
 private:
     void loadNextTuple() {
         while (currentPageIndex < bufferManager.getNumPages()) {
-            auto& currentPage = bufferManager.getPage(currentPageIndex);
+            auto& currentPage = bufferManager.getPage(currentPageIndex, tupleManager);
             if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
                 currentSlotIndex = 0; // Reset slot index when moving to a new page
             }
@@ -1320,10 +1414,11 @@ void executeQuery(const QueryComponents& components,
 class InsertOperator : public Operator {
 private:
     BufferManager& bufferManager;
+    TupleManager& tupleManager;
     std::unique_ptr<Tuple> tupleToInsert;
 
 public:
-    InsertOperator(BufferManager& manager) : bufferManager(manager) {}
+    InsertOperator(BufferManager& manager, TupleManager& tupleManager) : bufferManager(manager), tupleManager(tupleManager) {}
 
     // Set the tuple to be inserted by this operator.
     void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
@@ -1338,9 +1433,9 @@ public:
         if (!tupleToInsert) return false; // No tuple to insert
 
         for (size_t pageId = 0; pageId < bufferManager.getNumPages(); ++pageId) {
-            auto& page = bufferManager.getPage(pageId);
+            auto& page = bufferManager.getPage(pageId, tupleManager);
             // Attempt to insert the tuple
-            if (page->addTuple(tupleToInsert->clone())) { 
+            if (page->addTuple(tupleToInsert->clone(), pageId)) { 
                 // Flush the page to disk after insertion
                 bufferManager.flushPage(pageId); 
                 return true; // Insertion successful
@@ -1349,7 +1444,7 @@ public:
 
         // If insertion failed in all existing pages, extend the database and try again
         bufferManager.extend();
-        auto& newPage = bufferManager.getPage(bufferManager.getNumPages() - 1);
+        auto& newPage = bufferManager.getPage(bufferManager.getNumPages() - 1, tupleManager);
         if (newPage->addTuple(tupleToInsert->clone())) {
             bufferManager.flushPage(bufferManager.getNumPages() - 1);
             return true; // Insertion successful after extending the database
@@ -1370,19 +1465,20 @@ public:
 class DeleteOperator : public Operator {
 private:
     BufferManager& bufferManager;
+    TupleManager& tupleManager;
     size_t pageId;
     size_t tupleId;
 
 public:
-    DeleteOperator(BufferManager& manager, size_t pageId, size_t tupleId) 
-        : bufferManager(manager), pageId(pageId), tupleId(tupleId) {}
+    DeleteOperator(BufferManager& manager, size_t pageId, size_t tupleId, TupleManager& tupleManager) 
+        : bufferManager(manager), pageId(pageId), tupleId(tupleId), tupleManager(tupleManager) {}
 
     void open() override {
         // Not used in this context
     }
 
     bool next() override {
-        auto& page = bufferManager.getPage(pageId);
+        auto& page = bufferManager.getPage(pageId, tupleManager);
         if (!page) {
             std::cerr << "Page not found." << std::endl;
             return false;
@@ -1405,11 +1501,12 @@ public:
 class UpdateOperator : public Operator {
 private:
     BufferManager& bufferManager;
+    TupleManager& tupleManager;
     std::unique_ptr<Tuple> tupleToUpdate;
     std::unique_ptr<Tuple> currentTuple;
 
 public:
-    UpdateOperator(BufferManager& manager) : bufferManager(manager) {}
+    UpdateOperator(BufferManager& manager, TupleManager& tupleManager) : bufferManager(manager), tupleManager(tupleManager) {}
 
     // Set the tuple to be updated by this operator.
     void setTupleToUpdate(std::unique_ptr<Tuple> tuple) {
@@ -1426,7 +1523,7 @@ public:
         int currentSlotIndex = 0;
 
         while (currentPageIndex < bufferManager.getNumPages()) {
-            auto& currentPage = bufferManager.getPage(currentPageIndex);
+            auto& currentPage = bufferManager.getPage(currentPageIndex, tupleManager);
             if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
                 currentSlotIndex = 0; // Reset slot index when moving to a new page
             }
@@ -1474,12 +1571,13 @@ class BuzzDB {
 public:
     HashIndex hash_index;
     BufferManager buffer_manager;
+    TupleManager tuple_manager;
 
 public:
     size_t max_number_of_tuples = 5000;
     size_t tuple_insertion_attempt_counter = 0;
 
-    BuzzDB(){
+    BuzzDB() : tuple_manager(buffer_manager) {
         // Storage Manager automatically created
     }
 
