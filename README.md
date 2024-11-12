@@ -1,5 +1,7 @@
 # BuzzDB: An Educational Database System
 
+<img src="https://github.com/user-attachments/assets/1b9f85c1-cf48-47c4-9462-85a7547faecc" alt="buzzdb_logo" width="20%">
+
 BuzzDB is a relational database system written in C++ with a modular design for educational purposes. 
 
 It consists of advanced storage management, indexing, query execution components.
