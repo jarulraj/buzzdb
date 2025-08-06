@@ -18,6 +18,7 @@
 #include <optional>
 #include <regex>
 #include <stdexcept>
+#include <cassert>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -1372,7 +1373,6 @@ public:
     BufferManager buffer_manager;
 
 public:
-    size_t max_number_of_tuples = 5000;
     size_t tuple_insertion_attempt_counter = 0;
 
     BuzzDB(){
@@ -1403,7 +1403,7 @@ public:
 
         assert(status == true);
 
-        if (tuple_insertion_attempt_counter % 10 != 0) {
+        if (tuple_insertion_attempt_counter % 100 != 0) {
             // Assuming you want to delete the first tuple from the first page
             DeleteOperator delOp(buffer_manager, 0, 0); 
             if (!delOp.next()) {
@@ -1411,6 +1411,7 @@ public:
             }
         }
 
+        
 
     }
 
@@ -1422,7 +1423,7 @@ public:
 
         for (const auto& query : test_queries) {
             auto components = parseQuery(query);
-            //prettyPrint(components);
+            prettyPrint(components);
             executeQuery(components, buffer_manager);
         }
 
@@ -1442,11 +1443,8 @@ int main() {
     }
 
     int field1, field2;
-    int i = 0;
     while (inputFile >> field1 >> field2) {
-        if(i++ % 10000 == 0){
-            db.insert(field1, field2);
-        }
+        db.insert(field1, field2);
     }
 
     auto start = std::chrono::high_resolution_clock::now();
