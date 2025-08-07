@@ -645,10 +645,6 @@ public:
     void abort (TxnContext& tx) { tx.state = TxnContext::ABORTED;  }
 };
 
-struct ExecutionContext {
-    TxnPtr txn;
-};
-
 class Operator {
     public:
     virtual ~Operator() = default;
@@ -668,15 +664,13 @@ class Operator {
     /// next tuple. Each `Field` pointer in the vector stands for one attribute of the tuple.
     virtual std::vector<std::unique_ptr<Field>> getOutput() = 0;
 
-    // Non-owning, non-virtual setter
-    void setExecutionContext(ExecutionContext* ctx) { exec_ctx_ = ctx; }
+    // children can forward txn context to their child operators
+    virtual void setTxnContext(std::shared_ptr<TxnContext> txn) {
+        txn_ = std::move(txn);
+    }
 
     protected:
-    ExecutionContext* exec_ctx_ = nullptr; // borrowed pointer
-
-    std::shared_ptr<TxnContext> txn() const { 
-        return exec_ctx_ ? exec_ctx_->txn : nullptr; 
-    }
+    TxnPtr txn_;
 };
 
 class UnaryOperator : public Operator {
@@ -926,7 +920,7 @@ public:
         : UnaryOperator(input), predicate(std::move(predicate)), has_next(false) {}
 
     void open() override {
-        input->setExecutionContext(exec_ctx_);
+        input->setTxnContext(txn_);
         input->open();
         has_next = false;
         currentOutput.clear(); // Ensure currentOutput is cleared at the beginning
@@ -1029,7 +1023,6 @@ public:
         : UnaryOperator(input), group_by_attrs(group_by_attrs), aggr_funcs(aggr_funcs) {}
 
     void open() override {
-        input->setExecutionContext(exec_ctx_);
         input->open(); // Ensure the input operator is opened
         output_tuples_index = 0;
         output_tuples.clear();
@@ -1254,12 +1247,15 @@ void prettyPrint(const QueryComponents& components) {
 }
 
 void executeQuery(const QueryComponents& components, 
-                  BufferManager& buffer_manager) {
+                  BufferManager& buffer_manager,
+                  const TxnPtr& txn = nullptr) {
+
     // Stack allocation of ScanOperator
     ScanOperator scanOp(buffer_manager);
 
     // Using a pointer to Operator to handle polymorphism
     Operator* rootOp = &scanOp;
+    rootOp->setTxnContext(txn);   
 
     // Buffer for optional operators to ensure lifetime
     std::optional<SelectOperator> selectOpBuffer;
@@ -1424,7 +1420,7 @@ public:
     void abort (const TxnPtr& tx) { txn_manager.abort(*tx);  }
 
     // insert function
-    void insert(int key, int value, ExecutionContext* ctx = nullptr) {
+    void insert(int key, int value, const TxnPtr& txn = nullptr) {
         tuple_insertion_attempt_counter += 1;
 
         // Create a new tuple with the given key and value
@@ -1442,7 +1438,7 @@ public:
         newTuple->addField(std::move(string_field));
 
         InsertOperator insertOp(buffer_manager);
-        insertOp.setExecutionContext(ctx);
+        insertOp.setTxnContext(txn);
         insertOp.setTupleToInsert(std::move(newTuple));
         bool status = insertOp.next();
 
@@ -1451,7 +1447,7 @@ public:
         if (tuple_insertion_attempt_counter % 100 != 0) {
             // Assuming you want to delete the first tuple from the first page
             DeleteOperator delOp(buffer_manager, 0, 0); 
-            delOp.setExecutionContext(ctx);
+            delOp.setTxnContext(txn);
             if (!delOp.next()) {
                 std::cerr << "Failed to delete tuple." << std::endl;
             }
@@ -1461,7 +1457,7 @@ public:
 
     }
 
-    void executeQueries() {
+    void executeQueries(const TxnPtr& txn = nullptr) {
 
         std::vector<std::string> test_queries = {
             "SUM{1} GROUP BY {1} WHERE {1} > 2 and {1} < 6"
@@ -1470,7 +1466,7 @@ public:
         for (const auto& query : test_queries) {
             auto components = parseQuery(query);
             prettyPrint(components);
-            executeQuery(components, buffer_manager);
+            executeQuery(components, buffer_manager, txn);
         }
 
     }
@@ -1489,27 +1485,25 @@ int main() {
     }
 
     // --- Transaction 1: perform inserts ---
-    auto txn_ctx1 = std::make_unique<ExecutionContext>();
-    txn_ctx1->txn = db.begin();
+    TxnPtr txn1 = db.begin();
 
     int field1, field2;
     while (inputFile >> field1 >> field2) {
-        db.insert(field1, field2, txn_ctx1.get());
+        db.insert(field1, field2, txn1);
     }
 
-    db.commit(txn_ctx1->txn); // commit once for the whole batch
+    db.commit(txn1); // commit once for the whole batch
 
     // --- Transaction 2: perform queries ---
-    auto txn_ctx2 = std::make_unique<ExecutionContext>();
-    txn_ctx2->txn = db.begin(); 
+    TxnPtr txn2 = db.begin(); 
     auto start = std::chrono::high_resolution_clock::now();
 
     // Future: pass txn_ctx2 into executeQueries
-    db.executeQueries();
+    db.executeQueries(txn2);
 
     auto end = std::chrono::high_resolution_clock::now();
 
-    db.commit(txn_ctx2->txn); // Also commit this txn, even if read-only
+    db.commit(txn2); // Also commit this txn, even if read-only
     
     // Calculate and print the elapsed time
     std::chrono::duration<double> elapsed = end - start;
