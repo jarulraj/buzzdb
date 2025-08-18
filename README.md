@@ -1,5 +1,8 @@
 # BuzzDB: An Educational Database System
 
+## Website: https://buzzdb-docs.readthedocs.io/
+
+
 <br>
 
 <div align="center">
