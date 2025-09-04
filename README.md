@@ -58,6 +58,8 @@ To compile BuzzDB, use the following commands:
 g++ -std=c++17 -O3 -Wall -Werror -Wextra -g <module_name>.cpp
 ```
 
+On Apple silicon Macs, the error `error: use of undeclared identifier 'assert' occurs on compilation` as #include <cassert> is not currently there in the `buzzdb.cpp` file. Add the header file to resolve this error.
+
 ## Contributions
 
 We welcome contributions to enhance BuzzDB’s performance and extend its capabilities. Feel free to submit pull requests, report issues, and join discussions.
