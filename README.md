@@ -50,12 +50,12 @@ To compile BuzzDB, use the following commands:
 - **Compilation**: Compile a particular version of BuzzDB as follows:
 
 ```bash
-  g++ -std=c++14 -O3 -Wall -Werror -Wextra <module_name>.cpp
+  g++ -std=c++17 -O3 -Wall -Werror -Wextra <module_name>.cpp
 ```
 - **Compilation with Debugging Symbols**: Use -g flag to enable debugging with gdb or lldb:
 
 ```
-g++ -std=c++14 -O3 -Wall -Werror -Wextra -g <module_name>.cpp
+g++ -std=c++17 -O3 -Wall -Werror -Wextra -g <module_name>.cpp
 ```
 
 ## Contributions
