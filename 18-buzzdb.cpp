@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <chrono>
+#include <cassert>
 
 #include <list>
 #include <unordered_map>

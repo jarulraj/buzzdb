@@ -1,434 +1,432 @@
-#include <iostream>
+#include <algorithm>
 #include <vector>
-#include <limits>
-#include <cmath>
+#include <iostream>
 #include <queue>
+using namespace std;
 
-// Define a point in 2D space
+/* ========================= Geometry ========================= */
+
 struct Point {
     float x, y;
-    Point() : x(0), y(0) {}
-    Point(float x, float y) : x(x), y(y) {}
-
-    bool operator<(const Point& other) const {
-        return x < other.x || (x == other.x && y < other.y);
-    }
 };
 
-// Define a rectangle in 2D space
-struct Rectangle {
+struct Rect {
     float minX, minY, maxX, maxY;
-    Rectangle() : minX(0), minY(0), maxX(0), maxY(0) {}
-    Rectangle(float minX, float minY, float maxX, float maxY)
-        : minX(minX), minY(minY), maxX(maxX), maxY(maxY) {}
+
+    Rect() : minX(0), minY(0), maxX(0), maxY(0) {}
+    Rect(float x1, float y1, float x2, float y2)
+        : minX(min(x1,x2)), minY(min(y1,y2)),
+          maxX(max(x1,x2)), maxY(max(y1,y2)) {}
+
+    static Rect fromPoint(Point p) { return Rect(p.x, p.y, p.x, p.y); }
+
+    bool valid() const { return minX <= maxX && minY <= maxY; }
+
+    bool intersects(const Rect& o) const {
+        return !(o.minX > maxX || o.maxX < minX || o.minY > maxY || o.maxY < minY);
+    }
 
     bool contains(const Point& p) const {
-        return (p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY);
-    }
-
-    bool intersects(const Rectangle& other) const {
-        return !(other.minX > maxX || other.maxX < minX || other.minY > maxY || other.maxY < minY);
-    }
-
-    void expand(const Rectangle& other) {
-        if (other.minX < minX) minX = other.minX;
-        if (other.minY < minY) minY = other.minY;
-        if (other.maxX > maxX) maxX = other.maxX;
-        if (other.maxY > maxY) maxY = other.maxY;
+        return p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY;
     }
 
     float area() const {
-        return (maxX - minX) * (maxY - minY);
+        return max(0.0f, (maxX - minX)) * max(0.0f, (maxY - minY));
     }
 
-    float enlargement(const Rectangle& other) const {
-        Rectangle enlarged = *this;
-        enlarged.expand(other);
-        return enlarged.area() - this->area();
+    float enlargement(const Rect& o) const {
+        Rect e = *this;
+        e.expand(o);
+        return e.area() - this->area();
     }
 
-    void print() const {
-        std::cout << "[" << minX << ", " << minY << ", " << maxX << ", " << maxY << "]";
+    void expand(const Rect& o) {
+        if (!valid()) { *this = o; return; }
+        minX = std::min(minX, o.minX);
+        minY = std::min(minY, o.minY);
+        maxX = std::max(maxX, o.maxX);
+        maxY = std::max(maxY, o.maxY);
     }
 
-    float minDistance(const Point& p) const {
-        float dx = std::max({minX - p.x, 0.0f, p.x - maxX});
-        float dy = std::max({minY - p.y, 0.0f, p.y - maxY});
-        return std::sqrt(dx * dx + dy * dy);
+    static Rect combine(const Rect& a, const Rect& b) {
+        Rect r = a; r.expand(b); return r;
+    }
+
+    // min distance from point to rectangle (0 if inside)
+    float minDist(const Point& p) const {
+        float dx = 0.0f;
+        if      (p.x < minX) dx = minX - p.x;
+        else if (p.x > maxX) dx = p.x - maxX;
+        float dy = 0.0f;
+        if      (p.y < minY) dy = minY - p.y;
+        else if (p.y > maxY) dy = p.y - maxY;
+        return std::sqrt(dx*dx + dy*dy);
     }
 };
 
-// Define a node in the R-tree
-struct RTreeNode {
+/* ========================= R-Tree ========================= */
+
+struct Node;
+
+struct Entry {
+    Rect mbr;
+    Node* child;   // nullptr for leaf entries
+    int   id;      // payload id if leaf; undefined for internal
+    Entry(const Rect& r, Node* c, int id=-1) : mbr(r), child(c), id(id) {}
+};
+
+struct Node {
     bool isLeaf;
-    std::vector<Point> points;
-    std::vector<Rectangle> childrenRectangles;
-    std::vector<RTreeNode*> children;
+    vector<Entry> entries;
+    Node* parent = nullptr;
 
-    RTreeNode(bool isLeaf) : isLeaf(isLeaf) {}
+    explicit Node(bool leaf): isLeaf(leaf) {}
 };
 
-// Define the R-tree
 class RTree {
-private:
-    RTreeNode* root;
-    int maxPoints;
-
-    void insert(RTreeNode* node, const Point& point, const Rectangle& rect) {
-        if (node->isLeaf) {
-            node->points.push_back(point);
-            if (node->points.size() > static_cast<size_t>(maxPoints)) {
-                split(node);
-            }
-        } else {
-            int bestChild = chooseBestChild(node, rect);
-            insert(node->children[bestChild], point, rect);
-            node->childrenRectangles[bestChild].expand(rect);
-        }
-    }
-
-    void split(RTreeNode* node) {
-        if (node->isLeaf) {
-            quadraticSplitLeaf(node);
-        } else {
-            quadraticSplitInternal(node);
-        }
-    }
-
-    void quadraticSplitLeaf(RTreeNode* node) {
-        std::vector<Point> points = node->points;
-        node->points.clear();
-
-        // Choose seeds
-        int seed1, seed2;
-        chooseSeeds(points, seed1, seed2);
-
-        RTreeNode* newNode = new RTreeNode(true);
-        node->points.push_back(points[seed1]);
-        newNode->points.push_back(points[seed2]);
-
-        // Distribute remaining entries
-        for (size_t i = 0; i < points.size(); ++i) {
-            if (i == (size_t)seed1 || i == (size_t)seed2) continue;
-            distributeEntry(node, newNode, points[i]);
-        }
-
-        if (node == root) {
-            RTreeNode* newRoot = new RTreeNode(false);
-            newRoot->children.push_back(node);
-            newRoot->children.push_back(newNode);
-            newRoot->childrenRectangles.push_back(calculateBoundingRectangle(node));
-            newRoot->childrenRectangles.push_back(calculateBoundingRectangle(newNode));
-            root = newRoot;
-        } else {
-            // Update parent node with new child
-            updateParent(node, newNode);
-        }
-    }
-
-    void quadraticSplitInternal(RTreeNode* node) {
-        std::vector<Rectangle> rectangles = node->childrenRectangles;
-        std::vector<RTreeNode*> children = node->children;
-        node->childrenRectangles.clear();
-        node->children.clear();
-
-        // Choose seeds
-        int seed1, seed2;
-        chooseSeeds(rectangles, seed1, seed2);
-
-        RTreeNode* newNode = new RTreeNode(false);
-        node->children.push_back(children[seed1]);
-        newNode->children.push_back(children[seed2]);
-        node->childrenRectangles.push_back(rectangles[seed1]);
-        newNode->childrenRectangles.push_back(rectangles[seed2]);
-
-        // Distribute remaining entries
-        for (size_t i = 0; i < rectangles.size(); ++i) {
-            if (i == (size_t)seed1 || i == (size_t)seed2) continue;
-            distributeEntry(node, newNode, rectangles[i], children[i]);
-        }
-
-        if (node == root) {
-            RTreeNode* newRoot = new RTreeNode(false);
-            newRoot->children.push_back(node);
-            newRoot->children.push_back(newNode);
-            newRoot->childrenRectangles.push_back(calculateBoundingRectangle(node));
-            newRoot->childrenRectangles.push_back(calculateBoundingRectangle(newNode));
-            root = newRoot;
-        } else {
-            // Update parent node with new child
-            updateParent(node, newNode);
-        }
-    }
-
-    void chooseSeeds(const std::vector<Point>& points, int& seed1, int& seed2) {
-        float maxDistance = -1;
-        for (size_t i = 0; i < points.size(); ++i) {
-            for (size_t j = i + 1; j < points.size(); ++j) {
-                float distance = std::sqrt(std::pow(points[i].x - points[j].x, 2) +
-                                           std::pow(points[i].y - points[j].y, 2));
-                if (distance > maxDistance) {
-                    maxDistance = distance;
-                    seed1 = i;
-                    seed2 = j;
-                }
-            }
-        }
-    }
-
-    void chooseSeeds(const std::vector<Rectangle>& rectangles, int& seed1, int& seed2) {
-        float maxDistance = -1;
-        for (size_t i = 0; i < rectangles.size(); ++i) {
-            for (size_t j = i + 1; j < rectangles.size(); ++j) {
-                float distance = std::sqrt(std::pow(rectangles[i].minX - rectangles[j].minX, 2) +
-                                           std::pow(rectangles[i].minY - rectangles[j].minY, 2));
-                if (distance > maxDistance) {
-                    maxDistance = distance;
-                    seed1 = i;
-                    seed2 = j;
-                }
-            }
-        }
-    }
-
-    void distributeEntry(RTreeNode* node, RTreeNode* newNode, const Point& point) {
-        Rectangle rect(point.x, point.y, point.x, point.y);
-        float enlargement1 = calculateBoundingRectangle(node).enlargement(rect);
-        float enlargement2 = calculateBoundingRectangle(newNode).enlargement(rect);
-
-        if (enlargement1 < enlargement2) {
-            node->points.push_back(point);
-        } else {
-            newNode->points.push_back(point);
-        }
-    }
-
-    void distributeEntry(RTreeNode* node, RTreeNode* newNode, const Rectangle& rect, RTreeNode* child) {
-        float enlargement1 = calculateBoundingRectangle(node).enlargement(rect);
-        float enlargement2 = calculateBoundingRectangle(newNode).enlargement(rect);
-
-        if (enlargement1 < enlargement2) {
-            node->children.push_back(child);
-            node->childrenRectangles.push_back(rect);
-        } else {
-            newNode->children.push_back(child);
-            newNode->childrenRectangles.push_back(rect);
-        }
-    }
-
-    void updateParent(RTreeNode* node, RTreeNode* newNode) {
-        for (RTreeNode* parent : findParents(root, node)) {
-            parent->children.push_back(newNode);
-            parent->childrenRectangles.push_back(calculateBoundingRectangle(newNode));
-
-            if (parent->children.size() > static_cast<size_t>(maxPoints)) {
-                split(parent);
-            }
-        }
-    }
-
-    std::vector<RTreeNode*> findParents(RTreeNode* currentNode, RTreeNode* targetNode) {
-        std::vector<RTreeNode*> parents;
-        if (!currentNode->isLeaf) {
-            for (size_t i = 0; i < currentNode->children.size(); ++i) {
-                if (currentNode->children[i] == targetNode) {
-                    parents.push_back(currentNode);
-                } else {
-                    std::vector<RTreeNode*> foundParents = findParents(currentNode->children[i], targetNode);
-                    parents.insert(parents.end(), foundParents.begin(), foundParents.end());
-                }
-            }
-        }
-        return parents;
-    }
-
-    int chooseBestChild(RTreeNode* node, const Rectangle& rect) {
-        int bestChild = 0;
-        float minEnlargement = std::numeric_limits<float>::max();
-        for (size_t i = 0; i < node->children.size(); ++i) {
-            Rectangle enlarged = node->childrenRectangles[i];
-            enlarged.expand(rect);
-            float enlargement = (enlarged.maxX - enlarged.minX) * (enlarged.maxY - enlarged.minY) -
-                                (node->childrenRectangles[i].maxX - node->childrenRectangles[i].minX) *
-                                (node->childrenRectangles[i].maxY - node->childrenRectangles[i].minY);
-            if (enlargement < minEnlargement) {
-                minEnlargement = enlargement;
-                bestChild = i;
-            }
-        }
-        return bestChild;
-    }
-
-    Rectangle calculateBoundingRectangle(RTreeNode* node) {
-        float minX = std::numeric_limits<float>::max(), minY = std::numeric_limits<float>::max();
-        float maxX = std::numeric_limits<float>::lowest(), maxY = std::numeric_limits<float>::lowest();
-        for (const Point& p : node->points) {
-            if (p.x < minX) minX = p.x;
-            if (p.y < minY) minY = p.y;
-            if (p.x > maxX) maxX = p.x;
-            if (p.y > maxY) maxY = p.y;
-        }
-        for (const Rectangle& rect : node->childrenRectangles) {
-            if (rect.minX < minX) minX = rect.minX;
-            if (rect.minY < minY) minY = rect.minY;
-            if (rect.maxX > maxX) maxX = rect.maxX;
-            if (rect.maxY > maxY) maxY = rect.maxY;
-        }
-        return Rectangle(minX, minY, maxX, maxY);
-    }
-
-    void query(RTreeNode* node, const Rectangle& rect, std::vector<Point>& results) {
-        if (node->isLeaf) {
-            for (const Point& p : node->points) {
-                if (rect.contains(p)) {
-                    results.push_back(p);
-                }
-            }
-        } else {
-            for (size_t i = 0; i < node->children.size(); ++i) {
-                if (rect.intersects(node->childrenRectangles[i])) {
-                    query(node->children[i], rect, results);
-                }
-            }
-        }
-    }
-
-    void printTree(RTreeNode* node, int depth = 0) const {
-        if (node == nullptr) return;
-        std::string indent(depth * 2, ' ');
-        if (node->isLeaf) {
-            std::cout << indent << "Leaf Node with points: ";
-            for (const Point& p : node->points) {
-                std::cout << "(" << p.x << ", " << p.y << ") ";
-            }
-            std::cout << std::endl;
-        } else {
-            std::cout << indent << "Internal Node with bounding rectangles: ";
-            for (const Rectangle& r : node->childrenRectangles) {
-                r.print();
-                std::cout << " ";
-            }
-            std::cout << std::endl;
-            for (size_t i = 0; i < node->children.size(); ++i) {
-                printTree(node->children[i], depth + 1);
-            }
-        }
-    }
-
 public:
-    RTree(int maxPoints = 4) : root(new RTreeNode(true)), maxPoints(maxPoints) {}
-
-    void insert(const Point& point) {
-        Rectangle rect(point.x, point.y, point.x, point.y);
-        insert(root, point, rect);
-        std::cout << "Inserted point (" << point.x << ", " << point.y << ")" << std::endl;
-        printTree(root);
+    explicit RTree(int maxEntries = 8)
+        : M(max(4, maxEntries)), m((M+1)/2)  // min-fill = ceil((M+1)/2)
+    {
+        root = new Node(true);
     }
 
-    std::vector<Point> query(const Rectangle& rect) {
-        std::vector<Point> results;
-        query(root, rect, results);
-        return results;
+    ~RTree() { destroy(root); }
+
+    void insertPoint(Point p, int id) {
+        Rect r = Rect::fromPoint(p);
+        insertRect(r, id);
     }
 
-    // Define the nearest neighbor search function for the R-tree
-    void nearestNeighbor(RTreeNode* node, const Point& queryPoint, int k, 
-        std::priority_queue<std::pair<float, Point>, std::vector<std::pair<float, Point>>, std::less<>>& pq) {
-        // If the current node is a leaf node
-        if (node->isLeaf) {
-            // Iterate through all points in the leaf node
-            for (const Point& p : node->points) {
-                // Calculate the Euclidean distance from the query point to the current point
-                float distance = std::sqrt(std::pow(p.x - queryPoint.x, 2) + std::pow(p.y - queryPoint.y, 2));
-                // Add the distance and point to the priority queue
-                pq.push(std::make_pair(distance, p));
-                // If the size of the priority queue exceeds k, remove the farthest point
-                if (pq.size() > static_cast<size_t>(k)) {
-                    pq.pop();
+    void insertRect(const Rect& r, int id) {
+        Node* leaf = chooseSubtree(root, r);
+        leaf->entries.emplace_back(r, nullptr, id);
+        if ((int)leaf->entries.size() > M) handleOverflow(leaf);
+        adjustMBRsUpward(leaf);
+    }
+
+    vector<int> windowQuery(const Rect& q) const {
+        vector<int> out;
+        windowQuery(root, q, out);
+        return out;
+    }
+
+    vector<int> kNearest(const Point& q, int k) const {
+        if (k <= 0) return {};
+        using QItem = pair<float, const Node*>; // min-heap by bound
+        auto cmp = [](const QItem& a, const QItem& b){ return a.first > b.first; };
+        priority_queue<QItem, vector<QItem>, decltype(cmp)> pq(cmp);
+
+        float kth = numeric_limits<float>::infinity();
+        vector<pair<float,int>> best; best.reserve(k);
+
+        // best-first traversal over nodes by MBR distance
+        pq.emplace(0.0f, root);
+        while(!pq.empty()) {
+            auto [bound, node] = pq.top(); pq.pop();
+            if (bound > kth) break; // prune
+
+            if (node->isLeaf) {
+                for (auto& e : node->entries) {
+                    // distance to the point payload
+                    Point p{e.mbr.minX, e.mbr.minY}; // zero-area rect ⇒ point
+                    float d = std::sqrt((p.x-q.x)*(p.x-q.x) + (p.y-q.y)*(p.y-q.y));
+                    insertBest(best, k, d, e.id, kth);
+                }
+            } else {
+                for (auto& e : node->entries) {
+                    float b = e.mbr.minDist(q);
+                    if (b <= kth) pq.emplace(b, e.child);
                 }
             }
-        } else { // If the current node is an internal node
-            // Create a vector to store the distances from the query point to each child rectangle and the corresponding child nodes
-            std::vector<std::pair<float, RTreeNode*>> childDistances;
-            for (size_t i = 0; i < node->children.size(); ++i) {
-                // Calculate the minimum distance from the query point to the current child rectangle
-                float distance = node->childrenRectangles[i].minDistance(queryPoint);
-                // Add the distance and child node to the vector
-                childDistances.push_back(std::make_pair(distance, node->children[i]));
-            }
-            // Sort the vector in ascending order based on distance
-            std::sort(childDistances.begin(), childDistances.end());
+        }
+        // sort results by distance ascending
+        sort(best.begin(), best.end());
+        vector<int> ids; ids.reserve(best.size());
+        for (auto& x : best) ids.push_back(x.second);
+        return ids;
+    }
 
-            // Recursively call the nearest neighbor function for each child node in order of increasing distance
-            for (const auto& child : childDistances) {
-                nearestNeighbor(child.second, queryPoint, k, pq);
+    void print(ostream& os=std::cout) const { printNode(root, 0, os); }
+
+private:
+    Node* root;
+    const int M; // max entries per node
+    const int m; // min fill
+
+    /* -------- Utilities -------- */
+
+    static void destroy(Node* n){
+        if (!n) return;
+        if (!n->isLeaf) for (auto& e : n->entries) destroy(e.child);
+        delete n;
+    }
+
+    static Rect computeNodeMBR(const Node* n) {
+        Rect r; bool first=true;
+        for (auto& e : n->entries) {
+            if (first) { r = e.mbr; first=false; }
+            else r.expand(e.mbr);
+        }
+        return r;
+    }
+
+    void adjustMBRsUpward(Node* n) {
+        while (n && n->parent) {
+            // update the entry in the parent that points to n
+            for (auto& pe : n->parent->entries) {
+                if (pe.child == n) {
+                    pe.mbr = computeNodeMBR(n);
+                    break;
+                }
             }
+            n = n->parent;
         }
     }
 
-    // Function to perform nearest neighbor search
-    std::vector<Point> nearestNeighbor(const Point& queryPoint, int k) {
-        // Create a priority queue to store the k nearest neighbors
-        std::priority_queue<std::pair<float, Point>, 
-        std::vector<std::pair<float, Point>>, std::less<>> pq;
-        // Call the recursive nearest neighbor search function starting from the root node
-        nearestNeighbor(root, queryPoint, k, pq);
+    /* -------- ChooseSubtree (least enlargement, then area, then fewest entries) -------- */
+    Node* chooseSubtree(Node* cur, const Rect& r) const {
+        while (!cur->isLeaf) {
+            int best = -1;
+            float bestEnl = numeric_limits<float>::infinity();
+            float bestArea = numeric_limits<float>::infinity();
+            int bestCount = numeric_limits<int>::max();
 
-        // Create a vector to store the results
-        std::vector<Point> results;
-        // Retrieve the k nearest neighbors from the priority queue
-        while (!pq.empty()) {
-            results.push_back(pq.top().second);
-            pq.pop();
+            for (int i=0;i<(int)cur->entries.size();++i) {
+                const Rect& m = cur->entries[i].mbr;
+                float enl = m.enlargement(r);
+                float area = m.area();
+                int   cnt = (int)cur->entries[i].child->entries.size();
+                if (enl < bestEnl ||
+                    (enl == bestEnl && area < bestArea) ||
+                    (enl == bestEnl && area == bestArea && cnt < bestCount)) {
+                    best = i; bestEnl = enl; bestArea = area; bestCount = cnt;
+                }
+            }
+            cur = cur->entries[best].child;
         }
-
-        return results;
+        return cur;
     }
 
+    /* -------- Overflow handling (split + upward propagation) -------- */
+
+    struct SplitPack {
+        Node* n0;
+        Node* n1;
+        Rect  mbr0;
+        Rect  mbr1;
+    };
+
+    void handleOverflow(Node* n) {
+        SplitPack sp = quadraticSplit(n);
+
+        if (n == root) {
+            // new root
+            Node* newRoot = new Node(false);
+            newRoot->entries.emplace_back(sp.mbr0, sp.n0);
+            newRoot->entries.emplace_back(sp.mbr1, sp.n1);
+            sp.n0->parent = newRoot;
+            sp.n1->parent = newRoot;
+            root = newRoot;
+            return;
+        }
+
+        // replace parent's child entry pointing to n with n0,
+        // and add a new entry for n1. (We re-use n as n0 to avoid dangling pointers.)
+        Node* parent = n->parent;
+
+        for (auto& e : parent->entries) {
+            if (e.child == n) {
+                e.child = sp.n0;
+                e.mbr   = sp.mbr0;
+                break;
+            }
+        }
+        parent->entries.emplace_back(sp.mbr1, sp.n1);
+        sp.n0->parent = parent;
+        sp.n1->parent = parent;
+
+        if ((int)parent->entries.size() > M) handleOverflow(parent);
+    }
+
+    /* -------- Quadratic split (true wasted-area seeds, min-fill honored) -------- */
+
+    // PickSeeds: maximize wasted area if placed together
+    pair<int,int> pickSeedsQuadratic(const vector<Entry>& E) const {
+        float worstWaste = -1.0f;
+        pair<int,int> seeds{0,1};
+        int N = (int)E.size();
+        for (int i=0;i<N;i++){
+            for (int j=i+1;j<N;j++){
+                float waste = Rect::combine(E[i].mbr, E[j].mbr).area()
+                              - E[i].mbr.area() - E[j].mbr.area();
+                if (waste > worstWaste) { worstWaste = waste; seeds = {i,j}; }
+            }
+        }
+        return seeds;
+    }
+
+    SplitPack quadraticSplit(Node* n) {
+        // Gather entries to split
+        vector<Entry> E = std::move(n->entries); // steal
+        // Create two groups
+        Node* g0 = new Node(n->isLeaf);
+        Node* g1 = new Node(n->isLeaf);
+        g0->parent = n->parent; // keep old parent
+        g1->parent = n->parent;
+
+        // pick seeds
+        auto [s0, s1] = pickSeedsQuadratic(E);
+        vector<char> taken(E.size(), 0);
+        g0->entries.push_back(E[s0]); taken[s0]=1;
+        g1->entries.push_back(E[s1]); taken[s1]=1;
+        Rect cov0 = E[s0].mbr, cov1 = E[s1].mbr;
+
+        int remaining = (int)E.size()-2;
+
+        // Distribute remaining
+        while (remaining > 0) {
+            // enforce min-fill if remaining equals required for a group
+            int freeCount = 0;
+            for (size_t i=0;i<E.size();++i) if (!taken[i]) ++freeCount;
+
+            if ( (int)g0->entries.size() + freeCount == m ) {
+                for (size_t i=0;i<E.size();++i) if (!taken[i]) {
+                    g0->entries.push_back(E[i]); cov0.expand(E[i].mbr); taken[i]=1; --remaining;
+                }
+                break;
+            }
+            if ( (int)g1->entries.size() + freeCount == m ) {
+                for (size_t i=0;i<E.size();++i) if (!taken[i]) {
+                    g1->entries.push_back(E[i]); cov1.expand(E[i].mbr); taken[i]=1; --remaining;
+                }
+                break;
+            }
+
+            // choose the entry with the greatest preference (area gain difference)
+            float bestDiff = -1.0f;
+            int bestIdx = -1;
+            int bestGroup = -1;
+
+            for (int i=0;i<(int)E.size();++i) if (!taken[i]) {
+                float gain0 = cov0.enlargement(E[i].mbr);
+                float gain1 = cov1.enlargement(E[i].mbr);
+                float diff = fabs(gain0 - gain1);
+                int g = (gain0 < gain1) ? 0 : (gain1 < gain0 ? 1 : -1);
+
+                // tie-breaks when equal gain: pick smaller area, then fewer entries
+                if (g == -1) {
+                    float a0 = Rect::combine(cov0, E[i].mbr).area();
+                    float a1 = Rect::combine(cov1, E[i].mbr).area();
+                    if      (a0 < a1) g = 0;
+                    else if (a1 < a0) g = 1;
+                    else {
+                        int c0 = (int)g0->entries.size();
+                        int c1 = (int)g1->entries.size();
+                        g = (c0 <= c1) ? 0 : 1;
+                    }
+                }
+
+                if (diff > bestDiff) {
+                    bestDiff = diff; bestIdx = i; bestGroup = g;
+                }
+            }
+
+            if (bestIdx == -1) break; // shouldn't happen
+            taken[bestIdx] = 1;
+            if (bestGroup == 0) { g0->entries.push_back(E[bestIdx]); cov0.expand(E[bestIdx].mbr); }
+            else                { g1->entries.push_back(E[bestIdx]); cov1.expand(E[bestIdx].mbr); }
+            --remaining;
+        }
+
+        // Reuse n as group 0 to keep pointers stable; delete old children? (no—entries owned by node)
+        n->entries = std::move(g0->entries);
+        Node* n0 = n;
+        Node* n1 = g1;
+
+        // Set parent on internal children
+        if (!n0->isLeaf) for (auto& e : n0->entries) e.child->parent = n0;
+        if (!n1->isLeaf) for (auto& e : n1->entries) e.child->parent = n1;
+
+        return { n0, n1, computeNodeMBR(n0), computeNodeMBR(n1) };
+    }
+
+    /* -------- Query -------- */
+    static void windowQuery(const Node* n, const Rect& q, vector<int>& out) {
+        if (n->isLeaf) {
+            for (auto& e : n->entries) if (q.intersects(e.mbr)) out.push_back(e.id);
+        } else {
+            for (auto& e : n->entries) if (q.intersects(e.mbr)) windowQuery(e.child, q, out);
+        }
+    }
+
+    /* -------- kNN helpers -------- */
+    static void insertBest(vector<pair<float,int>>& best, int k, float d, int id, float& kth){
+        // maintain max-heap semantics via vector + sort at end; here keep size <= k and update kth
+        if ((int)best.size() < k) {
+            best.emplace_back(d, id);
+        } else if (d < best.back().first) {
+            best.back() = {d,id};
+        }
+        // keep worst at back: partial sort
+        sort(best.begin(), best.end()); // small k, fine
+        if ((int)best.size() == k) kth = best.back().first;
+    }
+
+    /* -------- Debug print -------- */
+    static void printNode(const Node* n, int depth, ostream& os){
+        string ind(depth*2, ' ');
+        if (n->isLeaf) {
+            os << ind << "Leaf(" << n->entries.size() << "): ";
+            for (auto& e : n->entries) {
+                os << "[" << e.mbr.minX << "," << e.mbr.minY << " "
+                   << e.mbr.maxX << "," << e.mbr.maxY << "]#" << e.id << " ";
+            }
+            os << "\n";
+        } else {
+            os << ind << "Internal(" << n->entries.size() << ")\n";
+            for (auto& e : n->entries) {
+                os << ind << "  MBR [" << e.mbr.minX << "," << e.mbr.minY
+                   << " " << e.mbr.maxX << "," << e.mbr.maxY << "]\n";
+                printNode(e.child, depth+1, os);
+            }
+        }
+    }
 };
 
-// Main function demonstrating the use case
+/* ========================= Demo ========================= */
 int main() {
-    RTree tree;
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
 
-    // Insert some ride pickup points in a more realistic order
-    std::vector<Point> points = {
-        Point(3.0, 3.0), Point(2.0, 5.0), Point(8.0, 8.0), Point(7.0, 1.0), Point(5.0, 5.0),
-        Point(6.0, 3.0), Point(4.0, 7.0), Point(1.0, 4.0), Point(9.0, 9.0), Point(10.0, 10.0)
+    RTree rt(/*maxEntries*/ 6);
+
+    vector<Point> pts = {
+        {3,3},{2,5},{8,8},{7,1},{5,5},
+        {6,3},{4,7},{1,4},{9,9},{10,10}
     };
+    for (int i=0;i<(int)pts.size();++i) rt.insertPoint(pts[i], /*id*/ i);
 
-    for (const Point& p : points) {
-        tree.insert(p);
-    }
+    cout << "Tree:\n"; rt.print();
 
-    // Define three rectangular zones for queries
-    std::vector<Rectangle> queryRects = {
-        Rectangle(1.5, 1.5, 4.5, 4.5),
-        Rectangle(5.5, 5.5, 9.5, 9.5),
-        Rectangle(0.0, 0.0, 10.0, 10.0)
+    // window queries
+    vector<Rect> qs = {
+        Rect(1.5,1.5,4.5,4.5),
+        Rect(5.5,5.5,9.5,9.5),
+        Rect(0.0,0.0,10.0,10.0)
     };
-
-    for (const Rectangle& rect : queryRects) {
-        std::vector<Point> results = tree.query(rect);
-        std::cout << "Points within the rectangle (" << rect.minX << ", " << rect.minY
-                  << ", " << rect.maxX << ", " << rect.maxY << "):" << std::endl;
-        for (const Point& p : results) {
-            std::cout << "(" << p.x << ", " << p.y << ")" << std::endl;
-            assert(rect.contains(p) && "Point is outside the query rectangle");
-        }
+    for (auto& q : qs) {
+        auto ans = rt.windowQuery(q);
+        cout << "Query ["<<q.minX<<","<<q.minY<<" "<<q.maxX<<","<<q.maxY<<"] ->";
+        for (int id: ans) cout<<" ["<<pts[id].x << ", " <<pts[id].y << "]";
+        cout<<"\n";
     }
 
-    // Define a query point
-    Point queryPoint(9.0, 8.0);
-
-    // Find the nearest neighbors
-    int k = 3;
-    std::vector<Point> nearestNeighbors = tree.nearestNeighbor(queryPoint, k);
-
-    std::cout << "The " << k << " nearest neighbors to (" << queryPoint.x << ", " << queryPoint.y << ") are:" << std::endl;
-    for (const Point& p : nearestNeighbors) {
-        std::cout << "(" << p.x << ", " << p.y << ")" << std::endl;
-    }
-
+    // kNN
+    Point q{9,8}; int k=3;
+    auto knn = rt.kNearest(q,k);
+    cout << k << "NN of ("<<q.x<<","<<q.y<<") :";
+    for (int id: knn) cout<<" ["<<pts[id].x << ", " <<pts[id].y << "]";
+    cout<<"\n";
     return 0;
 }
