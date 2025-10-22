@@ -1,5 +1,8 @@
 # BuzzDB: An Educational Database System
 
+## Website: https://buzzdb-docs.readthedocs.io/
+
+
 <br>
 
 <div align="center">
@@ -47,13 +50,15 @@ To compile BuzzDB, use the following commands:
 - **Compilation**: Compile a particular version of BuzzDB as follows:
 
 ```bash
-  g++ -std=c++14 -O3 -Wall -Werror -Wextra <module_name>.cpp
+  g++ -std=c++17 -O3 -Wall -Werror -Wextra <module_name>.cpp
 ```
 - **Compilation with Debugging Symbols**: Use -g flag to enable debugging with gdb or lldb:
 
 ```
-g++ -std=c++14 -O3 -Wall -Werror -Wextra -g <module_name>.cpp
+g++ -std=c++17 -O3 -Wall -Werror -Wextra -g <module_name>.cpp
 ```
+
+On Apple silicon Macs, the error `error: use of undeclared identifier 'assert' occurs on compilation` as #include <cassert> is not currently there in the `buzzdb.cpp` file. Add the header file to resolve this error.
 
 ## Contributions
 
