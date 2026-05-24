@@ -39,3 +39,5 @@ pgm.txt
 pgm.cpp
 
 myenv/*
+job_imdb_data/*
+imdb_large.txt
