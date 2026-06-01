@@ -19,10 +19,11 @@
 #include <regex>
 #include <stdexcept>
 #include <cassert>
-#include <cstring>
-#include <initializer_list>
-#include <utility>
 #include <cctype>
+#include <utility>
+#include <initializer_list>
+#include <cstring>
+#include <type_traits>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -201,64 +202,6 @@ public:
             std::cout << " ";
         }
         std::cout << "\n";
-    }
-};
-
-using TableId = uint16_t;
-
-struct ColumnSchema {
-    std::string name;
-    FieldType type;
-};
-
-struct TableSchema {
-    std::vector<ColumnSchema> columns;
-};
-
-using PageID = uint16_t;
-
-struct TableMetadata {
-    TableId table_id;
-    std::string name;
-    TableSchema schema;
-    std::vector<PageID> page_ids;
-};
-
-class Catalog {
-private:
-    TableId next_table_id = 1;
-    std::unordered_map<std::string, TableMetadata> tables_by_name;
-    std::unordered_map<TableId, std::string> table_names_by_id;
-
-public:
-    TableId createTable(const std::string& name, TableSchema schema) {
-        if (tables_by_name.find(name) != tables_by_name.end()) {
-            throw std::runtime_error("Table already exists: " + name);
-        }
-
-        TableMetadata metadata{next_table_id++, name, std::move(schema), {}};
-        TableId table_id = metadata.table_id;
-
-        tables_by_name.emplace(name, std::move(metadata));
-        table_names_by_id.emplace(table_id, name);
-
-        return table_id;
-    }
-
-    TableMetadata& getTable(const std::string& name) {
-        auto it = tables_by_name.find(name);
-        if (it == tables_by_name.end()) {
-            throw std::runtime_error("Unknown table: " + name);
-        }
-        return it->second;
-    }
-
-    TableMetadata& getTable(TableId table_id) {
-        auto it = table_names_by_id.find(table_id);
-        if (it == table_names_by_id.end()) {
-            throw std::runtime_error("Unknown table id.");
-        }
-        return getTable(it->second);
     }
 };
 
@@ -577,11 +520,6 @@ public:
     void extend(){
         storage_manager.extend();
     }
-
-    PageID allocatePage() {
-        storage_manager.extend();
-        return static_cast<PageID>(storage_manager.num_pages - 1);
-    }
     
     size_t getNumPages(){
         return storage_manager.num_pages;
@@ -589,6 +527,67 @@ public:
 
 };
 
+
+// Logical table identifier used by the in-memory catalog.
+using TableId = uint16_t;
+
+// One column in a table schema.
+struct ColumnSchema {
+    std::string name;
+    FieldType type;
+};
+
+// Ordered list of columns for a table.
+struct TableSchema {
+    std::vector<ColumnSchema> columns;
+};
+
+// In-memory metadata for one table and the pages owned by it.
+struct TableMetadata {
+    TableId table_id;
+    std::string name;
+    TableSchema schema;
+    std::vector<PageID> page_ids;
+};
+
+// In-memory catalog mapping table names and ids to table metadata.
+class Catalog {
+private:
+    TableId next_table_id = 1;
+    std::unordered_map<std::string, TableMetadata> tables_by_name;
+    std::unordered_map<TableId, std::string> table_names_by_id;
+
+public:
+    TableId createTable(const std::string& name, TableSchema schema) {
+        if (tables_by_name.find(name) != tables_by_name.end()) {
+            throw std::runtime_error("Table already exists: " + name);
+        }
+
+        TableMetadata metadata{next_table_id++, name, std::move(schema), {}};
+        TableId table_id = metadata.table_id;
+        tables_by_name.emplace(name, std::move(metadata));
+        table_names_by_id.emplace(table_id, name);
+        return table_id;
+    }
+
+    TableMetadata& getTable(const std::string& name) {
+        auto it = tables_by_name.find(name);
+        if (it == tables_by_name.end()) {
+            throw std::runtime_error("Unknown table: " + name);
+        }
+        return it->second;
+    }
+
+    TableMetadata& getTable(TableId table_id) {
+        auto it = table_names_by_id.find(table_id);
+        if (it == table_names_by_id.end()) {
+            throw std::runtime_error("Unknown table id.");
+        }
+        return getTable(it->second);
+    }
+};
+
+// Heap storage for one table: unordered tuple pages tracked by TableMetadata.
 class TableHeap {
 private:
     TableMetadata& metadata;
@@ -607,7 +606,8 @@ public:
             }
         }
 
-        PageID page_id = buffer_manager.allocatePage();
+        buffer_manager.extend();
+        PageID page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
         metadata.page_ids.push_back(page_id);
 
         auto& page = buffer_manager.getPage(page_id);
@@ -625,10 +625,6 @@ public:
 
     const std::vector<PageID>& getPageIds() const {
         return metadata.page_ids;
-    }
-
-    const TableMetadata& getMetadata() const {
-        return metadata;
     }
 };
 
@@ -819,7 +815,7 @@ public:
         currentPageIndex = 0;
         currentSlotIndex = 0;
         tuple_count = 0;
-        currentTuple.reset();
+        currentTuple.reset(); // Ensure currentTuple is reset
     }
 
     bool next() override {
@@ -838,15 +834,17 @@ public:
         if (currentTuple) {
             return std::move(currentTuple->fields);
         }
-        return {};
+        return {}; // Return an empty vector if no tuple is available
     }
 
 private:
     void loadNextTuple() {
         const auto& page_ids = tableHeap.getPageIds();
-
         while (currentPageIndex < page_ids.size()) {
             auto& currentPage = tableHeap.getPage(page_ids[currentPageIndex]);
+            if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
+                currentSlotIndex = 0; // Reset slot index when moving to a new page
+            }
 
             char* page_buffer = currentPage->page_data.get();
             Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
@@ -854,27 +852,21 @@ private:
             while (currentSlotIndex < MAX_SLOTS) {
                 if (!slot_array[currentSlotIndex].empty) {
                     assert(slot_array[currentSlotIndex].offset != INVALID_VALUE);
-
-                    const char* tuple_data =
-                        page_buffer + slot_array[currentSlotIndex].offset;
-
-                    std::istringstream iss(
-                        std::string(tuple_data, slot_array[currentSlotIndex].length)
-                    );
-
+                    const char* tuple_data = page_buffer + slot_array[currentSlotIndex].offset;
+                    std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length));
                     currentTuple = Tuple::deserialize(iss);
-                    currentSlotIndex++;
+                    currentSlotIndex++; // Move to the next slot for the next call
                     tuple_count++;
-                    return;
+                    return; // Tuple loaded successfully
                 }
-
                 currentSlotIndex++;
             }
 
+            // Increment page index after exhausting current page
             currentPageIndex++;
-            currentSlotIndex = 0;
         }
 
+        // No more tuples are available
         currentTuple.reset();
     }
 };
@@ -1274,7 +1266,7 @@ private:
 };
 
 struct QueryComponents {
-    std::vector<int> selectAttributes;
+    std::string tableName;
     bool sumOperation = false;
     int sumAttributeIndex = -1;
     bool groupBy = false;
@@ -1285,28 +1277,30 @@ struct QueryComponents {
     int upperBound = std::numeric_limits<int>::max();
 };
 
+enum class StatementType {
+    INSERT
+};
+
+struct StatementComponents {
+    StatementType type = StatementType::INSERT;
+    std::string tableName;
+    std::vector<std::string> values;
+    size_t lineNumber = 0;
+};
+
 QueryComponents parseQuery(const std::string& query) {
     QueryComponents components;
 
-    // Parse selected attributes
-    std::regex selectRegex("\\{(\\d+)\\}(, \\{(\\d+)\\})?");
-    std::smatch selectMatches;
-    std::string::const_iterator queryStart(query.cbegin());
-    while (std::regex_search(queryStart, query.cend(), selectMatches, selectRegex)) {
-        for (size_t i = 1; i < selectMatches.size(); i += 2) {
-            if (!selectMatches[i].str().empty()) {
-                components.selectAttributes.push_back(std::stoi(selectMatches[i]) - 1);
-            }
+    // Parse the query target: {*} FROM table_name or SUM{n} FROM table_name ...
+    std::regex tableRegex(
+        "^\\s*(?:\\{\\*\\}|SUM\\{(\\d+)\\})\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)");
+    std::smatch tableMatches;
+    if (std::regex_search(query, tableMatches, tableRegex)) {
+        if (tableMatches[1].matched) {
+            components.sumOperation = true;
+            components.sumAttributeIndex = std::stoi(tableMatches[1]) - 1;
         }
-        queryStart = selectMatches.suffix().first;
-    }
-
-    // Check for SUM operation
-    std::regex sumRegex("SUM\\{(\\d+)\\}");
-    std::smatch sumMatches;
-    if (std::regex_search(query, sumMatches, sumRegex)) {
-        components.sumOperation = true;
-        components.sumAttributeIndex = std::stoi(sumMatches[1]) - 1;
+        components.tableName = tableMatches[2];
     }
 
     // Check for GROUP BY clause
@@ -1334,36 +1328,87 @@ QueryComponents parseQuery(const std::string& query) {
         }
     }
 
+    if (components.tableName.empty()) {
+        throw std::runtime_error("Query must name a table.");
+    }
+
     return components;
 }
 
-void prettyPrint(const QueryComponents& components) {
-    std::cout << "Query Components:\n";
-    std::cout << "  Selected Attributes: ";
-    for (auto attr : components.selectAttributes) {
-        std::cout << "{" << attr + 1 << "} "; // Convert back to 1-based indexing for display
+void addColumnIfMissing(std::vector<int>& columns, int column) {
+    if (column < 0) {
+        return;
     }
-    std::cout << "\n  SUM Operation: " << (components.sumOperation ? "Yes" : "No");
-    if (components.sumOperation) {
-        std::cout << " on {" << components.sumAttributeIndex + 1 << "}";
+
+    for (auto existing : columns) {
+        if (existing == column) {
+            return;
+        }
     }
-    std::cout << "\n  GROUP BY: " << (components.groupBy ? "Yes" : "No");
-    if (components.groupBy) {
-        std::cout << " on {" << components.groupByAttributeIndex + 1 << "}";
+    columns.push_back(column);
+}
+
+std::vector<int> deriveQueryColumns(const QueryComponents& components,
+                                    const TableMetadata& metadata) {
+    std::vector<int> columns;
+
+    if (!components.sumOperation && !components.groupBy) {
+        for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
+            columns.push_back(static_cast<int>(i));
+        }
+        return columns;
     }
-    std::cout << "\n  WHERE Condition: " << (components.whereCondition ? "Yes" : "No");
-    if (components.whereCondition) {
-        std::cout << " on {" << components.whereAttributeIndex + 1 << "} > " << components.lowerBound << " and < " << components.upperBound;
+
+    addColumnIfMissing(columns, components.groupByAttributeIndex);
+    addColumnIfMissing(columns, components.sumAttributeIndex);
+    addColumnIfMissing(columns, components.whereAttributeIndex);
+    return columns;
+}
+
+template <typename Components>
+void prettyPrint(const Components& components,
+                 const std::vector<int>& queryColumns = {}) {
+    if constexpr (std::is_same<Components, QueryComponents>::value) {
+        std::cout << "Query Components for table " << components.tableName << ":\n";
+        std::cout << "  Columns: ";
+        for (auto attr : queryColumns) {
+            std::cout << "{" << attr + 1 << "} "; // Convert back to 1-based indexing for display
+        }
+        std::cout << "\n  SUM Operation: " << (components.sumOperation ? "Yes" : "No");
+        if (components.sumOperation) {
+            std::cout << " on {" << components.sumAttributeIndex + 1 << "}";
+        }
+        std::cout << "\n  GROUP BY: " << (components.groupBy ? "Yes" : "No");
+        if (components.groupBy) {
+            std::cout << " on {" << components.groupByAttributeIndex + 1 << "}";
+        }
+        std::cout << "\n  WHERE Condition: " << (components.whereCondition ? "Yes" : "No");
+        if (components.whereCondition) {
+            std::cout << " on {" << components.whereAttributeIndex + 1 << "} > " << components.lowerBound << " and < " << components.upperBound;
+        }
+    } else if constexpr (std::is_same<Components, StatementComponents>::value) {
+        (void)queryColumns;
+        std::cout << "Statement Components for table " << components.tableName << ":\n";
+        std::cout << "  Operation: ";
+        switch (components.type) {
+            case StatementType::INSERT:
+                std::cout << "INSERT";
+                break;
+        }
+        std::cout << "\n  Values: ";
+        for (size_t i = 0; i < components.values.size(); i++) {
+            std::cout << "{" << i + 1 << "}=" << components.values[i] << " ";
+        }
     }
     std::cout << std::endl;
 }
 
-void executeQuery(const QueryComponents& components,
-                  TableHeap& table_heap,
-                  const TxnPtr& txn = nullptr){
+void executeQuery(const QueryComponents& components, 
+                  TableHeap& table,
+                  const TxnPtr& txn = nullptr) {
 
     // Stack allocation of ScanOperator
-    ScanOperator scanOp(table_heap);
+    ScanOperator scanOp(table);
 
     // Using a pointer to Operator to handle polymorphism
     Operator* rootOp = &scanOp;
@@ -1429,12 +1474,13 @@ void executeQuery(const QueryComponents& components,
 
 class InsertOperator : public Operator {
 private:
-    TableHeap& tableHeap;
+    BufferManager& bufferManager;
     std::unique_ptr<Tuple> tupleToInsert;
 
 public:
-    InsertOperator(TableHeap& table) : tableHeap(table) {}
+    InsertOperator(BufferManager& manager) : bufferManager(manager) {}
 
+    // Set the tuple to be inserted by this operator.
     void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
         tupleToInsert = std::move(tuple);
     }
@@ -1444,11 +1490,27 @@ public:
     }
 
     bool next() override {
-        if (!tupleToInsert) {
-            return false;
+        if (!tupleToInsert) return false; // No tuple to insert
+
+        for (size_t pageId = 0; pageId < bufferManager.getNumPages(); ++pageId) {
+            auto& page = bufferManager.getPage(pageId);
+            // Attempt to insert the tuple
+            if (page->addTuple(tupleToInsert->clone())) { 
+                // Flush the page to disk after insertion
+                bufferManager.flushPage(pageId); 
+                return true; // Insertion successful
+            }
         }
 
-        return tableHeap.insertTuple(std::move(tupleToInsert));
+        // If insertion failed in all existing pages, extend the database and try again
+        bufferManager.extend();
+        auto& newPage = bufferManager.getPage(bufferManager.getNumPages() - 1);
+        if (newPage->addTuple(tupleToInsert->clone())) {
+            bufferManager.flushPage(bufferManager.getNumPages() - 1);
+            return true; // Insertion successful after extending the database
+        }
+
+        return false; // Insertion failed even after extending the database
     }
 
     void close() override {
@@ -1456,7 +1518,7 @@ public:
     }
 
     std::vector<std::unique_ptr<Field>> getOutput() override {
-        return {};
+        return {}; // Return empty vector
     }
 };
 
@@ -1498,18 +1560,19 @@ public:
 
 class BuzzDB {
 public:
+    HashIndex hash_index;
     Catalog catalog;
     BufferManager buffer_manager;
     TransactionManager txn_manager;
 
-public:
-    BuzzDB() {
-        // Storage Manager, Catalog, and Transaction Manager automatically created
+    BuzzDB(){
+        // Storage Manager and Transaction Manager automatically created
     }
 
+    // NEW: helpers
     TxnPtr begin() { return txn_manager.begin(); }
     void commit(const TxnPtr& tx) { txn_manager.commit(*tx); }
-    void abort(const TxnPtr& tx) { txn_manager.abort(*tx); }
+    void abort (const TxnPtr& tx) { txn_manager.abort(*tx);  }
 
     TableId createTable(const std::string& name,
                         std::initializer_list<ColumnSchema> columns) {
@@ -1520,53 +1583,7 @@ public:
 
         auto table_id = catalog.createTable(name, std::move(schema));
         std::cout << "Created table " << name << " with id " << table_id << "\n";
-
         return table_id;
-    }
-
-    void insert(const std::string& table_name,
-                const std::vector<Field>& fields,
-                const TxnPtr& txn = nullptr) {
-        auto& metadata = catalog.getTable(table_name);
-
-        if (fields.size() != metadata.schema.columns.size()) {
-            throw std::runtime_error(
-                "Field count does not match schema for table: " + table_name
-            );
-        }
-
-        auto tuple = std::make_unique<Tuple>();
-
-        for (size_t field_index = 0; field_index < fields.size(); field_index++) {
-            const auto expected_type = metadata.schema.columns[field_index].type;
-
-            if (fields[field_index].getType() != expected_type) {
-                throw std::runtime_error(
-                    "Field type does not match schema for table: " + table_name
-                );
-            }
-
-            tuple->addField(fields[field_index].clone());
-        }
-
-        TableHeap table(metadata, buffer_manager);
-        InsertOperator insertOp(table);
-        insertOp.setTxnContext(txn);
-        insertOp.setTupleToInsert(std::move(tuple));
-
-        bool status = insertOp.next();
-        assert(status == true);
-    }
-
-    void insert(const std::string& table_name,
-                std::initializer_list<Field> fields,
-                const TxnPtr& txn = nullptr) {
-        std::vector<Field> field_vector;
-        for (const auto& field : fields) {
-            field_vector.push_back(field);
-        }
-
-        insert(table_name, field_vector, txn);
     }
 
     static std::string trim(const std::string& input) {
@@ -1597,6 +1614,14 @@ public:
         return tokens;
     }
 
+    static std::string lineContext(size_t line_number) {
+        if (line_number == 0) {
+            return "";
+        }
+
+        return " at line " + std::to_string(line_number);
+    }
+
     static Field parseFieldValue(FieldType type,
                                  const std::string& token,
                                  const std::string& table_name,
@@ -1613,15 +1638,69 @@ public:
         } catch (const std::exception&) {
             throw std::runtime_error(
                 "Bad field value '" + token + "' for table " + table_name +
-                " at line " + std::to_string(line_number)
+                lineContext(line_number)
             );
         }
 
         throw std::runtime_error("Unknown field type.");
     }
 
+    static StatementComponents parseStatement(const std::string& statement,
+                                              size_t line_number = 0) {
+        std::regex insert_regex(
+            "^\\s*INSERT\\s+([A-Za-z_][A-Za-z0-9_]*)\\|(.*)$");
+        std::smatch matches;
+
+        if (!std::regex_match(statement, matches, insert_regex)) {
+            throw std::runtime_error("Unsupported statement: " + statement);
+        }
+
+        StatementComponents components;
+        components.type = StatementType::INSERT;
+        components.tableName = matches[1];
+        components.values = splitPipeLine(matches[2]);
+        components.lineNumber = line_number;
+        return components;
+    }
+
+    // Data-changing statements are separate from read queries.
+    void executeStatement(const std::string& statement,
+                          const TxnPtr& txn = nullptr,
+                          size_t line_number = 0,
+                          bool print_statement = true) {
+        (void)txn;
+        auto components = parseStatement(statement, line_number);
+        if (print_statement) {
+            prettyPrint(components);
+        }
+
+        auto& metadata = catalog.getTable(components.tableName);
+        if (components.values.size() != metadata.schema.columns.size()) {
+            throw std::runtime_error(
+                "Wrong field count for table " + components.tableName +
+                lineContext(line_number)
+            );
+        }
+
+        auto tuple = std::make_unique<Tuple>();
+
+        for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
+            FieldType expected_type = metadata.schema.columns[i].type;
+            auto field = parseFieldValue(
+                expected_type, components.values[i],
+                components.tableName, components.lineNumber
+            );
+            tuple->addField(field.clone());
+        }
+
+        TableHeap table(metadata, buffer_manager);
+        bool status = table.insertTuple(std::move(tuple));
+        assert(status == true);
+    }
+
     void loadImdbFile(const std::string& filename,
-                      const TxnPtr& txn = nullptr) {
+                      const TxnPtr& txn = nullptr,
+                      bool print_statements = false) {
         std::ifstream inputFile(filename);
 
         if (!inputFile) {
@@ -1639,79 +1718,49 @@ public:
                 continue;
             }
 
-            auto tokens = splitPipeLine(line);
-            if (tokens.empty()) {
-                continue;
-            }
-
-            const std::string& table_name = tokens[0];
-            auto& metadata = catalog.getTable(table_name);
-
-            if (tokens.size() - 1 != metadata.schema.columns.size()) {
-                throw std::runtime_error(
-                    "Wrong field count for table " + table_name +
-                    " at line " + std::to_string(line_number)
-                );
-            }
-
-            std::vector<Field> fields;
-            fields.reserve(metadata.schema.columns.size());
-
-            for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
-                FieldType expected_type = metadata.schema.columns[i].type;
-                fields.push_back(
-                    parseFieldValue(expected_type, tokens[i + 1], table_name, line_number)
-                );
-            }
-
-            insert(table_name, fields, txn);
+            executeStatement(
+                "INSERT " + line, txn, line_number, print_statements
+            );
         }
     }
 
-    void scan(const std::string& table_name,
-              const TxnPtr& txn = nullptr) {
-        auto& metadata = catalog.getTable(table_name);
+    void executeQuery(const std::string& query,
+                      const TxnPtr& txn = nullptr) {
+        auto components = parseQuery(query);
+        auto& metadata = catalog.getTable(components.tableName);
+        auto queryColumns = deriveQueryColumns(components, metadata);
+        prettyPrint(components, queryColumns);
+
         TableHeap table(metadata, buffer_manager);
-
-        ScanOperator scanOp(table);
-        scanOp.setTxnContext(txn);
-
-        std::cout << "\nTable " << table_name << "\n";
-
-        scanOp.open();
-        while (scanOp.next()) {
-            auto output = scanOp.getOutput();
-
-            for (const auto& field : output) {
-                field->print();
-                std::cout << " ";
-            }
-
-            std::cout << "\n";
-        }
-        scanOp.close();
+        ::executeQuery(components, table, txn);
     }
 
-    void executeQueries(const std::string& table_name,
-                        const TxnPtr& txn = nullptr) {
+    void executeQueries(const TxnPtr& txn = nullptr) {
         std::vector<std::string> test_queries = {
-            "SUM{1} GROUP BY {1} WHERE {1} > 2 and {1} < 6"
+            "{*} FROM title",
+            "{*} FROM kind_type",
+            "{*} FROM company_name",
+            "{*} FROM company_type",
+            "{*} FROM movie_companies",
+            // For titles produced between 1981 and 2012,
+            // group by production_year,
+            // sum kind_id to derive count
+            "SUM{3} FROM title GROUP BY {4} WHERE {4} > 1980 and {4} < 2013"
         };
 
-        auto& metadata = catalog.getTable(table_name);
-        TableHeap table(metadata, buffer_manager);
-
         for (const auto& query : test_queries) {
-            auto components = parseQuery(query);
-            prettyPrint(components);
-            executeQuery(components, table, txn);
+            executeQuery(query, txn);
         }
+
     }
+    
 };
 
 int main() {
+
     BuzzDB db;
 
+    // --- Transaction 1: perform inserts ---
     TxnPtr txn1 = db.begin();
 
     db.createTable("title", {
@@ -1747,25 +1796,24 @@ int main() {
 
     db.loadImdbFile("imdb.txt", txn1);
 
-    db.commit(txn1);
+    db.commit(txn1); // commit once for the whole batch
 
-    TxnPtr txn2 = db.begin();
+    // --- Transaction 2: perform queries ---
+    TxnPtr txn2 = db.begin(); 
     auto start = std::chrono::high_resolution_clock::now();
 
-    db.scan("title", txn2);
-    db.scan("kind_type", txn2);
-    db.scan("company_name", txn2);
-    db.scan("company_type", txn2);
-    db.scan("movie_companies", txn2);
+    db.executeQueries(txn2);
 
     auto end = std::chrono::high_resolution_clock::now();
 
-    db.commit(txn2);
-
+    db.commit(txn2); // Also commit this txn, even if read-only
+    
+    // Calculate and print the elapsed time
     std::chrono::duration<double> elapsed = end - start;
-    std::cout << "Elapsed time: "
-              << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()
-              << " microseconds" << std::endl;
+    std::cout << "Elapsed time: " << 
+    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() 
+          << " microseconds" << std::endl;
 
+    
     return 0;
 }
