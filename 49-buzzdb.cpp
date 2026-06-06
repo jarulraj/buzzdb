@@ -1960,10 +1960,13 @@ struct StatementComponents {
 
 QueryComponents parseQuery(const std::string& query) {
     QueryComponents components;
+    if (!std::regex_search(query, std::regex("^\\s*PROJECT\\s+"))) {
+        throw std::runtime_error("Query must start with PROJECT.");
+    }
 
-    // Parse the query target: {*} FROM table_name or SUM{n} FROM table_name ...
+    // Parse the query target: PROJECT {*} FROM table_name, or PROJECT SUM{n}.
     std::regex tableRegex(
-        "^\\s*(?:\\{\\*\\}|SUM\\{(\\d+)\\})\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)");
+        "^\\s*PROJECT\\s+(?:\\{\\*\\}|SUM\\{(\\d+)\\})\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)");
     std::smatch tableMatches;
     if (std::regex_search(query, tableMatches, tableRegex)) {
         if (tableMatches[1].matched) {
@@ -2083,10 +2086,7 @@ std::string operatorTreeString(const QueryComponents& components) {
     if (components.sumOperation || components.groupBy) {
         tree = "HashAggregate(" + tree + ")";
     }
-    if (!components.selectColumns.empty()) {
-        tree = "Project(" + tree + ")";
-    }
-    return tree;
+    return "Project(" + tree + ")";
 }
 
 template <typename Components>
@@ -2211,6 +2211,12 @@ void executeQuery(const QueryComponents& components,
         );
     }
 
+    if (projected_columns.empty() && !components.sumOperation && !components.groupBy) {
+        for (size_t attr_index = 0; attr_index < output_width; attr_index++) {
+            projected_columns.push_back(attr_index);
+        }
+    }
+
     // Apply WHERE conditions
     if (components.whereAttributeIndex != -1) {
         // Create simple predicates with comparison operators
@@ -2249,6 +2255,11 @@ void executeQuery(const QueryComponents& components,
         // Using std::optional to manage the lifetime of HashAggregationOperator
         hashAggOpBuffer.emplace(*rootOp, groupByAttrs, aggrFuncs);
         rootOp = &*hashAggOpBuffer;
+        if (projected_columns.empty()) {
+            for (size_t attr_index = 0; attr_index < groupByAttrs.size() + aggrFuncs.size(); attr_index++) {
+                projected_columns.push_back(attr_index);
+            }
+        }
     }
 
     if (!projected_columns.empty()) {
@@ -2539,10 +2550,10 @@ public:
 
     void executeQueries(const TxnPtr& txn = nullptr) {
         std::vector<std::string> test_queries = {
-            "{*} FROM title",
-            "SUM{3} FROM title GROUP BY {4} WHERE {4} > 1980 and {4} < 2013",
+            "PROJECT {*} FROM title",
+            "PROJECT SUM{3} FROM title GROUP BY {4} WHERE {4} > 1980 and {4} < 2013",
             // Join query
-            "{title.2}, {title.4}, {company_name.2}, {company_type.2}, "
+            "PROJECT {title.2}, {title.4}, {company_name.2}, {company_type.2}, "
             "{movie_companies.5} FROM title "
             "JOIN movie_companies ON {title.1} = {movie_companies.2} "
             "JOIN company_name ON {movie_companies.3} = {company_name.1} "
