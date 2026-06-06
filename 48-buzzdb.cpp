@@ -221,6 +221,7 @@ constexpr TableId FIRST_USER_TABLE_ID = 100;
 constexpr uint32_t BUZZDB_MAGIC = 0x425A4442;
 constexpr uint16_t BUZZDB_VERSION = 48;
 
+// Page 0 root used to find the catalog after restart.
 struct BootstrapPage {
     uint32_t magic = BUZZDB_MAGIC;
     uint16_t version = BUZZDB_VERSION;
@@ -231,6 +232,7 @@ struct BootstrapPage {
     PageID columns_last_page = INVALID_PAGE_ID;
 };
 
+// Heap pages carry table ownership and table-local links.
 struct PageHeader {
     TableId table_id = INVALID_TABLE_ID;
     PageID prev_page = INVALID_PAGE_ID;
@@ -265,6 +267,7 @@ public:
     }
 
     PageHeader* getHeader() {
+        // Header stays after slots so v47-style scans still work.
         return reinterpret_cast<PageHeader*>(
             page_data.get() + sizeof(Slot) * MAX_SLOTS
         );
@@ -603,6 +606,7 @@ public:
             throw std::runtime_error("Bootstrap page is not initialized.");
         }
 
+        // Page 0 points to catalog roots.
         BootstrapPage bootstrap;
         auto& page = getPage(0);
         std::memcpy(&bootstrap, page->page_data.get(), sizeof(BootstrapPage));
@@ -617,6 +621,7 @@ public:
             throw std::runtime_error("Cannot initialize bootstrap page in a non-empty database.");
         }
 
+        // Reserve page 0 before table heap pages.
         storage_manager.extend();
         auto& page = getPage(0);
         std::memset(page->page_data.get(), 0, PAGE_SIZE);
@@ -671,6 +676,7 @@ private:
 public:
     TableHeap(TableMetadata& metadata, BufferManager& buffer_manager)
         : metadata(metadata), buffer_manager(buffer_manager) {
+        // page_ids is rebuilt from first_page/next_page.
         loadPageIds();
     }
 
@@ -692,6 +698,7 @@ public:
         }
         metadata.last_page = page_id;
 
+        // Link the new page so the table can be reopened.
         if (previous_last_page != INVALID_PAGE_ID) {
             auto& previous_last = getPage(previous_last_page);
             previous_last->setNextPage(page_id);
@@ -717,10 +724,6 @@ public:
             throw std::runtime_error("Page ownership mismatch for table: " + metadata.name);
         }
         return page;
-    }
-
-    PageID getFirstPage() const {
-        return metadata.first_page;
     }
 
     const std::vector<PageID>& getPageIds() const {
@@ -765,6 +768,7 @@ private:
         metadata.page_ids.clear();
         PageID page_id = metadata.first_page;
 
+        // Rebuild v47-style page_ids from persisted links.
         while (page_id != INVALID_PAGE_ID) {
             metadata.page_ids.push_back(page_id);
             auto& page = getPage(page_id);
@@ -786,6 +790,7 @@ public:
     explicit Catalog(BufferManager& buffer_manager) : buffer_manager(buffer_manager) {}
 
     void bootstrap() {
+        // Empty files create the catalog; existing files load it.
         if (buffer_manager.isEmptyDatabase()) {
             initializeNewDatabase();
             initialized_new_database = true;
@@ -804,16 +809,19 @@ public:
     CreateTableResult createTable(const std::string& name, TableSchema schema) {
         auto it = tables_by_name.find(name);
         if (it != tables_by_name.end()) {
+            // Existing declarations must match the stored schema.
             validateSchema(name, it->second.schema, schema);
             return {it->second.table_id, false};
         }
 
         if (loadTableByName(name)) {
             auto& metadata = tables_by_name.at(name);
+            // Lazily load existing table metadata from the catalog.
             validateSchema(name, metadata.schema, schema);
             return {metadata.table_id, false};
         }
 
+        // New tables start with one owned heap page.
         TableId table_id = next_table_id++;
         PageID first_page = buffer_manager.extend(table_id);
         auto& page = buffer_manager.getPage(first_page);
@@ -828,6 +836,7 @@ public:
         };
         auto& cached_metadata = cacheTable(std::move(metadata));
 
+        // Store table and column metadata in catalog tables.
         persistTableRecord(cached_metadata);
         persistColumns(cached_metadata);
         persistNextTableId();
@@ -874,6 +883,7 @@ private:
             throw std::runtime_error("Schema mismatch for table: " + table_name);
         }
 
+        // Query column references are positional.
         for (size_t column_index = 0; column_index < existing_schema.columns.size(); column_index++) {
             const auto& existing_column = existing_schema.columns[column_index];
             const auto& requested_column = requested_schema.columns[column_index];
@@ -907,6 +917,7 @@ private:
         BootstrapPage bootstrap_page;
         buffer_manager.initializeBootstrap(bootstrap_page);
 
+        // Give system catalog tables their first heap pages.
         PageID tables_page = buffer_manager.extend(SYS_TABLES_ID);
         PageID columns_page = buffer_manager.extend(SYS_COLUMNS_ID);
 
@@ -929,6 +940,7 @@ private:
     }
 
     void installSystemTables(const BootstrapPage& bootstrap_page) {
+        // Cache system tables before catalog lookups can work.
         TableMetadata tables_metadata{
             SYS_TABLES_ID, "__tables", tablesTableSchema(),
             {bootstrap_page.tables_first_page},
@@ -964,6 +976,7 @@ private:
     void syncSystemTableBootstrap(const TableMetadata& metadata) {
         BootstrapPage bootstrap_page = buffer_manager.getBootstrap();
 
+        // Keep page 0 in sync when a system table grows.
         if (metadata.table_id == SYS_TABLES_ID) {
             bootstrap_page.tables_first_page = metadata.first_page;
             bootstrap_page.tables_last_page = metadata.last_page;
@@ -981,6 +994,7 @@ private:
         auto& metadata = getTable(system_table_id);
         PageID previous_last_page = metadata.last_page;
 
+        // System tables share heap code; only page-0 roots need syncing.
         TableHeap table(metadata, buffer_manager);
         bool status = table.insertTuple(std::move(tuple));
         assert(status == true);
@@ -990,13 +1004,53 @@ private:
         }
     }
 
-    void persistTableRecord(const TableMetadata& metadata) {
+    std::unique_ptr<Tuple> makeTableRecordTuple(const TableMetadata& metadata) {
+        // Match tuple layout to tablesTableSchema().
         auto tuple = std::make_unique<Tuple>();
         tuple->addField(std::make_unique<Field>(static_cast<int>(metadata.table_id)));
         tuple->addField(std::make_unique<Field>(metadata.name));
         tuple->addField(std::make_unique<Field>(static_cast<int>(metadata.first_page)));
         tuple->addField(std::make_unique<Field>(static_cast<int>(metadata.last_page)));
         tuple->addField(std::make_unique<Field>(static_cast<int>(metadata.row_count)));
+        return tuple;
+    }
+
+    void persistTableRecord(const TableMetadata& metadata) {
+        auto tuple = makeTableRecordTuple(metadata);
+        auto& tables_metadata = getTable(SYS_TABLES_ID);
+        TableHeap tables_heap(tables_metadata, buffer_manager);
+
+        // Replace visible catalog row with current metadata.
+        for (PageID page_id : tables_heap.getPageIds()) {
+            auto& page = tables_heap.getPage(page_id);
+            char* page_buffer = page->page_data.get();
+            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+
+            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+                if (slot_array[slot_itr].empty) {
+                    continue;
+                }
+
+                const char* tuple_data = page_buffer + slot_array[slot_itr].offset;
+                std::istringstream iss(
+                    std::string(tuple_data, slot_array[slot_itr].length)
+                );
+                auto old_tuple = Tuple::deserialize(iss);
+                TableId table_id = static_cast<TableId>(old_tuple->fields[0]->asInt());
+
+                if (table_id == metadata.table_id) {
+                    page->deleteTuple(slot_itr);
+                    // Reuse the slot if the new row still fits.
+                    if (page->addTuple(tuple->clone())) {
+                        buffer_manager.flushPage(page_id);
+                    } else {
+                        insertSystemTuple(SYS_TABLES_ID, std::move(tuple));
+                    }
+                    return;
+                }
+            }
+        }
+
         insertSystemTuple(SYS_TABLES_ID, std::move(tuple));
     }
 
@@ -1043,8 +1097,8 @@ private:
     std::optional<TableMetadata> findTableRecord(Predicate predicate) {
         auto& tables_metadata = getTable(SYS_TABLES_ID);
         TableHeap tables_heap(tables_metadata, buffer_manager);
-        std::optional<TableMetadata> latest_match;
 
+        // __tables holds table metadata; __columns holds schemas.
         for (auto& tuple : tables_heap.readAllTuples()) {
             TableId table_id = static_cast<TableId>(tuple->fields[0]->asInt());
             if (table_id == SYS_TABLES_ID || table_id == SYS_COLUMNS_ID) {
@@ -1063,11 +1117,11 @@ private:
             };
 
             if (predicate(candidate)) {
-                latest_match = std::move(candidate);
+                return candidate;
             }
         }
 
-        return latest_match;
+        return std::nullopt;
     }
 
     void loadColumns(TableMetadata& metadata) {
@@ -1075,6 +1129,7 @@ private:
         TableHeap columns_heap(columns_metadata, buffer_manager);
         std::map<int, ColumnSchema> columns_by_id;
 
+        // Rebuild schema by column_id, not scan order.
         for (auto& tuple : columns_heap.readAllTuples()) {
             TableId table_id = static_cast<TableId>(tuple->fields[0]->asInt());
             if (table_id != metadata.table_id) {
@@ -2264,6 +2319,10 @@ int main() {
         {"company_type_id", INT},
         {"note", STRING}
     });
+
+    // Scan catalog before loading user data.
+    db.executeQuery("{*} FROM __tables", txn1);
+    db.executeQuery("{*} FROM __columns", txn1);
 
     if (seed_database) {
         db.loadImdbFile("imdb.txt", txn1);
