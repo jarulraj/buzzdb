@@ -1,0 +1,11 @@
+# Booking dataset for WAL/recovery and concurrency-control examples.
+# Format: table_name|field1|field2|...
+
+flights|1|BZ101|SFO|JFK|2026-07-01
+
+seats|1|1|1A|available|none
+seats|2|1|1B|available|none
+seats|3|1|2A|available|none
+seats|4|1|2B|available|none
+
+# holds starts empty; v52 inserts a couple of active holds as statements.
