@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -238,6 +239,12 @@ struct BootstrapPage {
     uint16_t version = BUZZDB_VERSION;
     TableId next_table_id = FIRST_USER_TABLE_ID;
     CatalogRoot catalog_roots[2];
+};
+
+struct GarbageCollectionStats {
+    size_t pages_before = 0;
+    size_t pages_after = 0;
+    size_t pages_reclaimed = 0;
 };
 
 uint32_t catalogRootChecksum(const CatalogRoot& root) {
@@ -529,6 +536,45 @@ public:
         num_pages += 1;
     }
 
+    void rewrite(const std::vector<PageID>& source_pages,
+                 const std::map<PageID, std::unique_ptr<SlottedPage>>& replacement_pages) {
+        std::string temp_filename = database_filename + ".gc";
+        std::fstream output(temp_filename, std::ios::out | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to create temporary GC file.");
+        }
+
+        for (PageID new_page_id = 0; new_page_id < source_pages.size(); new_page_id++) {
+            auto replacement = replacement_pages.find(new_page_id);
+            if (replacement != replacement_pages.end()) {
+                output.write(replacement->second->page_data.get(), PAGE_SIZE);
+                continue;
+            }
+
+            PageID old_page_id = source_pages[new_page_id];
+            if (old_page_id == INVALID_PAGE_ID) {
+                throw std::runtime_error("GC rewrite is missing a source page.");
+            }
+            auto page = load(old_page_id);
+            output.write(page->page_data.get(), PAGE_SIZE);
+        }
+        output.flush();
+        output.close();
+
+        if (fileStream.is_open()) {
+            fileStream.close();
+        }
+        if (std::rename(temp_filename.c_str(), database_filename.c_str()) != 0) {
+            throw std::runtime_error("Unable to replace buzzdb.dat during GC.");
+        }
+
+        fileStream.open(database_filename, std::ios::in | std::ios::out);
+        if (!fileStream) {
+            throw std::runtime_error("Unable to reopen buzzdb.dat after GC.");
+        }
+        num_pages = source_pages.size();
+    }
+
 };
 
 class Policy {
@@ -663,6 +709,14 @@ public:
         return storage_manager.num_pages;
     }
 
+    void rewriteDatabase(
+        const std::vector<PageID>& source_pages,
+        const std::map<PageID, std::unique_ptr<SlottedPage>>& replacement_pages) {
+        storage_manager.rewrite(source_pages, replacement_pages);
+        pageMap.clear();
+        policy = std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY);
+    }
+
     bool isEmptyDatabase() const {
         return storage_manager.num_pages == 0;
     }
@@ -724,6 +778,8 @@ private:
     size_t aborted_data_pages_copied = 0;
     size_t catalog_pages_copied = 0;
     size_t catalog_root_switches = 0;
+    size_t garbage_collections = 0;
+    size_t garbage_pages_reclaimed = 0;
 
 public:
     RecoveryManager(BufferManager& buffer_manager, Catalog& catalog) : buffer_manager(buffer_manager), catalog(catalog) {}
@@ -732,6 +788,7 @@ public:
     void begin();
     void commit();
     void abort();
+    void collectGarbage();
     void printPolicy() const;
     void printSummary();
     PageID getShadowPage(PageID page_id) const;
@@ -1156,6 +1213,142 @@ public:
         tables_metadata.first_page = shadow_tables_metadata.first_page;
         tables_metadata.last_page = shadow_tables_metadata.last_page;
         return shadow_tables_metadata.page_ids.size();
+    }
+
+    GarbageCollectionStats collectGarbage() {
+        GarbageCollectionStats stats;
+        stats.pages_before = buffer_manager.getNumPages();
+        if (stats.pages_before == 0) {
+            return stats;
+        }
+
+        buffer_manager.flushAllPages();
+        BootstrapPage old_bootstrap = buffer_manager.getBootstrap();
+        const auto& old_root = activeCatalogRoot(old_bootstrap);
+        auto old_tables_pages = bootstrapPageIds(old_root.tables_page_count,
+                                                 old_root.tables_pages);
+        auto old_columns_pages = bootstrapPageIds(old_root.columns_page_count,
+                                                  old_root.columns_pages);
+
+        auto& tables_metadata = getTable(SYS_TABLES_ID);
+        auto& columns_metadata = getTable(SYS_COLUMNS_ID);
+        tables_metadata.page_ids = old_tables_pages;
+        columns_metadata.page_ids = old_columns_pages;
+
+        std::vector<TableMetadata> user_tables;
+        for (const auto& table_name : listUserTableNames()) {
+            user_tables.push_back(getTable(table_name));
+        }
+
+        std::map<PageID, PageID> page_remap;
+        page_remap[0] = 0;
+        PageID next_page_id = 1;
+        auto remapPages = [&](const std::vector<PageID>& old_pages) {
+            std::vector<PageID> new_pages;
+            for (PageID old_page_id : old_pages) {
+                auto it = page_remap.find(old_page_id);
+                if (it == page_remap.end()) {
+                    it = page_remap.emplace(old_page_id, next_page_id++).first;
+                }
+                new_pages.push_back(it->second);
+            }
+            return new_pages;
+        };
+        auto setMetadataPages = [](TableMetadata& metadata,
+                                   const std::vector<PageID>& page_ids) {
+            metadata.page_ids = page_ids;
+            metadata.first_page = page_ids.empty() ? INVALID_PAGE_ID : page_ids.front();
+            metadata.last_page = page_ids.empty() ? INVALID_PAGE_ID : page_ids.back();
+        };
+
+        TableMetadata remapped_tables_metadata = tables_metadata;
+        TableMetadata remapped_columns_metadata = columns_metadata;
+        setMetadataPages(remapped_tables_metadata, remapPages(old_tables_pages));
+        setMetadataPages(remapped_columns_metadata, remapPages(old_columns_pages));
+
+        std::vector<TableMetadata> remapped_user_tables = user_tables;
+        for (size_t i = 0; i < user_tables.size(); i++) {
+            setMetadataPages(
+                remapped_user_tables[i],
+                remapPages(user_tables[i].page_ids)
+            );
+        }
+
+        std::vector<PageID> source_pages(next_page_id, INVALID_PAGE_ID);
+        for (const auto& entry : page_remap) {
+            source_pages[entry.second] = entry.first;
+        }
+        std::map<PageID, std::unique_ptr<SlottedPage>> replacement_pages;
+        auto makeReplacementPage = [&](PageID page_id,
+                                       TableId table_id) -> SlottedPage& {
+            replacement_pages[page_id] = std::make_unique<SlottedPage>();
+            replacement_pages[page_id]->setTableId(table_id);
+            return *replacement_pages[page_id];
+        };
+
+        BootstrapPage new_bootstrap;
+        new_bootstrap.next_table_id = old_bootstrap.next_table_id;
+        auto& new_root = new_bootstrap.catalog_roots[0];
+        new_root.catalog_version = old_root.catalog_version + 1;
+        storeBootstrapPageIds(new_root.tables_page_count,
+                              new_root.tables_pages,
+                              remapped_tables_metadata.page_ids);
+        storeBootstrapPageIds(new_root.columns_page_count,
+                              new_root.columns_pages,
+                              remapped_columns_metadata.page_ids);
+        new_root.checksum = catalogRootChecksum(new_root);
+
+        auto& bootstrap_page = makeReplacementPage(0, INVALID_TABLE_ID);
+        std::memset(bootstrap_page.page_data.get(), 0, PAGE_SIZE);
+        std::memcpy(
+            bootstrap_page.page_data.get(),
+            &new_bootstrap,
+            sizeof(BootstrapPage)
+        );
+        for (PageID page_id : remapped_tables_metadata.page_ids) {
+            makeReplacementPage(page_id, SYS_TABLES_ID);
+        }
+
+        TableHeap columns_heap(columns_metadata, buffer_manager);
+        remapped_tables_metadata.row_count = 2 + remapped_user_tables.size();
+        remapped_columns_metadata.row_count = columns_heap.readAllTuples().size();
+        auto insertTableRecord = [&](const TableMetadata& metadata) {
+            auto tuple = makeTableRecordTuple(metadata);
+            for (PageID page_id : remapped_tables_metadata.page_ids) {
+                if (replacement_pages[page_id]->addTuple(tuple->clone())) {
+                    return;
+                }
+            }
+            throw std::runtime_error("Compacted __tables pages are full.");
+        };
+        insertTableRecord(remapped_tables_metadata);
+        insertTableRecord(remapped_columns_metadata);
+        for (const auto& metadata : remapped_user_tables) {
+            insertTableRecord(metadata);
+        }
+
+        for (PageID page_id = 0; page_id < source_pages.size(); page_id++) {
+            if (source_pages[page_id] == INVALID_PAGE_ID &&
+                replacement_pages.find(page_id) == replacement_pages.end()) {
+                throw std::runtime_error("GC failed to map a compact page.");
+            }
+        }
+
+        buffer_manager.rewriteDatabase(source_pages, replacement_pages);
+        setMetadataPages(tables_metadata, remapped_tables_metadata.page_ids);
+        setMetadataPages(columns_metadata, remapped_columns_metadata.page_ids);
+        tables_metadata.row_count = remapped_tables_metadata.row_count;
+        columns_metadata.row_count = remapped_columns_metadata.row_count;
+        for (const auto& metadata : remapped_user_tables) {
+            auto& cached_metadata = getTable(metadata.table_id);
+            setMetadataPages(cached_metadata, metadata.page_ids);
+        }
+
+        stats.pages_after = source_pages.size();
+        stats.pages_reclaimed = stats.pages_before > stats.pages_after
+            ? stats.pages_before - stats.pages_after
+            : 0;
+        return stats;
     }
 
 private:
@@ -1592,11 +1785,26 @@ void RecoveryManager::abort() {
     txn_active = false;
 }
 
+void RecoveryManager::collectGarbage() {
+    if (txn_active) {
+        throw std::runtime_error("Cannot garbage collect during an active transaction.");
+    }
+
+    auto stats = catalog.collectGarbage();
+    garbage_collections++;
+    garbage_pages_reclaimed += stats.pages_reclaimed;
+    std::cout << "Shadow GC: compacted buzzdb.dat from "
+              << stats.pages_before << " to " << stats.pages_after
+              << " page(s); reclaimed " << stats.pages_reclaimed
+              << " unreachable page(s)." << std::endl;
+}
+
 void RecoveryManager::printPolicy() const {
     std::cout << "Recovery policy: No-Undo/No-Redo (Shadow Paging)" << std::endl;
     std::cout << "  Steal: No; updates write copied pages, not committed pages." << std::endl;
     std::cout << "  Force: Yes; copied pages are flushed before the root switch." << std::endl;
     std::cout << "  Restart: choose latest valid catalog root; no log undo/redo." << std::endl;
+    std::cout << "  GC: streaming compaction keeps only active-root pages." << std::endl;
 }
 
 void RecoveryManager::printSummary() {
@@ -1608,6 +1816,8 @@ void RecoveryManager::printSummary() {
     std::cout << "  Aborted data pages copied: " << aborted_data_pages_copied << std::endl;
     std::cout << "  Catalog pages copied/updated: " << catalog_pages_copied << std::endl;
     std::cout << "  Catalog root switches: " << catalog_root_switches << std::endl;
+    std::cout << "  Garbage collections: " << garbage_collections << std::endl;
+    std::cout << "  Pages reclaimed by GC: " << garbage_pages_reclaimed << std::endl;
     std::cout << "  Total pages in buzzdb.dat at end: " << buffer_manager.getNumPages() << std::endl;
 }
 
@@ -3662,6 +3872,7 @@ COMMIT;
 
     db.recovery_manager.printPolicy();
     db.execute(script);
+    db.recovery_manager.collectGarbage();
     db.recovery_manager.printSummary();
     
     return 0;
