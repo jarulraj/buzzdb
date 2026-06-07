@@ -654,6 +654,7 @@ private:
     StorageManager storage_manager;
     PageMap pageMap;
     std::unique_ptr<Policy> policy;
+    std::map<PageID, size_t> pin_count;
 
 public:
     BufferManager(): 
@@ -667,7 +668,23 @@ public:
         }
 
         if (pageMap.size() >= MAX_PAGES_IN_MEMORY) {
-            auto evictedPageId = policy->evict();
+            PageID evictedPageId = INVALID_VALUE;
+            size_t attempts = pageMap.size();
+            while (attempts-- > 0) {
+                PageID candidate = policy->evict();
+                if (candidate == INVALID_VALUE) {
+                    break;
+                }
+                if (pin_count.find(candidate) != pin_count.end()) {
+                    policy->touch(candidate);
+                    continue;
+                }
+                evictedPageId = candidate;
+                break;
+            }
+            if (evictedPageId == INVALID_VALUE) {
+                throw std::runtime_error("All buffer pages are pinned.");
+            }
             if(evictedPageId != INVALID_VALUE){
                 if (TRACE_STORAGE) {
                     std::cout << "Evicting page " << evictedPageId << "\n";
@@ -688,12 +705,32 @@ public:
 
     void flushPage(int page_id) {
         //std::cout << "Flush page " << page_id << "\n";
+        if (pin_count.find(page_id) != pin_count.end()) {
+            throw std::runtime_error("Cannot flush a pinned uncommitted page.");
+        }
         storage_manager.flush(page_id, pageMap[page_id]);
     }
 
     void flushAllPages() {
         for (auto& entry : pageMap) {
+            if (pin_count.find(entry.first) != pin_count.end()) {
+                continue;
+            }
             storage_manager.flush(entry.first, entry.second);
+        }
+    }
+
+    void pinPage(PageID page_id) {
+        pin_count[page_id]++;
+    }
+
+    void unpinPage(PageID page_id) {
+        auto it = pin_count.find(page_id);
+        if (it == pin_count.end()) {
+            return;
+        }
+        if (--it->second == 0) {
+            pin_count.erase(it);
         }
     }
 
@@ -822,10 +859,11 @@ struct DeferredUpdate {
     TableId table_id;
     PageID page_id;
     size_t slot_id;
+    std::unique_ptr<Tuple> before_tuple;
     std::unique_ptr<Tuple> after_tuple;
 };
 
-// Recovery policy for v56: deferred updates plus redo after-images.
+// Recovery policy for v56: no-steal buffer pages plus redo after-images.
 class RecoveryManager {
 private:
     BufferManager& buffer_manager;
@@ -836,11 +874,14 @@ private:
     int current_txn_id = 0;
     bool crash_after_commit_before_apply = false;
     std::vector<DeferredUpdate> deferred_updates;
+    std::vector<PageID> pinned_pages;
     size_t deferred_updates_collected = 0;
     size_t committed_tuple_after_image_records = 0;
     size_t tuple_after_image_bytes_logged = 0;
     size_t aborted_deferred_updates = 0;
     size_t redo_records_applied = 0;
+    size_t pinned_page_count = 0;
+    size_t in_memory_abort_undos = 0;
 
 public:
     RecoveryManager(BufferManager& buffer_manager, Catalog& catalog) : buffer_manager(buffer_manager), catalog(catalog) {}
@@ -853,11 +894,10 @@ public:
     void recover();
     void deferUpdate(TableId table_id,
                      PageID page_id,
-                     size_t slot_id,
-                     std::unique_ptr<Tuple> after_tuple);
-    const Tuple* getDeferredTuple(TableId table_id,
-                                  PageID page_id,
-                                  size_t slot_id) const;
+                                  size_t slot_id,
+                                  std::unique_ptr<Tuple> before_tuple,
+                                  std::unique_ptr<Tuple> after_tuple);
+    int getCurrentTxnId() const { return current_txn_id; }
     void printPolicy() const;
     void printSummary();
 };
@@ -993,17 +1033,7 @@ public:
                 std::istringstream iss(
                     std::string(tuple_data, slot_array[slot_itr].length)
                 );
-                std::unique_ptr<Tuple> old_tuple;
-                if (recovery_manager == nullptr) {
-                    old_tuple = Tuple::deserialize(iss);
-                } else {
-                    const Tuple* pending_tuple = recovery_manager->getDeferredTuple(
-                        metadata.table_id, page_id, slot_itr
-                    );
-                    old_tuple = pending_tuple == nullptr
-                        ? Tuple::deserialize(iss)
-                        : pending_tuple->clone();
-                }
+                auto old_tuple = Tuple::deserialize(iss);
                 if (where_column >= old_tuple->fields.size() ||
                     !(*old_tuple->fields[where_column] == where_value)) {
                     continue;
@@ -1025,10 +1055,12 @@ public:
 
                 if (recovery_manager != nullptr) {
                     recovery_manager->deferUpdate(
-                        metadata.table_id, page_id, slot_itr, std::move(new_tuple)
+                        metadata.table_id,
+                        page_id,
+                        slot_itr,
+                        old_tuple->clone(),
+                        new_tuple->clone()
                     );
-                    updated_count++;
-                    continue;
                 }
 
                 bool status = (*page)->updateTuple(slot_itr, std::move(new_tuple));
@@ -1037,7 +1069,7 @@ public:
                 updated_count++;
             }
 
-            if (page_updated) {
+            if (page_updated && recovery_manager == nullptr) {
                 buffer_manager.flushPage(page_id);
             }
         }
@@ -1822,6 +1854,8 @@ void RecoveryManager::begin() {
     txn_active = true;
     current_txn_id = next_txn_id++;
     deferred_updates.clear();
+    pinned_pages.clear();
+    std::cout << "\nTXN " << current_txn_id << " BEGIN" << std::endl;
 }
 
 void RecoveryManager::commit() {
@@ -1829,6 +1863,7 @@ void RecoveryManager::commit() {
         throw std::runtime_error("COMMIT without BEGIN.");
     }
 
+    std::cout << "TXN " << current_txn_id << " COMMIT" << std::endl;
     if (!deferred_updates.empty()) {
         log_manager.append("BEGIN " + std::to_string(current_txn_id));
         for (auto& update : deferred_updates) {
@@ -1846,21 +1881,27 @@ void RecoveryManager::commit() {
         committed_tuple_after_image_records += deferred_updates.size();
 
         if (crash_after_commit_before_apply) {
-            std::cout << "Simulated crash after COMMIT log, before applying updates." << std::endl;
+            std::cout << "  recovery: wrote COMMIT log for "
+                      << deferred_updates.size()
+                      << " tuple after-image record(s)" << std::endl;
+            std::cout << "  crash: after COMMIT log, before dirty page flush" << std::endl;
             std::exit(2);
         }
 
-        for (const auto& update : deferred_updates) {
-            auto& metadata = catalog.getTable(update.table_id);
-            TableHeap table(metadata, buffer_manager);
-            table.applyUpdate(update.page_id, update.slot_id, update.after_tuple->clone(), false);
+        for (PageID page_id : pinned_pages) {
+            buffer_manager.unpinPage(page_id);
         }
-        std::cout << "No-Undo/Redo commit: logged "
+        std::cout << "  recovery: wrote "
                   << deferred_updates.size()
-                  << " tuple after-image record(s) and applied them." << std::endl;
+                  << " tuple after-image record(s), unpinned "
+                  << pinned_pages.size()
+                  << " page(s), forced 0 data page(s)" << std::endl;
+    } else {
+        std::cout << "  recovery: read-only transaction, no log records" << std::endl;
     }
 
     deferred_updates.clear();
+    pinned_pages.clear();
     crash_after_commit_before_apply = false;
     current_txn_id = 0;
     txn_active = false;
@@ -1870,13 +1911,28 @@ void RecoveryManager::abort() {
     if (!txn_active) {
         throw std::runtime_error("ABORT without BEGIN.");
     }
+    std::cout << "TXN " << current_txn_id << " ABORT" << std::endl;
     if (!deferred_updates.empty()) {
         aborted_deferred_updates += deferred_updates.size();
-        std::cout << "No-Undo/Redo abort: discarded "
+        for (auto it = deferred_updates.rbegin(); it != deferred_updates.rend(); ++it) {
+            auto& metadata = catalog.getTable(it->table_id);
+            TableHeap table(metadata, buffer_manager);
+            table.applyUpdate(it->page_id, it->slot_id, it->before_tuple->clone(), false);
+            in_memory_abort_undos++;
+        }
+        for (PageID page_id : pinned_pages) {
+            buffer_manager.unpinPage(page_id);
+        }
+        std::cout << "  recovery: restored "
                   << deferred_updates.size()
-                  << " deferred update(s); no undo needed." << std::endl;
+                  << " in-memory update(s), unpinned "
+                  << pinned_pages.size()
+                  << " page(s), wrote 0 log record(s)" << std::endl;
+    } else {
+        std::cout << "  recovery: no updates to discard" << std::endl;
     }
     deferred_updates.clear();
+    pinned_pages.clear();
     crash_after_commit_before_apply = false;
     current_txn_id = 0;
     txn_active = false;
@@ -1938,49 +1994,56 @@ void RecoveryManager::recover() {
 void RecoveryManager::deferUpdate(TableId table_id,
                                   PageID page_id,
                                   size_t slot_id,
+                                  std::unique_ptr<Tuple> before_tuple,
                                   std::unique_ptr<Tuple> after_tuple) {
     if (!txn_active) {
-        throw std::runtime_error("Deferred update requested without BEGIN.");
+        throw std::runtime_error("In-place recovery update requested without BEGIN.");
     }
 
     deferred_updates_collected++;
+    auto& metadata = catalog.getTable(table_id);
     for (auto& update : deferred_updates) {
         if (update.table_id == table_id &&
             update.page_id == page_id &&
             update.slot_id == slot_id) {
             update.after_tuple = std::move(after_tuple);
-            std::cout << "Deferred update: table " << table_id
-                      << " page " << page_id << " slot " << slot_id << std::endl;
+            std::cout << "  recovery: update " << metadata.name
+                      << " page " << page_id
+                      << " slot " << slot_id
+                      << " in place; coalesced after-image" << std::endl;
             return;
         }
+    }
+
+    bool already_pinned = false;
+    for (PageID pinned_page : pinned_pages) {
+        if (pinned_page == page_id) {
+            already_pinned = true;
+            break;
+        }
+    }
+    if (!already_pinned) {
+        buffer_manager.pinPage(page_id);
+        pinned_pages.push_back(page_id);
+        pinned_page_count++;
     }
 
     DeferredUpdate update;
     update.table_id = table_id;
     update.page_id = page_id;
     update.slot_id = slot_id;
+    update.before_tuple = std::move(before_tuple);
     update.after_tuple = std::move(after_tuple);
     deferred_updates.push_back(std::move(update));
-    std::cout << "Deferred update: table " << table_id
-              << " page " << page_id << " slot " << slot_id << std::endl;
-}
-
-const Tuple* RecoveryManager::getDeferredTuple(TableId table_id,
-                                               PageID page_id,
-                                               size_t slot_id) const {
-    for (auto it = deferred_updates.rbegin(); it != deferred_updates.rend(); ++it) {
-        if (it->table_id == table_id &&
-            it->page_id == page_id &&
-            it->slot_id == slot_id) {
-            return it->after_tuple.get();
-        }
-    }
-    return nullptr;
+    std::cout << "  recovery: update " << metadata.name
+              << " page " << page_id
+              << " slot " << slot_id
+              << " in place; pinned page and staged after-image" << std::endl;
 }
 
 void RecoveryManager::printPolicy() const {
-    std::cout << "Recovery policy: No-Undo/Redo (Deferred Update)" << std::endl;
-    std::cout << "  Steal: No; uncommitted updates stay in memory." << std::endl;
+    std::cout << "Recovery policy: No-Undo/Redo (No-Steal Buffer Updates)" << std::endl;
+    std::cout << "  Steal: No; uncommitted dirty pages stay pinned." << std::endl;
     std::cout << "  Force: No; commit forces log records, not data pages." << std::endl;
     std::cout << "  Restart: redo committed tuple after-images; no undo." << std::endl;
 }
@@ -1991,20 +2054,22 @@ void RecoveryManager::printSummary() {
     };
 
     std::cout << "Recovery policy summary:" << std::endl;
-    std::cout << "  Policy: No-Undo/Redo (Deferred Update)" << std::endl;
+    std::cout << "  Policy: No-Undo/Redo (No-Steal Buffer Updates)" << std::endl;
     std::cout << "  Log records written this run: " << log_manager.getRecordsWritten() << std::endl;
     std::cout << "  Log bytes written this run: " << log_manager.getBytesWritten() << std::endl;
     std::cout << "  Log pages written this run: " << pagesForBytes(log_manager.getBytesWritten()) << std::endl;
     std::cout << "  Log bytes on disk: " << log_manager.getBytesOnDisk() << std::endl;
     std::cout << "  Log pages on disk: " << pagesForBytes(log_manager.getBytesOnDisk()) << std::endl;
-    std::cout << "  Deferred updates collected: " << deferred_updates_collected << std::endl;
+    std::cout << "  In-place tuple updates protected from steal: " << deferred_updates_collected << std::endl;
+    std::cout << "  Data page pin events: " << pinned_page_count << std::endl;
     std::cout << "  Committed tuple after-image records: " << committed_tuple_after_image_records << std::endl;
     std::cout << "  Tuple after-image bytes logged: " << tuple_after_image_bytes_logged << std::endl;
     std::cout << "  Tuple after-image payload pages in log: "
               << pagesForBytes(tuple_after_image_bytes_logged) << std::endl;
-    std::cout << "  Aborted deferred updates: " << aborted_deferred_updates << std::endl;
+    std::cout << "  Aborted update intentions: " << aborted_deferred_updates << std::endl;
+    std::cout << "  In-memory abort restores: " << in_memory_abort_undos << std::endl;
     std::cout << "  Redo tuple after-image records applied on restart: " << redo_records_applied << std::endl;
-    std::cout << "  Undo records applied: 0" << std::endl;
+    std::cout << "  Restart undo records applied: 0" << std::endl;
     std::cout << "  Full data page images written: 0" << std::endl;
     std::cout << "  Full catalog page images written: 0" << std::endl;
     std::cout << "  Data pages forced at commit: 0" << std::endl;
@@ -3245,44 +3310,22 @@ void prettyPrint(const Components& components,
         }
     } else if constexpr (std::is_same<Components, StatementComponents>::value) {
         (void)queryColumns;
-        std::cout << "Statement Components";
-        if (!components.tableName.empty()) {
-            std::cout << " for table " << components.tableName;
-        }
-        std::cout << ":\n";
-        std::cout << "  Operation: ";
-        switch (components.type) {
-            case StatementType::BEGIN:
-                std::cout << "BEGIN";
-                break;
-            case StatementType::COMMIT:
-                std::cout << "COMMIT";
-                break;
-            case StatementType::ABORT:
-                std::cout << "ABORT";
-                break;
-            case StatementType::INSERT:
-                std::cout << "INSERT";
-                break;
-            case StatementType::UPDATE:
-                std::cout << "UPDATE";
-                break;
-        }
         if (components.type == StatementType::BEGIN ||
             components.type == StatementType::COMMIT ||
             components.type == StatementType::ABORT) {
-            std::cout << "\n  Recovery boundary";
+            return;
         } else if (components.type == StatementType::INSERT) {
-            std::cout << "\n  Values: ";
+            std::cout << "INSERT " << components.tableName << " ";
             for (size_t i = 0; i < components.values.size(); i++) {
-                std::cout << "{" << i + 1 << "}=" << components.values[i] << " ";
+                if (i != 0) std::cout << "|";
+                std::cout << components.values[i];
             }
         } else {
-            std::cout << "\n  SET: ";
+            std::cout << "UPDATE " << components.tableName << " SET ";
             for (const auto& assignment : components.assignments) {
                 std::cout << assignment.first << "=" << assignment.second << " ";
             }
-            std::cout << "\n  WHERE: "
+            std::cout << "WHERE "
                       << components.whereColumn << "=" << components.whereValue;
         }
     }
@@ -3787,7 +3830,7 @@ public:
             );
         }
         if (recovery_manager.isActive()) {
-            throw std::runtime_error("INSERT inside a deferred update transaction is not supported in v56.");
+            throw std::runtime_error("INSERT inside a no-steal update transaction is not supported in v56.");
         }
 
         auto tuple = std::make_unique<Tuple>();
@@ -3883,8 +3926,8 @@ public:
         resolveQueryColumns(components, catalog);
         auto& metadata = catalog.getTable(components.tableName);
         auto queryColumns = deriveQueryColumns(components, metadata);
-        std::cout << "Operator Tree: " << operatorTreeString(components) << std::endl;
-        prettyPrint(components, queryColumns);
+        (void)queryColumns;
+        std::cout << "QUERY " << operatorTreeString(components) << std::endl;
         ::executeQuery(
             components,
             catalog,
