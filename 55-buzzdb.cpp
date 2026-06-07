@@ -771,6 +771,8 @@ private:
     BufferManager& buffer_manager;
     Catalog& catalog;
     bool txn_active = false;
+    size_t next_txn_id = 1;
+    size_t current_txn_id = 0;
     std::map<PageID, PageID> shadow_page_table;
     bool crash_before_catalog_root_switch = false;
     size_t shadow_pages_copied = 0;
@@ -1204,7 +1206,7 @@ public:
                               shadow_tables_metadata.page_ids);
         new_root.checksum = catalogRootChecksum(new_root);
         if (crash_before_root_switch) {
-            std::cout << "Simulated crash before catalog root switch." << std::endl;
+            std::cout << "  crash: before catalog root switch" << std::endl;
             std::exit(2);
         }
 
@@ -1562,7 +1564,7 @@ private:
         auto& shadow_page = buffer_manager.getPage(shadow_page_id);
         std::memcpy(shadow_page->page_data.get(), source_page->page_data.get(), PAGE_SIZE);
         buffer_manager.flushPage(shadow_page_id);
-        std::cout << "Copy page: catalog page " << page_id
+        std::cout << "  recovery: copied catalog page " << page_id
                   << " -> " << shadow_page_id << std::endl;
         return shadow_page_id;
     }
@@ -1733,8 +1735,10 @@ void RecoveryManager::begin() {
         throw std::runtime_error("Transaction already active.");
     }
     txn_active = true;
+    current_txn_id = next_txn_id++;
     shadow_page_table.clear();
     shadow_pages_copied = 0;
+    std::cout << "\nTXN " << current_txn_id << " BEGIN" << std::endl;
 }
 
 void RecoveryManager::commit() {
@@ -1742,6 +1746,7 @@ void RecoveryManager::commit() {
         throw std::runtime_error("COMMIT without BEGIN.");
     }
 
+    std::cout << "TXN " << current_txn_id << " COMMIT" << std::endl;
     std::map<TableId, TableMetadata> updated_metadata;
     for (const auto& entry : shadow_page_table) {
         PageID old_page_id = entry.first;
@@ -1763,14 +1768,17 @@ void RecoveryManager::commit() {
         committed_data_pages_copied += shadow_pages_copied;
         this->catalog_pages_copied += catalog_pages_copied;
         catalog_root_switches++;
-        std::cout << "Shadow paging cost: copied " << shadow_pages_copied
-                  << " data page(s), copied " << catalog_pages_copied
-                  << " catalog page(s), switched catalog root." << std::endl;
+        std::cout << "  recovery: installed " << shadow_pages_copied
+                  << " copied data page(s), copied " << catalog_pages_copied
+                  << " catalog page(s), switched catalog root" << std::endl;
+    } else {
+        std::cout << "  recovery: read-only transaction, no shadow pages copied" << std::endl;
     }
 
     shadow_page_table.clear();
     crash_before_catalog_root_switch = false;
     shadow_pages_copied = 0;
+    current_txn_id = 0;
     txn_active = false;
 }
 
@@ -1778,14 +1786,18 @@ void RecoveryManager::abort() {
     if (!txn_active) {
         throw std::runtime_error("ABORT without BEGIN.");
     }
+    std::cout << "TXN " << current_txn_id << " ABORT" << std::endl;
     if (shadow_pages_copied != 0) {
         aborted_data_pages_copied += shadow_pages_copied;
-        std::cout << "Shadow paging cost: discarded " << shadow_pages_copied
-                  << " copied data page(s); they remain unreachable." << std::endl;
+        std::cout << "  recovery: discarded " << shadow_pages_copied
+                  << " copied data page(s); unreachable until GC" << std::endl;
+    } else {
+        std::cout << "  recovery: no copied pages to discard" << std::endl;
     }
     shadow_page_table.clear();
     crash_before_catalog_root_switch = false;
     shadow_pages_copied = 0;
+    current_txn_id = 0;
     txn_active = false;
 }
 
@@ -1848,8 +1860,11 @@ PageID RecoveryManager::ensureShadowPageForUpdate(PageID page_id) {
     buffer_manager.flushPage(shadow_page_id);
     shadow_page_table[page_id] = shadow_page_id;
     shadow_pages_copied++;
-    std::cout << "Copy page: data page " << page_id
-              << " -> " << shadow_page_id << std::endl;
+    auto& metadata = catalog.getTable(source_page->getTableId());
+    std::cout << "  recovery: copied " << metadata.name
+              << " data page " << page_id
+              << " -> " << shadow_page_id
+              << " for shadow update" << std::endl;
     return shadow_page_id;
 }
 
@@ -3087,44 +3102,22 @@ void prettyPrint(const Components& components,
         }
     } else if constexpr (std::is_same<Components, StatementComponents>::value) {
         (void)queryColumns;
-        std::cout << "Statement Components";
-        if (!components.tableName.empty()) {
-            std::cout << " for table " << components.tableName;
-        }
-        std::cout << ":\n";
-        std::cout << "  Operation: ";
-        switch (components.type) {
-            case StatementType::BEGIN:
-                std::cout << "BEGIN";
-                break;
-            case StatementType::COMMIT:
-                std::cout << "COMMIT";
-                break;
-            case StatementType::ABORT:
-                std::cout << "ABORT";
-                break;
-            case StatementType::INSERT:
-                std::cout << "INSERT";
-                break;
-            case StatementType::UPDATE:
-                std::cout << "UPDATE";
-                break;
-        }
         if (components.type == StatementType::BEGIN ||
             components.type == StatementType::COMMIT ||
             components.type == StatementType::ABORT) {
-            std::cout << "\n  Shadow paging boundary";
+            return;
         } else if (components.type == StatementType::INSERT) {
-            std::cout << "\n  Values: ";
+            std::cout << "INSERT " << components.tableName << " ";
             for (size_t i = 0; i < components.values.size(); i++) {
-                std::cout << "{" << i + 1 << "}=" << components.values[i] << " ";
+                if (i != 0) std::cout << "|";
+                std::cout << components.values[i];
             }
         } else {
-            std::cout << "\n  SET: ";
+            std::cout << "UPDATE " << components.tableName << " SET ";
             for (const auto& assignment : components.assignments) {
                 std::cout << assignment.first << "=" << assignment.second << " ";
             }
-            std::cout << "\n  WHERE: "
+            std::cout << "WHERE "
                       << components.whereColumn << "=" << components.whereValue;
         }
     }
@@ -3722,8 +3715,8 @@ public:
         resolveQueryColumns(components, catalog);
         auto& metadata = catalog.getTable(components.tableName);
         auto queryColumns = deriveQueryColumns(components, metadata);
-        std::cout << "Operator Tree: " << operatorTreeString(components) << std::endl;
-        prettyPrint(components, queryColumns);
+        (void)queryColumns;
+        std::cout << "QUERY " << operatorTreeString(components) << std::endl;
         ::executeQuery(
             components,
             catalog,
