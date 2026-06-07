@@ -1208,6 +1208,7 @@ public:
             std::exit(2);
         }
 
+        // The catalog root switch is the shadow transaction commit point.
         buffer_manager.flushBootstrap(bootstrap_page);
         tables_metadata.page_ids = shadow_tables_metadata.page_ids;
         tables_metadata.first_page = shadow_tables_metadata.first_page;
@@ -1240,6 +1241,7 @@ public:
             user_tables.push_back(getTable(table_name));
         }
 
+        // Compact ids are assigned only to pages reachable from the active root.
         std::map<PageID, PageID> page_remap;
         page_remap[0] = 0;
         PageID next_page_id = 1;
@@ -1274,6 +1276,7 @@ public:
             );
         }
 
+        // Unchanged pages are streamed from old ids instead of buffered here.
         std::vector<PageID> source_pages(next_page_id, INVALID_PAGE_ID);
         for (const auto& entry : page_remap) {
             source_pages[entry.second] = entry.first;
@@ -1306,6 +1309,7 @@ public:
             sizeof(BootstrapPage)
         );
         for (PageID page_id : remapped_tables_metadata.page_ids) {
+            // Page 0 and __tables are rebuilt because they contain page ids.
             makeReplacementPage(page_id, SYS_TABLES_ID);
         }
 
@@ -1836,6 +1840,7 @@ PageID RecoveryManager::ensureShadowPageForUpdate(PageID page_id) {
         return it->second;
     }
 
+    // First write copies the page; later writes reuse the same shadow page.
     auto& source_page = buffer_manager.getPage(page_id);
     PageID shadow_page_id = buffer_manager.extend(source_page->getTableId());
     auto& shadow_page = buffer_manager.getPage(shadow_page_id);
