@@ -23,8 +23,8 @@
 #include <initializer_list>
 #include <cstring>
 #include <type_traits>
-#include <cstdint>
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 
@@ -208,11 +208,12 @@ public:
     }
 };
 
-static constexpr size_t PAGE_SIZE = 4096;  // Fixed page size
-static constexpr size_t MAX_SLOTS = 512;   // Fixed number of slots
+static constexpr size_t PAGE_SIZE = 128;  // Tiny pages for recovery workloads
+static constexpr size_t MAX_SLOTS = 4;    // Small slot directory leaves tuple space
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
 
 using PageID = uint16_t;
+using BootstrapPageID = uint8_t;
 using TableId = uint16_t;
 
 constexpr PageID INVALID_PAGE_ID = std::numeric_limits<PageID>::max();
@@ -222,15 +223,15 @@ constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
 constexpr uint32_t BUZZDB_MAGIC = 0x425A4442;
 constexpr uint16_t BUZZDB_VERSION = 58;
-constexpr size_t MAX_SYSTEM_TABLE_PAGES = 32;
+constexpr size_t MAX_SYSTEM_TABLE_PAGES = 16;
 const std::string log_filename = "buzzdb.log";
 
 struct CatalogRoot {
     uint64_t catalog_version = 0;
     uint16_t tables_page_count = 0;
-    PageID tables_pages[MAX_SYSTEM_TABLE_PAGES] = {};
+    BootstrapPageID tables_pages[MAX_SYSTEM_TABLE_PAGES] = {};
     uint16_t columns_page_count = 0;
-    PageID columns_pages[MAX_SYSTEM_TABLE_PAGES] = {};
+    BootstrapPageID columns_pages[MAX_SYSTEM_TABLE_PAGES] = {};
     uint32_t checksum = 0;
 };
 
@@ -241,6 +242,9 @@ struct BootstrapPage {
     TableId next_table_id = FIRST_USER_TABLE_ID;
     CatalogRoot catalog_roots[2];
 };
+
+static_assert(sizeof(BootstrapPage) <= PAGE_SIZE,
+              "BootstrapPage must fit in page 0.");
 
 struct GarbageCollectionStats {
     size_t pages_before = 0;
@@ -259,8 +263,8 @@ uint32_t catalogRootChecksum(const CatalogRoot& root) {
     mix(root.catalog_version);
     mix(root.tables_page_count);
     mix(root.columns_page_count);
-    for (PageID page_id : root.tables_pages) mix(page_id);
-    for (PageID page_id : root.columns_pages) mix(page_id);
+    for (BootstrapPageID page_id : root.tables_pages) mix(page_id);
+    for (BootstrapPageID page_id : root.columns_pages) mix(page_id);
     return checksum == 0 ? 1 : checksum;
 }
 
@@ -301,6 +305,9 @@ struct Slot {
     uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
     uint16_t length = INVALID_VALUE;    // Length of the slot
 };
+
+static_assert(sizeof(Slot) * MAX_SLOTS + sizeof(PageHeader) < PAGE_SIZE,
+              "Slot directory must leave space for tuples.");
 
 // Slotted Page class
 class SlottedPage {
@@ -647,6 +654,17 @@ public:
 
 constexpr size_t MAX_PAGES_IN_MEMORY = 10;
 
+struct BufferPoolStats {
+    size_t page_loads = 0;
+    size_t cache_hits = 0;
+    size_t evictions = 0;
+    size_t data_page_writes = 0;
+    size_t page_flushes_from_eviction = 0;
+    size_t evictions_blocked_by_pins = 0;
+    size_t max_pinned_pages = 0;
+    std::map<std::string, size_t> data_page_writes_by_tag;
+};
+
 class BufferManager {
 private:
     using PageMap = std::unordered_map<PageID, std::unique_ptr<SlottedPage>>;
@@ -655,14 +673,32 @@ private:
     PageMap pageMap;
     std::unique_ptr<Policy> policy;
     std::map<PageID, size_t> pin_count;
+    BufferPoolStats stats;
+
+    std::string evictionWriteTag(PageID page_id) {
+        if (page_id == 0) {
+            return "catalog eviction";
+        }
+        TableId table_id = pageMap[page_id]->getTableId();
+        if (table_id == SYS_TABLES_ID || table_id == SYS_COLUMNS_ID) {
+            return "catalog eviction";
+        }
+        return "eviction";
+    }
 
 public:
     BufferManager(): 
     policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
+    void recordDataPageWrite(const std::string& tag) {
+        stats.data_page_writes++;
+        stats.data_page_writes_by_tag[tag]++;
+    }
+
     std::unique_ptr<SlottedPage>& getPage(int page_id) {
         auto it = pageMap.find(page_id);
         if (it != pageMap.end()) {
+            stats.cache_hits++;
             policy->touch(page_id);
             return pageMap.find(page_id)->second;
         }
@@ -676,6 +712,7 @@ public:
                     break;
                 }
                 if (pin_count.find(candidate) != pin_count.end()) {
+                    stats.evictions_blocked_by_pins++;
                     policy->touch(candidate);
                     continue;
                 }
@@ -691,10 +728,15 @@ public:
                 }
                 storage_manager.flush(evictedPageId, 
                                       pageMap[evictedPageId]);
+                recordDataPageWrite(evictionWriteTag(evictedPageId));
+                stats.evictions++;
+                stats.page_flushes_from_eviction++;
+                pageMap.erase(evictedPageId);
             }
         }
 
         auto page = storage_manager.load(page_id);
+        stats.page_loads++;
         policy->touch(page_id);
         if (TRACE_STORAGE) {
             std::cout << "Loading page: " << page_id << "\n";
@@ -703,25 +745,28 @@ public:
         return pageMap[page_id];
     }
 
-    void flushPage(int page_id) {
+    void flushPage(int page_id, const std::string& tag = "explicit") {
         //std::cout << "Flush page " << page_id << "\n";
         if (pin_count.find(page_id) != pin_count.end()) {
             throw std::runtime_error("Cannot flush a pinned uncommitted page.");
         }
         storage_manager.flush(page_id, pageMap[page_id]);
+        recordDataPageWrite(tag);
     }
 
-    void flushAllPages() {
+    void flushAllPages(const std::string& tag = "flush all") {
         for (auto& entry : pageMap) {
             if (pin_count.find(entry.first) != pin_count.end()) {
                 continue;
             }
             storage_manager.flush(entry.first, entry.second);
+            recordDataPageWrite(tag);
         }
     }
 
     void pinPage(PageID page_id) {
         pin_count[page_id]++;
+        stats.max_pinned_pages = std::max(stats.max_pinned_pages, pin_count.size());
     }
 
     void unpinPage(PageID page_id) {
@@ -734,17 +779,67 @@ public:
         }
     }
 
-    PageID extend(TableId table_id = INVALID_TABLE_ID){
+    PageID extend(TableId table_id = INVALID_TABLE_ID,
+                  const std::string& tag = "new page initialization"){
         storage_manager.extend();
+        recordDataPageWrite("new empty page");
         PageID page_id = static_cast<PageID>(storage_manager.num_pages - 1);
         auto& page = getPage(page_id);
         page->setTableId(table_id);
-        flushPage(page_id);
+        flushPage(page_id, tag);
         return page_id;
     }
 
     size_t getNumPages(){
         return storage_manager.num_pages;
+    }
+
+    void printBufferPoolSummary() const {
+        const std::vector<std::string> recovery_action_tags = {
+            "commit force",
+            "runtime abort undo",
+            "restart redo",
+            "restart undo"
+        };
+        const std::vector<std::string> buffer_pressure_tags = {
+            "eviction",
+            "uncommitted flush"
+        };
+        auto countTag = [&](const std::string& tag) {
+            auto it = stats.data_page_writes_by_tag.find(tag);
+            return it == stats.data_page_writes_by_tag.end() ? 0 : it->second;
+        };
+        auto sumTags = [&](const std::vector<std::string>& tags) {
+            size_t total = 0;
+            for (const auto& tag : tags) {
+                total += countTag(tag);
+            }
+            return total;
+        };
+        auto printTags = [&](const std::vector<std::string>& tags) {
+            for (const auto& tag : tags) {
+                size_t count = countTag(tag);
+                if (count != 0) {
+                    std::cout << "    " << tag << ": " << count << std::endl;
+                }
+            }
+        };
+
+        std::cout << "Database page write summary:" << std::endl;
+        size_t recovery_writes = sumTags(recovery_action_tags);
+        size_t buffer_pressure_writes = sumTags(buffer_pressure_tags);
+        std::cout << "  Recovery-applied database page writes: "
+                  << recovery_writes << std::endl;
+        if (recovery_writes != 0) {
+            std::cout << "  Recovery-applied writes by tag:" << std::endl;
+            printTags(recovery_action_tags);
+        }
+        std::cout << "  User-data buffer-pressure database page writes: "
+                  << buffer_pressure_writes << std::endl;
+        if (buffer_pressure_writes != 0) {
+            std::cout << "  User-data buffer-pressure writes by tag:" << std::endl;
+            printTags(buffer_pressure_tags);
+        }
     }
 
     void rewriteDatabase(
@@ -785,17 +880,18 @@ public:
 
         // Reserve page 0 before table heap pages.
         storage_manager.extend();
+        recordDataPageWrite("bootstrap page allocation");
         auto& page = getPage(0);
         std::memset(page->page_data.get(), 0, PAGE_SIZE);
         std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
-        flushPage(0);
+        flushPage(0, "bootstrap");
     }
 
     void flushBootstrap(const BootstrapPage& bootstrap) {
         auto& page = getPage(0);
         std::memset(page->page_data.get(), 0, PAGE_SIZE);
         std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
-        flushPage(0);
+        flushPage(0, "bootstrap");
     }
 
 };
@@ -965,7 +1061,7 @@ public:
             auto& page = getPage(metadata.last_page);
             if (page->addTuple(tuple->clone())) {
                 if (flush_on_insert) {
-                    buffer_manager.flushPage(metadata.last_page);
+                    buffer_manager.flushPage(metadata.last_page, "insert");
                 }
                 metadata.row_count++;
                 return true;
@@ -979,7 +1075,7 @@ public:
             auto& page = getPage(page_id);
             if (page->addTuple(tuple->clone())) {
                 if (flush_on_insert) {
-                    buffer_manager.flushPage(page_id);
+                    buffer_manager.flushPage(page_id, "insert");
                 }
                 metadata.row_count++;
                 return true;
@@ -996,7 +1092,7 @@ public:
         auto& page = getPage(page_id);
         if (page->addTuple(std::move(tuple))) {
             if (flush_on_insert) {
-                buffer_manager.flushPage(page_id);
+                buffer_manager.flushPage(page_id, "insert");
             }
             metadata.row_count++;
             return true;
@@ -1083,7 +1179,7 @@ public:
             }
 
             if (page_updated && recovery_manager == nullptr) {
-                buffer_manager.flushPage(page_id);
+                buffer_manager.flushPage(page_id, "update without recovery");
             }
         }
 
@@ -1113,12 +1209,13 @@ public:
     void applyUpdate(PageID page_id,
                      size_t slot_id,
                      std::unique_ptr<Tuple> tuple,
-                     bool flush_page = true) {
+                     bool flush_page = true,
+                     const std::string& flush_tag = "recovery apply") {
         auto& page = getPage(page_id);
         bool status = page->updateTuple(slot_id, std::move(tuple));
         assert(status == true);
         if (flush_page) {
-            buffer_manager.flushPage(page_id);
+            buffer_manager.flushPage(page_id, flush_tag);
         }
     }
 
@@ -1153,7 +1250,7 @@ public:
             }
 
             if (page_updated) {
-                buffer_manager.flushPage(page_id);
+                buffer_manager.flushPage(page_id, "delete");
             }
         }
 
@@ -1189,7 +1286,7 @@ private:
         PageID page_id = buffer_manager.extend(metadata.table_id);
         auto& page = buffer_manager.getPage(page_id);
         page->setTableId(metadata.table_id);
-        buffer_manager.flushPage(page_id);
+        buffer_manager.flushPage(page_id, "page allocation");
         return page_id;
     }
 };
@@ -1259,7 +1356,7 @@ public:
         PageID first_page = buffer_manager.extend(table_id);
         auto& page = buffer_manager.getPage(first_page);
         page->setTableId(table_id);
-        buffer_manager.flushPage(first_page);
+        buffer_manager.flushPage(first_page, "table create");
 
         TableMetadata metadata{
             table_id, name, std::move(schema), {first_page},
@@ -1355,7 +1452,7 @@ public:
             return stats;
         }
 
-        buffer_manager.flushAllPages();
+        buffer_manager.flushAllPages("gc flush all");
         BootstrapPage old_bootstrap = buffer_manager.getBootstrap();
         const auto& old_root = activeCatalogRoot(old_bootstrap);
         auto old_tables_pages = bootstrapPageIds(old_root.tables_page_count,
@@ -1528,23 +1625,29 @@ private:
     }
 
     static std::vector<PageID> bootstrapPageIds(uint16_t page_count,
-                                                const PageID* pages) {
+                                                const BootstrapPageID* pages) {
         std::vector<PageID> page_ids;
         for (uint16_t i = 0; i < page_count; i++) {
-            page_ids.push_back(pages[i]);
+            page_ids.push_back(static_cast<PageID>(pages[i]));
         }
         return page_ids;
     }
 
     static void storeBootstrapPageIds(uint16_t& page_count,
-                                      PageID* pages,
+                                      BootstrapPageID* pages,
                                       const std::vector<PageID>& page_ids) {
         if (page_ids.size() > MAX_SYSTEM_TABLE_PAGES) {
             throw std::runtime_error("System table page list is too large.");
         }
         page_count = static_cast<uint16_t>(page_ids.size());
         for (size_t i = 0; i < MAX_SYSTEM_TABLE_PAGES; i++) {
-            pages[i] = i < page_ids.size() ? page_ids[i] : INVALID_PAGE_ID;
+            if (i < page_ids.size() &&
+                page_ids[i] > std::numeric_limits<BootstrapPageID>::max()) {
+                throw std::runtime_error("System table page id is too large for bootstrap.");
+            }
+            pages[i] = i < page_ids.size()
+                ? static_cast<BootstrapPageID>(page_ids[i])
+                : std::numeric_limits<BootstrapPageID>::max();
         }
     }
 
@@ -1573,8 +1676,8 @@ private:
         buffer_manager.initializeBootstrap(bootstrap_page);
 
         // Give system catalog tables their first heap pages.
-        PageID tables_page = buffer_manager.extend(SYS_TABLES_ID);
-        PageID columns_page = buffer_manager.extend(SYS_COLUMNS_ID);
+        PageID tables_page = buffer_manager.extend(SYS_TABLES_ID, "system table create");
+        PageID columns_page = buffer_manager.extend(SYS_COLUMNS_ID, "system table create");
 
         bootstrap_page = buffer_manager.getBootstrap();
         auto& catalog_root = bootstrap_page.catalog_roots[0];
@@ -1693,7 +1796,7 @@ private:
         PageID shadow_page_id = buffer_manager.extend(source_page->getTableId());
         auto& shadow_page = buffer_manager.getPage(shadow_page_id);
         std::memcpy(shadow_page->page_data.get(), source_page->page_data.get(), PAGE_SIZE);
-        buffer_manager.flushPage(shadow_page_id);
+        buffer_manager.flushPage(shadow_page_id, "shadow page copy");
         std::cout << "Copy page: catalog page " << page_id
                   << " -> " << shadow_page_id << std::endl;
         return shadow_page_id;
@@ -1739,7 +1842,7 @@ private:
                     page->deleteTuple(slot_itr);
                     // Reuse the slot if the new row still fits.
                     if (page->addTuple(tuple->clone())) {
-                        buffer_manager.flushPage(page_id);
+                        buffer_manager.flushPage(page_id, "catalog metadata");
                     } else {
                         insertTableRecordInHeap(
                             tables_metadata, std::move(tuple), sync_bootstrap
@@ -1801,6 +1904,7 @@ private:
     std::optional<TableMetadata> findTableRecord(Predicate predicate) {
         auto& tables_metadata = getTable(SYS_TABLES_ID);
         TableHeap tables_heap(tables_metadata, buffer_manager);
+        std::optional<TableMetadata> found;
 
         // __tables holds table metadata; __columns holds schemas.
         for (auto& tuple : tables_heap.readAllTuples()) {
@@ -1828,11 +1932,11 @@ private:
             };
 
             if (predicate(candidate)) {
-                return candidate;
+                found = std::move(candidate);
             }
         }
 
-        return std::nullopt;
+        return found;
     }
 
     void loadColumns(TableMetadata& metadata) {
@@ -1913,7 +2017,10 @@ void RecoveryManager::abort() {
         for (auto it = wal_updates.rbegin(); it != wal_updates.rend(); ++it) {
             auto& metadata = catalog.getTable(it->table_id);
             TableHeap table(metadata, buffer_manager);
-            table.applyUpdate(it->page_id, it->slot_id, it->before_tuple->clone());
+            table.applyUpdate(
+                it->page_id, it->slot_id, it->before_tuple->clone(),
+                true, "runtime abort undo"
+            );
             runtime_undo_records++;
         }
         log_manager.append("ABORT " + std::to_string(current_txn_id));
@@ -1980,7 +2087,10 @@ void RecoveryManager::recover() {
         }
         auto& metadata = catalog.getTable(record.table_id);
         TableHeap table(metadata, buffer_manager);
-        table.applyUpdate(record.page_id, record.slot_id, record.after_tuple->clone());
+        table.applyUpdate(
+            record.page_id, record.slot_id, record.after_tuple->clone(),
+            true, "restart redo"
+        );
         redone++;
     }
 
@@ -1992,7 +2102,10 @@ void RecoveryManager::recover() {
         }
         auto& metadata = catalog.getTable(it->table_id);
         TableHeap table(metadata, buffer_manager);
-        table.applyUpdate(it->page_id, it->slot_id, it->before_tuple->clone());
+        table.applyUpdate(
+            it->page_id, it->slot_id, it->before_tuple->clone(),
+            true, "restart undo"
+        );
         losers[it->txn_id] = true;
         undone++;
     }
@@ -2070,7 +2183,7 @@ void RecoveryManager::maybeCrashAfterSteal(PageID page_id) {
         return;
     }
 
-    buffer_manager.flushPage(page_id);
+    buffer_manager.flushPage(page_id, "uncommitted flush");
     std::cout << "  recovery: stole dirty page " << page_id
               << " before COMMIT" << std::endl;
     std::cout << "  crash: after uncommitted page flush, before COMMIT log" << std::endl;
@@ -2091,31 +2204,14 @@ void RecoveryManager::printSummary() {
 
     std::cout << "Recovery policy summary:" << std::endl;
     std::cout << "  Policy: Undo/Redo WAL (Steal + No-Force)" << std::endl;
-    std::cout << "  Log records written this run: " << log_manager.getRecordsWritten() << std::endl;
-    std::cout << "  Log bytes written this run: " << log_manager.getBytesWritten() << std::endl;
     std::cout << "  Log pages written this run: " << pagesForBytes(log_manager.getBytesWritten()) << std::endl;
-    std::cout << "  Log bytes on disk: " << log_manager.getBytesOnDisk() << std::endl;
     std::cout << "  Log pages on disk: " << pagesForBytes(log_manager.getBytesOnDisk()) << std::endl;
     std::cout << "  Before-image records logged: " << before_image_records_logged << std::endl;
-    std::cout << "  Before-image bytes logged: " << before_image_bytes_logged << std::endl;
-    std::cout << "  Before-image payload pages in log: "
-              << pagesForBytes(before_image_bytes_logged) << std::endl;
     std::cout << "  After-image records logged: " << after_image_records_logged << std::endl;
-    std::cout << "  After-image bytes logged: " << after_image_bytes_logged << std::endl;
-    std::cout << "  After-image payload pages in log: "
-              << pagesForBytes(after_image_bytes_logged) << std::endl;
-    std::cout << "  Committed update records: " << committed_update_records << std::endl;
-    std::cout << "  Runtime abort update records: " << aborted_update_records << std::endl;
     std::cout << "  Runtime undo records applied: " << runtime_undo_records << std::endl;
     std::cout << "  Restart undo records applied: " << restart_undo_records << std::endl;
     std::cout << "  Restart redo records applied: " << restart_redo_records << std::endl;
-    std::cout << "  WAL update log forces: " << wal_update_log_forces << std::endl;
-    std::cout << "  COMMIT log forces: " << commit_log_forces << std::endl;
-    std::cout << "  ABORT log records written: " << abort_log_records << std::endl;
-    std::cout << "  Full data page images written: 0" << std::endl;
-    std::cout << "  Full catalog page images written: 0" << std::endl;
     std::cout << "  Data pages forced at commit: " << data_pages_forced_at_commit << std::endl;
-    std::cout << "  Total pages in buzzdb.dat at end: " << buffer_manager.getNumPages() << std::endl;
 }
 
 class HashIndex {
@@ -2866,7 +2962,7 @@ public:
             // Update aggregate values
             auto& aggr_values = hash_table[group_keys];
             for (size_t i = 0; i < aggr_funcs.size(); ++i) {
-                // Simplified update logic for demonstration
+                // Simplified update logic for this toy engine.
                 // You'll need to implement actual aggregation logic here
                 aggr_values[i] = updateAggregate(aggr_funcs[i], aggr_values[i], *tuple[aggr_funcs[i].attr_index]);
             }
@@ -3657,6 +3753,10 @@ public:
         return catalog.listUserTableNames();
     }
 
+    void printBufferPoolSummary() const {
+        buffer_manager.printBufferPoolSummary();
+    }
+
     // NEW: helpers
     TxnPtr begin() { return txn_manager.begin(); }
     void commit(const TxnPtr& tx) { txn_manager.commit(*tx); }
@@ -3954,7 +4054,7 @@ public:
             );
         }
 
-        buffer_manager.flushAllPages();
+        buffer_manager.flushAllPages("bulk load");
 
         for (const auto& table_name : touched_tables) {
             catalog.persistTableMetadata(catalog.getTable(table_name));
@@ -4028,8 +4128,10 @@ int main(int argc, char* argv[]) {
     BuzzDB db;
     std::string mode = argc > 1 && std::string(argv[1]).rfind("--", 0) == 0
         ? argv[1] : "";
-    bool crash_demo = mode == "--crash-demo";
-    bool loser_crash_demo = mode == "--loser-crash-demo";
+    bool crash_after_uncommitted_flush =
+        mode == "--crash-after-uncommitted-flush";
+    bool crash_after_commit_record =
+        mode == "--crash-after-commit-record";
     int data_arg = mode.empty() ? 1 : 2;
     std::string data_filename = argc > data_arg ? argv[data_arg] : "booking.txt";
 
@@ -4037,7 +4139,7 @@ int main(int argc, char* argv[]) {
     for (const auto& table_name : existing_tables) {
         if (!isBookingTableName(table_name)) {
             throw std::runtime_error(
-                "This v58 booking demo cannot open a buzzdb.dat containing "
+                "This v58 booking workload cannot open a buzzdb.dat containing "
                 "older tables such as '" + table_name + "'. "
                 "Use a fresh directory or remove the old buzzdb.dat."
             );
@@ -4073,25 +4175,23 @@ int main(int argc, char* argv[]) {
     bool seed_booking_tables =
         flights_table.created || seats_table.created || holds_table.created;
     std::string script;
-    if (crash_demo || loser_crash_demo) {
+    if (crash_after_uncommitted_flush || crash_after_commit_record) {
         if (!seed_booking_tables) {
             throw std::runtime_error(mode + " expects a fresh buzzdb.dat.");
         }
 
         db.loadDataFile(data_filename);
-        if (loser_crash_demo) {
+        if (crash_after_uncommitted_flush) {
             db.recovery_manager.simulateCrashAfterStealBeforeCommit();
         } else {
             db.recovery_manager.simulateCrashAfterCommitBeforeFlush();
         }
         script += R"(
-INSERT holds|1|1|1|alice|held;
 BEGIN;
 UPDATE seats SET status=sold, customer=alice WHERE seat_no=1A;
 )";
-        if (!loser_crash_demo) {
+        if (!crash_after_uncommitted_flush) {
             script += R"(
-UPDATE holds SET status=sold WHERE id=1;
 COMMIT;
 )";
         }
@@ -4103,41 +4203,37 @@ COMMIT;
     if (seed_booking_tables) {
         db.loadDataFile(data_filename);
         script += R"(
-INSERT holds|1|1|1|alice|held;
-INSERT holds|2|1|2|bob|held;
 BEGIN;
-UPDATE seats SET status=held, customer=alice WHERE seat_no=1A;
-UPDATE seats SET status=sold WHERE seat_no=1A;
-UPDATE holds SET status=sold WHERE id=1;
-UPDATE seats SET status=held, customer=bob WHERE seat_no=1B;
-UPDATE seats SET status=available, customer=none WHERE seat_no=1B;
-UPDATE holds SET status=void WHERE id=2;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1A;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1B;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1C;
 COMMIT;
 BEGIN;
-UPDATE seats SET status=held, customer=chris WHERE seat_no=2A;
+UPDATE seats SET status=held, customer=patel WHERE seat_no=1B;
 ABORT;
 BEGIN;
-PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
+UPDATE seats SET status=held, customer=lee WHERE seat_no=2A;
 COMMIT;
 BEGIN;
-UPDATE seats SET status=held, customer=chris WHERE seat_no=2A;
+UPDATE seats SET status=held, customer=chen WHERE seat_no=2A;
+ABORT;
+BEGIN;
+UPDATE seats SET status=held, customer=nguyen WHERE seat_no=2B;
+PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
+COMMIT;
+)";
+    } else {
+        script += R"(
+BEGIN;
+PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
 COMMIT;
 )";
     }
 
-    script += R"(
-BEGIN;
-UPDATE seats SET status=held, customer=demo WHERE seat_no=2B;
-ABORT;
-BEGIN;
-PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
-PROJECT {holds.customer}, {seats.seat_no}, {holds.status}, {flights.flight_no}, {flights.origin}, {flights.destination} FROM holds JOIN seats ON {holds.seat_id} = {seats.id} JOIN flights ON {holds.flight_id} = {flights.id};
-COMMIT;
-)";
-
     db.recovery_manager.printPolicy();
     db.execute(script);
     db.recovery_manager.printSummary();
+    db.printBufferPoolSummary();
     
     return 0;
 }

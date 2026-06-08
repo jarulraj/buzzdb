@@ -208,11 +208,12 @@ public:
     }
 };
 
-static constexpr size_t PAGE_SIZE = 4096;  // Fixed page size
-static constexpr size_t MAX_SLOTS = 512;   // Fixed number of slots
+static constexpr size_t PAGE_SIZE = 128;  // Tiny pages for recovery workloads
+static constexpr size_t MAX_SLOTS = 4;    // Small slot directory leaves tuple space
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
 
 using PageID = uint16_t;
+using BootstrapPageID = uint8_t;
 using TableId = uint16_t;
 
 constexpr PageID INVALID_PAGE_ID = std::numeric_limits<PageID>::max();
@@ -222,14 +223,14 @@ constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
 constexpr uint32_t BUZZDB_MAGIC = 0x425A4442;
 constexpr uint16_t BUZZDB_VERSION = 55;
-constexpr size_t MAX_SYSTEM_TABLE_PAGES = 32;
+constexpr size_t MAX_SYSTEM_TABLE_PAGES = 16;
 
 struct CatalogRoot {
     uint64_t catalog_version = 0;
     uint16_t tables_page_count = 0;
-    PageID tables_pages[MAX_SYSTEM_TABLE_PAGES] = {};
+    BootstrapPageID tables_pages[MAX_SYSTEM_TABLE_PAGES] = {};
     uint16_t columns_page_count = 0;
-    PageID columns_pages[MAX_SYSTEM_TABLE_PAGES] = {};
+    BootstrapPageID columns_pages[MAX_SYSTEM_TABLE_PAGES] = {};
     uint32_t checksum = 0;
 };
 
@@ -240,6 +241,9 @@ struct BootstrapPage {
     TableId next_table_id = FIRST_USER_TABLE_ID;
     CatalogRoot catalog_roots[2];
 };
+
+static_assert(sizeof(BootstrapPage) <= PAGE_SIZE,
+              "BootstrapPage must fit in page 0.");
 
 struct GarbageCollectionStats {
     size_t pages_before = 0;
@@ -258,8 +262,8 @@ uint32_t catalogRootChecksum(const CatalogRoot& root) {
     mix(root.catalog_version);
     mix(root.tables_page_count);
     mix(root.columns_page_count);
-    for (PageID page_id : root.tables_pages) mix(page_id);
-    for (PageID page_id : root.columns_pages) mix(page_id);
+    for (BootstrapPageID page_id : root.tables_pages) mix(page_id);
+    for (BootstrapPageID page_id : root.columns_pages) mix(page_id);
     return checksum == 0 ? 1 : checksum;
 }
 
@@ -1398,7 +1402,7 @@ private:
     }
 
     static std::vector<PageID> bootstrapPageIds(uint16_t page_count,
-                                                const PageID* pages) {
+                                                const BootstrapPageID* pages) {
         std::vector<PageID> page_ids;
         for (uint16_t i = 0; i < page_count; i++) {
             page_ids.push_back(pages[i]);
@@ -1407,14 +1411,20 @@ private:
     }
 
     static void storeBootstrapPageIds(uint16_t& page_count,
-                                      PageID* pages,
+                                      BootstrapPageID* pages,
                                       const std::vector<PageID>& page_ids) {
         if (page_ids.size() > MAX_SYSTEM_TABLE_PAGES) {
             throw std::runtime_error("System table page list is too large.");
         }
         page_count = static_cast<uint16_t>(page_ids.size());
         for (size_t i = 0; i < MAX_SYSTEM_TABLE_PAGES; i++) {
-            pages[i] = i < page_ids.size() ? page_ids[i] : INVALID_PAGE_ID;
+            if (i < page_ids.size() &&
+                page_ids[i] > std::numeric_limits<BootstrapPageID>::max()) {
+                throw std::runtime_error("System table page id is too large for bootstrap.");
+            }
+            pages[i] = i < page_ids.size()
+                ? static_cast<BootstrapPageID>(page_ids[i])
+                : std::numeric_limits<BootstrapPageID>::max();
         }
     }
 
@@ -1671,6 +1681,7 @@ private:
     std::optional<TableMetadata> findTableRecord(Predicate predicate) {
         auto& tables_metadata = getTable(SYS_TABLES_ID);
         TableHeap tables_heap(tables_metadata, buffer_manager);
+        std::optional<TableMetadata> found;
 
         // __tables holds table metadata; __columns holds schemas.
         for (auto& tuple : tables_heap.readAllTuples()) {
@@ -1698,11 +1709,11 @@ private:
             };
 
             if (predicate(candidate)) {
-                return candidate;
+                found = std::move(candidate);
             }
         }
 
-        return std::nullopt;
+        return found;
     }
 
     void loadColumns(TableMetadata& metadata) {
@@ -1824,17 +1835,35 @@ void RecoveryManager::printPolicy() const {
 }
 
 void RecoveryManager::printSummary() {
+    size_t runtime_shadow_page_writes =
+        committed_data_pages_copied + aborted_data_pages_copied + catalog_pages_copied;
+
     std::cout << "Recovery policy summary:" << std::endl;
     std::cout << "  Policy: No-Undo/No-Redo (Shadow Paging)" << std::endl;
     std::cout << "  Log records written: 0" << std::endl;
     std::cout << "  Restart log records scanned: 0" << std::endl;
-    std::cout << "  Committed data pages copied: " << committed_data_pages_copied << std::endl;
-    std::cout << "  Aborted data pages copied: " << aborted_data_pages_copied << std::endl;
-    std::cout << "  Catalog pages copied/updated: " << catalog_pages_copied << std::endl;
     std::cout << "  Catalog root switches: " << catalog_root_switches << std::endl;
-    std::cout << "  Garbage collections: " << garbage_collections << std::endl;
     std::cout << "  Pages reclaimed by GC: " << garbage_pages_reclaimed << std::endl;
-    std::cout << "  Total pages in buzzdb.dat at end: " << buffer_manager.getNumPages() << std::endl;
+    std::cout << "Shadow paging write summary:" << std::endl;
+    std::cout << "  Restart recovery database page writes: 0" << std::endl;
+    std::cout << "  Runtime shadow-copy database page writes: "
+              << runtime_shadow_page_writes << std::endl;
+    if (runtime_shadow_page_writes != 0) {
+        std::cout << "  Runtime shadow-copy writes by tag:" << std::endl;
+        if (committed_data_pages_copied != 0) {
+            std::cout << "    shadow committed data copy: "
+                      << committed_data_pages_copied << std::endl;
+        }
+        if (aborted_data_pages_copied != 0) {
+            std::cout << "    shadow aborted data copy: "
+                      << aborted_data_pages_copied << std::endl;
+        }
+        if (catalog_pages_copied != 0) {
+            std::cout << "    shadow catalog/root copy: "
+                      << catalog_pages_copied << std::endl;
+        }
+    }
+    std::cout << "  User-data buffer-pressure database page writes: 0" << std::endl;
 }
 
 PageID RecoveryManager::getShadowPage(PageID page_id) const {
@@ -3773,8 +3802,15 @@ bool isBookingTableName(const std::string& table_name) {
 int main(int argc, char* argv[]) {
 
     BuzzDB db;
-    bool crash_demo = argc > 1 && std::string(argv[1]) == "--crash-demo";
-    std::string data_filename = argc > (crash_demo ? 2 : 1) ? argv[crash_demo ? 2 : 1] : "booking.txt";
+    std::string mode = argc > 1 && std::string(argv[1]).rfind("--", 0) == 0
+        ? argv[1] : "";
+    bool crash_after_uncommitted_flush =
+        mode == "--crash-after-uncommitted-flush";
+    bool crash_after_commit_record =
+        mode == "--crash-after-commit-record";
+    bool crash_mode = crash_after_uncommitted_flush || crash_after_commit_record;
+    int data_arg = mode.empty() ? 1 : 2;
+    std::string data_filename = argc > data_arg ? argv[data_arg] : "booking.txt";
 
     auto existing_tables = db.userTableNames();
     for (const auto& table_name : existing_tables) {
@@ -3814,12 +3850,16 @@ int main(int argc, char* argv[]) {
     bool seed_booking_tables =
         flights_table.created || seats_table.created || holds_table.created;
     std::string script;
-    if (crash_demo) {
+    if (crash_mode) {
         if (!seed_booking_tables) {
-            throw std::runtime_error("--crash-demo expects a fresh buzzdb.dat.");
+            throw std::runtime_error(mode + " expects a fresh buzzdb.dat.");
         }
 
         db.loadDataFile(data_filename);
+        if (crash_after_commit_record) {
+            std::cout << "Shadow paging has no COMMIT log record; "
+                      << "crashing before the catalog root switch." << std::endl;
+        }
         db.recovery_manager.simulateCrashBeforeCatalogRootSwitch();
         script += R"(
 INSERT holds|1|1|1|alice|held;
@@ -3836,37 +3876,32 @@ COMMIT;
     if (seed_booking_tables) {
         db.loadDataFile(data_filename);
         script += R"(
-INSERT holds|1|1|1|alice|held;
-INSERT holds|2|1|2|bob|held;
 BEGIN;
-UPDATE seats SET status=held, customer=alice WHERE seat_no=1A;
-UPDATE seats SET status=sold WHERE seat_no=1A;
-UPDATE holds SET status=sold WHERE id=1;
-UPDATE seats SET status=held, customer=bob WHERE seat_no=1B;
-UPDATE seats SET status=available, customer=none WHERE seat_no=1B;
-UPDATE holds SET status=void WHERE id=2;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1A;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1B;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1C;
 COMMIT;
 BEGIN;
-UPDATE seats SET status=held, customer=chris WHERE seat_no=2A;
+UPDATE seats SET status=held, customer=patel WHERE seat_no=1B;
 ABORT;
 BEGIN;
-PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
+UPDATE seats SET status=held, customer=lee WHERE seat_no=2A;
 COMMIT;
 BEGIN;
-UPDATE seats SET status=held, customer=chris WHERE seat_no=2A;
+UPDATE seats SET status=held, customer=chen WHERE seat_no=2A;
+ABORT;
+BEGIN;
+UPDATE seats SET status=held, customer=nguyen WHERE seat_no=2B;
+PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
+COMMIT;
+)";
+    } else {
+        script += R"(
+BEGIN;
+PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
 COMMIT;
 )";
     }
-
-    script += R"(
-BEGIN;
-UPDATE seats SET status=held, customer=demo WHERE seat_no=2B;
-ABORT;
-BEGIN;
-PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
-PROJECT {holds.customer}, {seats.seat_no}, {holds.status}, {flights.flight_no}, {flights.origin}, {flights.destination} FROM holds JOIN seats ON {holds.seat_id} = {seats.id} JOIN flights ON {holds.flight_id} = {flights.id};
-COMMIT;
-)";
 
     db.recovery_manager.printPolicy();
     db.execute(script);
