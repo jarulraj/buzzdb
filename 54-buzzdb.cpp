@@ -618,40 +618,7 @@ public:
         return storage_manager.num_pages == 0;
     }
 
-    BootstrapPage getBootstrap() {
-        if (storage_manager.num_pages == 0) {
-            throw std::runtime_error("Bootstrap page is not initialized.");
-        }
 
-        // Page 0 points to catalog roots.
-        BootstrapPage bootstrap;
-        auto& page = getPage(0);
-        std::memcpy(&bootstrap, page->page_data.get(), sizeof(BootstrapPage));
-        if (bootstrap.magic != BUZZDB_MAGIC || bootstrap.version != BUZZDB_VERSION) {
-            throw std::runtime_error(database_filename + " is not a v48 BuzzDB file.");
-        }
-        return bootstrap;
-    }
-
-    void initializeBootstrap(const BootstrapPage& bootstrap) {
-        if (storage_manager.num_pages != 0) {
-            throw std::runtime_error("Cannot initialize bootstrap page in a non-empty database.");
-        }
-
-        // Reserve page 0 before table heap pages.
-        storage_manager.extend();
-        auto& page = getPage(0);
-        std::memset(page->page_data.get(), 0, PAGE_SIZE);
-        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
-        flushPage(0);
-    }
-
-    void flushBootstrap(const BootstrapPage& bootstrap) {
-        auto& page = getPage(0);
-        std::memset(page->page_data.get(), 0, PAGE_SIZE);
-        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
-        flushPage(0);
-    }
 
 };
 
@@ -965,7 +932,7 @@ public:
             return;
         }
 
-        const auto& bootstrap_page = buffer_manager.getBootstrap();
+        const auto& bootstrap_page = getBootstrap();
         installSystemTables(bootstrap_page);
         next_table_id = bootstrap_page.next_table_id;
     }
@@ -1058,6 +1025,42 @@ public:
     }
 
 private:
+    BootstrapPage getBootstrap() {
+        if (buffer_manager.isEmptyDatabase()) {
+            throw std::runtime_error("Bootstrap page is not initialized.");
+        }
+
+        // Page 0 points to catalog roots.
+        BootstrapPage bootstrap;
+        auto& page = buffer_manager.getPage(0);
+        std::memcpy(&bootstrap, page->page_data.get(), sizeof(BootstrapPage));
+        if (bootstrap.magic != BUZZDB_MAGIC || bootstrap.version != BUZZDB_VERSION) {
+            throw std::runtime_error(database_filename + " is not a v48 BuzzDB file.");
+        }
+        return bootstrap;
+    }
+
+    void initializeBootstrap(const BootstrapPage& bootstrap) {
+        if (!buffer_manager.isEmptyDatabase()) {
+            throw std::runtime_error("Cannot initialize bootstrap page in a non-empty database.");
+        }
+
+        // Reserve page 0 before table heap pages.
+        PageID bootstrap_page_id = buffer_manager.extend();
+        assert(bootstrap_page_id == 0);
+        auto& page = buffer_manager.getPage(0);
+        std::memset(page->page_data.get(), 0, PAGE_SIZE);
+        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
+        buffer_manager.flushPage(0);
+    }
+
+    void flushBootstrap(const BootstrapPage& bootstrap) {
+        auto& page = buffer_manager.getPage(0);
+        std::memset(page->page_data.get(), 0, PAGE_SIZE);
+        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
+        buffer_manager.flushPage(0);
+    }
+
     static void validateSchema(const std::string& table_name,
                                const TableSchema& existing_schema,
                                const TableSchema& requested_schema) {
@@ -1140,13 +1143,13 @@ private:
 
     void initializeNewDatabase() {
         BootstrapPage bootstrap_page;
-        buffer_manager.initializeBootstrap(bootstrap_page);
+        initializeBootstrap(bootstrap_page);
 
         // Give system catalog tables their first heap pages.
         PageID tables_page = buffer_manager.extend(SYS_TABLES_ID);
         PageID columns_page = buffer_manager.extend(SYS_COLUMNS_ID);
 
-        bootstrap_page = buffer_manager.getBootstrap();
+        bootstrap_page = getBootstrap();
         storeBootstrapPageIds(bootstrap_page.tables_page_count,
                               bootstrap_page.tables_pages,
                               std::vector<PageID>{tables_page});
@@ -1154,7 +1157,7 @@ private:
                               bootstrap_page.columns_pages,
                               std::vector<PageID>{columns_page});
         bootstrap_page.next_table_id = FIRST_USER_TABLE_ID;
-        buffer_manager.flushBootstrap(bootstrap_page);
+        flushBootstrap(bootstrap_page);
 
         installSystemTables(bootstrap_page);
 
@@ -1199,13 +1202,13 @@ private:
     }
 
     void persistNextTableId() {
-        BootstrapPage bootstrap_page = buffer_manager.getBootstrap();
+        BootstrapPage bootstrap_page = getBootstrap();
         bootstrap_page.next_table_id = next_table_id;
-        buffer_manager.flushBootstrap(bootstrap_page);
+        flushBootstrap(bootstrap_page);
     }
 
     void syncSystemTableBootstrap(const TableMetadata& metadata) {
-        BootstrapPage bootstrap_page = buffer_manager.getBootstrap();
+        BootstrapPage bootstrap_page = getBootstrap();
 
         // Keep page 0 in sync when a system table grows.
         if (metadata.table_id == SYS_TABLES_ID) {
@@ -1220,7 +1223,7 @@ private:
             return;
         }
 
-        buffer_manager.flushBootstrap(bootstrap_page);
+        flushBootstrap(bootstrap_page);
     }
 
     void insertSystemTuple(TableId system_table_id, std::unique_ptr<Tuple> tuple) {

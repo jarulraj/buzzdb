@@ -854,45 +854,7 @@ public:
         return storage_manager.num_pages == 0;
     }
 
-    BootstrapPage getBootstrap() {
-        if (storage_manager.num_pages == 0) {
-            throw std::runtime_error("Bootstrap page is not initialized.");
-        }
 
-        // Page 0 points to catalog roots.
-        BootstrapPage bootstrap;
-        auto& page = getPage(0);
-        std::memcpy(&bootstrap, page->page_data.get(), sizeof(BootstrapPage));
-        if (bootstrap.magic != BUZZDB_MAGIC || bootstrap.version != BUZZDB_VERSION) {
-            throw std::runtime_error(
-                database_filename +
-                " was created by an older BuzzDB format. "
-                "v58 uses undo/redo WAL recovery metadata; use a fresh directory or remove buzzdb.dat."
-            );
-        }
-        return bootstrap;
-    }
-
-    void initializeBootstrap(const BootstrapPage& bootstrap) {
-        if (storage_manager.num_pages != 0) {
-            throw std::runtime_error("Cannot initialize bootstrap page in a non-empty database.");
-        }
-
-        // Reserve page 0 before table heap pages.
-        storage_manager.extend();
-        recordDataPageWrite("bootstrap page allocation");
-        auto& page = getPage(0);
-        std::memset(page->page_data.get(), 0, PAGE_SIZE);
-        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
-        flushPage(0, "bootstrap");
-    }
-
-    void flushBootstrap(const BootstrapPage& bootstrap) {
-        auto& page = getPage(0);
-        std::memset(page->page_data.get(), 0, PAGE_SIZE);
-        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
-        flushPage(0, "bootstrap");
-    }
 
 };
 
@@ -917,6 +879,7 @@ public:
             throw std::runtime_error("Unable to append to recovery log.");
         }
         output << record << "\n";
+        // v58 forces every log append; v59 will compare pageLSN to flushedLSN.
         output.flush();
         records_written++;
         bytes_written += record.size() + 1;
@@ -1311,7 +1274,7 @@ public:
             return;
         }
 
-        const auto& bootstrap_page = buffer_manager.getBootstrap();
+        const auto& bootstrap_page = getBootstrap();
         installSystemTables(bootstrap_page);
         next_table_id = bootstrap_page.next_table_id;
     }
@@ -1423,7 +1386,7 @@ public:
             persistTableRecordInHeap(shadow_tables_metadata, metadata, false);
         }
 
-        BootstrapPage bootstrap_page = buffer_manager.getBootstrap();
+        BootstrapPage bootstrap_page = getBootstrap();
         const auto& active_root = activeCatalogRoot(bootstrap_page);
         auto& new_root = inactiveCatalogRoot(bootstrap_page);
         new_root = active_root;
@@ -1438,7 +1401,7 @@ public:
         }
 
         // The catalog root switch is the shadow transaction commit point.
-        buffer_manager.flushBootstrap(bootstrap_page);
+        flushBootstrap(bootstrap_page);
         tables_metadata.page_ids = shadow_tables_metadata.page_ids;
         tables_metadata.first_page = shadow_tables_metadata.first_page;
         tables_metadata.last_page = shadow_tables_metadata.last_page;
@@ -1453,7 +1416,7 @@ public:
         }
 
         buffer_manager.flushAllPages("gc flush all");
-        BootstrapPage old_bootstrap = buffer_manager.getBootstrap();
+        BootstrapPage old_bootstrap = getBootstrap();
         const auto& old_root = activeCatalogRoot(old_bootstrap);
         auto old_tables_pages = bootstrapPageIds(old_root.tables_page_count,
                                                  old_root.tables_pages);
@@ -1585,6 +1548,46 @@ public:
     }
 
 private:
+    BootstrapPage getBootstrap() {
+        if (buffer_manager.isEmptyDatabase()) {
+            throw std::runtime_error("Bootstrap page is not initialized.");
+        }
+
+        // Page 0 points to catalog roots.
+        BootstrapPage bootstrap;
+        auto& page = buffer_manager.getPage(0);
+        std::memcpy(&bootstrap, page->page_data.get(), sizeof(BootstrapPage));
+        if (bootstrap.magic != BUZZDB_MAGIC || bootstrap.version != BUZZDB_VERSION) {
+            throw std::runtime_error(
+                database_filename +
+                " was created by an older BuzzDB format. "
+                "v58 uses undo/redo WAL recovery metadata; use a fresh directory or remove buzzdb.dat."
+            );
+        }
+        return bootstrap;
+    }
+
+    void initializeBootstrap(const BootstrapPage& bootstrap) {
+        if (!buffer_manager.isEmptyDatabase()) {
+            throw std::runtime_error("Cannot initialize bootstrap page in a non-empty database.");
+        }
+
+        // Reserve page 0 before table heap pages.
+        PageID bootstrap_page_id = buffer_manager.extend(INVALID_TABLE_ID, "bootstrap");
+        assert(bootstrap_page_id == 0);
+        auto& page = buffer_manager.getPage(0);
+        std::memset(page->page_data.get(), 0, PAGE_SIZE);
+        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
+        buffer_manager.flushPage(0, "bootstrap");
+    }
+
+    void flushBootstrap(const BootstrapPage& bootstrap) {
+        auto& page = buffer_manager.getPage(0);
+        std::memset(page->page_data.get(), 0, PAGE_SIZE);
+        std::memcpy(page->page_data.get(), &bootstrap, sizeof(BootstrapPage));
+        buffer_manager.flushPage(0, "bootstrap");
+    }
+
     static void validateSchema(const std::string& table_name,
                                const TableSchema& existing_schema,
                                const TableSchema& requested_schema) {
@@ -1673,13 +1676,13 @@ private:
 
     void initializeNewDatabase() {
         BootstrapPage bootstrap_page;
-        buffer_manager.initializeBootstrap(bootstrap_page);
+        initializeBootstrap(bootstrap_page);
 
         // Give system catalog tables their first heap pages.
         PageID tables_page = buffer_manager.extend(SYS_TABLES_ID, "system table create");
         PageID columns_page = buffer_manager.extend(SYS_COLUMNS_ID, "system table create");
 
-        bootstrap_page = buffer_manager.getBootstrap();
+        bootstrap_page = getBootstrap();
         auto& catalog_root = bootstrap_page.catalog_roots[0];
         catalog_root.catalog_version = 1;
         storeBootstrapPageIds(catalog_root.tables_page_count,
@@ -1690,7 +1693,7 @@ private:
                               std::vector<PageID>{columns_page});
         catalog_root.checksum = catalogRootChecksum(catalog_root);
         bootstrap_page.next_table_id = FIRST_USER_TABLE_ID;
-        buffer_manager.flushBootstrap(bootstrap_page);
+        flushBootstrap(bootstrap_page);
 
         installSystemTables(bootstrap_page);
 
@@ -1736,13 +1739,13 @@ private:
     }
 
     void persistNextTableId() {
-        BootstrapPage bootstrap_page = buffer_manager.getBootstrap();
+        BootstrapPage bootstrap_page = getBootstrap();
         bootstrap_page.next_table_id = next_table_id;
-        buffer_manager.flushBootstrap(bootstrap_page);
+        flushBootstrap(bootstrap_page);
     }
 
     void syncSystemTableBootstrap(const TableMetadata& metadata) {
-        BootstrapPage bootstrap_page = buffer_manager.getBootstrap();
+        BootstrapPage bootstrap_page = getBootstrap();
         const auto& active_root = activeCatalogRoot(bootstrap_page);
         auto& new_root = inactiveCatalogRoot(bootstrap_page);
         new_root = active_root;
@@ -1762,7 +1765,7 @@ private:
         }
 
         new_root.checksum = catalogRootChecksum(new_root);
-        buffer_manager.flushBootstrap(bootstrap_page);
+        flushBootstrap(bootstrap_page);
     }
 
     void insertSystemTuple(TableId system_table_id, std::unique_ptr<Tuple> tuple) {
