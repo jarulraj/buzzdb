@@ -1007,6 +1007,7 @@ public:
 
 struct WalUpdate {
     LSN lsn = 0;
+    LSN prev_lsn = 0;
     TableId table_id;
     PageID page_id;
     size_t slot_id;
@@ -1014,7 +1015,7 @@ struct WalUpdate {
     std::unique_ptr<Tuple> after_tuple;
 };
 
-// Recovery policy for v61: ARIES analysis with a dirty page table.
+// Recovery policy for v61: ARIES DPT/pageLSN redo with CLRs.
 class RecoveryManager {
 private:
     enum class TxnStatus {
@@ -1049,10 +1050,10 @@ private:
     size_t runtime_undo_records = 0;
     size_t restart_undo_records = 0;
     size_t restart_redo_records = 0;
+    size_t clr_records_logged = 0;
     size_t restart_redo_records_examined = 0;
     size_t restart_redo_records_skipped_by_dpt = 0;
     size_t restart_redo_records_skipped_by_page_lsn = 0;
-    size_t restart_redo_records_skipped_non_winner = 0;
     size_t commit_log_forces = 0;
     size_t data_pages_forced_at_commit = 0;
     size_t abort_log_records = 0;
@@ -1093,6 +1094,27 @@ private:
             *prev_lsn_out = prev_lsn;
         }
         return lsn;
+    }
+
+    LSN appendClrRecord(int txn_id,
+                        LSN prev_lsn,
+                        LSN undo_next_lsn,
+                        TableId table_id,
+                        PageID page_id,
+                        size_t slot_id,
+                        Tuple& after_undo_tuple) {
+        auto after_undo_image = after_undo_tuple.serialize();
+        LSN clr_lsn = log_manager.append(
+            "CLR " + std::to_string(txn_id) + " " +
+            std::to_string(prev_lsn) + " " +
+            std::to_string(undo_next_lsn) + " " +
+            std::to_string(table_id) + " " +
+            std::to_string(page_id) + " " +
+            std::to_string(slot_id) + " " +
+            after_undo_image
+        );
+        clr_records_logged++;
+        return clr_lsn;
     }
 
 public:
@@ -1734,7 +1756,7 @@ private:
             throw std::runtime_error(
                 database_filename +
                 " was created by an older BuzzDB format. "
-                "v61 uses ARIES DPT/pageLSN recovery metadata; use a fresh directory or remove buzzdb.dat."
+                "v61 uses ARIES DPT/pageLSN/CLR metadata; use a fresh directory or remove buzzdb.dat."
             );
         }
         return bootstrap;
@@ -2217,9 +2239,25 @@ void RecoveryManager::abort() {
         for (auto it = wal_updates.rbegin(); it != wal_updates.rend(); ++it) {
             auto& metadata = catalog.getTable(it->table_id);
             TableHeap table(metadata, buffer_manager);
+            LSN clr_prev_lsn = current_txn_last_lsn;
+            LSN clr_lsn = appendClrRecord(
+                current_txn_id,
+                clr_prev_lsn,
+                it->prev_lsn,
+                it->table_id,
+                it->page_id,
+                it->slot_id,
+                *it->before_tuple
+            );
+            current_txn_last_lsn = clr_lsn;
+            transaction_table[current_txn_id] = {TxnStatus::ABORTING, clr_lsn};
+            std::cout << "  log: CLR txn " << current_txn_id
+                      << " LSN " << clr_lsn
+                      << " prevLSN " << clr_prev_lsn
+                      << " undoNextLSN " << it->prev_lsn << std::endl;
             table.applyUpdate(
                 it->page_id, it->slot_id, it->before_tuple->clone(),
-                true, "runtime abort undo"
+                true, "runtime abort undo", clr_lsn
             );
             runtime_undo_records++;
         }
@@ -2234,7 +2272,7 @@ void RecoveryManager::abort() {
         abort_log_records++;
         std::cout << "  recovery: restored "
                   << wal_updates.size()
-                  << " before-image record(s), forced restored page(s), wrote ABORT log" << std::endl;
+                  << " before-image record(s), forced restored page(s), wrote CLR+ABORT logs" << std::endl;
     } else {
         std::cout << "  recovery: no updates to discard" << std::endl;
     }
@@ -2265,11 +2303,12 @@ void RecoveryManager::recover() {
         TableId table_id;
         PageID page_id;
         size_t slot_id;
+        bool is_clr = false;
+        LSN undo_next_lsn = 0;
         std::unique_ptr<Tuple> before_tuple;
         std::unique_ptr<Tuple> after_tuple;
     };
 
-    std::map<int, bool> committed;
     std::map<int, TxnTableEntry> analysis_table;
     std::map<PageID, LSN> dirty_page_table;
     std::map<LSN, LSN> prev_lsn_by_lsn;
@@ -2293,7 +2332,6 @@ void RecoveryManager::recover() {
         if (type == "BEGIN") {
             analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
         } else if (type == "COMMIT") {
-            committed[txn_id] = true;
             analysis_table[txn_id] = {TxnStatus::COMMITTING, record_lsn};
         } else if (type == "ABORT") {
             analysis_table[txn_id] = {TxnStatus::ABORTING, record_lsn};
@@ -2316,7 +2354,37 @@ void RecoveryManager::recover() {
                 static_cast<TableId>(table_id),
                 static_cast<PageID>(page_id),
                 slot_id,
+                false,
+                0,
                 Tuple::deserialize(input),
+                Tuple::deserialize(input)
+            });
+        } else if (type == "CLR") {
+            LSN undo_next_lsn;
+            int table_id;
+            int page_id;
+            size_t slot_id;
+            input >> undo_next_lsn >> table_id >> page_id >> slot_id;
+            PageID dirty_page_id = static_cast<PageID>(page_id);
+            if (dirty_page_table.find(dirty_page_id) == dirty_page_table.end()) {
+                dirty_page_table[dirty_page_id] = record_lsn;
+            }
+            auto status = TxnStatus::RUNNING;
+            auto txn_entry = analysis_table.find(txn_id);
+            if (txn_entry != analysis_table.end()) {
+                status = txn_entry->second.status;
+            }
+            analysis_table[txn_id] = {status, record_lsn};
+            wal_records.push_back({
+                record_lsn,
+                prev_lsn,
+                txn_id,
+                static_cast<TableId>(table_id),
+                static_cast<PageID>(page_id),
+                slot_id,
+                true,
+                undo_next_lsn,
+                nullptr,
                 Tuple::deserialize(input)
             });
         }
@@ -2369,10 +2437,6 @@ void RecoveryManager::recover() {
             restart_redo_records_skipped_by_dpt++;
             continue;
         }
-        if (!committed[record.txn_id]) {
-            restart_redo_records_skipped_non_winner++;
-            continue;
-        }
         auto& metadata = catalog.getTable(record.table_id);
         TableHeap table(metadata, buffer_manager);
         auto& page = table.getPage(record.page_id);
@@ -2398,19 +2462,42 @@ void RecoveryManager::recover() {
             continue;
         }
         losers[txn_entry.first] = txn_entry.second;
-        LSN next_lsn = txn_entry.second.last_lsn;
+        LSN txn_last_lsn = txn_entry.second.last_lsn;
+        LSN next_lsn = txn_last_lsn;
         while (next_lsn != 0) {
             auto record = update_by_lsn.find(next_lsn);
             if (record != update_by_lsn.end()) {
+                if (record->second->is_clr) {
+                    next_lsn = record->second->undo_next_lsn;
+                    continue;
+                }
                 auto& metadata = catalog.getTable(record->second->table_id);
                 TableHeap table(metadata, buffer_manager);
+                LSN clr_lsn = appendClrRecord(
+                    txn_entry.first,
+                    txn_last_lsn,
+                    record->second->prev_lsn,
+                    record->second->table_id,
+                    record->second->page_id,
+                    record->second->slot_id,
+                    *record->second->before_tuple
+                );
+                losers[txn_entry.first] = {txn_entry.second.status, clr_lsn};
+                std::cout << "  log: CLR txn " << txn_entry.first
+                          << " LSN " << clr_lsn
+                          << " prevLSN " << txn_last_lsn
+                          << " undoNextLSN " << record->second->prev_lsn
+                          << " during restart" << std::endl;
                 table.applyUpdate(
                     record->second->page_id,
                     record->second->slot_id,
                     record->second->before_tuple->clone(),
-                    true, "restart undo", record->second->lsn
+                    true, "restart undo", clr_lsn
                 );
                 undone++;
+                txn_last_lsn = clr_lsn;
+                next_lsn = record->second->prev_lsn;
+                continue;
             }
 
             auto prev_lsn = prev_lsn_by_lsn.find(next_lsn);
@@ -2456,8 +2543,8 @@ void RecoveryManager::recover() {
     restart_undo_records += undone;
     if (redone != 0 || undone != 0) {
         std::cout << "Restart recovery: redid " << redone
-                  << " winner after-image record(s), undid " << undone
-                  << " loser before-image record(s)." << std::endl;
+                  << " history record(s), undid " << undone
+                  << " loser update record(s)." << std::endl;
     }
 }
 
@@ -2511,6 +2598,7 @@ LSN RecoveryManager::logUpdate(TableId table_id,
 
     WalUpdate update;
     update.lsn = update_lsn;
+    update.prev_lsn = update_prev_lsn;
     update.table_id = table_id;
     update.page_id = page_id;
     update.slot_id = slot_id;
@@ -2549,13 +2637,13 @@ void RecoveryManager::maybeCrashAfterSteal(PageID page_id) {
 }
 
 void RecoveryManager::printPolicy() const {
-    std::cout << "Recovery policy: Undo/Redo WAL + ARIES DPT/pageLSN (Steal + No-Force)" << std::endl;
+    std::cout << "Recovery policy: Undo/Redo WAL + ARIES DPT/pageLSN + CLRs (Steal + No-Force)" << std::endl;
     std::cout << "  Steal: Yes; dirty uncommitted pages may reach disk." << std::endl;
     std::cout << "  Force: No; commit forces the log, not dirty data pages." << std::endl;
     std::cout << "  WAL: page flushes force the log through the page's LSN." << std::endl;
     std::cout << "  Analysis: restart rebuilds the transaction table and dirty page table." << std::endl;
-    std::cout << "  Redo: start at the smallest recLSN and skip pages current by pageLSN." << std::endl;
-    std::cout << "  Undo: loser transactions follow prevLSN to before-images." << std::endl;
+    std::cout << "  Redo: repeat history from the smallest recLSN, using pageLSN skips." << std::endl;
+    std::cout << "  Undo: loser transactions write CLRs and follow undoNextLSN." << std::endl;
 }
 
 void RecoveryManager::printSummary() {
@@ -2564,7 +2652,7 @@ void RecoveryManager::printSummary() {
     };
 
     std::cout << "Recovery policy summary:" << std::endl;
-    std::cout << "  Policy: Undo/Redo WAL + ARIES DPT/pageLSN (Steal + No-Force)" << std::endl;
+    std::cout << "  Policy: Undo/Redo WAL + ARIES DPT/pageLSN + CLRs (Steal + No-Force)" << std::endl;
     std::cout << "  Log pages written this run: " << pagesForBytes(log_manager.getBytesWritten()) << std::endl;
     std::cout << "  Log pages on disk: " << pagesForBytes(log_manager.getBytesOnDisk()) << std::endl;
     std::cout << "  Log force requests: " << log_force_requests << std::endl;
@@ -2572,12 +2660,12 @@ void RecoveryManager::printSummary() {
     std::cout << "  Log force skips: " << log_force_skips << std::endl;
     std::cout << "  Before-image records logged: " << before_image_records_logged << std::endl;
     std::cout << "  After-image records logged: " << after_image_records_logged << std::endl;
+    std::cout << "  CLR records logged: " << clr_records_logged << std::endl;
     std::cout << "  Runtime undo records applied: " << runtime_undo_records << std::endl;
     std::cout << "  Restart undo records applied: " << restart_undo_records << std::endl;
     std::cout << "  Restart redo records examined: " << restart_redo_records_examined << std::endl;
     std::cout << "  Restart redo skipped by DPT/recLSN: " << restart_redo_records_skipped_by_dpt << std::endl;
     std::cout << "  Restart redo skipped by pageLSN: " << restart_redo_records_skipped_by_page_lsn << std::endl;
-    std::cout << "  Restart redo skipped for loser/aborted txns: " << restart_redo_records_skipped_non_winner << std::endl;
     std::cout << "  Restart redo records applied: " << restart_redo_records << std::endl;
     std::cout << "  Data pages forced at commit: " << data_pages_forced_at_commit << std::endl;
 }
