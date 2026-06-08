@@ -693,49 +693,14 @@ public:
         }
     }
 
-    bool insertTuple(std::unique_ptr<Tuple> tuple) {
-        if (metadata.last_page != INVALID_PAGE_ID) {
-            auto& page = getPage(metadata.last_page);
-            if (page->addTuple(tuple->clone())) {
-                if (flush_on_insert) {
-                    buffer_manager.flushPage(metadata.last_page);
-                }
-                metadata.row_count++;
-                return true;
-            }
-        }
-
-        for (PageID page_id : metadata.page_ids) {
-            if (page_id == metadata.last_page) {
-                continue;
-            }
-            auto& page = getPage(page_id);
-            if (page->addTuple(tuple->clone())) {
-                if (flush_on_insert) {
-                    buffer_manager.flushPage(page_id);
-                }
-                metadata.row_count++;
-                return true;
-            }
-        }
-
-        PageID page_id = allocatePage();
+    PageID allocatePage() {
+        PageID page_id = allocatePhysicalPage();
         metadata.page_ids.push_back(page_id);
         if (metadata.first_page == INVALID_PAGE_ID) {
             metadata.first_page = page_id;
         }
         metadata.last_page = page_id;
-
-        auto& page = getPage(page_id);
-        if (page->addTuple(std::move(tuple))) {
-            if (flush_on_insert) {
-                buffer_manager.flushPage(page_id);
-            }
-            metadata.row_count++;
-            return true;
-        }
-
-        return false;
+        return page_id;
     }
 
     std::unique_ptr<SlottedPage>& getPage(PageID page_id) {
@@ -750,8 +715,22 @@ public:
         return metadata.page_ids;
     }
 
+    PageID getLastPage() const {
+        return metadata.last_page;
+    }
+
     TableId getTableId() const {
         return metadata.table_id;
+    }
+
+    void flushInsertedPage(PageID page_id) {
+        if (flush_on_insert) {
+            buffer_manager.flushPage(page_id);
+        }
+    }
+
+    void recordInsertedTuple() {
+        metadata.row_count++;
     }
 
     size_t updateTuples(size_t where_column,
@@ -903,7 +882,7 @@ public:
     }
 
 private:
-    PageID allocatePage() {
+    PageID allocatePhysicalPage() {
         PageID page_id = buffer_manager.extend(metadata.table_id);
         auto& page = buffer_manager.getPage(page_id);
         page->setTableId(metadata.table_id);
@@ -911,6 +890,39 @@ private:
         return page_id;
     }
 };
+
+bool insertTupleIntoTable(TableHeap& table, std::unique_ptr<Tuple> tuple) {
+    auto insertIntoPage = [&](PageID page_id) {
+        auto& page = table.getPage(page_id);
+        if (page->addTuple(tuple->clone())) {
+            table.flushInsertedPage(page_id);
+            table.recordInsertedTuple();
+            return true;
+        }
+        return false;
+    };
+
+    PageID last_page = table.getLastPage();
+    if (last_page != INVALID_PAGE_ID && insertIntoPage(last_page)) {
+        return true;
+    }
+
+    for (PageID page_id : table.getPageIds()) {
+        if (page_id != last_page && insertIntoPage(page_id)) {
+            return true;
+        }
+    }
+
+    PageID page_id = table.allocatePage();
+    auto& page = table.getPage(page_id);
+    if (page->addTuple(std::move(tuple))) {
+        table.flushInsertedPage(page_id);
+        table.recordInsertedTuple();
+        return true;
+    }
+
+    return false;
+}
 
 // Catalog records are stored as ordinary tuples in system tables.
 class Catalog {
@@ -1232,7 +1244,7 @@ private:
 
         // System tables share heap code; only page-0 roots need syncing.
         TableHeap table(metadata, buffer_manager);
-        bool status = table.insertTuple(std::move(tuple));
+        bool status = insertTupleIntoTable(table, std::move(tuple));
         assert(status == true);
 
         if (metadata.last_page != previous_last_page) {
@@ -2897,7 +2909,27 @@ public:
     bool next() override {
         if (!tupleToInsert) return false; // No tuple to insert
 
-        return tableHeap.insertTuple(std::move(tupleToInsert));
+        for (PageID pageId : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(pageId);
+            // Attempt to insert the tuple
+            if (page->addTuple(tupleToInsert->clone())) {
+                // Flush the page to disk after insertion
+                tableHeap.flushInsertedPage(pageId);
+                tableHeap.recordInsertedTuple();
+                return true; // Insertion successful
+            }
+        }
+
+        // If insertion failed in all table pages, allocate one and try again.
+        PageID pageId = tableHeap.allocatePage();
+        auto& newPage = tableHeap.getPage(pageId);
+        if (newPage->addTuple(std::move(tupleToInsert))) {
+            tableHeap.flushInsertedPage(pageId);
+            tableHeap.recordInsertedTuple();
+            return true; // Insertion successful after extending the database
+        }
+
+        return false; // Insertion failed even after extending the database
     }
 
     void close() override {

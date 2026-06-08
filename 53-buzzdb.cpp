@@ -689,39 +689,19 @@ public:
         loadPageIds();
     }
 
-    bool insertTuple(std::unique_ptr<Tuple> tuple) {
-        if (metadata.last_page != INVALID_PAGE_ID) {
-            auto& page = getPage(metadata.last_page);
-            if (page->addTuple(tuple->clone())) {
-                if (flush_on_insert) {
-                    buffer_manager.flushPage(metadata.last_page);
-                }
-                metadata.row_count++;
-                return true;
-            }
-        }
-
-        for (PageID page_id : metadata.page_ids) {
-            if (page_id == metadata.last_page) {
-                continue;
-            }
-            auto& page = getPage(page_id);
-            if (page->addTuple(tuple->clone())) {
-                if (flush_on_insert) {
-                    buffer_manager.flushPage(page_id);
-                }
-                metadata.row_count++;
-                return true;
-            }
-        }
-
+    PageID allocatePage() {
         PageID previous_last_page = metadata.last_page;
-        PageID page_id = allocatePage();
+        PageID page_id = buffer_manager.extend(metadata.table_id);
         metadata.page_ids.push_back(page_id);
         if (metadata.first_page == INVALID_PAGE_ID) {
             metadata.first_page = page_id;
         }
         metadata.last_page = page_id;
+
+        auto& page = buffer_manager.getPage(page_id);
+        page->setTableId(metadata.table_id);
+        page->setPrevPage(INVALID_PAGE_ID);
+        page->setNextPage(INVALID_PAGE_ID);
 
         // Link the new page so the table can be reopened.
         if (previous_last_page != INVALID_PAGE_ID) {
@@ -730,21 +710,13 @@ public:
             if (flush_on_insert) {
                 buffer_manager.flushPage(previous_last_page);
             }
-
-            auto& page = getPage(page_id);
             page->setPrevPage(previous_last_page);
         }
 
-        auto& page = getPage(page_id);
-        if (page->addTuple(std::move(tuple))) {
-            if (flush_on_insert) {
-                buffer_manager.flushPage(page_id);
-            }
-            metadata.row_count++;
-            return true;
+        if (flush_on_insert) {
+            buffer_manager.flushPage(page_id);
         }
-
-        return false;
+        return page_id;
     }
 
     std::unique_ptr<SlottedPage>& getPage(PageID page_id) {
@@ -755,106 +727,34 @@ public:
         return page;
     }
 
+    void flushPage(PageID page_id) {
+        buffer_manager.flushPage(page_id);
+    }
+
     const std::vector<PageID>& getPageIds() const {
         return metadata.page_ids;
+    }
+
+    PageID getLastPage() const {
+        return metadata.last_page;
     }
 
     TableId getTableId() const {
         return metadata.table_id;
     }
 
-    size_t updateTuples(size_t where_column,
-                        const Field& where_value,
-                        const std::vector<std::pair<size_t, Field>>& assignments) {
-        size_t updated_count = 0;
-
-        for (PageID page_id : metadata.page_ids) {
-            auto& page = getPage(page_id);
-            char* page_buffer = page->page_data.get();
-            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
-            bool page_updated = false;
-
-            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
-                if (slot_array[slot_itr].empty) {
-                    continue;
-                }
-
-                assert(slot_array[slot_itr].offset != INVALID_VALUE);
-                const char* tuple_data = page_buffer + slot_array[slot_itr].offset;
-                std::istringstream iss(
-                    std::string(tuple_data, slot_array[slot_itr].length)
-                );
-                auto old_tuple = Tuple::deserialize(iss);
-                if (where_column >= old_tuple->fields.size() ||
-                    !(*old_tuple->fields[where_column] == where_value)) {
-                    continue;
-                }
-
-                auto new_tuple = std::make_unique<Tuple>();
-                for (size_t field_index = 0;
-                     field_index < old_tuple->fields.size();
-                     field_index++) {
-                    const Field* field = old_tuple->fields[field_index].get();
-                    for (const auto& assignment : assignments) {
-                        if (assignment.first == field_index) {
-                            field = &assignment.second;
-                            break;
-                        }
-                    }
-                    new_tuple->addField(field->clone());
-                }
-
-                bool status = page->updateTuple(slot_itr, std::move(new_tuple));
-                assert(status == true);
-                page_updated = true;
-                updated_count++;
-            }
-
-            if (page_updated) {
-                buffer_manager.flushPage(page_id);
-            }
+    void flushInsertedPage(PageID page_id) {
+        if (flush_on_insert) {
+            buffer_manager.flushPage(page_id);
         }
-
-        return updated_count;
     }
 
-    size_t deleteTuples(size_t where_column, const Field& where_value) {
-        size_t deleted_count = 0;
+    void recordInsertedTuple() {
+        metadata.row_count++;
+    }
 
-        for (PageID page_id : metadata.page_ids) {
-            auto& page = getPage(page_id);
-            char* page_buffer = page->page_data.get();
-            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
-            bool page_updated = false;
-
-            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
-                if (slot_array[slot_itr].empty) {
-                    continue;
-                }
-
-                assert(slot_array[slot_itr].offset != INVALID_VALUE);
-                const char* tuple_data = page_buffer + slot_array[slot_itr].offset;
-                std::istringstream iss(
-                    std::string(tuple_data, slot_array[slot_itr].length)
-                );
-                auto tuple = Tuple::deserialize(iss);
-                if (where_column >= tuple->fields.size() ||
-                    !(*tuple->fields[where_column] == where_value)) {
-                    continue;
-                }
-
-                page->deleteTuple(slot_itr);
-                page_updated = true;
-                deleted_count++;
-            }
-
-            if (page_updated) {
-                buffer_manager.flushPage(page_id);
-            }
-        }
-
+    void recordDeletedTuples(size_t deleted_count) {
         metadata.row_count -= deleted_count;
-        return deleted_count;
     }
 
     std::vector<std::unique_ptr<Tuple>> readAllTuples() {
@@ -881,16 +781,6 @@ public:
     }
 
 private:
-    PageID allocatePage() {
-        PageID page_id = buffer_manager.extend(metadata.table_id);
-        auto& page = buffer_manager.getPage(page_id);
-        page->setTableId(metadata.table_id);
-        page->setPrevPage(INVALID_PAGE_ID);
-        page->setNextPage(INVALID_PAGE_ID);
-        buffer_manager.flushPage(page_id);
-        return page_id;
-    }
-
     void loadPageIds() {
         metadata.page_ids.clear();
         PageID page_id = metadata.first_page;
@@ -903,6 +793,39 @@ private:
         }
     }
 };
+
+bool insertTupleIntoTable(TableHeap& table, std::unique_ptr<Tuple> tuple) {
+    auto insertIntoPage = [&](PageID page_id) {
+        auto& page = table.getPage(page_id);
+        if (page->addTuple(tuple->clone())) {
+            table.flushInsertedPage(page_id);
+            table.recordInsertedTuple();
+            return true;
+        }
+        return false;
+    };
+
+    PageID last_page = table.getLastPage();
+    if (last_page != INVALID_PAGE_ID && insertIntoPage(last_page)) {
+        return true;
+    }
+
+    for (PageID page_id : table.getPageIds()) {
+        if (page_id != last_page && insertIntoPage(page_id)) {
+            return true;
+        }
+    }
+
+    PageID page_id = table.allocatePage();
+    auto& page = table.getPage(page_id);
+    if (page->addTuple(std::move(tuple))) {
+        table.flushInsertedPage(page_id);
+        table.recordInsertedTuple();
+        return true;
+    }
+
+    return false;
+}
 
 // Catalog records are stored as ordinary tuples in system tables.
 class Catalog {
@@ -1175,7 +1098,7 @@ private:
 
         // System tables share heap code; only page-0 roots need syncing.
         TableHeap table(metadata, buffer_manager);
-        bool status = table.insertTuple(std::move(tuple));
+        bool status = insertTupleIntoTable(table, std::move(tuple));
         assert(status == true);
 
         if (metadata.last_page != previous_last_page) {
@@ -2221,7 +2144,8 @@ enum class StatementType {
     BEGIN,
     COMMIT,
     INSERT,
-    UPDATE
+    UPDATE,
+    DELETE
 };
 
 struct StatementComponents {
@@ -2580,6 +2504,9 @@ void prettyPrint(const Components& components,
             case StatementType::UPDATE:
                 std::cout << "UPDATE";
                 break;
+            case StatementType::DELETE:
+                std::cout << "DELETE";
+                break;
         }
         if (components.type == StatementType::BEGIN ||
             components.type == StatementType::COMMIT) {
@@ -2589,11 +2516,14 @@ void prettyPrint(const Components& components,
             for (size_t i = 0; i < components.values.size(); i++) {
                 std::cout << "{" << i + 1 << "}=" << components.values[i] << " ";
             }
-        } else {
+        } else if (components.type == StatementType::UPDATE) {
             std::cout << "\n  SET: ";
             for (const auto& assignment : components.assignments) {
                 std::cout << assignment.first << "=" << assignment.second << " ";
             }
+            std::cout << "\n  WHERE: "
+                      << components.whereColumn << "=" << components.whereValue;
+        } else {
             std::cout << "\n  WHERE: "
                       << components.whereColumn << "=" << components.whereValue;
         }
@@ -2763,7 +2693,27 @@ public:
     bool next() override {
         if (!tupleToInsert) return false; // No tuple to insert
 
-        return tableHeap.insertTuple(std::move(tupleToInsert));
+        for (PageID pageId : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(pageId);
+            // Attempt to insert the tuple
+            if (page->addTuple(tupleToInsert->clone())) {
+                // Flush the page to disk after insertion
+                tableHeap.flushInsertedPage(pageId);
+                tableHeap.recordInsertedTuple();
+                return true; // Insertion successful
+            }
+        }
+
+        // If insertion failed in all table pages, allocate one and try again.
+        PageID pageId = tableHeap.allocatePage();
+        auto& newPage = tableHeap.getPage(pageId);
+        if (newPage->addTuple(std::move(tupleToInsert))) {
+            tableHeap.flushInsertedPage(pageId);
+            tableHeap.recordInsertedTuple();
+            return true; // Insertion successful after extending the database
+        }
+
+        return false; // Insertion failed even after extending the database
     }
 
     void close() override {
@@ -2804,7 +2754,54 @@ public:
             return false;
         }
 
-        updatedCount = tableHeap.updateTuples(whereColumn, whereValue, assignments);
+        updatedCount = 0;
+        for (PageID page_id : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(page_id);
+            char* page_buffer = page->page_data.get();
+            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+            bool page_updated = false;
+
+            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+                if (slot_array[slot_itr].empty) {
+                    continue;
+                }
+
+                assert(slot_array[slot_itr].offset != INVALID_VALUE);
+                const char* tuple_data = page_buffer + slot_array[slot_itr].offset;
+                std::istringstream iss(
+                    std::string(tuple_data, slot_array[slot_itr].length)
+                );
+                auto old_tuple = Tuple::deserialize(iss);
+                if (whereColumn >= old_tuple->fields.size() ||
+                    !(*old_tuple->fields[whereColumn] == whereValue)) {
+                    continue;
+                }
+
+                auto new_tuple = std::make_unique<Tuple>();
+                for (size_t field_index = 0;
+                     field_index < old_tuple->fields.size();
+                     field_index++) {
+                    const Field* field = old_tuple->fields[field_index].get();
+                    for (const auto& assignment : assignments) {
+                        if (assignment.first == field_index) {
+                            field = &assignment.second;
+                            break;
+                        }
+                    }
+                    new_tuple->addField(field->clone());
+                }
+
+                bool status = page->updateTuple(slot_itr, std::move(new_tuple));
+                assert(status == true);
+                page_updated = true;
+                updatedCount++;
+            }
+
+            if (page_updated) {
+                tableHeap.flushPage(page_id);
+            }
+        }
+
         executed = true;
         return updatedCount > 0;
     }
@@ -2842,7 +2839,40 @@ public:
             return false;
         }
 
-        deletedCount = tableHeap.deleteTuples(whereColumn, whereValue);
+        deletedCount = 0;
+        for (PageID page_id : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(page_id);
+            char* page_buffer = page->page_data.get();
+            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+            bool page_updated = false;
+
+            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+                if (slot_array[slot_itr].empty) {
+                    continue;
+                }
+
+                assert(slot_array[slot_itr].offset != INVALID_VALUE);
+                const char* tuple_data = page_buffer + slot_array[slot_itr].offset;
+                std::istringstream iss(
+                    std::string(tuple_data, slot_array[slot_itr].length)
+                );
+                auto tuple = Tuple::deserialize(iss);
+                if (whereColumn >= tuple->fields.size() ||
+                    !(*tuple->fields[whereColumn] == whereValue)) {
+                    continue;
+                }
+
+                page->deleteTuple(slot_itr);
+                page_updated = true;
+                deletedCount++;
+            }
+
+            if (page_updated) {
+                tableHeap.flushPage(page_id);
+            }
+        }
+
+        tableHeap.recordDeletedTuples(deletedCount);
         executed = true;
         return deletedCount > 0;
     }
@@ -2958,6 +2988,9 @@ public:
         std::regex update_regex(
             "^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+(.+)\\s+"
             "WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s]+)\\s*$");
+        std::regex delete_regex(
+            "^\\s*DELETE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+"
+            "WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s]+)\\s*$");
         std::smatch matches;
 
         StatementComponents components;
@@ -2996,6 +3029,14 @@ public:
             }
             components.whereColumn = matches[3];
             components.whereValue = matches[4];
+            return components;
+        }
+
+        if (std::regex_match(statement, matches, delete_regex)) {
+            components.type = StatementType::DELETE;
+            components.tableName = matches[1];
+            components.whereColumn = matches[2];
+            components.whereValue = matches[3];
             return components;
         }
 
@@ -3062,6 +3103,35 @@ public:
             updateOp.open();
             updateOp.next();
             updateOp.close();
+            return;
+        }
+
+        if (components.type == StatementType::DELETE) {
+            if (bulk_table != nullptr) {
+                throw std::runtime_error("Bulk loading only supports INSERT.");
+            }
+
+            int where_column = findColumnIndex(metadata, components.whereColumn);
+            auto where_value = parseFieldValue(
+                metadata.schema.columns[where_column].type,
+                components.whereValue,
+                components.tableName,
+                components.lineNumber
+            );
+
+            TableHeap table(metadata, buffer_manager);
+            DeleteOperator deleteOp(
+                table,
+                static_cast<size_t>(where_column),
+                where_value
+            );
+            deleteOp.setTxnContext(txn);
+            deleteOp.open();
+            deleteOp.next();
+            deleteOp.close();
+            if (persist_metadata) {
+                catalog.persistTableMetadata(metadata);
+            }
             return;
         }
 
@@ -3275,6 +3345,8 @@ INSERT holds|2|1|2|bob|held;
 UPDATE seats SET status=held, customer=bob WHERE seat_no=1B;
 UPDATE seats SET status=available, customer=none WHERE seat_no=1B;
 UPDATE holds SET status=void WHERE id=2;
+INSERT holds|3|1|4|temp|held;
+DELETE holds WHERE id=3;
 COMMIT;
 )";
     }

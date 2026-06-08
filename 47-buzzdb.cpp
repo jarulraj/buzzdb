@@ -542,7 +542,7 @@ struct TableSchema {
     std::vector<ColumnSchema> columns;
 };
 
-// In-memory metadata for one table and the pages owned by it.
+// Catalog-owned table description; TableHeap borrows it at runtime.
 struct TableMetadata {
     TableId table_id;
     std::string name;
@@ -587,7 +587,7 @@ public:
     }
 };
 
-// Heap storage for one table: unordered tuple pages tracked by TableMetadata.
+// Runtime handle for one table's heap pages; owns no catalog metadata.
 class TableHeap {
 private:
     TableMetadata& metadata;
@@ -597,30 +597,19 @@ public:
     TableHeap(TableMetadata& metadata, BufferManager& buffer_manager)
         : metadata(metadata), buffer_manager(buffer_manager) {}
 
-    bool insertTuple(std::unique_ptr<Tuple> tuple) {
-        for (PageID page_id : metadata.page_ids) {
-            auto& page = buffer_manager.getPage(page_id);
-            if (page->addTuple(tuple->clone())) {
-                buffer_manager.flushPage(page_id);
-                return true;
-            }
-        }
-
+    PageID allocatePage() {
         buffer_manager.extend();
         PageID page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
         metadata.page_ids.push_back(page_id);
-
-        auto& page = buffer_manager.getPage(page_id);
-        if (page->addTuple(std::move(tuple))) {
-            buffer_manager.flushPage(page_id);
-            return true;
-        }
-
-        return false;
+        return page_id;
     }
 
     std::unique_ptr<SlottedPage>& getPage(PageID page_id) {
         return buffer_manager.getPage(page_id);
+    }
+
+    void flushPage(PageID page_id) {
+        buffer_manager.flushPage(page_id);
     }
 
     const std::vector<PageID>& getPageIds() const {
@@ -1474,11 +1463,11 @@ void executeQuery(const QueryComponents& components,
 
 class InsertOperator : public Operator {
 private:
-    BufferManager& bufferManager;
+    TableHeap& tableHeap;
     std::unique_ptr<Tuple> tupleToInsert;
 
 public:
-    InsertOperator(BufferManager& manager) : bufferManager(manager) {}
+    InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
 
     // Set the tuple to be inserted by this operator.
     void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
@@ -1492,21 +1481,21 @@ public:
     bool next() override {
         if (!tupleToInsert) return false; // No tuple to insert
 
-        for (size_t pageId = 0; pageId < bufferManager.getNumPages(); ++pageId) {
-            auto& page = bufferManager.getPage(pageId);
+        for (PageID pageId : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(pageId);
             // Attempt to insert the tuple
-            if (page->addTuple(tupleToInsert->clone())) { 
+            if (page->addTuple(tupleToInsert->clone())) {
                 // Flush the page to disk after insertion
-                bufferManager.flushPage(pageId); 
+                tableHeap.flushPage(pageId);
                 return true; // Insertion successful
             }
         }
 
-        // If insertion failed in all existing pages, extend the database and try again
-        bufferManager.extend();
-        auto& newPage = bufferManager.getPage(bufferManager.getNumPages() - 1);
-        if (newPage->addTuple(tupleToInsert->clone())) {
-            bufferManager.flushPage(bufferManager.getNumPages() - 1);
+        // If insertion failed in all table pages, allocate one and try again.
+        PageID pageId = tableHeap.allocatePage();
+        auto& newPage = tableHeap.getPage(pageId);
+        if (newPage->addTuple(std::move(tupleToInsert))) {
+            tableHeap.flushPage(pageId);
             return true; // Insertion successful after extending the database
         }
 
@@ -1524,28 +1513,65 @@ public:
 
 class DeleteOperator : public Operator {
 private:
-    BufferManager& bufferManager;
-    size_t pageId;
-    size_t tupleId;
+    TableHeap& tableHeap;
+    size_t whereColumn;
+    Field whereValue;
+    bool executed = false;
+    size_t deletedCount = 0;
 
 public:
-    DeleteOperator(BufferManager& manager, size_t pageId, size_t tupleId) 
-        : bufferManager(manager), pageId(pageId), tupleId(tupleId) {}
+    DeleteOperator(TableHeap& tableHeap,
+                   size_t whereColumn,
+                   const Field& whereValue)
+        : tableHeap(tableHeap),
+          whereColumn(whereColumn),
+          whereValue(whereValue) {}
 
     void open() override {
-        // Not used in this context
+        executed = false;
+        deletedCount = 0;
     }
 
     bool next() override {
-        auto& page = bufferManager.getPage(pageId);
-        if (!page) {
-            std::cerr << "Page not found." << std::endl;
+        if (executed) {
             return false;
         }
 
-        page->deleteTuple(tupleId); // Perform deletion
-        bufferManager.flushPage(pageId); // Flush the page to disk after deletion
-        return true;
+        deletedCount = 0;
+        for (PageID pageId : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(pageId);
+            char* pageBuffer = page->page_data.get();
+            Slot* slotArray = reinterpret_cast<Slot*>(pageBuffer);
+            bool pageUpdated = false;
+
+            for (size_t slotId = 0; slotId < MAX_SLOTS; slotId++) {
+                if (slotArray[slotId].empty) {
+                    continue;
+                }
+
+                assert(slotArray[slotId].offset != INVALID_VALUE);
+                const char* tupleData = pageBuffer + slotArray[slotId].offset;
+                std::istringstream iss(
+                    std::string(tupleData, slotArray[slotId].length)
+                );
+                auto tuple = Tuple::deserialize(iss);
+                if (whereColumn >= tuple->fields.size() ||
+                    !(*tuple->fields[whereColumn] == whereValue)) {
+                    continue;
+                }
+
+                page->deleteTuple(slotId);
+                pageUpdated = true;
+                deletedCount++;
+            }
+
+            if (pageUpdated) {
+                tableHeap.flushPage(pageId);
+            }
+        }
+
+        executed = true;
+        return deletedCount > 0;
     }
 
     void close() override {
@@ -1694,7 +1720,10 @@ public:
         }
 
         TableHeap table(metadata, buffer_manager);
-        bool status = table.insertTuple(std::move(tuple));
+        InsertOperator insertOp(table);
+        insertOp.setTxnContext(txn);
+        insertOp.setTupleToInsert(std::move(tuple));
+        bool status = insertOp.next();
         assert(status == true);
     }
 
