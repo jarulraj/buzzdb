@@ -1014,7 +1014,7 @@ struct PageUpdateLogRecord {
     std::unique_ptr<Tuple> after_tuple;
 };
 
-// Recovery policy for v60: ARIES analysis with prevLSN and transaction table.
+// Recovery policy for v60: ARIES analysis with prevLSN and active transaction table.
 class RecoveryManager {
 private:
     enum class TxnStatus {
@@ -1055,7 +1055,7 @@ private:
     size_t log_force_requests = 0;
     size_t log_force_writes = 0;
     size_t log_force_skips = 0;
-    std::map<int, TxnTableEntry> transaction_table;
+    std::map<int, TxnTableEntry> active_transaction_table;
 
     static std::string txnStatusName(TxnStatus status) {
         switch (status) {
@@ -1084,7 +1084,7 @@ private:
         LSN prev_lsn = current_txn_last_lsn;
         LSN lsn = appendTxnRecord(current_txn_id, type, prev_lsn);
         current_txn_last_lsn = lsn;
-        transaction_table[current_txn_id] = {status, lsn};
+        active_transaction_table[current_txn_id] = {status, lsn};
         if (prev_lsn_out != nullptr) {
             *prev_lsn_out = prev_lsn;
         }
@@ -2190,7 +2190,7 @@ void RecoveryManager::commit() {
               << " LSN " << end_lsn
               << " prevLSN " << end_prev_lsn << std::endl;
     forceLogUpTo(end_lsn);
-    transaction_table.erase(current_txn_id);
+    active_transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
     page_update_log_records.clear();
@@ -2210,15 +2210,6 @@ void RecoveryManager::abort() {
     std::cout << "TXN " << current_txn_id << " ABORT" << std::endl;
     if (!page_update_log_records.empty()) {
         aborted_update_records += page_update_log_records.size();
-        for (auto it = page_update_log_records.rbegin(); it != page_update_log_records.rend(); ++it) {
-            auto& metadata = catalog.getTable(it->table_id);
-            TableHeap table(metadata, buffer_manager);
-            table.applyUpdate(
-                it->page_id, it->slot_id, it->before_tuple->clone(),
-                true, "runtime abort undo"
-            );
-            runtime_undo_records++;
-        }
         LSN abort_prev_lsn = 0;
         LSN abort_lsn = appendTxnRecord(
             "ABORT", TxnStatus::ABORTING, &abort_prev_lsn
@@ -2228,6 +2219,15 @@ void RecoveryManager::abort() {
                   << " prevLSN " << abort_prev_lsn << std::endl;
         forceLogUpTo(abort_lsn);
         abort_log_records++;
+        for (auto it = page_update_log_records.rbegin(); it != page_update_log_records.rend(); ++it) {
+            auto& metadata = catalog.getTable(it->table_id);
+            TableHeap table(metadata, buffer_manager);
+            table.applyUpdate(
+                it->page_id, it->slot_id, it->before_tuple->clone(),
+                true, "runtime abort undo", abort_lsn
+            );
+            runtime_undo_records++;
+        }
         std::cout << "  recovery: restored "
                   << page_update_log_records.size()
                   << " before-image record(s), forced restored page(s), wrote ABORT log" << std::endl;
@@ -2240,7 +2240,7 @@ void RecoveryManager::abort() {
               << " LSN " << end_lsn
               << " prevLSN " << end_prev_lsn << std::endl;
     forceLogUpTo(end_lsn);
-    transaction_table.erase(current_txn_id);
+    active_transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
     page_update_log_records.clear();
@@ -2265,8 +2265,7 @@ void RecoveryManager::recover() {
         std::unique_ptr<Tuple> after_tuple;
     };
 
-    std::map<int, bool> committed;
-    std::map<int, TxnTableEntry> analysis_table;
+    std::map<int, TxnTableEntry> active_transaction_table;
     std::map<LSN, LSN> prev_lsn_by_lsn;
     std::vector<WalRecord> wal_records;
     auto log_records = log_manager.readAll();
@@ -2286,20 +2285,19 @@ void RecoveryManager::recover() {
         next_txn_id = std::max(next_txn_id, txn_id + 1);
 
         if (type == "BEGIN") {
-            analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
         } else if (type == "COMMIT") {
-            committed[txn_id] = true;
-            analysis_table[txn_id] = {TxnStatus::COMMITTING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::COMMITTING, record_lsn};
         } else if (type == "ABORT") {
-            analysis_table[txn_id] = {TxnStatus::ABORTING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::ABORTING, record_lsn};
         } else if (type == "END") {
-            analysis_table.erase(txn_id);
+            active_transaction_table.erase(txn_id);
         } else if (type == "UPDATE") {
             int table_id;
             int page_id;
             size_t slot_id;
             input >> table_id >> page_id >> slot_id;
-            analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
             wal_records.push_back({
                 record_lsn,
                 prev_lsn,
@@ -2314,11 +2312,11 @@ void RecoveryManager::recover() {
     }
 
     if (!log_records.empty()) {
-        std::cout << "ARIES analysis: transaction table after log scan" << std::endl;
-        if (analysis_table.empty()) {
+        std::cout << "ARIES analysis: active transaction table after log scan" << std::endl;
+        if (active_transaction_table.empty()) {
             std::cout << "  empty; every logged transaction reached END" << std::endl;
         } else {
-            for (const auto& entry : analysis_table) {
+            for (const auto& entry : active_transaction_table) {
                 std::cout << "  txn " << entry.first
                           << " " << txnStatusName(entry.second.status)
                           << " lastLSN " << entry.second.last_lsn << std::endl;
@@ -2328,11 +2326,12 @@ void RecoveryManager::recover() {
 
     size_t redone = 0;
     for (const auto& record : wal_records) {
-        if (!committed[record.txn_id]) {
-            continue;
-        }
         auto& metadata = catalog.getTable(record.table_id);
         TableHeap table(metadata, buffer_manager);
+        auto& page = table.getPage(record.page_id);
+        if (page->getPageLSN() >= record.lsn) {
+            continue;
+        }
         table.applyUpdate(
             record.page_id, record.slot_id, record.after_tuple->clone(),
             true, "restart redo", record.lsn
@@ -2346,7 +2345,7 @@ void RecoveryManager::recover() {
     for (const auto& record : wal_records) {
         update_by_lsn[record.lsn] = &record;
     }
-    for (const auto& txn_entry : analysis_table) {
+    for (const auto& txn_entry : active_transaction_table) {
         if (txn_entry.second.status == TxnStatus::COMMITTING) {
             continue;
         }
@@ -2393,7 +2392,7 @@ void RecoveryManager::recover() {
                   << " during restart" << std::endl;
     }
 
-    for (const auto& entry : analysis_table) {
+    for (const auto& entry : active_transaction_table) {
         if (entry.second.status != TxnStatus::COMMITTING) {
             continue;
         }
@@ -2409,7 +2408,7 @@ void RecoveryManager::recover() {
     restart_undo_records += undone;
     if (redone != 0 || undone != 0) {
         std::cout << "Restart recovery: redid " << redone
-                  << " winner after-image record(s), undid " << undone
+                  << " history after-image record(s), undid " << undone
                   << " loser before-image record(s)." << std::endl;
     }
 }
@@ -2455,7 +2454,7 @@ LSN RecoveryManager::logUpdate(TableId table_id,
         before_image + after_image
     );
     current_txn_last_lsn = update_lsn;
-    transaction_table[current_txn_id] = {TxnStatus::RUNNING, update_lsn};
+    active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, update_lsn};
     std::cout << "  log: UPDATE txn " << current_txn_id
               << " page " << page_id
               << " slot " << slot_id
@@ -2502,12 +2501,12 @@ void RecoveryManager::maybeCrashAfterSteal(PageID page_id) {
 }
 
 void RecoveryManager::printPolicy() const {
-    std::cout << "Recovery policy: Undo/Redo WAL + pageLSN + ARIES analysis (Steal + No-Force)" << std::endl;
+    std::cout << "Recovery policy: Undo/Redo WAL + pageLSN + ARIES repeat-history redo (Steal + No-Force)" << std::endl;
     std::cout << "  Steal: Yes; dirty uncommitted pages may reach disk." << std::endl;
     std::cout << "  Force: No; commit forces the log, not dirty data pages." << std::endl;
     std::cout << "  WAL: page flushes force the log through the page's LSN." << std::endl;
-    std::cout << "  Analysis: restart rebuilds the transaction table; undo follows prevLSN." << std::endl;
-    std::cout << "  Restart: redo winner after-images, then undo loser before-images." << std::endl;
+    std::cout << "  Analysis: restart rebuilds the active transaction table; undo follows prevLSN." << std::endl;
+    std::cout << "  Restart: repeat history, then undo loser before-images." << std::endl;
 }
 
 void RecoveryManager::printSummary() {
@@ -2516,7 +2515,7 @@ void RecoveryManager::printSummary() {
     };
 
     std::cout << "Recovery policy summary:" << std::endl;
-    std::cout << "  Policy: Undo/Redo WAL + pageLSN + ARIES analysis (Steal + No-Force)" << std::endl;
+    std::cout << "  Policy: Undo/Redo WAL + pageLSN + ARIES repeat-history redo (Steal + No-Force)" << std::endl;
     std::cout << "  Log pages written this run: " << pagesForBytes(log_manager.getBytesWritten()) << std::endl;
     std::cout << "  Log pages on disk: " << pagesForBytes(log_manager.getBytesOnDisk()) << std::endl;
     std::cout << "  Log force requests: " << log_force_requests << std::endl;

@@ -1069,7 +1069,7 @@ private:
     size_t log_force_requests = 0;
     size_t log_force_writes = 0;
     size_t log_force_skips = 0;
-    std::map<int, TxnTableEntry> transaction_table;
+    std::map<int, TxnTableEntry> active_transaction_table;
 
     static std::string txnStatusName(TxnStatus status) {
         switch (status) {
@@ -1098,7 +1098,7 @@ private:
         LSN prev_lsn = current_txn_last_lsn;
         LSN lsn = appendTxnRecord(current_txn_id, type, prev_lsn);
         current_txn_last_lsn = lsn;
-        transaction_table[current_txn_id] = {status, lsn};
+        active_transaction_table[current_txn_id] = {status, lsn};
         if (prev_lsn_out != nullptr) {
             *prev_lsn_out = prev_lsn;
         }
@@ -2228,7 +2228,7 @@ void RecoveryManager::commit() {
               << " LSN " << end_lsn
               << " prevLSN " << end_prev_lsn << std::endl;
     forceLogUpTo(end_lsn);
-    transaction_table.erase(current_txn_id);
+    active_transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
     page_update_log_records.clear();
@@ -2283,7 +2283,7 @@ void RecoveryManager::rollbackTo(const std::string& name) {
             *update.before_tuple
         );
         current_txn_last_lsn = clr_lsn;
-        transaction_table[current_txn_id] = {TxnStatus::RUNNING, clr_lsn};
+        active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, clr_lsn};
         std::cout << "  log: CLR txn " << current_txn_id
                   << " LSN " << clr_lsn
                   << " prevLSN " << clr_prev_lsn
@@ -2333,7 +2333,7 @@ void RecoveryManager::abort() {
                 *it->before_tuple
             );
             current_txn_last_lsn = clr_lsn;
-            transaction_table[current_txn_id] = {TxnStatus::ABORTING, clr_lsn};
+            active_transaction_table[current_txn_id] = {TxnStatus::ABORTING, clr_lsn};
             std::cout << "  log: CLR txn " << current_txn_id
                       << " LSN " << clr_lsn
                       << " prevLSN " << clr_prev_lsn
@@ -2365,7 +2365,7 @@ void RecoveryManager::abort() {
               << " LSN " << end_lsn
               << " prevLSN " << end_prev_lsn << std::endl;
     forceLogUpTo(end_lsn);
-    transaction_table.erase(current_txn_id);
+    active_transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
     page_update_log_records.clear();
@@ -2393,7 +2393,7 @@ void RecoveryManager::recover() {
         std::unique_ptr<Tuple> after_tuple;
     };
 
-    std::map<int, TxnTableEntry> analysis_table;
+    std::map<int, TxnTableEntry> active_transaction_table;
     std::map<PageID, LSN> dirty_page_table;
     std::map<LSN, LSN> prev_lsn_by_lsn;
     std::vector<WalRecord> wal_records;
@@ -2414,13 +2414,13 @@ void RecoveryManager::recover() {
         next_txn_id = std::max(next_txn_id, txn_id + 1);
 
         if (type == "BEGIN") {
-            analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
         } else if (type == "COMMIT") {
-            analysis_table[txn_id] = {TxnStatus::COMMITTING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::COMMITTING, record_lsn};
         } else if (type == "ABORT") {
-            analysis_table[txn_id] = {TxnStatus::ABORTING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::ABORTING, record_lsn};
         } else if (type == "END") {
-            analysis_table.erase(txn_id);
+            active_transaction_table.erase(txn_id);
         } else if (type == "UPDATE") {
             int table_id;
             int page_id;
@@ -2430,7 +2430,7 @@ void RecoveryManager::recover() {
             if (dirty_page_table.find(dirty_page_id) == dirty_page_table.end()) {
                 dirty_page_table[dirty_page_id] = record_lsn;
             }
-            analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
+            active_transaction_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
             wal_records.push_back({
                 record_lsn,
                 prev_lsn,
@@ -2454,11 +2454,11 @@ void RecoveryManager::recover() {
                 dirty_page_table[dirty_page_id] = record_lsn;
             }
             auto status = TxnStatus::RUNNING;
-            auto txn_entry = analysis_table.find(txn_id);
-            if (txn_entry != analysis_table.end()) {
+            auto txn_entry = active_transaction_table.find(txn_id);
+            if (txn_entry != active_transaction_table.end()) {
                 status = txn_entry->second.status;
             }
-            analysis_table[txn_id] = {status, record_lsn};
+            active_transaction_table[txn_id] = {status, record_lsn};
             wal_records.push_back({
                 record_lsn,
                 prev_lsn,
@@ -2475,11 +2475,11 @@ void RecoveryManager::recover() {
     }
 
     if (!log_records.empty()) {
-        std::cout << "ARIES analysis: transaction table after log scan" << std::endl;
-        if (analysis_table.empty()) {
+        std::cout << "ARIES analysis: active transaction table after log scan" << std::endl;
+        if (active_transaction_table.empty()) {
             std::cout << "  empty; every logged transaction reached END" << std::endl;
         } else {
-            for (const auto& entry : analysis_table) {
+            for (const auto& entry : active_transaction_table) {
                 std::cout << "  txn " << entry.first
                           << " " << txnStatusName(entry.second.status)
                           << " lastLSN " << entry.second.last_lsn << std::endl;
@@ -2541,54 +2541,68 @@ void RecoveryManager::recover() {
     for (const auto& record : wal_records) {
         update_by_lsn[record.lsn] = &record;
     }
-    for (const auto& txn_entry : analysis_table) {
+    std::map<LSN, int> to_undo;
+    for (const auto& txn_entry : active_transaction_table) {
         if (txn_entry.second.status == TxnStatus::COMMITTING) {
             continue;
         }
         losers[txn_entry.first] = txn_entry.second;
-        LSN txn_last_lsn = txn_entry.second.last_lsn;
-        LSN next_lsn = txn_last_lsn;
-        while (next_lsn != 0) {
-            auto record = update_by_lsn.find(next_lsn);
-            if (record != update_by_lsn.end()) {
-                if (record->second->is_clr) {
-                    next_lsn = record->second->undo_next_lsn;
-                    continue;
+        if (txn_entry.second.last_lsn != 0) {
+            to_undo[txn_entry.second.last_lsn] = txn_entry.first;
+        }
+    }
+
+    while (!to_undo.empty()) {
+        auto undo_entry = std::prev(to_undo.end());
+        LSN next_lsn = undo_entry->first;
+        int txn_id = undo_entry->second;
+        to_undo.erase(undo_entry);
+        auto loser = losers.find(txn_id);
+        if (loser == losers.end()) {
+            continue;
+        }
+
+        auto record = update_by_lsn.find(next_lsn);
+        if (record != update_by_lsn.end()) {
+            if (record->second->is_clr) {
+                if (record->second->undo_next_lsn != 0) {
+                    to_undo[record->second->undo_next_lsn] = txn_id;
                 }
-                auto& metadata = catalog.getTable(record->second->table_id);
-                TableHeap table(metadata, buffer_manager);
-                LSN clr_lsn = appendClrRecord(
-                    txn_entry.first,
-                    txn_last_lsn,
-                    record->second->prev_lsn,
-                    record->second->table_id,
-                    record->second->page_id,
-                    record->second->slot_id,
-                    *record->second->before_tuple
-                );
-                losers[txn_entry.first] = {txn_entry.second.status, clr_lsn};
-                std::cout << "  log: CLR txn " << txn_entry.first
-                          << " LSN " << clr_lsn
-                          << " prevLSN " << txn_last_lsn
-                          << " undoNextLSN " << record->second->prev_lsn
-                          << " during restart" << std::endl;
-                table.applyUpdate(
-                    record->second->page_id,
-                    record->second->slot_id,
-                    record->second->before_tuple->clone(),
-                    true, "restart undo", clr_lsn
-                );
-                undone++;
-                txn_last_lsn = clr_lsn;
-                next_lsn = record->second->prev_lsn;
                 continue;
             }
-
-            auto prev_lsn = prev_lsn_by_lsn.find(next_lsn);
-            if (prev_lsn == prev_lsn_by_lsn.end()) {
-                break;
+            auto& metadata = catalog.getTable(record->second->table_id);
+            TableHeap table(metadata, buffer_manager);
+            LSN clr_lsn = appendClrRecord(
+                txn_id,
+                loser->second.last_lsn,
+                record->second->prev_lsn,
+                record->second->table_id,
+                record->second->page_id,
+                record->second->slot_id,
+                *record->second->before_tuple
+            );
+            std::cout << "  log: CLR txn " << txn_id
+                      << " LSN " << clr_lsn
+                      << " prevLSN " << loser->second.last_lsn
+                      << " undoNextLSN " << record->second->prev_lsn
+                      << " during restart" << std::endl;
+            loser->second.last_lsn = clr_lsn;
+            table.applyUpdate(
+                record->second->page_id,
+                record->second->slot_id,
+                record->second->before_tuple->clone(),
+                true, "restart undo", clr_lsn
+            );
+            undone++;
+            if (record->second->prev_lsn != 0) {
+                to_undo[record->second->prev_lsn] = txn_id;
             }
-            next_lsn = prev_lsn->second;
+            continue;
+        }
+
+        auto prev_lsn = prev_lsn_by_lsn.find(next_lsn);
+        if (prev_lsn != prev_lsn_by_lsn.end() && prev_lsn->second != 0) {
+            to_undo[prev_lsn->second] = txn_id;
         }
     }
 
@@ -2611,7 +2625,7 @@ void RecoveryManager::recover() {
                   << " during restart" << std::endl;
     }
 
-    for (const auto& entry : analysis_table) {
+    for (const auto& entry : active_transaction_table) {
         if (entry.second.status != TxnStatus::COMMITTING) {
             continue;
         }
@@ -2673,7 +2687,7 @@ LSN RecoveryManager::logUpdate(TableId table_id,
         before_image + after_image
     );
     current_txn_last_lsn = update_lsn;
-    transaction_table[current_txn_id] = {TxnStatus::RUNNING, update_lsn};
+    active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, update_lsn};
     std::cout << "  log: UPDATE txn " << current_txn_id
               << " page " << page_id
               << " slot " << slot_id
@@ -2725,7 +2739,7 @@ void RecoveryManager::printPolicy() const {
     std::cout << "  Steal: Yes; dirty uncommitted pages may reach disk." << std::endl;
     std::cout << "  Force: No; commit forces the log, not dirty data pages." << std::endl;
     std::cout << "  WAL: page flushes force the log through the page's LSN." << std::endl;
-    std::cout << "  Analysis: restart rebuilds the transaction table and dirty page table." << std::endl;
+    std::cout << "  Analysis: restart rebuilds the active transaction table and dirty page table." << std::endl;
     std::cout << "  Redo: repeat history from the smallest recLSN, using pageLSN skips." << std::endl;
     std::cout << "  Undo: loser transactions write CLRs and follow undoNextLSN." << std::endl;
 }

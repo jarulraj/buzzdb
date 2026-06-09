@@ -227,6 +227,7 @@ constexpr uint32_t BUZZDB_MAGIC = 0x425A4442;
 constexpr uint16_t BUZZDB_VERSION = 62;
 constexpr size_t MAX_SYSTEM_TABLE_PAGES = 16;
 const std::string log_filename = "buzzdb.log";
+const std::string master_record_filename = "buzzdb.master";
 
 struct CatalogRoot {
     uint64_t catalog_version = 0;
@@ -689,6 +690,7 @@ private:
     std::map<PageID, size_t> pin_count;
     BufferPoolStats stats;
     std::function<bool(LSN)> wal_force_callback;
+    std::function<void(PageID, LSN, const std::string&)> page_flush_callback;
 
     std::string evictionWriteTag(PageID page_id) {
         if (page_id == 0) {
@@ -707,6 +709,10 @@ public:
 
     void setWalForceCallback(std::function<bool(LSN)> callback) {
         wal_force_callback = std::move(callback);
+    }
+
+    void setPageFlushCallback(std::function<void(PageID, LSN, const std::string&)> callback) {
+        page_flush_callback = std::move(callback);
     }
 
     void recordDataPageWrite(const std::string& tag) {
@@ -741,8 +747,12 @@ public:
 
     void flushPageToDisk(PageID page_id, const std::string& tag) {
         forceLogBeforeFlush(page_id, tag);
+        LSN page_lsn = pageMap[page_id]->getPageLSN();
         storage_manager.flush(page_id, pageMap[page_id]);
         recordDataPageWrite(tag);
+        if (page_flush_callback && page_id != 0 && page_lsn != 0) {
+            page_flush_callback(page_id, page_lsn, tag);
+        }
     }
 
     std::unique_ptr<SlottedPage>& getPage(int page_id) {
@@ -778,9 +788,13 @@ public:
                 }
                 std::string eviction_tag = evictionWriteTag(evictedPageId);
                 forceLogBeforeFlush(evictedPageId, eviction_tag);
+                LSN page_lsn = pageMap[evictedPageId]->getPageLSN();
                 storage_manager.flush(evictedPageId, 
                                       pageMap[evictedPageId]);
                 recordDataPageWrite(eviction_tag);
+                if (page_flush_callback && evictedPageId != 0 && page_lsn != 0) {
+                    page_flush_callback(evictedPageId, page_lsn, eviction_tag);
+                }
                 stats.evictions++;
                 stats.page_flushes_from_eviction++;
                 pageMap.erase(evictedPageId);
@@ -925,9 +939,18 @@ private:
     size_t records_written = 0;
     size_t bytes_written = 0;
 
+    size_t durableLogSize() const {
+        std::ifstream input(log_filename, std::ios::binary | std::ios::ate);
+        if (!input) {
+            return 0;
+        }
+        return static_cast<size_t>(input.tellg());
+    }
+
 public:
     void reset() {
         std::ofstream output(log_filename, std::ios::trunc);
+        std::remove(master_record_filename.c_str());
         pending_records.clear();
         next_lsn = 1;
         flushed_lsn = 0;
@@ -936,11 +959,12 @@ public:
     }
 
     LSN append(const std::string& record) {
-        LSN lsn = next_lsn++;
+        LSN lsn = next_lsn;
         std::string durable_record = std::to_string(lsn) + " " + record;
         pending_records.push_back({lsn, durable_record});
         records_written++;
         bytes_written += durable_record.size() + 1;
+        next_lsn = lsn + durable_record.size() + 1;
         return lsn;
     }
 
@@ -965,9 +989,19 @@ public:
         return wrote;
     }
 
-    std::vector<std::string> readAll() {
-        std::ifstream input(log_filename);
+    std::vector<std::string> readFromLSN(LSN start_lsn) {
+        std::ifstream input(log_filename, std::ios::binary);
         std::vector<std::string> records;
+        next_lsn = std::max<LSN>(next_lsn, durableLogSize() + 1);
+        if (!input) {
+            return records;
+        }
+        if (start_lsn > 1) {
+            input.seekg(static_cast<std::streamoff>(start_lsn - 1), std::ios::beg);
+            if (!input) {
+                throw std::runtime_error("Unable to seek to ARIES log LSN.");
+            }
+        }
         std::string line;
         LSN durable_lsn = flushed_lsn;
         while (std::getline(input, line)) {
@@ -1002,6 +1036,24 @@ public:
 
     LSN getFlushedLSN() const {
         return flushed_lsn;
+    }
+
+    void writeMasterRecord(LSN checkpoint_begin_lsn) {
+        std::ofstream output(master_record_filename, std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to write ARIES master record.");
+        }
+        output << checkpoint_begin_lsn << "\n";
+        output.flush();
+    }
+
+    LSN readMasterRecord() const {
+        std::ifstream input(master_record_filename);
+        LSN checkpoint_begin_lsn = 0;
+        if (input) {
+            input >> checkpoint_begin_lsn;
+        }
+        return checkpoint_begin_lsn;
     }
 };
 
@@ -1043,6 +1095,8 @@ private:
     // Crash knobs for the two recovery demos in main().
     bool crash_after_commit_before_flush = false;
     bool crash_after_steal_before_commit = false;
+    bool checkpoint_active = false;
+    LSN active_checkpoint_begin_lsn = 0;
     // In-memory page-update records used for abort and savepoint rollback.
     std::vector<PageUpdateLogRecord> page_update_log_records;
     // Savepoints remember a transaction-local target LSN.
@@ -1063,7 +1117,7 @@ private:
     size_t restart_redo_records = 0;
     size_t restart_analysis_records_total = 0;
     size_t restart_analysis_records_replayed = 0;
-    size_t restart_analysis_records_skipped_by_checkpoint = 0;
+    size_t restart_analysis_bytes_skipped_by_checkpoint = 0;
     size_t clr_records_logged = 0;
     size_t restart_redo_records_examined = 0;
     size_t restart_redo_records_skipped_by_dpt = 0;
@@ -1076,7 +1130,7 @@ private:
     size_t log_force_skips = 0;
     size_t checkpoints_written = 0;
     size_t checkpoint_analysis_start_lsn = 0;
-    std::map<int, TxnTableEntry> transaction_table;
+    std::map<int, TxnTableEntry> active_transaction_table;
 
     static std::string txnStatusName(TxnStatus status) {
         switch (status) {
@@ -1118,7 +1172,7 @@ private:
         LSN prev_lsn = current_txn_last_lsn;
         LSN lsn = appendTxnRecord(current_txn_id, type, prev_lsn);
         current_txn_last_lsn = lsn;
-        transaction_table[current_txn_id] = {status, lsn};
+        active_transaction_table[current_txn_id] = {status, lsn};
         if (prev_lsn_out != nullptr) {
             *prev_lsn_out = prev_lsn;
         }
@@ -1155,6 +1209,11 @@ public:
         this->buffer_manager.setWalForceCallback([this](LSN lsn) {
             return forceLogUpTo(lsn);
         });
+        this->buffer_manager.setPageFlushCallback(
+            [this](PageID page_id, LSN page_lsn, const std::string& tag) {
+                notePageFlushed(page_id, page_lsn, tag);
+            }
+        );
     }
     bool isActive() const { return txn_active; }
     void resetLog() {
@@ -1168,6 +1227,8 @@ public:
     void abort();
     void savepoint(const std::string& name);
     void rollbackTo(const std::string& name);
+    void beginCheckpoint();
+    void endCheckpoint();
     void checkpoint();
     void recover();
     LSN logUpdate(TableId table_id,
@@ -1176,6 +1237,7 @@ public:
                    std::unique_ptr<Tuple> before_tuple,
                    std::unique_ptr<Tuple> after_tuple);
     bool forceLogUpTo(LSN lsn);
+    void notePageFlushed(PageID page_id, LSN page_lsn, const std::string& tag);
     void maybeCrashAfterSteal(PageID page_id);
     int getCurrentTxnId() const { return current_txn_id; }
     void printPolicy() const;
@@ -2255,7 +2317,7 @@ void RecoveryManager::commit() {
               << " LSN " << end_lsn
               << " prevLSN " << end_prev_lsn << std::endl;
     forceLogUpTo(end_lsn);
-    transaction_table.erase(current_txn_id);
+    active_transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
     page_update_log_records.clear();
@@ -2310,7 +2372,7 @@ void RecoveryManager::rollbackTo(const std::string& name) {
             *update.before_tuple
         );
         current_txn_last_lsn = clr_lsn;
-        transaction_table[current_txn_id] = {TxnStatus::RUNNING, clr_lsn};
+        active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, clr_lsn};
         std::cout << "  log: CLR txn " << current_txn_id
                   << " LSN " << clr_lsn
                   << " prevLSN " << clr_prev_lsn
@@ -2360,7 +2422,7 @@ void RecoveryManager::abort() {
                 *it->before_tuple
             );
             current_txn_last_lsn = clr_lsn;
-            transaction_table[current_txn_id] = {TxnStatus::ABORTING, clr_lsn};
+            active_transaction_table[current_txn_id] = {TxnStatus::ABORTING, clr_lsn};
             std::cout << "  log: CLR txn " << current_txn_id
                       << " LSN " << clr_lsn
                       << " prevLSN " << clr_prev_lsn
@@ -2392,7 +2454,7 @@ void RecoveryManager::abort() {
               << " LSN " << end_lsn
               << " prevLSN " << end_prev_lsn << std::endl;
     forceLogUpTo(end_lsn);
-    transaction_table.erase(current_txn_id);
+    active_transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
     page_update_log_records.clear();
@@ -2406,11 +2468,23 @@ void RecoveryManager::abort() {
     txn_active = false;
 }
 
-void RecoveryManager::checkpoint() {
+void RecoveryManager::beginCheckpoint() {
+    if (checkpoint_active) {
+        throw std::runtime_error("BEGIN CHECKPOINT while another checkpoint is active.");
+    }
     LSN begin_lsn = appendTxnRecord(0, "BEGIN_CHECKPOINT", 0);
+    checkpoint_active = true;
+    active_checkpoint_begin_lsn = begin_lsn;
+    std::cout << "  log: BEGIN_CHECKPOINT LSN " << begin_lsn << std::endl;
+}
+
+void RecoveryManager::endCheckpoint() {
+    if (!checkpoint_active) {
+        throw std::runtime_error("END CHECKPOINT without BEGIN CHECKPOINT.");
+    }
     std::stringstream record;
-    record << "END_CHECKPOINT 0 0 TT " << transaction_table.size();
-    for (const auto& entry : transaction_table) {
+    record << "END_CHECKPOINT 0 0 ATT " << active_transaction_table.size();
+    for (const auto& entry : active_transaction_table) {
         record << " " << entry.first
                << " " << txnStatusName(entry.second.status)
                << " " << entry.second.last_lsn;
@@ -2422,13 +2496,22 @@ void RecoveryManager::checkpoint() {
 
     LSN end_lsn = log_manager.append(record.str());
     forceLogUpTo(end_lsn);
+    log_manager.writeMasterRecord(active_checkpoint_begin_lsn);
     checkpoints_written++;
-    checkpoint_analysis_start_lsn = end_lsn;
-    std::cout << "  log: BEGIN_CHECKPOINT LSN " << begin_lsn << std::endl;
+    checkpoint_analysis_start_lsn = active_checkpoint_begin_lsn;
+    checkpoint_active = false;
     std::cout << "  log: END_CHECKPOINT LSN " << end_lsn
-              << " saved TT=" << transaction_table.size()
+              << " saved ATT=" << active_transaction_table.size()
               << " DPT=" << dirty_page_table.size() << std::endl;
+    std::cout << "  master: checkpoint starts at LSN "
+              << active_checkpoint_begin_lsn << std::endl;
     std::cout << "  recovery: fuzzy checkpoint forced log only; data pages remain no-force" << std::endl;
+    active_checkpoint_begin_lsn = 0;
+}
+
+void RecoveryManager::checkpoint() {
+    beginCheckpoint();
+    endCheckpoint();
 }
 
 void RecoveryManager::recover() {
@@ -2449,10 +2532,10 @@ void RecoveryManager::recover() {
     std::map<PageID, LSN> restart_dirty_page_table;
     std::map<LSN, LSN> prev_lsn_by_lsn;
     std::vector<WalRecord> wal_records;
-    auto log_records = log_manager.readAll();
-
-    size_t analysis_start_index = 0;
-    LSN checkpoint_lsn = 0;
+    LSN master_checkpoint_begin_lsn = log_manager.readMasterRecord();
+    LSN analysis_start_lsn = master_checkpoint_begin_lsn == 0 ? 1 : master_checkpoint_begin_lsn;
+    auto log_records = log_manager.readFromLSN(analysis_start_lsn);
+    LSN checkpoint_end_lsn = 0;
     std::map<int, TxnTableEntry> checkpoint_table;
     std::map<PageID, LSN> checkpoint_dirty_page_table;
 
@@ -2461,8 +2544,8 @@ void RecoveryManager::recover() {
         size_t entry_count = 0;
         checkpoint_table.clear();
         checkpoint_dirty_page_table.clear();
-        if (!(input >> marker >> entry_count) || marker != "TT") {
-            throw std::runtime_error("Malformed END_CHECKPOINT transaction table.");
+        if (!(input >> marker >> entry_count) || marker != "ATT") {
+            throw std::runtime_error("Malformed END_CHECKPOINT active transaction table.");
         }
         for (size_t i = 0; i < entry_count; i++) {
             int txn_id;
@@ -2483,8 +2566,8 @@ void RecoveryManager::recover() {
         }
     };
 
-    for (size_t record_index = 0; record_index < log_records.size(); record_index++) {
-        std::istringstream input(log_records[record_index]);
+    auto collectWalRecord = [&](const std::string& record) {
+        std::istringstream input(record);
         LSN record_lsn;
         LSN prev_lsn;
         std::string type;
@@ -2498,19 +2581,63 @@ void RecoveryManager::recover() {
         if (txn_id > 0) {
             next_txn_id = std::max(next_txn_id, txn_id + 1);
         }
-        if (type == "END_CHECKPOINT") {
-            readCheckpoint(input);
-            checkpoint_lsn = record_lsn;
-            analysis_start_index = record_index + 1;
+        prev_lsn_by_lsn[record_lsn] = prev_lsn;
+        if (type == "UPDATE") {
+            int table_id;
+            int page_id;
+            size_t slot_id;
+            input >> table_id >> page_id >> slot_id;
+            wal_records.push_back({
+                record_lsn,
+                prev_lsn,
+                txn_id,
+                static_cast<TableId>(table_id),
+                static_cast<PageID>(page_id),
+                slot_id,
+                false,
+                0,
+                Tuple::deserialize(input),
+                Tuple::deserialize(input)
+            });
+        } else if (type == "CLR") {
+            LSN undo_next_lsn;
+            int table_id;
+            int page_id;
+            size_t slot_id;
+            input >> undo_next_lsn >> table_id >> page_id >> slot_id;
+            wal_records.push_back({
+                record_lsn,
+                prev_lsn,
+                txn_id,
+                static_cast<TableId>(table_id),
+                static_cast<PageID>(page_id),
+                slot_id,
+                true,
+                undo_next_lsn,
+                nullptr,
+                Tuple::deserialize(input)
+            });
+        }
+    };
+
+    if (master_checkpoint_begin_lsn != 0) {
+        if (log_records.empty()) {
+            throw std::runtime_error("Master record points past the end of buzzdb.log.");
+        }
+        std::istringstream input(log_records.front());
+        LSN record_lsn;
+        std::string type;
+        input >> record_lsn >> type;
+        if (record_lsn != master_checkpoint_begin_lsn || type != "BEGIN_CHECKPOINT") {
+            throw std::runtime_error("Master record does not point at BEGIN_CHECKPOINT.");
         }
     }
 
-    analysis_table = checkpoint_table;
-    restart_dirty_page_table = checkpoint_dirty_page_table;
-    checkpoint_analysis_start_lsn = checkpoint_lsn;
+    checkpoint_analysis_start_lsn = master_checkpoint_begin_lsn;
     restart_analysis_records_total = log_records.size();
-    restart_analysis_records_replayed = log_records.size() - analysis_start_index;
-    restart_analysis_records_skipped_by_checkpoint = analysis_start_index;
+    restart_analysis_records_replayed = log_records.size();
+    restart_analysis_bytes_skipped_by_checkpoint =
+        master_checkpoint_begin_lsn == 0 ? 0 : master_checkpoint_begin_lsn - 1;
 
     for (size_t record_index = 0; record_index < log_records.size(); record_index++) {
         const auto& record = log_records[record_index];
@@ -2525,8 +2652,14 @@ void RecoveryManager::recover() {
                 "buzzdb.log was written by an older WAL format; remove it before running v62."
             );
         }
+        if (txn_id > 0) {
+            next_txn_id = std::max(next_txn_id, txn_id + 1);
+        }
         prev_lsn_by_lsn[record_lsn] = prev_lsn;
-        bool in_analysis_scan = record_index >= analysis_start_index;
+        bool in_analysis_scan = record_lsn >= analysis_start_lsn;
+        if (type == "UPDATE" || type == "CLR") {
+            collectWalRecord(record);
+        }
 
         if (type == "BEGIN") {
             if (in_analysis_scan) {
@@ -2556,18 +2689,6 @@ void RecoveryManager::recover() {
                 }
                 analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
             }
-            wal_records.push_back({
-                record_lsn,
-                prev_lsn,
-                txn_id,
-                static_cast<TableId>(table_id),
-                static_cast<PageID>(page_id),
-                slot_id,
-                false,
-                0,
-                Tuple::deserialize(input),
-                Tuple::deserialize(input)
-            });
         } else if (type == "CLR") {
             LSN undo_next_lsn;
             int table_id;
@@ -2586,32 +2707,43 @@ void RecoveryManager::recover() {
                 }
                 analysis_table[txn_id] = {status, record_lsn};
             }
-            wal_records.push_back({
-                record_lsn,
-                prev_lsn,
-                txn_id,
-                static_cast<TableId>(table_id),
-                static_cast<PageID>(page_id),
-                slot_id,
-                true,
-                undo_next_lsn,
-                nullptr,
-                Tuple::deserialize(input)
-            });
+        } else if (type == "END_CHECKPOINT" && in_analysis_scan) {
+            readCheckpoint(input);
+            for (const auto& entry : checkpoint_table) {
+                auto current = analysis_table.find(entry.first);
+                if (current == analysis_table.end() ||
+                    current->second.last_lsn < entry.second.last_lsn) {
+                    analysis_table[entry.first] = entry.second;
+                }
+            }
+            for (const auto& entry : checkpoint_dirty_page_table) {
+                auto current = restart_dirty_page_table.find(entry.first);
+                if (current == restart_dirty_page_table.end() ||
+                    entry.second < current->second) {
+                    restart_dirty_page_table[entry.first] = entry.second;
+                }
+            }
+            checkpoint_end_lsn = record_lsn;
         }
     }
 
+    if (master_checkpoint_begin_lsn != 0 && checkpoint_end_lsn == 0) {
+        throw std::runtime_error("Master record checkpoint has no END_CHECKPOINT record.");
+    }
+
     if (!log_records.empty()) {
-        if (checkpoint_lsn != 0) {
+        if (master_checkpoint_begin_lsn != 0) {
+            std::cout << "ARIES analysis: master record starts at LSN "
+                      << master_checkpoint_begin_lsn << std::endl;
             std::cout << "ARIES analysis: loaded checkpoint ending at LSN "
-                      << checkpoint_lsn
-                      << " with TT=" << checkpoint_table.size()
+                      << checkpoint_end_lsn
+                      << " with ATT=" << checkpoint_table.size()
                       << " DPT=" << checkpoint_dirty_page_table.size()
                       << std::endl;
         } else {
             std::cout << "ARIES analysis: no checkpoint found; scanning from log start" << std::endl;
         }
-        std::cout << "ARIES analysis: transaction table after checkpointed log scan" << std::endl;
+        std::cout << "ARIES analysis: active transaction table after checkpointed log scan" << std::endl;
         if (analysis_table.empty()) {
             std::cout << "  empty; every logged transaction reached END" << std::endl;
         } else {
@@ -2643,6 +2775,14 @@ void RecoveryManager::recover() {
     if (redo_start_lsn != 0) {
         std::cout << "ARIES redo: start from recLSN "
                   << redo_start_lsn << std::endl;
+    }
+    if (redo_start_lsn != 0 && redo_start_lsn < analysis_start_lsn) {
+        wal_records.clear();
+        prev_lsn_by_lsn.clear();
+        auto redo_log_records = log_manager.readFromLSN(redo_start_lsn);
+        for (const auto& record : redo_log_records) {
+            collectWalRecord(record);
+        }
     }
 
     for (const auto& record : wal_records) {
@@ -2677,54 +2817,68 @@ void RecoveryManager::recover() {
     for (const auto& record : wal_records) {
         update_by_lsn[record.lsn] = &record;
     }
+    std::map<LSN, int> to_undo;
     for (const auto& txn_entry : analysis_table) {
         if (txn_entry.second.status == TxnStatus::COMMITTING) {
             continue;
         }
         losers[txn_entry.first] = txn_entry.second;
-        LSN txn_last_lsn = txn_entry.second.last_lsn;
-        LSN next_lsn = txn_last_lsn;
-        while (next_lsn != 0) {
-            auto record = update_by_lsn.find(next_lsn);
-            if (record != update_by_lsn.end()) {
-                if (record->second->is_clr) {
-                    next_lsn = record->second->undo_next_lsn;
-                    continue;
+        if (txn_entry.second.last_lsn != 0) {
+            to_undo[txn_entry.second.last_lsn] = txn_entry.first;
+        }
+    }
+
+    while (!to_undo.empty()) {
+        auto undo_entry = std::prev(to_undo.end());
+        LSN next_lsn = undo_entry->first;
+        int txn_id = undo_entry->second;
+        to_undo.erase(undo_entry);
+        auto loser = losers.find(txn_id);
+        if (loser == losers.end()) {
+            continue;
+        }
+
+        auto record = update_by_lsn.find(next_lsn);
+        if (record != update_by_lsn.end()) {
+            if (record->second->is_clr) {
+                if (record->second->undo_next_lsn != 0) {
+                    to_undo[record->second->undo_next_lsn] = txn_id;
                 }
-                auto& metadata = catalog.getTable(record->second->table_id);
-                TableHeap table(metadata, buffer_manager);
-                LSN clr_lsn = appendClrRecord(
-                    txn_entry.first,
-                    txn_last_lsn,
-                    record->second->prev_lsn,
-                    record->second->table_id,
-                    record->second->page_id,
-                    record->second->slot_id,
-                    *record->second->before_tuple
-                );
-                losers[txn_entry.first] = {txn_entry.second.status, clr_lsn};
-                std::cout << "  log: CLR txn " << txn_entry.first
-                          << " LSN " << clr_lsn
-                          << " prevLSN " << txn_last_lsn
-                          << " undoNextLSN " << record->second->prev_lsn
-                          << " during restart" << std::endl;
-                table.applyUpdate(
-                    record->second->page_id,
-                    record->second->slot_id,
-                    record->second->before_tuple->clone(),
-                    true, "restart undo", clr_lsn
-                );
-                undone++;
-                txn_last_lsn = clr_lsn;
-                next_lsn = record->second->prev_lsn;
                 continue;
             }
-
-            auto prev_lsn = prev_lsn_by_lsn.find(next_lsn);
-            if (prev_lsn == prev_lsn_by_lsn.end()) {
-                break;
+            auto& metadata = catalog.getTable(record->second->table_id);
+            TableHeap table(metadata, buffer_manager);
+            LSN clr_lsn = appendClrRecord(
+                txn_id,
+                loser->second.last_lsn,
+                record->second->prev_lsn,
+                record->second->table_id,
+                record->second->page_id,
+                record->second->slot_id,
+                *record->second->before_tuple
+            );
+            std::cout << "  log: CLR txn " << txn_id
+                      << " LSN " << clr_lsn
+                      << " prevLSN " << loser->second.last_lsn
+                      << " undoNextLSN " << record->second->prev_lsn
+                      << " during restart" << std::endl;
+            loser->second.last_lsn = clr_lsn;
+            table.applyUpdate(
+                record->second->page_id,
+                record->second->slot_id,
+                record->second->before_tuple->clone(),
+                true, "restart undo", clr_lsn
+            );
+            undone++;
+            if (record->second->prev_lsn != 0) {
+                to_undo[record->second->prev_lsn] = txn_id;
             }
-            next_lsn = prev_lsn->second;
+            continue;
+        }
+
+        auto prev_lsn = prev_lsn_by_lsn.find(next_lsn);
+        if (prev_lsn != prev_lsn_by_lsn.end() && prev_lsn->second != 0) {
+            to_undo[prev_lsn->second] = txn_id;
         }
     }
 
@@ -2810,7 +2964,7 @@ LSN RecoveryManager::logUpdate(TableId table_id,
         before_image + after_image
     );
     current_txn_last_lsn = update_lsn;
-    transaction_table[current_txn_id] = {TxnStatus::RUNNING, update_lsn};
+    active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, update_lsn};
     if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
         dirty_page_table[page_id] = update_lsn;
     }
@@ -2848,6 +3002,16 @@ bool RecoveryManager::forceLogUpTo(LSN lsn) {
     return wrote;
 }
 
+void RecoveryManager::notePageFlushed(PageID page_id,
+                                      LSN page_lsn,
+                                      const std::string& tag) {
+    (void)tag;
+    auto dirty_page = dirty_page_table.find(page_id);
+    if (dirty_page != dirty_page_table.end() && dirty_page->second <= page_lsn) {
+        dirty_page_table.erase(dirty_page);
+    }
+}
+
 void RecoveryManager::maybeCrashAfterSteal(PageID page_id) {
     if (!crash_after_steal_before_commit) {
         return;
@@ -2865,8 +3029,8 @@ void RecoveryManager::printPolicy() const {
     std::cout << "  Steal: Yes; dirty uncommitted pages may reach disk." << std::endl;
     std::cout << "  Force: No; commit forces the log, not dirty data pages." << std::endl;
     std::cout << "  WAL: page flushes force the log through the page's LSN." << std::endl;
-    std::cout << "  Checkpoint: fuzzy snapshots log TT+DPT without forcing data pages." << std::endl;
-    std::cout << "  Analysis: restart begins from the latest checkpoint, then scans forward." << std::endl;
+    std::cout << "  Checkpoint: fuzzy snapshots log ATT+DPT without forcing data pages." << std::endl;
+    std::cout << "  Analysis: master record points to the latest checkpoint begin LSN." << std::endl;
     std::cout << "  Redo: repeat history from the smallest recLSN, using pageLSN skips." << std::endl;
     std::cout << "  Undo: loser transactions write CLRs and follow undoNextLSN." << std::endl;
 }
@@ -2885,7 +3049,7 @@ void RecoveryManager::printSummary() {
     std::cout << "  Log force skips: " << log_force_skips << std::endl;
     std::cout << "  Checkpoints written this run: " << checkpoints_written << std::endl;
     if (checkpoint_analysis_start_lsn != 0) {
-        std::cout << "  Latest checkpoint END LSN seen this run: "
+        std::cout << "  Master checkpoint BEGIN LSN: "
                   << checkpoint_analysis_start_lsn << std::endl;
     }
     std::cout << "  Before-image records logged: " << before_image_records_logged << std::endl;
@@ -2893,10 +3057,10 @@ void RecoveryManager::printSummary() {
     std::cout << "  CLR records logged: " << clr_records_logged << std::endl;
     std::cout << "  Runtime undo records applied: " << runtime_undo_records << std::endl;
     std::cout << "  Partial rollback undo records applied: " << partial_rollback_records << std::endl;
-    std::cout << "  Restart analysis log records total: " << restart_analysis_records_total << std::endl;
+    std::cout << "  Restart analysis log records read: " << restart_analysis_records_total << std::endl;
     std::cout << "  Restart analysis log records replayed: " << restart_analysis_records_replayed << std::endl;
-    std::cout << "  Restart analysis log records skipped by checkpoint: "
-              << restart_analysis_records_skipped_by_checkpoint << std::endl;
+    std::cout << "  Restart analysis log bytes skipped by checkpoint seek: "
+              << restart_analysis_bytes_skipped_by_checkpoint << std::endl;
     std::cout << "  Restart undo records applied: " << restart_undo_records << std::endl;
     std::cout << "  Restart redo records examined: " << restart_redo_records_examined << std::endl;
     std::cout << "  Restart redo skipped by DPT/recLSN: " << restart_redo_records_skipped_by_dpt << std::endl;
@@ -3801,6 +3965,8 @@ enum class StatementType {
     SAVEPOINT,
     ROLLBACK_TO,
     CHECKPOINT,
+    BEGIN_CHECKPOINT,
+    END_CHECKPOINT,
     INSERT,
     UPDATE
 };
@@ -4153,6 +4319,10 @@ void prettyPrint(const Components& components,
             std::cout << "ROLLBACK TO " << components.savepointName;
         } else if (components.type == StatementType::CHECKPOINT) {
             std::cout << "CHECKPOINT";
+        } else if (components.type == StatementType::BEGIN_CHECKPOINT) {
+            std::cout << "BEGIN CHECKPOINT";
+        } else if (components.type == StatementType::END_CHECKPOINT) {
+            std::cout << "END CHECKPOINT";
         } else if (components.type == StatementType::INSERT) {
             std::cout << "INSERT " << components.tableName << " ";
             for (size_t i = 0; i < components.values.size(); i++) {
@@ -4561,6 +4731,8 @@ public:
         std::regex commit_regex("^\\s*COMMIT\\s*$");
         std::regex abort_regex("^\\s*ABORT\\s*$");
         std::regex checkpoint_regex("^\\s*CHECKPOINT\\s*$");
+        std::regex begin_checkpoint_regex("^\\s*BEGIN\\s+CHECKPOINT\\s*$");
+        std::regex end_checkpoint_regex("^\\s*END\\s+CHECKPOINT\\s*$");
         std::regex savepoint_regex(
             "^\\s*SAVEPOINT\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$");
         std::regex rollback_to_regex(
@@ -4591,6 +4763,16 @@ public:
 
         if (std::regex_match(statement, checkpoint_regex)) {
             components.type = StatementType::CHECKPOINT;
+            return components;
+        }
+
+        if (std::regex_match(statement, begin_checkpoint_regex)) {
+            components.type = StatementType::BEGIN_CHECKPOINT;
+            return components;
+        }
+
+        if (std::regex_match(statement, end_checkpoint_regex)) {
+            components.type = StatementType::END_CHECKPOINT;
             return components;
         }
 
@@ -4662,6 +4844,14 @@ public:
         }
         if (components.type == StatementType::CHECKPOINT) {
             recovery_manager.checkpoint();
+            return;
+        }
+        if (components.type == StatementType::BEGIN_CHECKPOINT) {
+            recovery_manager.beginCheckpoint();
+            return;
+        }
+        if (components.type == StatementType::END_CHECKPOINT) {
+            recovery_manager.endCheckpoint();
             return;
         }
         if (components.type == StatementType::SAVEPOINT) {
@@ -4964,15 +5154,16 @@ COMMIT;
 BEGIN;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1A;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1B;
+BEGIN CHECKPOINT;
 SAVEPOINT garcia_two;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1C;
 SAVEPOINT garcia_three;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1D;
+END CHECKPOINT;
 ROLLBACK TO garcia_three;
 ROLLBACK TO garcia_two;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1C;
 COMMIT;
-CHECKPOINT;
 BEGIN;
 UPDATE seats SET status=held, customer=patel WHERE seat_no=1B;
 ABORT;
@@ -4983,6 +5174,7 @@ BEGIN;
 UPDATE seats SET status=held, customer=chen WHERE seat_no=2A;
 UPDATE seats SET status=held, customer=chen WHERE seat_no=2B;
 ABORT;
+CHECKPOINT;
 BEGIN;
 UPDATE seats SET status=held, customer=nguyen WHERE seat_no=2B;
 PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats;
