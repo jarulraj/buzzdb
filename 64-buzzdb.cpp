@@ -228,6 +228,7 @@ constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
 constexpr uint32_t BUZZDB_MAGIC = 0x425A4442;
 constexpr uint16_t BUZZDB_VERSION = 64;
+constexpr uint16_t BUZZDB_MIN_COMPATIBLE_VERSION = 59;
 constexpr size_t MAX_SYSTEM_TABLE_PAGES = 16;
 const std::string log_filename = "buzzdb.log";
 const std::string master_record_filename = "buzzdb.master";
@@ -1856,11 +1857,12 @@ private:
         BootstrapPage bootstrap;
         auto& page = buffer_manager.getPage(0);
         std::memcpy(&bootstrap, page->page_data.get(), sizeof(BootstrapPage));
-        if (bootstrap.magic != BUZZDB_MAGIC || bootstrap.version != BUZZDB_VERSION) {
+        if (bootstrap.magic != BUZZDB_MAGIC ||
+            bootstrap.version < BUZZDB_MIN_COMPATIBLE_VERSION ||
+            bootstrap.version > BUZZDB_VERSION) {
             throw std::runtime_error(
                 database_filename +
-                " was created by an older BuzzDB format. "
-                "v64 uses ARIES checkpoint/pageLSN/CLR metadata; use a fresh directory or remove buzzdb.dat."
+                " was created by an incompatible BuzzDB storage format."
             );
         }
         return bootstrap;
