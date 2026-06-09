@@ -931,11 +931,24 @@ public:
 
 class Catalog;
 
+struct MasterRecord {
+    LSN checkpoint_begin_lsn = 0;
+    size_t checkpoint_begin_offset = 0;
+};
+
 class LogManager {
 private:
-    std::vector<std::pair<LSN, std::string>> pending_records;
+    struct PendingRecord {
+        LSN lsn;
+        size_t offset;
+        std::string record;
+    };
+
+    std::vector<PendingRecord> pending_records;
+    std::map<LSN, size_t> log_offsets;
     LSN next_lsn = 1;
     LSN flushed_lsn = 0;
+    size_t next_log_offset = 0;
     size_t records_written = 0;
     size_t bytes_written = 0;
 
@@ -952,19 +965,22 @@ public:
         std::ofstream output(log_filename, std::ios::trunc);
         std::remove(master_record_filename.c_str());
         pending_records.clear();
+        log_offsets.clear();
         next_lsn = 1;
         flushed_lsn = 0;
+        next_log_offset = 0;
         records_written = 0;
         bytes_written = 0;
     }
 
     LSN append(const std::string& record) {
-        LSN lsn = next_lsn;
+        LSN lsn = next_lsn++;
         std::string durable_record = std::to_string(lsn) + " " + record;
-        pending_records.push_back({lsn, durable_record});
+        pending_records.push_back({lsn, next_log_offset, durable_record});
+        log_offsets[lsn] = next_log_offset;
         records_written++;
         bytes_written += durable_record.size() + 1;
-        next_lsn = lsn + durable_record.size() + 1;
+        next_log_offset += durable_record.size() + 1;
         return lsn;
     }
 
@@ -979,9 +995,9 @@ public:
         }
 
         bool wrote = false;
-        while (!pending_records.empty() && pending_records.front().first <= lsn) {
-            output << pending_records.front().second << "\n";
-            flushed_lsn = pending_records.front().first;
+        while (!pending_records.empty() && pending_records.front().lsn <= lsn) {
+            output << pending_records.front().record << "\n";
+            flushed_lsn = pending_records.front().lsn;
             pending_records.erase(pending_records.begin());
             wrote = true;
         }
@@ -989,29 +1005,32 @@ public:
         return wrote;
     }
 
-    std::vector<std::string> readFromLSN(LSN start_lsn) {
+    std::vector<std::string> readFromOffset(size_t start_offset) {
         std::ifstream input(log_filename, std::ios::binary);
         std::vector<std::string> records;
-        next_lsn = std::max<LSN>(next_lsn, durableLogSize() + 1);
+        next_log_offset = std::max(next_log_offset, durableLogSize());
         if (!input) {
             return records;
         }
-        if (start_lsn > 1) {
-            input.seekg(static_cast<std::streamoff>(start_lsn - 1), std::ios::beg);
+        if (start_offset != 0) {
+            input.seekg(static_cast<std::streamoff>(start_offset), std::ios::beg);
             if (!input) {
-                throw std::runtime_error("Unable to seek to ARIES log LSN.");
+                throw std::runtime_error("Unable to seek to ARIES log offset.");
             }
         }
         std::string line;
         LSN durable_lsn = flushed_lsn;
+        size_t line_offset = start_offset;
         while (std::getline(input, line)) {
             if (!line.empty()) {
                 std::istringstream record_input(line);
                 LSN lsn;
                 record_input >> lsn;
+                log_offsets[lsn] = line_offset;
                 durable_lsn = std::max(durable_lsn, lsn);
                 records.push_back(line);
             }
+            line_offset += line.size() + 1;
         }
         flushed_lsn = durable_lsn;
         next_lsn = std::max(next_lsn, durable_lsn + 1);
@@ -1038,22 +1057,39 @@ public:
         return flushed_lsn;
     }
 
+    size_t getLogOffset(LSN lsn) const {
+        auto offset = log_offsets.find(lsn);
+        if (offset == log_offsets.end()) {
+            throw std::runtime_error("No log offset found for LSN.");
+        }
+        return offset->second;
+    }
+
     void writeMasterRecord(LSN checkpoint_begin_lsn) {
         std::ofstream output(master_record_filename, std::ios::trunc);
         if (!output) {
             throw std::runtime_error("Unable to write ARIES master record.");
         }
-        output << checkpoint_begin_lsn << "\n";
+        output << "checkpoint_lsn " << checkpoint_begin_lsn << "\n"
+               << "checkpoint_offset " << getLogOffset(checkpoint_begin_lsn) << "\n";
         output.flush();
     }
 
-    LSN readMasterRecord() const {
+    MasterRecord readMasterRecord() const {
         std::ifstream input(master_record_filename);
-        LSN checkpoint_begin_lsn = 0;
+        MasterRecord master_record;
         if (input) {
-            input >> checkpoint_begin_lsn;
+            std::string key;
+            input >> key >> master_record.checkpoint_begin_lsn;
+            if (key != "checkpoint_lsn") {
+                throw std::runtime_error("Malformed ARIES master record.");
+            }
+            input >> key >> master_record.checkpoint_begin_offset;
+            if (key != "checkpoint_offset") {
+                throw std::runtime_error("Malformed ARIES master record.");
+            }
         }
-        return checkpoint_begin_lsn;
+        return master_record;
     }
 };
 
@@ -2504,7 +2540,10 @@ void RecoveryManager::endCheckpoint() {
               << " saved ATT=" << active_transaction_table.size()
               << " DPT=" << dirty_page_table.size() << std::endl;
     std::cout << "  master: checkpoint starts at LSN "
-              << active_checkpoint_begin_lsn << std::endl;
+              << active_checkpoint_begin_lsn
+              << " offset "
+              << log_manager.getLogOffset(active_checkpoint_begin_lsn)
+              << std::endl;
     std::cout << "  recovery: fuzzy checkpoint forced log only; data pages remain no-force" << std::endl;
     active_checkpoint_begin_lsn = 0;
 }
@@ -2532,9 +2571,10 @@ void RecoveryManager::recover() {
     std::map<PageID, LSN> restart_dirty_page_table;
     std::map<LSN, LSN> prev_lsn_by_lsn;
     std::vector<WalRecord> wal_records;
-    LSN master_checkpoint_begin_lsn = log_manager.readMasterRecord();
+    MasterRecord master_record = log_manager.readMasterRecord();
+    LSN master_checkpoint_begin_lsn = master_record.checkpoint_begin_lsn;
     LSN analysis_start_lsn = master_checkpoint_begin_lsn == 0 ? 1 : master_checkpoint_begin_lsn;
-    auto log_records = log_manager.readFromLSN(analysis_start_lsn);
+    auto log_records = log_manager.readFromOffset(master_record.checkpoint_begin_offset);
     LSN checkpoint_end_lsn = 0;
     std::map<int, TxnTableEntry> checkpoint_table;
     std::map<PageID, LSN> checkpoint_dirty_page_table;
@@ -2637,7 +2677,7 @@ void RecoveryManager::recover() {
     restart_analysis_records_total = log_records.size();
     restart_analysis_records_replayed = log_records.size();
     restart_analysis_bytes_skipped_by_checkpoint =
-        master_checkpoint_begin_lsn == 0 ? 0 : master_checkpoint_begin_lsn - 1;
+        master_record.checkpoint_begin_offset;
 
     for (size_t record_index = 0; record_index < log_records.size(); record_index++) {
         const auto& record = log_records[record_index];
@@ -2734,7 +2774,9 @@ void RecoveryManager::recover() {
     if (!log_records.empty()) {
         if (master_checkpoint_begin_lsn != 0) {
             std::cout << "ARIES analysis: master record starts at LSN "
-                      << master_checkpoint_begin_lsn << std::endl;
+                      << master_checkpoint_begin_lsn
+                      << " (log offset "
+                      << master_record.checkpoint_begin_offset << ")" << std::endl;
             std::cout << "ARIES analysis: loaded checkpoint ending at LSN "
                       << checkpoint_end_lsn
                       << " with ATT=" << checkpoint_table.size()
@@ -2779,7 +2821,7 @@ void RecoveryManager::recover() {
     if (redo_start_lsn != 0 && redo_start_lsn < analysis_start_lsn) {
         wal_records.clear();
         prev_lsn_by_lsn.clear();
-        auto redo_log_records = log_manager.readFromLSN(redo_start_lsn);
+        auto redo_log_records = log_manager.readFromOffset(0);
         for (const auto& record : redo_log_records) {
             collectWalRecord(record);
         }
