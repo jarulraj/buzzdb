@@ -1005,7 +1005,8 @@ public:
     }
 };
 
-struct WalUpdate {
+// In-memory copy of one ARIES page-update record for runtime undo.
+struct PageUpdateLogRecord {
     LSN lsn = 0;
     LSN prev_lsn = 0;
     TableId table_id;
@@ -1029,17 +1030,24 @@ private:
         LSN last_lsn = 0;
     };
 
+    // Shared storage, catalog, and WAL components used by recovery.
     BufferManager& buffer_manager;
     Catalog& catalog;
     LogManager log_manager;
+    // Current transaction state and ARIES lastLSN chain.
     bool txn_active = false;
     bool txn_logged = false;
     LSN current_txn_last_lsn = 0;
     int next_txn_id = 1;
     int current_txn_id = 0;
+    // Crash knobs for the two recovery demos in main().
     bool crash_after_commit_before_flush = false;
     bool crash_after_steal_before_commit = false;
-    std::vector<WalUpdate> wal_updates;
+    // In-memory page-update records used for abort and savepoint rollback.
+    std::vector<PageUpdateLogRecord> page_update_log_records;
+    // Savepoints remember a transaction-local target LSN.
+    std::map<std::string, LSN> savepoints;
+    // Pages dirtied by the active transaction.
     std::vector<PageID> dirty_pages;
     size_t before_image_records_logged = 0;
     size_t before_image_bytes_logged = 0;
@@ -1048,6 +1056,7 @@ private:
     size_t committed_update_records = 0;
     size_t aborted_update_records = 0;
     size_t runtime_undo_records = 0;
+    size_t partial_rollback_records = 0;
     size_t restart_undo_records = 0;
     size_t restart_redo_records = 0;
     size_t clr_records_logged = 0;
@@ -1131,6 +1140,8 @@ public:
     void begin();
     void commit();
     void abort();
+    void savepoint(const std::string& name);
+    void rollbackTo(const std::string& name);
     void recover();
     LSN logUpdate(TableId table_id,
                    PageID page_id,
@@ -2169,7 +2180,8 @@ void RecoveryManager::begin() {
     txn_active = true;
     current_txn_id = next_txn_id++;
     current_txn_last_lsn = 0;
-    wal_updates.clear();
+    page_update_log_records.clear();
+    savepoints.clear();
     dirty_pages.clear();
     std::cout << "\nTXN " << current_txn_id << " BEGIN" << std::endl;
     LSN begin_prev_lsn = 0;
@@ -2186,7 +2198,7 @@ void RecoveryManager::commit() {
     }
 
     std::cout << "TXN " << current_txn_id << " COMMIT" << std::endl;
-    if (!wal_updates.empty()) {
+    if (!page_update_log_records.empty()) {
         LSN commit_prev_lsn = 0;
         LSN commit_lsn = appendTxnRecord(
             "COMMIT", TxnStatus::COMMITTING, &commit_prev_lsn
@@ -2196,7 +2208,7 @@ void RecoveryManager::commit() {
                   << " prevLSN " << commit_prev_lsn << std::endl;
         forceLogUpTo(commit_lsn);
         commit_log_forces++;
-        committed_update_records += wal_updates.size();
+        committed_update_records += page_update_log_records.size();
 
         if (crash_after_commit_before_flush) {
             std::cout << "  recovery: forced COMMIT log, forced 0 data page(s)" << std::endl;
@@ -2219,7 +2231,8 @@ void RecoveryManager::commit() {
     transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
-    wal_updates.clear();
+    page_update_log_records.clear();
+    savepoints.clear();
     dirty_pages.clear();
     txn_logged = false;
     crash_after_commit_before_flush = false;
@@ -2229,14 +2242,84 @@ void RecoveryManager::commit() {
     txn_active = false;
 }
 
+void RecoveryManager::savepoint(const std::string& name) {
+    if (!txn_active) {
+        throw std::runtime_error("SAVEPOINT without BEGIN.");
+    }
+
+    savepoints[name] = current_txn_last_lsn;
+    std::cout << "TXN " << current_txn_id
+              << " SAVEPOINT " << name
+              << " at LSN " << current_txn_last_lsn << std::endl;
+}
+
+void RecoveryManager::rollbackTo(const std::string& name) {
+    if (!txn_active) {
+        throw std::runtime_error("ROLLBACK TO without BEGIN.");
+    }
+    auto savepoint = savepoints.find(name);
+    if (savepoint == savepoints.end()) {
+        throw std::runtime_error("Unknown SAVEPOINT: " + name);
+    }
+
+    LSN target_lsn = savepoint->second;
+    size_t undone = 0;
+    std::cout << "TXN " << current_txn_id
+              << " ROLLBACK TO " << name
+              << " targetLSN " << target_lsn << std::endl;
+
+    while (!page_update_log_records.empty() && page_update_log_records.back().lsn > target_lsn) {
+        auto& update = page_update_log_records.back();
+        auto& metadata = catalog.getTable(update.table_id);
+        TableHeap table(metadata, buffer_manager);
+        LSN clr_prev_lsn = current_txn_last_lsn;
+        LSN clr_lsn = appendClrRecord(
+            current_txn_id,
+            clr_prev_lsn,
+            update.prev_lsn,
+            update.table_id,
+            update.page_id,
+            update.slot_id,
+            *update.before_tuple
+        );
+        current_txn_last_lsn = clr_lsn;
+        transaction_table[current_txn_id] = {TxnStatus::RUNNING, clr_lsn};
+        std::cout << "  log: CLR txn " << current_txn_id
+                  << " LSN " << clr_lsn
+                  << " prevLSN " << clr_prev_lsn
+                  << " undoNextLSN " << update.prev_lsn
+                  << " for rollback to " << name << std::endl;
+        table.applyUpdate(
+            update.page_id, update.slot_id, update.before_tuple->clone(),
+            true, "partial rollback undo", clr_lsn
+        );
+        page_update_log_records.pop_back();
+        runtime_undo_records++;
+        partial_rollback_records++;
+        undone++;
+    }
+
+    for (auto it = savepoints.begin(); it != savepoints.end(); ) {
+        if (it->second > target_lsn) {
+            it = savepoints.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::cout << "  recovery: partial rollback restored "
+              << undone << " update record(s); transaction remains active"
+              << std::endl;
+}
+
 void RecoveryManager::abort() {
     if (!txn_active) {
         throw std::runtime_error("ABORT without BEGIN.");
     }
     std::cout << "TXN " << current_txn_id << " ABORT" << std::endl;
-    if (!wal_updates.empty()) {
-        aborted_update_records += wal_updates.size();
-        for (auto it = wal_updates.rbegin(); it != wal_updates.rend(); ++it) {
+    if (!page_update_log_records.empty()) {
+        aborted_update_records += page_update_log_records.size();
+        for (auto it = page_update_log_records.rbegin(); it != page_update_log_records.rend(); ++it) {
             auto& metadata = catalog.getTable(it->table_id);
             TableHeap table(metadata, buffer_manager);
             LSN clr_prev_lsn = current_txn_last_lsn;
@@ -2271,7 +2354,7 @@ void RecoveryManager::abort() {
         forceLogUpTo(abort_lsn);
         abort_log_records++;
         std::cout << "  recovery: restored "
-                  << wal_updates.size()
+                  << page_update_log_records.size()
                   << " before-image record(s), forced restored page(s), wrote CLR+ABORT logs" << std::endl;
     } else {
         std::cout << "  recovery: no updates to discard" << std::endl;
@@ -2285,7 +2368,8 @@ void RecoveryManager::abort() {
     transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
-    wal_updates.clear();
+    page_update_log_records.clear();
+    savepoints.clear();
     dirty_pages.clear();
     txn_logged = false;
     crash_after_commit_before_flush = false;
@@ -2596,7 +2680,7 @@ LSN RecoveryManager::logUpdate(TableId table_id,
               << " LSN " << update_lsn
               << " prevLSN " << update_prev_lsn << std::endl;
 
-    WalUpdate update;
+    PageUpdateLogRecord update;
     update.lsn = update_lsn;
     update.prev_lsn = update_prev_lsn;
     update.table_id = table_id;
@@ -2604,7 +2688,7 @@ LSN RecoveryManager::logUpdate(TableId table_id,
     update.slot_id = slot_id;
     update.before_tuple = std::move(before_tuple);
     update.after_tuple = std::move(after_tuple);
-    wal_updates.push_back(std::move(update));
+    page_update_log_records.push_back(std::move(update));
     std::cout << "  recovery: update " << metadata.name
               << " page " << page_id
               << " slot " << slot_id
@@ -2662,6 +2746,7 @@ void RecoveryManager::printSummary() {
     std::cout << "  After-image records logged: " << after_image_records_logged << std::endl;
     std::cout << "  CLR records logged: " << clr_records_logged << std::endl;
     std::cout << "  Runtime undo records applied: " << runtime_undo_records << std::endl;
+    std::cout << "  Partial rollback undo records applied: " << partial_rollback_records << std::endl;
     std::cout << "  Restart undo records applied: " << restart_undo_records << std::endl;
     std::cout << "  Restart redo records examined: " << restart_redo_records_examined << std::endl;
     std::cout << "  Restart redo skipped by DPT/recLSN: " << restart_redo_records_skipped_by_dpt << std::endl;
@@ -3563,6 +3648,8 @@ enum class StatementType {
     BEGIN,
     COMMIT,
     ABORT,
+    SAVEPOINT,
+    ROLLBACK_TO,
     INSERT,
     UPDATE
 };
@@ -3574,6 +3661,7 @@ struct StatementComponents {
     std::vector<std::pair<std::string, std::string>> assignments;
     std::string whereColumn;
     std::string whereValue;
+    std::string savepointName;
     size_t lineNumber = 0;
 };
 
@@ -3908,6 +3996,10 @@ void prettyPrint(const Components& components,
             components.type == StatementType::COMMIT ||
             components.type == StatementType::ABORT) {
             return;
+        } else if (components.type == StatementType::SAVEPOINT) {
+            std::cout << "SAVEPOINT " << components.savepointName;
+        } else if (components.type == StatementType::ROLLBACK_TO) {
+            std::cout << "ROLLBACK TO " << components.savepointName;
         } else if (components.type == StatementType::INSERT) {
             std::cout << "INSERT " << components.tableName << " ";
             for (size_t i = 0; i < components.values.size(); i++) {
@@ -4315,6 +4407,10 @@ public:
         std::regex begin_regex("^\\s*BEGIN\\s*$");
         std::regex commit_regex("^\\s*COMMIT\\s*$");
         std::regex abort_regex("^\\s*ABORT\\s*$");
+        std::regex savepoint_regex(
+            "^\\s*SAVEPOINT\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$");
+        std::regex rollback_to_regex(
+            "^\\s*ROLLBACK\\s+TO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$");
         std::regex insert_regex(
             "^\\s*INSERT\\s+([A-Za-z_][A-Za-z0-9_]*)\\|(.*)$");
         std::regex update_regex(
@@ -4336,6 +4432,18 @@ public:
 
         if (std::regex_match(statement, abort_regex)) {
             components.type = StatementType::ABORT;
+            return components;
+        }
+
+        if (std::regex_match(statement, matches, savepoint_regex)) {
+            components.type = StatementType::SAVEPOINT;
+            components.savepointName = matches[1];
+            return components;
+        }
+
+        if (std::regex_match(statement, matches, rollback_to_regex)) {
+            components.type = StatementType::ROLLBACK_TO;
+            components.savepointName = matches[1];
             return components;
         }
 
@@ -4391,6 +4499,14 @@ public:
         }
         if (components.type == StatementType::ABORT) {
             recovery_manager.abort();
+            return;
+        }
+        if (components.type == StatementType::SAVEPOINT) {
+            recovery_manager.savepoint(components.savepointName);
+            return;
+        }
+        if (components.type == StatementType::ROLLBACK_TO) {
+            recovery_manager.rollbackTo(components.savepointName);
             return;
         }
 
@@ -4685,6 +4801,12 @@ COMMIT;
 BEGIN;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1A;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1B;
+SAVEPOINT garcia_two;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1C;
+SAVEPOINT garcia_three;
+UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1D;
+ROLLBACK TO garcia_three;
+ROLLBACK TO garcia_two;
 UPDATE seats SET status=held, customer=garcia_family WHERE seat_no=1C;
 COMMIT;
 BEGIN;
@@ -4695,6 +4817,7 @@ UPDATE seats SET status=held, customer=lee WHERE seat_no=2A;
 COMMIT;
 BEGIN;
 UPDATE seats SET status=held, customer=chen WHERE seat_no=2A;
+UPDATE seats SET status=held, customer=chen WHERE seat_no=2B;
 ABORT;
 BEGIN;
 UPDATE seats SET status=held, customer=nguyen WHERE seat_no=2B;

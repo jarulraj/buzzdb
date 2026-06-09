@@ -1005,7 +1005,7 @@ public:
     }
 };
 
-struct WalUpdate {
+struct PageUpdateLogRecord {
     LSN lsn = 0;
     TableId table_id;
     PageID page_id;
@@ -1038,7 +1038,7 @@ private:
     int current_txn_id = 0;
     bool crash_after_commit_before_flush = false;
     bool crash_after_steal_before_commit = false;
-    std::vector<WalUpdate> wal_updates;
+    std::vector<PageUpdateLogRecord> page_update_log_records;
     std::vector<PageID> dirty_pages;
     size_t before_image_records_logged = 0;
     size_t before_image_bytes_logged = 0;
@@ -2143,7 +2143,7 @@ void RecoveryManager::begin() {
     txn_active = true;
     current_txn_id = next_txn_id++;
     current_txn_last_lsn = 0;
-    wal_updates.clear();
+    page_update_log_records.clear();
     dirty_pages.clear();
     std::cout << "\nTXN " << current_txn_id << " BEGIN" << std::endl;
     LSN begin_prev_lsn = 0;
@@ -2160,7 +2160,7 @@ void RecoveryManager::commit() {
     }
 
     std::cout << "TXN " << current_txn_id << " COMMIT" << std::endl;
-    if (!wal_updates.empty()) {
+    if (!page_update_log_records.empty()) {
         LSN commit_prev_lsn = 0;
         LSN commit_lsn = appendTxnRecord(
             "COMMIT", TxnStatus::COMMITTING, &commit_prev_lsn
@@ -2170,7 +2170,7 @@ void RecoveryManager::commit() {
                   << " prevLSN " << commit_prev_lsn << std::endl;
         forceLogUpTo(commit_lsn);
         commit_log_forces++;
-        committed_update_records += wal_updates.size();
+        committed_update_records += page_update_log_records.size();
 
         if (crash_after_commit_before_flush) {
             std::cout << "  recovery: forced COMMIT log, forced 0 data page(s)" << std::endl;
@@ -2193,7 +2193,7 @@ void RecoveryManager::commit() {
     transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
-    wal_updates.clear();
+    page_update_log_records.clear();
     dirty_pages.clear();
     txn_logged = false;
     crash_after_commit_before_flush = false;
@@ -2208,9 +2208,9 @@ void RecoveryManager::abort() {
         throw std::runtime_error("ABORT without BEGIN.");
     }
     std::cout << "TXN " << current_txn_id << " ABORT" << std::endl;
-    if (!wal_updates.empty()) {
-        aborted_update_records += wal_updates.size();
-        for (auto it = wal_updates.rbegin(); it != wal_updates.rend(); ++it) {
+    if (!page_update_log_records.empty()) {
+        aborted_update_records += page_update_log_records.size();
+        for (auto it = page_update_log_records.rbegin(); it != page_update_log_records.rend(); ++it) {
             auto& metadata = catalog.getTable(it->table_id);
             TableHeap table(metadata, buffer_manager);
             table.applyUpdate(
@@ -2229,7 +2229,7 @@ void RecoveryManager::abort() {
         forceLogUpTo(abort_lsn);
         abort_log_records++;
         std::cout << "  recovery: restored "
-                  << wal_updates.size()
+                  << page_update_log_records.size()
                   << " before-image record(s), forced restored page(s), wrote ABORT log" << std::endl;
     } else {
         std::cout << "  recovery: no updates to discard" << std::endl;
@@ -2243,7 +2243,7 @@ void RecoveryManager::abort() {
     transaction_table.erase(current_txn_id);
     std::cout << "  recovery: transaction cleanup complete" << std::endl;
 
-    wal_updates.clear();
+    page_update_log_records.clear();
     dirty_pages.clear();
     txn_logged = false;
     crash_after_commit_before_flush = false;
@@ -2462,14 +2462,14 @@ LSN RecoveryManager::logUpdate(TableId table_id,
               << " LSN " << update_lsn
               << " prevLSN " << update_prev_lsn << std::endl;
 
-    WalUpdate update;
+    PageUpdateLogRecord update;
     update.lsn = update_lsn;
     update.table_id = table_id;
     update.page_id = page_id;
     update.slot_id = slot_id;
     update.before_tuple = std::move(before_tuple);
     update.after_tuple = std::move(after_tuple);
-    wal_updates.push_back(std::move(update));
+    page_update_log_records.push_back(std::move(update));
     std::cout << "  recovery: update " << metadata.name
               << " page " << page_id
               << " slot " << slot_id
