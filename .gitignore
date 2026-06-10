@@ -35,6 +35,8 @@
 output.txt
 page.dat
 buzzdb.dat
+buzzdb.log
+buzzdb.master
 pgm.txt
 pgm.cpp
 
