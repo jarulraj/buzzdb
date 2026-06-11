@@ -3303,43 +3303,71 @@ struct ConflictEdge {
     std::string reason;
 };
 
-class SerializationGraph {
+class DirectedGraph {
 public:
-    void addTransaction(int txn_id) {
-        adjacency[txn_id];
+    void addNode(int node) {
+        adjacency[node];
     }
 
-    void addEdge(int from_txn, int to_txn, const std::string& reason) {
-        auto edge = std::make_pair(from_txn, to_txn);
-        if (edge_seen[edge]) {
-            return;
+    void addEdge(int from, int to) {
+        auto& edges = adjacency[from];
+        if (std::find(edges.begin(), edges.end(), to) == edges.end()) {
+            edges.push_back(to);
         }
-        edge_seen[edge] = true;
-        adjacency[from_txn].push_back(to_txn);
-        adjacency[to_txn];
-        conflict_edges.push_back({from_txn, to_txn, reason});
+        adjacency[to];
     }
 
-    const std::vector<ConflictEdge>& edges() const {
-        return conflict_edges;
+    void setOutgoingEdges(int from, const std::vector<int>& to_nodes) {
+        adjacency[from] = to_nodes;
+        for (int to : to_nodes) {
+            adjacency[to];
+        }
+    }
+
+    void removeNode(int node) {
+        adjacency.erase(node);
+        for (auto& entry : adjacency) {
+            auto& edges = entry.second;
+            edges.erase(
+                std::remove(edges.begin(), edges.end(), node),
+                edges.end()
+            );
+        }
     }
 
     bool hasCycle() const {
+        return !cycle().empty();
+    }
+
+    std::vector<int> cycle() const {
         std::map<int, int> state;
+        std::vector<int> path;
+        std::vector<int> cycle_path;
         for (const auto& entry : adjacency) {
-            if (state[entry.first] == 0 && visit(entry.first, state)) {
-                return true;
+            if (state[entry.first] == 0 &&
+                findCycle(entry.first, state, path, cycle_path)) {
+                return cycle_path;
             }
         }
-        return false;
+        return {};
+    }
+
+    std::vector<int> cycleFrom(int node) const {
+        std::vector<int> path;
+        std::map<int, bool> visited;
+        if (findCycleToTarget(node, node, visited, path)) {
+            path.push_back(node);
+            return path;
+        }
+        return {};
     }
 
     std::vector<int> topologicalOrder() const {
         std::map<int, size_t> indegree;
         for (const auto& entry : adjacency) {
             indegree[entry.first];
-            for (int next_txn : entry.second) {
-                indegree[next_txn]++;
+            for (int next : entry.second) {
+                indegree[next]++;
             }
         }
 
@@ -3352,18 +3380,18 @@ public:
 
         std::vector<int> order;
         while (!ready.empty()) {
-            int txn_id = ready.front();
+            int node = ready.front();
             ready.pop();
-            order.push_back(txn_id);
+            order.push_back(node);
 
-            auto it = adjacency.find(txn_id);
+            auto it = adjacency.find(node);
             if (it == adjacency.end()) {
                 continue;
             }
-            for (int next_txn : it->second) {
-                indegree[next_txn]--;
-                if (indegree[next_txn] == 0) {
-                    ready.push(next_txn);
+            for (int next : it->second) {
+                indegree[next]--;
+                if (indegree[next] == 0) {
+                    ready.push(next);
                 }
             }
         }
@@ -3376,25 +3404,96 @@ public:
 
 private:
     std::map<int, std::vector<int>> adjacency;
-    std::map<std::pair<int, int>, bool> edge_seen;
-    std::vector<ConflictEdge> conflict_edges;
 
-    bool visit(int txn_id, std::map<int, int>& state) const {
-        state[txn_id] = 1;
-        auto it = adjacency.find(txn_id);
+    bool findCycle(int node,
+                   std::map<int, int>& state,
+                   std::vector<int>& path,
+                   std::vector<int>& cycle_path) const {
+        state[node] = 1;
+        path.push_back(node);
+
+        auto it = adjacency.find(node);
         if (it != adjacency.end()) {
-            for (int next_txn : it->second) {
-                if (state[next_txn] == 1) {
+            for (int next : it->second) {
+                if (state[next] == 0 &&
+                    findCycle(next, state, path, cycle_path)) {
                     return true;
                 }
-                if (state[next_txn] == 0 && visit(next_txn, state)) {
+                if (state[next] == 1) {
+                    auto start = std::find(path.begin(), path.end(), next);
+                    cycle_path.assign(start, path.end());
+                    cycle_path.push_back(next);
                     return true;
                 }
             }
         }
-        state[txn_id] = 2;
+
+        path.pop_back();
+        state[node] = 2;
         return false;
     }
+
+    bool findCycleToTarget(int current,
+                           int target,
+                           std::map<int, bool>& visited,
+                           std::vector<int>& path) const {
+        visited[current] = true;
+        path.push_back(current);
+
+        auto it = adjacency.find(current);
+        if (it != adjacency.end()) {
+            for (int next : it->second) {
+                if (next == target) {
+                    return true;
+                }
+                if (!visited[next] &&
+                    findCycleToTarget(next, target, visited, path)) {
+                    return true;
+                }
+            }
+        }
+
+        path.pop_back();
+        return false;
+    }
+};
+
+class SerializationGraph {
+public:
+    void addTransaction(int txn_id) {
+        graph.addNode(txn_id);
+    }
+
+    void addEdge(int from_txn, int to_txn, const std::string& reason) {
+        auto edge = std::make_pair(from_txn, to_txn);
+        if (edge_seen[edge]) {
+            return;
+        }
+        edge_seen[edge] = true;
+        graph.addEdge(from_txn, to_txn);
+        conflict_edges.push_back({from_txn, to_txn, reason});
+    }
+
+    const std::vector<ConflictEdge>& edges() const {
+        return conflict_edges;
+    }
+
+    bool hasCycle() const {
+        return graph.hasCycle();
+    }
+
+    std::vector<int> cycle() const {
+        return graph.cycle();
+    }
+
+    std::vector<int> topologicalOrder() const {
+        return graph.topologicalOrder();
+    }
+
+private:
+    DirectedGraph graph;
+    std::map<std::pair<int, int>, bool> edge_seen;
+    std::vector<ConflictEdge> conflict_edges;
 };
 
 class ScheduleAnalyzer {
@@ -3408,6 +3507,7 @@ class ScheduleAnalyzer {
     struct Analysis {
         std::vector<ConflictEdge> conflict_edges;
         std::vector<int> serial_order;
+        std::vector<int> cycle;
         bool conflict_serializable = true;
         bool recoverable = true;
         bool avoids_cascading_aborts = true;
@@ -3438,6 +3538,10 @@ public:
         if (analysis.conflict_serializable) {
             std::cout << "      Topological order: "
                       << serialOrderLabel(analysis.serial_order) << std::endl;
+        } else if (!analysis.cycle.empty()) {
+            std::cout << "      Cycle: "
+                      << serialOrderLabel(analysis.cycle) << std::endl;
+            std::cout << "      Meaning: the graph requires both directions, so no serial order exists." << std::endl;
         }
         std::cout << "      Recovery class: " << recoveryClass(analysis) << std::endl;
         printResult("Recoverable", analysis.recoverable);
@@ -3471,6 +3575,8 @@ private:
         analysis.conflict_serializable = !graph.hasCycle();
         if (analysis.conflict_serializable) {
             analysis.serial_order = graph.topologicalOrder();
+        } else {
+            analysis.cycle = graph.cycle();
         }
         analyzeRecoveryProperties(analysis);
         return analysis;
@@ -3718,7 +3824,7 @@ private:
     std::mutex latch;
     std::condition_variable lock_cv;
     std::map<std::string, LockState> locks;
-    std::map<int, std::vector<int>> waits_for;
+    DirectedGraph waits_for;
     std::function<void(int, const std::vector<int>&)> wait_observer;
 
     bool canGrantShared(int txn_id, const std::string& resource) {
@@ -3759,7 +3865,7 @@ private:
     }
 
     void setWaitEdges(int txn_id, const std::vector<int>& blockers) {
-        waits_for[txn_id] = blockers;
+        waits_for.setOutgoingEdges(txn_id, blockers);
     }
 
     void notifyWaitObserver(int txn_id, const std::vector<int>& blockers) {
@@ -3769,48 +3875,11 @@ private:
     }
 
     void removeWaitEdges(int txn_id) {
-        waits_for.erase(txn_id);
-        for (auto& entry : waits_for) {
-            auto& blockers = entry.second;
-            blockers.erase(
-                std::remove(blockers.begin(), blockers.end(), txn_id),
-                blockers.end()
-            );
-        }
+        waits_for.removeNode(txn_id);
     }
 
     std::vector<int> findCycleFrom(int txn_id) const {
-        std::vector<int> path;
-        std::map<int, bool> visited;
-        if (findCycleDfs(txn_id, txn_id, visited, path)) {
-            path.push_back(txn_id);
-            return path;
-        }
-        return {};
-    }
-
-    bool findCycleDfs(int current,
-                      int target,
-                      std::map<int, bool>& visited,
-                      std::vector<int>& path) const {
-        visited[current] = true;
-        path.push_back(current);
-
-        auto it = waits_for.find(current);
-        if (it != waits_for.end()) {
-            for (int next_txn : it->second) {
-                if (next_txn == target) {
-                    return true;
-                }
-                if (!visited[next_txn] &&
-                    findCycleDfs(next_txn, target, visited, path)) {
-                    return true;
-                }
-            }
-        }
-
-        path.pop_back();
-        return false;
+        return waits_for.cycleFrom(txn_id);
     }
 
     static void addSharedHolder(LockState& state, int txn_id) {
@@ -5907,10 +5976,12 @@ private:
         auto hold_1 = parseScheduleItem("holds.id=1.customer");
         auto hold_2 = parseScheduleItem("holds.id=2.customer");
         auto seat_resource = resourceFor(seat_item);
+        std::vector<ScheduleOperation> unsafe_history;
 
         std::cout << "\n  Unsafe contrast: release S before taking X" << std::endl;
         requestLock(1, "S", seat_resource, std::chrono::milliseconds(1000));
         auto t1_read = readItem(seat_item);
+        unsafe_history.push_back({1, ScheduleOpType::READ, seat_item_name, ""});
         log("T1 reads seat 1B as " + t1_read.value +
             " at " + tupleIdLabel(t1_read.tuple_id));
         log("T1 releases S before booking; this violates 2PL's shrinking phase");
@@ -5918,23 +5989,33 @@ private:
 
         requestLock(2, "X", seat_resource, std::chrono::milliseconds(1000));
         auto t2_old_seat = writeItem(seat_item, "held");
+        unsafe_history.push_back({2, ScheduleOpType::WRITE, seat_item_name, "held"});
         log("T2 books first: seats.1B.status " + t2_old_seat.value + " -> held");
         requestLock(2, "X", resourceFor(hold_2), std::chrono::milliseconds(1000));
         writeItem(hold_2, "patel");
+        unsafe_history.push_back({2, ScheduleOpType::WRITE, "holds.id=2.customer", "patel"});
         log("T2 records hold id=2 for patel");
+        unsafe_history.push_back({2, ScheduleOpType::COMMIT, "", ""});
+        log("T2 COMMIT");
         releaseAndLog(2);
 
         requestLock(1, "X", seat_resource, std::chrono::milliseconds(1000));
         auto t1_old_seat = writeItem(seat_item, "held");
+        unsafe_history.push_back({1, ScheduleOpType::WRITE, seat_item_name, "held"});
         log("T1 uses its stale earlier read and writes seats.1B.status " +
             t1_old_seat.value + " -> held");
         requestLock(1, "X", resourceFor(hold_1), std::chrono::milliseconds(1000));
         writeItem(hold_1, "garcia");
+        unsafe_history.push_back({1, ScheduleOpType::WRITE, "holds.id=1.customer", "garcia"});
         log("T1 records hold id=1 for garcia");
+        unsafe_history.push_back({1, ScheduleOpType::COMMIT, "", ""});
+        log("T1 COMMIT");
         releaseAndLog(1);
 
         printFinalState();
         std::cout << "  Result: releasing S before X allowed two holds for one seat." << std::endl;
+        std::cout << "  Unsafe schedule analysis:" << std::endl;
+        ScheduleAnalyzer(unsafe_history).printAnalysis();
         std::cout << "\n  Safe path: keep S and request an S->X upgrade" << std::endl;
     }
 

@@ -3300,10 +3300,73 @@ struct ConflictEdge {
     std::string reason;
 };
 
+class DirectedGraph {
+public:
+    void addNode(int node) {
+        adjacency[node];
+    }
+
+    void addEdge(int from, int to) {
+        auto& edges = adjacency[from];
+        if (std::find(edges.begin(), edges.end(), to) == edges.end()) {
+            edges.push_back(to);
+        }
+        adjacency[to];
+    }
+
+    bool hasCycle() const {
+        return !cycle().empty();
+    }
+
+    std::vector<int> cycle() const {
+        std::map<int, int> state;
+        std::vector<int> path;
+        std::vector<int> cycle_path;
+        for (const auto& entry : adjacency) {
+            if (state[entry.first] == 0 &&
+                findCycle(entry.first, state, path, cycle_path)) {
+                return cycle_path;
+            }
+        }
+        return {};
+    }
+
+private:
+    std::map<int, std::vector<int>> adjacency;
+
+    bool findCycle(int node,
+                   std::map<int, int>& state,
+                   std::vector<int>& path,
+                   std::vector<int>& cycle_path) const {
+        state[node] = 1;
+        path.push_back(node);
+
+        auto it = adjacency.find(node);
+        if (it != adjacency.end()) {
+            for (int next : it->second) {
+                if (state[next] == 0 &&
+                    findCycle(next, state, path, cycle_path)) {
+                    return true;
+                }
+                if (state[next] == 1) {
+                    auto start = std::find(path.begin(), path.end(), next);
+                    cycle_path.assign(start, path.end());
+                    cycle_path.push_back(next);
+                    return true;
+                }
+            }
+        }
+
+        path.pop_back();
+        state[node] = 2;
+        return false;
+    }
+};
+
 class SerializationGraph {
 public:
     void addTransaction(int txn_id) {
-        adjacency[txn_id];
+        graph.addNode(txn_id);
     }
 
     void addEdge(int from_txn, int to_txn, const std::string& reason) {
@@ -3312,8 +3375,7 @@ public:
             return;
         }
         edge_seen[edge] = true;
-        adjacency[from_txn].push_back(to_txn);
-        adjacency[to_txn];
+        graph.addEdge(from_txn, to_txn);
         conflict_edges.push_back({from_txn, to_txn, reason});
     }
 
@@ -3322,36 +3384,13 @@ public:
     }
 
     bool hasCycle() const {
-        std::map<int, int> state;
-        for (const auto& entry : adjacency) {
-            if (state[entry.first] == 0 && visit(entry.first, state)) {
-                return true;
-            }
-        }
-        return false;
+        return graph.hasCycle();
     }
 
 private:
-    std::map<int, std::vector<int>> adjacency;
+    DirectedGraph graph;
     std::map<std::pair<int, int>, bool> edge_seen;
     std::vector<ConflictEdge> conflict_edges;
-
-    bool visit(int txn_id, std::map<int, int>& state) const {
-        state[txn_id] = 1;
-        auto it = adjacency.find(txn_id);
-        if (it != adjacency.end()) {
-            for (int next_txn : it->second) {
-                if (state[next_txn] == 1) {
-                    return true;
-                }
-                if (state[next_txn] == 0 && visit(next_txn, state)) {
-                    return true;
-                }
-            }
-        }
-        state[txn_id] = 2;
-        return false;
-    }
 };
 
 class ScheduleAnalyzer {
