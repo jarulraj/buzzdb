@@ -155,6 +155,40 @@ bool operator==(const Field& lhs, const Field& rhs) {
     }
 }
 
+struct TupleId {
+    uint16_t page_id;
+    size_t slot_id;
+};
+
+struct QueryRow {
+    std::vector<std::unique_ptr<Field>> fields;
+    std::optional<TupleId> tuple_id;
+};
+
+using QueryTable = std::vector<QueryRow>;
+
+std::string fieldToString(const Field& field) {
+    switch (field.getType()) {
+        case INT:
+            return std::to_string(field.asInt());
+        case FLOAT:
+            return std::to_string(field.asFloat());
+        case STRING:
+            return field.asString();
+    }
+    throw std::runtime_error("Unknown field type.");
+}
+
+void printQueryTable(const QueryTable& rows) {
+    for (const auto& row : rows) {
+        for (const auto& field : row.fields) {
+            field->print();
+            std::cout << " ";
+        }
+        std::cout << std::endl;
+    }
+}
+
 class Tuple {
 public:
     std::vector<std::unique_ptr<Field>> fields;
@@ -3235,6 +3269,31 @@ struct ScheduleOperation {
     std::string value;
 };
 
+struct ScheduleItemRef {
+    std::string table;
+    std::string key_column;
+    std::string key_value;
+    std::string column;
+};
+
+ScheduleItemRef parseScheduleItem(const std::string& item) {
+    auto first_dot = item.find('.');
+    auto equals = item.find('=', first_dot + 1);
+    auto second_dot = item.find('.', equals + 1);
+    if (first_dot == std::string::npos ||
+        equals == std::string::npos ||
+        second_dot == std::string::npos) {
+        throw std::runtime_error("Bad schedule item: " + item);
+    }
+
+    return {
+        item.substr(0, first_dot),
+        item.substr(first_dot + 1, equals - first_dot - 1),
+        item.substr(equals + 1, second_dot - equals - 1),
+        item.substr(second_dot + 1)
+    };
+}
+
 struct ConflictEdge {
     int from_txn;
     int to_txn;
@@ -3477,168 +3536,101 @@ private:
     }
 };
 
-class ScheduleSimulator {
+class LockManager {
+    struct LockState {
+        std::vector<int> shared_holders;
+        int exclusive_holder = 0;
+    };
+
 public:
-    explicit ScheduleSimulator(std::map<std::string, std::string> initial_state)
-        : initial_state(std::move(initial_state)) {}
+    bool acquireShared(int txn_id,
+                       const std::string& resource,
+                       std::string& reason) {
+        auto& state = locks[resource];
+        if (state.exclusive_holder != 0 && state.exclusive_holder != txn_id) {
+            reason = "X lock is held by T" + std::to_string(state.exclusive_holder);
+            return false;
+        }
 
-    void print(const std::vector<ScheduleOperation>& schedule,
-               const std::vector<std::string>& observations = {}) const {
-        auto state = initial_state;
-        std::map<int, std::vector<std::pair<std::string, std::string>>> undo_log;
+        addSharedHolder(state, txn_id);
+        return true;
+    }
 
-        std::cout << "  State simulation:" << std::endl;
-        printState("Initial", state);
+    bool acquireExclusive(int txn_id,
+                          const std::string& resource,
+                          std::string& reason) {
+        auto& state = locks[resource];
+        if (state.exclusive_holder != 0 && state.exclusive_holder != txn_id) {
+            reason = "X lock is held by T" + std::to_string(state.exclusive_holder);
+            return false;
+        }
+        if (hasOtherSharedHolder(state, txn_id)) {
+            reason = "S lock is held by " + sharedHolderLabel(state, txn_id);
+            return false;
+        }
 
-        for (const auto& operation : schedule) {
-            switch (operation.type) {
-                case ScheduleOpType::READ:
-                    std::cout << "    T" << operation.txn_id
-                              << " READ " << operation.item
-                              << " -> " << valueOf(state, operation.item)
-                              << std::endl;
-                    break;
-                case ScheduleOpType::WRITE: {
-                    auto old_value = valueOf(state, operation.item);
-                    undo_log[operation.txn_id].push_back({operation.item, old_value});
-                    state[operation.item] = operation.value;
-                    std::cout << "    T" << operation.txn_id
-                              << " WRITE " << operation.item
-                              << ": " << old_value
-                              << " -> " << operation.value
-                              << std::endl;
-                    break;
-                }
-                case ScheduleOpType::COMMIT:
-                    std::cout << "    T" << operation.txn_id
-                              << " COMMIT" << std::endl;
-                    break;
-                case ScheduleOpType::ABORT:
-                    std::cout << "    T" << operation.txn_id
-                              << " ABORT" << std::endl;
-                    restoreWrites(state, undo_log[operation.txn_id]);
-                    break;
+        removeSharedHolder(state, txn_id);
+        state.exclusive_holder = txn_id;
+        return true;
+    }
+
+    bool releaseAll(int txn_id) {
+        bool released = false;
+        for (auto& entry : locks) {
+            auto& state = entry.second;
+            if (state.exclusive_holder == txn_id) {
+                state.exclusive_holder = 0;
+                released = true;
             }
+            auto old_size = state.shared_holders.size();
+            removeSharedHolder(state, txn_id);
+            released = released || old_size != state.shared_holders.size();
         }
-
-        printState("Final", state);
-        for (const auto& observation : observations) {
-            std::cout << "    Observation: " << observation << std::endl;
-        }
+        return released;
     }
 
 private:
-    std::map<std::string, std::string> initial_state;
+    std::map<std::string, LockState> locks;
 
-    static std::string valueOf(const std::map<std::string, std::string>& state,
-                               const std::string& item) {
-        auto it = state.find(item);
-        return it == state.end() ? "unknown" : it->second;
-    }
-
-    static void restoreWrites(
-        std::map<std::string, std::string>& state,
-        const std::vector<std::pair<std::string, std::string>>& writes) {
-        for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
-            std::cout << "      restore " << it->first
-                      << " -> " << it->second << std::endl;
-            state[it->first] = it->second;
+    static void addSharedHolder(LockState& state, int txn_id) {
+        if (std::find(state.shared_holders.begin(),
+                      state.shared_holders.end(),
+                      txn_id) == state.shared_holders.end()) {
+            state.shared_holders.push_back(txn_id);
         }
     }
 
-    static void printState(const std::string& label,
-                           const std::map<std::string, std::string>& state) {
-        std::cout << "    " << label << " state:" << std::endl;
-        for (const auto& entry : state) {
-            std::cout << "      " << entry.first
-                      << " = " << entry.second << std::endl;
+    static bool hasOtherSharedHolder(const LockState& state, int txn_id) {
+        return std::any_of(
+            state.shared_holders.begin(),
+            state.shared_holders.end(),
+            [txn_id](int holder) { return holder != txn_id; }
+        );
+    }
+
+    static void removeSharedHolder(LockState& state, int txn_id) {
+        state.shared_holders.erase(
+            std::remove(state.shared_holders.begin(),
+                        state.shared_holders.end(),
+                        txn_id),
+            state.shared_holders.end()
+        );
+    }
+
+    static std::string sharedHolderLabel(const LockState& state, int txn_id) {
+        std::string label;
+        for (int holder : state.shared_holders) {
+            if (holder == txn_id) {
+                continue;
+            }
+            if (!label.empty()) {
+                label += ", ";
+            }
+            label += "T" + std::to_string(holder);
         }
+        return label;
     }
 };
-
-void runScheduleDemo(const std::string& title,
-                     const std::map<std::string, std::string>& initial_state,
-                     const std::vector<ScheduleOperation>& schedule,
-                     const std::vector<std::string>& observations = {}) {
-    std::cout << "\nSchedule: " << title << std::endl;
-    ScheduleSimulator(initial_state).print(schedule, observations);
-    ScheduleAnalyzer(schedule).printAnalysis();
-}
-
-void runScheduleChecks() {
-    const std::string seat_1a = "seats.1A.status";
-    const std::string seat_1b = "seats.1B.status";
-
-    std::cout << "\nSchedule checks" << std::endl;
-    std::cout << "  Conflict-serializable iff the serialization graph is acyclic." << std::endl;
-    std::cout << "  Recovery-class containment: strict => cascadeless => recoverable." << std::endl;
-    std::cout << "  Recoverable schedules can still be non-serializable." << std::endl;
-    std::cout << "  Strict schedules also forbid dirty writes." << std::endl;
-
-    runScheduleDemo(
-        "non-recoverable dirty read",
-        {{seat_1a, "available"}},
-        {
-            {1, ScheduleOpType::WRITE, seat_1a, "held_by_garcia"},
-            {2, ScheduleOpType::READ, seat_1a, ""},
-            {2, ScheduleOpType::COMMIT, "", ""},
-            {1, ScheduleOpType::ABORT, "", ""}
-        },
-        {"T2 committed after reading a value that T1 later aborted"}
-    );
-
-    runScheduleDemo(
-        "recoverable but cascading abort",
-        {{seat_1a, "available"}},
-        {
-            {1, ScheduleOpType::WRITE, seat_1a, "held_by_garcia"},
-            {2, ScheduleOpType::READ, seat_1a, ""},
-            {1, ScheduleOpType::ABORT, "", ""},
-            {2, ScheduleOpType::ABORT, "", ""}
-        },
-        {"T2 must abort because it read T1's uncommitted value"}
-    );
-
-    runScheduleDemo(
-        "cascadeless and recoverable, but not strict",
-        {{seat_1a, "available"}},
-        {
-            {1, ScheduleOpType::WRITE, seat_1a, "held_by_garcia"},
-            {2, ScheduleOpType::WRITE, seat_1a, "held_by_patel"},
-            {1, ScheduleOpType::COMMIT, "", ""},
-            {2, ScheduleOpType::COMMIT, "", ""}
-        },
-        {"there is no dirty read, but T2 performs a dirty write before T1 commits"}
-    );
-
-    runScheduleDemo(
-        "cascadeless but not serializable double booking",
-        {{seat_1b, "available"}},
-        {
-            {1, ScheduleOpType::READ, seat_1b, ""},
-            {2, ScheduleOpType::READ, seat_1b, ""},
-            {1, ScheduleOpType::WRITE, seat_1b, "held_by_garcia"},
-            {2, ScheduleOpType::WRITE, seat_1b, "held_by_patel"},
-            {1, ScheduleOpType::COMMIT, "", ""},
-            {2, ScheduleOpType::COMMIT, "", ""}
-        },
-        {"no dirty read occurs, but the read/write conflicts form a cycle",
-         "recovery safety does not prevent the double booking anomaly"}
-    );
-
-    runScheduleDemo(
-        "strict seat update",
-        {{seat_1a, "available"}},
-        {
-            {1, ScheduleOpType::WRITE, seat_1a, "held_by_garcia"},
-            {1, ScheduleOpType::COMMIT, "", ""},
-            {2, ScheduleOpType::READ, seat_1a, ""},
-            {2, ScheduleOpType::WRITE, seat_1a, "sold_to_garcia"},
-            {2, ScheduleOpType::COMMIT, "", ""}
-        },
-        {"T2 waits until T1 finishes before reading or writing the seat"}
-    );
-}
 
 class Operator {
     public:
@@ -3658,6 +3650,10 @@ class Operator {
     /// `next()` returns true, the Fields will contain the values for the
     /// next tuple. Each `Field` pointer in the vector stands for one attribute of the tuple.
     virtual std::vector<std::unique_ptr<Field>> getOutput() = 0;
+
+    virtual std::optional<TupleId> getTupleId() const {
+        return std::nullopt;
+    }
 
     // children can forward txn context to their child operators
     virtual void setTxnContext(std::shared_ptr<TxnContext> txn) {
@@ -3696,6 +3692,7 @@ private:
     size_t currentPageIndex = 0;
     size_t currentSlotIndex = 0;
     std::unique_ptr<Tuple> currentTuple;
+    std::optional<TupleId> currentTupleId;
     size_t tuple_count = 0;
 
 public:
@@ -3706,6 +3703,7 @@ public:
         currentSlotIndex = 0;
         tuple_count = 0;
         currentTuple.reset(); // Ensure currentTuple is reset
+        currentTupleId.reset();
     }
 
     bool next() override {
@@ -3717,6 +3715,7 @@ public:
         currentPageIndex = 0;
         currentSlotIndex = 0;
         currentTuple.reset();
+        currentTupleId.reset();
     }
 
     std::vector<std::unique_ptr<Field>> getOutput() override {
@@ -3724,6 +3723,10 @@ public:
             return std::move(currentTuple->fields);
         }
         return {}; // Return an empty vector if no tuple is available
+    }
+
+    std::optional<TupleId> getTupleId() const override {
+        return currentTupleId;
     }
 
 private:
@@ -3744,6 +3747,7 @@ private:
                     const char* tuple_data = page_buffer + slot_array[currentSlotIndex].offset;
                     std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length));
                     currentTuple = Tuple::deserialize(iss);
+                    currentTupleId = TupleId{page_ids[currentPageIndex], currentSlotIndex};
                     currentSlotIndex++; // Move to the next slot for the next call
                     tuple_count++;
                     return; // Tuple loaded successfully
@@ -3757,6 +3761,7 @@ private:
 
         // No more tuples are available
         currentTuple.reset();
+        currentTupleId.reset();
     }
 };
 
@@ -3907,6 +3912,7 @@ private:
     std::unique_ptr<IPredicate> predicate;
     bool has_next;
     std::vector<std::unique_ptr<Field>> currentOutput; // Store the current output here
+    std::optional<TupleId> currentTupleId;
 
 public:
     SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate)
@@ -3917,6 +3923,7 @@ public:
         input->open();
         has_next = false;
         currentOutput.clear(); // Ensure currentOutput is cleared at the beginning
+        currentTupleId.reset();
     }
 
     bool next() override {
@@ -3929,18 +3936,21 @@ public:
                     // Assuming Field class has a clone method or copy constructor to duplicate fields
                     currentOutput.push_back(field->clone());
                 }
+                currentTupleId = input->getTupleId();
                 has_next = true;
                 return true;
             }
         }
         has_next = false;
         currentOutput.clear(); // Clear output if no more tuples satisfy the predicate
+        currentTupleId.reset();
         return false;
     }
 
     void close() override {
         input->close();
         currentOutput.clear(); // Ensure currentOutput is cleared at the end
+        currentTupleId.reset();
     }
 
     std::vector<std::unique_ptr<Field>> getOutput() override {
@@ -3956,12 +3966,18 @@ public:
             return {}; // Return an empty vector if no matching tuple is found
         }
     }
+
+    std::optional<TupleId> getTupleId() const override {
+        return has_next ? currentTupleId : std::nullopt;
+    }
+
 };
 
 class ProjectionOperator : public UnaryOperator {
 private:
     std::vector<size_t> projected_attrs;
     std::vector<std::unique_ptr<Field>> currentOutput;
+    std::optional<TupleId> currentTupleId;
     bool has_next = false;
 
 public:
@@ -3972,17 +3988,20 @@ public:
         input->setTxnContext(txn_);
         input->open();
         currentOutput.clear();
+        currentTupleId.reset();
         has_next = false;
     }
 
     bool next() override {
         if (!input->next()) {
             currentOutput.clear();
+            currentTupleId.reset();
             has_next = false;
             return false;
         }
 
         auto input_tuple = input->getOutput();
+        currentTupleId = input->getTupleId();
         currentOutput.clear();
         for (auto attr_index : projected_attrs) {
             if (attr_index >= input_tuple.size()) {
@@ -3997,6 +4016,7 @@ public:
     void close() override {
         input->close();
         currentOutput.clear();
+        currentTupleId.reset();
         has_next = false;
     }
 
@@ -4010,6 +4030,11 @@ public:
         }
         return outputCopy;
     }
+
+    std::optional<TupleId> getTupleId() const override {
+        return has_next ? currentTupleId : std::nullopt;
+    }
+
 };
 
 class HashJoinOperator : public BinaryOperator {
@@ -4793,11 +4818,11 @@ void prettyPrint(const Components& components,
     std::cout << std::endl;
 }
 
-void executeQuery(const QueryComponents& components,
-                  Catalog& catalog,
-                  BufferManager& buffer_manager,
-                  const TxnPtr& txn = nullptr,
-                  bool print_tuples = true) {
+QueryTable executeQuery(const QueryComponents& components,
+                        Catalog& catalog,
+                        BufferManager& buffer_manager,
+                        const TxnPtr& txn = nullptr,
+                        bool print_tuples = true) {
     std::map<std::string, size_t> table_offsets;
     std::map<std::string, size_t> table_widths;
     std::vector<std::unique_ptr<TableHeap>> heaps;
@@ -4917,22 +4942,15 @@ void executeQuery(const QueryComponents& components,
     // Execute the Root Operator
     rootOp->setTxnContext(txn);
     rootOp->open();
-    size_t output_tuple_count = 0;
+    QueryTable result;
     while (rootOp->next()) {
-        output_tuple_count++;
-        if (print_tuples) {
-            const auto& output = rootOp->getOutput();
-            for (const auto& field : output) {
-                field->print();
-                std::cout << " ";
-            }
-            std::cout << std::endl;
-        }
-    }
-    if (!print_tuples) {
-        std::cout << "Output tuple_count: " << output_tuple_count << std::endl;
+        result.push_back({rootOp->getOutput(), rootOp->getTupleId()});
     }
     rootOp->close();
+    if (print_tuples) {
+        printQueryTable(result);
+    }
+    return result;
 }
 
 class InsertOperator : public Operator {
@@ -5412,43 +5430,6 @@ public:
         }
     }
 
-    std::string readValue(const std::string& table_name,
-                          const std::string& read_column,
-                          const std::string& where_column,
-                          const std::string& where_value_text) {
-        auto& metadata = catalog.getTable(table_name);
-        int read_index = findColumnIndex(metadata, read_column);
-        int where_index = findColumnIndex(metadata, where_column);
-        auto where_value = parseFieldValue(
-            metadata.schema.columns[where_index].type,
-            where_value_text,
-            table_name,
-            0
-        );
-
-        TableHeap table(metadata, buffer_manager);
-        ScanOperator scan(table);
-        scan.open();
-        while (scan.next()) {
-            auto fields = scan.getOutput();
-            if (where_index < static_cast<int>(fields.size()) &&
-                *fields[where_index] == where_value) {
-                if (read_index >= static_cast<int>(fields.size())) {
-                    throw std::runtime_error("Read column is out of range.");
-                }
-                auto value = fieldToString(*fields[read_index]);
-                scan.close();
-                return value;
-            }
-        }
-        scan.close();
-
-        throw std::runtime_error(
-            "No row in " + table_name + " where " +
-            where_column + "=" + where_value_text
-        );
-    }
-
     void loadDataFile(const std::string& filename,
                       const TxnPtr& txn = nullptr,
                       bool print_statements = false) {
@@ -5505,16 +5486,18 @@ public:
         }
     }
 
-    void executeQuery(const std::string& query,
-                      const TxnPtr& txn = nullptr,
-                      bool print_tuples = true) {
+    QueryTable executeQuery(const std::string& query,
+                            const TxnPtr& txn = nullptr,
+                            bool print_tuples = true) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
         auto& metadata = catalog.getTable(components.tableName);
         auto queryColumns = deriveQueryColumns(components, metadata);
         (void)queryColumns;
-        std::cout << "QUERY " << operatorTreeString(components) << std::endl;
-        ::executeQuery(
+        if (print_tuples) {
+            std::cout << "QUERY " << operatorTreeString(components) << std::endl;
+        }
+        return ::executeQuery(
             components,
             catalog,
             buffer_manager,
@@ -5558,125 +5541,280 @@ public:
             txn
         );
     }
-    
-private:
-    static std::string fieldToString(const Field& field) {
-        switch (field.getType()) {
-            case INT:
-                return std::to_string(field.asInt());
-            case FLOAT:
-                return std::to_string(field.asFloat());
-            case STRING:
-                return field.asString();
-        }
-        throw std::runtime_error("Unknown field type.");
-    }
 };
 
-class InterleavedScheduleExecutor {
-public:
-    explicit InterleavedScheduleExecutor(BuzzDB& db) : db(db) {}
+void executeQuiet(BuzzDB& db, const std::string& statement) {
+    db.executeStatement(statement, nullptr, 0, false);
+}
 
-    void run(const std::vector<ScheduleOperation>& schedule) {
-        std::cout << "  Actual seat-table execution:" << std::endl;
+class ScheduleExecutor {
+    struct UndoRecord {
+        ScheduleItemRef item;
+        std::string old_value;
+    };
+
+public:
+    explicit ScheduleExecutor(BuzzDB& db) : db(db) {}
+
+    bool run(const std::vector<ScheduleOperation>& schedule) {
+        std::cout << "  Actual table execution:" << std::endl;
         for (const auto& operation : schedule) {
-            std::string seat_no = seatNoFromItem(operation.item);
             switch (operation.type) {
                 case ScheduleOpType::READ:
-                    std::cout << "    T" << operation.txn_id
-                              << " READ " << operation.item
-                              << " -> " << readSeatColumn(seat_no, columnFromItem(operation.item))
-                              << std::endl;
+                    if (!lockAndPrint(operation)) {
+                        return false;
+                    }
+                    readAndPrint(operation.txn_id, operation.item);
                     break;
-                case ScheduleOpType::WRITE: {
-                    auto column_name = columnFromItem(operation.item);
-                    auto old_value = readSeatColumn(seat_no, column_name);
-                    db.executeStatement(
-                        "UPDATE seats SET " + column_name + "=" + operation.value +
-                        " WHERE seat_no=" + seat_no,
-                        nullptr,
-                        0,
-                        false
-                    );
-                    std::cout << "    T" << operation.txn_id
-                              << " WRITE " << operation.item
-                              << ": " << old_value
-                              << " -> " << operation.value
-                              << std::endl;
+                case ScheduleOpType::WRITE:
+                    if (!lockAndPrint(operation)) {
+                        return false;
+                    }
+                    writeAndPrint(operation);
                     break;
-                }
                 case ScheduleOpType::COMMIT:
                     std::cout << "    T" << operation.txn_id
                               << " COMMIT" << std::endl;
+                    releaseAndPrint(operation.txn_id);
                     break;
                 case ScheduleOpType::ABORT:
                     std::cout << "    T" << operation.txn_id
                               << " ABORT" << std::endl;
+                    restoreTxn(operation.txn_id);
+                    releaseAndPrint(operation.txn_id);
                     break;
             }
         }
+        return true;
     }
 
-    void printSeatStatus(const std::vector<std::string>& seat_numbers) {
-        std::cout << "  Final seat status:" << std::endl;
-        for (const auto& seat_no : seat_numbers) {
-            std::cout << "    " << seat_no
-                      << " status=" << readSeatColumn(seat_no, "status")
-                      << " customer=" << readSeatColumn(seat_no, "customer")
-                      << std::endl;
+    void printTouchedState(const std::vector<ScheduleOperation>& schedule,
+                           bool completed) {
+        std::vector<std::string> seen_items;
+        std::cout << (completed ? "  Final touched tuples:"
+                                : "  Touched tuples after blocked prefix:")
+                  << std::endl;
+        for (const auto& operation : schedule) {
+            if (operation.item.empty() ||
+                std::find(seen_items.begin(), seen_items.end(), operation.item) !=
+                    seen_items.end()) {
+                continue;
+            }
+            seen_items.push_back(operation.item);
+            auto item = parseScheduleItem(operation.item);
+            auto read = readValue(item);
+            std::cout << "    " << operation.item
+                      << "=" << read.first;
+            if (read.second) {
+                std::cout << " at TupleId(page=" << read.second->page_id
+                          << ", slot=" << read.second->slot_id << ")";
+            }
+            std::cout << std::endl;
         }
     }
 
 private:
     BuzzDB& db;
+    LockManager lock_manager;
+    std::map<int, std::vector<UndoRecord>> undo_log;
 
-    std::string readSeatColumn(const std::string& seat_no,
-                               const std::string& column_name) {
-        return db.readValue("seats", column_name, "seat_no", seat_no);
+    bool lockAndPrint(const ScheduleOperation& operation) {
+        auto item = parseScheduleItem(operation.item);
+        auto resource = resourceFor(item);
+        bool read_lock = operation.type == ScheduleOpType::READ;
+        std::string reason;
+        bool granted = read_lock ?
+            lock_manager.acquireShared(operation.txn_id, resource, reason) :
+            lock_manager.acquireExclusive(operation.txn_id, resource, reason);
+
+        std::cout << "    T" << operation.txn_id
+                  << " LOCK-" << (read_lock ? "S " : "X ")
+                  << resource;
+        if (granted) {
+            std::cout << " granted" << std::endl;
+            return true;
+        }
+
+        std::cout << " blocked; " << reason << std::endl;
+        std::cout << "    Schedule stops before "
+                  << (read_lock ? "READ " : "WRITE ")
+                  << operation.item << std::endl;
+        return false;
     }
 
-    static std::string seatNoFromItem(const std::string& item) {
-        auto first_dot = item.find('.');
-        auto second_dot = item.find('.', first_dot + 1);
-        if (first_dot == std::string::npos || second_dot == std::string::npos) {
-            return "";
+    void releaseAndPrint(int txn_id) {
+        if (lock_manager.releaseAll(txn_id)) {
+            std::cout << "    T" << txn_id
+                      << " RELEASE locks" << std::endl;
         }
-        return item.substr(first_dot + 1, second_dot - first_dot - 1);
     }
 
-    static std::string columnFromItem(const std::string& item) {
-        auto second_dot = item.find('.', item.find('.') + 1);
-        if (second_dot == std::string::npos) {
-            return "";
+    void readAndPrint(int txn_id, const std::string& item_name) {
+        auto item = parseScheduleItem(item_name);
+        auto query = projectStatement(item);
+        auto read = readValue(item);
+        std::cout << "    T" << txn_id
+                  << " " << query
+                  << " WHERE " << item.key_column << "=" << item.key_value
+                  << " -> " << read.first;
+        if (read.second) {
+            std::cout << " at TupleId(page=" << read.second->page_id
+                      << ", slot=" << read.second->slot_id << ")";
         }
-        return item.substr(second_dot + 1);
+        std::cout << std::endl;
+    }
+
+    void writeAndPrint(const ScheduleOperation& operation) {
+        auto item = parseScheduleItem(operation.item);
+        auto old_value = readValue(item);
+        undo_log[operation.txn_id].push_back({item, old_value.first});
+        auto statement = updateStatement(item, operation.value);
+        executeQuiet(db, statement);
+        std::cout << "    T" << operation.txn_id
+                  << " " << statement
+                  << ": " << old_value.first
+                  << " -> " << operation.value;
+        if (old_value.second) {
+            std::cout << " at TupleId(page=" << old_value.second->page_id
+                      << ", slot=" << old_value.second->slot_id << ")";
+        }
+        std::cout << std::endl;
+    }
+
+    std::pair<std::string, std::optional<TupleId>> readValue(const ScheduleItemRef& item) {
+        auto rows = db.executeQuery(
+            projectStatement(item),
+            nullptr,
+            false
+        );
+        for (const auto& row : rows) {
+            if (row.fields.size() >= 2 &&
+                fieldToString(*row.fields[0]) == item.key_value) {
+                return {fieldToString(*row.fields[1]), row.tuple_id};
+            }
+        }
+        throw std::runtime_error(
+            "Unknown schedule item: " + item.table + "." +
+            item.key_column + "=" + item.key_value
+        );
+    }
+
+    void restoreTxn(int txn_id) {
+        auto& writes = undo_log[txn_id];
+        for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
+            auto statement = updateStatement(it->item, it->old_value);
+            executeQuiet(db, statement);
+            std::cout << "      restore " << operationItemLabel(it->item)
+                      << " with " << statement
+                      << std::endl;
+        }
+    }
+
+    static std::string projectStatement(const ScheduleItemRef& item) {
+        return "PROJECT {" + item.table + "." + item.key_column + "}, {" +
+               item.table + "." + item.column + "} FROM " + item.table;
+    }
+
+    static std::string updateStatement(const ScheduleItemRef& item,
+                                       const std::string& value) {
+        return "UPDATE " + item.table + " SET " + item.column + "=" + value +
+               " WHERE " + item.key_column + "=" + item.key_value;
+    }
+
+    static std::string resourceFor(const ScheduleItemRef& item) {
+        return item.table + "." + item.key_column + "=" + item.key_value;
+    }
+
+    static std::string operationItemLabel(const ScheduleItemRef& item) {
+        return item.table + "." + item.key_column + "=" +
+               item.key_value + "." + item.column;
     }
 };
 
+bool rowExists(BuzzDB& db,
+               const std::string& table_name,
+               const std::string& key_column,
+               const std::string& key_value) {
+    auto rows = db.executeQuery(
+        "PROJECT {" + table_name + "." + key_column + "} FROM " + table_name,
+        nullptr,
+        false
+    );
+    for (const auto& row : rows) {
+        if (!row.fields.empty() && fieldToString(*row.fields[0]) == key_value) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void resetSeat(BuzzDB& db, int id, const std::string& seat_no) {
-    try {
-        db.readValue("seats", "status", "seat_no", seat_no);
-        db.executeStatement(
+    if (rowExists(db, "seats", "seat_no", seat_no)) {
+        executeQuiet(
+            db,
             "UPDATE seats SET status=available, customer=unassigned "
-            "WHERE seat_no=" + seat_no,
-            nullptr,
-            0,
-            false
+            "WHERE seat_no=" + seat_no
         );
-    } catch (const std::runtime_error&) {
-        db.executeStatement(
+    } else {
+        executeQuiet(
+            db,
             "INSERT seats|" + std::to_string(id) + "|1|" +
-            seat_no + "|available|unassigned",
-            nullptr,
-            0,
-            false
+            seat_no + "|available|unassigned"
         );
     }
 }
 
-void runSchedule() {
-    const std::string seat_1b = "seats.1B.status";
-    const std::string seat_1b_customer = "seats.1B.customer";
+void resetHold(BuzzDB& db, int id, int seat_id) {
+    std::string hold_id = std::to_string(id);
+    if (rowExists(db, "holds", "id", hold_id)) {
+        executeQuiet(
+            db,
+            "UPDATE holds SET customer=unassigned, status=open "
+            "WHERE id=" + hold_id
+        );
+    } else {
+        executeQuiet(
+            db,
+            "INSERT holds|" + hold_id + "|1|" +
+            std::to_string(seat_id) + "|unassigned|open"
+        );
+    }
+}
+
+void resetBookingRows(BuzzDB& db) {
+    resetSeat(db, 1, "1A");
+    resetSeat(db, 2, "1B");
+    resetHold(db, 1, 2);
+    resetHold(db, 2, 2);
+}
+
+void runScheduleDemo(BuzzDB& db,
+                     const std::string& title,
+                     const std::vector<ScheduleOperation>& schedule,
+                     const std::vector<std::string>& observations = {}) {
+    resetBookingRows(db);
+    std::cout << "\nSchedule: " << title << std::endl;
+    ScheduleExecutor executor(db);
+    bool completed = executor.run(schedule);
+    executor.printTouchedState(schedule, completed);
+    if (!completed) {
+        std::cout << "    Locking result: strict 2PL blocks this interleaving; "
+                  << "a later scheduler would wait, reorder, or abort."
+                  << std::endl;
+    }
+    for (const auto& observation : observations) {
+        std::cout << "    " << (completed ? "Observation: "
+                                           : "Original schedule risk: ")
+                  << observation << std::endl;
+    }
+    ScheduleAnalyzer(schedule).printAnalysis();
+}
+
+void runScheduleChecks() {
+    const std::string seat_1a = "seats.seat_no=1A.status";
+    const std::string seat_1b = "seats.seat_no=1B.status";
+    const std::string hold_1_customer = "holds.id=1.customer";
+    const std::string hold_2_customer = "holds.id=2.customer";
 
     BuzzDB db;
     db.createTable("seats", {
@@ -5686,31 +5824,93 @@ void runSchedule() {
         {"status", STRING},
         {"customer", STRING}
     });
-    resetSeat(db, 1, "1A");
-    resetSeat(db, 2, "1B");
+    db.createTable("holds", {
+        {"id", INT},
+        {"flight_id", INT},
+        {"seat_id", INT},
+        {"customer", STRING},
+        {"status", STRING}
+    });
 
-    std::vector<ScheduleOperation> schedule = {
-        {1, ScheduleOpType::READ, seat_1b, ""},
-        {2, ScheduleOpType::READ, seat_1b, ""},
-        {1, ScheduleOpType::WRITE, seat_1b, "held"},
-        {1, ScheduleOpType::WRITE, seat_1b_customer, "garcia"},
-        {2, ScheduleOpType::WRITE, seat_1b, "held"},
-        {2, ScheduleOpType::WRITE, seat_1b_customer, "patel"},
-        {1, ScheduleOpType::COMMIT, "", ""},
-        {2, ScheduleOpType::COMMIT, "", ""}
-    };
+    std::cout << "\nSchedule checks over BuzzDB tables" << std::endl;
+    std::cout << "  Conflict-serializable iff the serialization graph is acyclic." << std::endl;
+    std::cout << "  Recovery-class containment: strict => cascadeless => recoverable." << std::endl;
+    std::cout << "  Recoverable schedules can still be non-serializable." << std::endl;
+    std::cout << "  Strict schedules also forbid dirty writes." << std::endl;
+    std::cout << "  v66 adds strict 2PL: S/X row locks are held until COMMIT or ABORT." << std::endl;
+    std::cout << "  Analysis describes the requested schedule; locked execution shows what runs." << std::endl;
 
-    std::cout << "\nInterleaved seat booking without concurrency control" << std::endl;
-    std::cout << "  T1 and T2 both try to hold seat 1B." << std::endl;
-    InterleavedScheduleExecutor executor(db);
-    executor.run(schedule);
-    executor.printSeatStatus({"1A", "1B"});
-    std::cout << "  Observation: both transactions saw 1B as available, "
-              << "but the final hold belongs to T2." << std::endl;
-    ScheduleAnalyzer(schedule).printAnalysis();
+    runScheduleDemo(
+        db,
+        "non-recoverable dirty read",
+        {
+            {1, ScheduleOpType::WRITE, seat_1a, "held"},
+            {2, ScheduleOpType::READ, seat_1a, ""},
+            {2, ScheduleOpType::WRITE, hold_1_customer, "garcia"},
+            {2, ScheduleOpType::COMMIT, "", ""},
+            {1, ScheduleOpType::ABORT, "", ""}
+        },
+        {"T2 created a hold after reading a seat update that T1 later aborted"}
+    );
+
+    runScheduleDemo(
+        db,
+        "recoverable but cascading abort",
+        {
+            {1, ScheduleOpType::WRITE, seat_1a, "held"},
+            {2, ScheduleOpType::READ, seat_1a, ""},
+            {2, ScheduleOpType::WRITE, hold_1_customer, "garcia"},
+            {1, ScheduleOpType::ABORT, "", ""},
+            {2, ScheduleOpType::ABORT, "", ""}
+        },
+        {"T2 must abort its hold because it read T1's uncommitted seat update"}
+    );
+
+    runScheduleDemo(
+        db,
+        "cascadeless and recoverable, but not strict",
+        {
+            {1, ScheduleOpType::WRITE, hold_1_customer, "garcia"},
+            {2, ScheduleOpType::WRITE, hold_1_customer, "patel"},
+            {1, ScheduleOpType::COMMIT, "", ""},
+            {2, ScheduleOpType::COMMIT, "", ""}
+        },
+        {"there is no dirty read, but T2 overwrites T1's hold tuple before T1 commits"}
+    );
+
+    runScheduleDemo(
+        db,
+        "cascadeless but not serializable double booking",
+        {
+            {1, ScheduleOpType::READ, seat_1b, ""},
+            {2, ScheduleOpType::READ, seat_1b, ""},
+            {1, ScheduleOpType::WRITE, seat_1b, "held"},
+            {1, ScheduleOpType::WRITE, hold_1_customer, "garcia"},
+            {2, ScheduleOpType::WRITE, seat_1b, "held"},
+            {2, ScheduleOpType::WRITE, hold_2_customer, "patel"},
+            {1, ScheduleOpType::COMMIT, "", ""},
+            {2, ScheduleOpType::COMMIT, "", ""}
+        },
+        {"no dirty read occurs, but the read/write conflicts form a cycle",
+         "recovery safety does not prevent the double booking anomaly"}
+    );
+
+    runScheduleDemo(
+        db,
+        "strict seat update",
+        {
+            {1, ScheduleOpType::WRITE, seat_1a, "held"},
+            {1, ScheduleOpType::WRITE, hold_1_customer, "garcia"},
+            {1, ScheduleOpType::COMMIT, "", ""},
+            {2, ScheduleOpType::READ, seat_1a, ""},
+            {2, ScheduleOpType::WRITE, seat_1a, "sold"},
+            {2, ScheduleOpType::COMMIT, "", ""}
+        },
+        {"T2 waits until T1 finishes before reading or confirming the seat"}
+    );
 }
 
 int main() {
-    runSchedule();
+    runScheduleChecks();
     return 0;
 }
