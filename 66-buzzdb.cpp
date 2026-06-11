@@ -3387,6 +3387,10 @@ public:
         return graph.hasCycle();
     }
 
+    std::vector<int> cycle() const {
+        return graph.cycle();
+    }
+
 private:
     DirectedGraph graph;
     std::map<std::pair<int, int>, bool> edge_seen;
@@ -3403,6 +3407,7 @@ class ScheduleAnalyzer {
 
     struct Analysis {
         std::vector<ConflictEdge> conflict_edges;
+        std::vector<int> cycle;
         bool conflict_serializable = true;
         bool recoverable = true;
         bool avoids_cascading_aborts = true;
@@ -3430,6 +3435,10 @@ public:
 
         std::cout << "    Result:" << std::endl;
         printResult("Conflict-serializable", analysis.conflict_serializable);
+        if (!analysis.conflict_serializable && !analysis.cycle.empty()) {
+            std::cout << "      Serialization graph cycle: "
+                      << serialOrderLabel(analysis.cycle) << std::endl;
+        }
         std::cout << "      Recovery class: " << recoveryClass(analysis) << std::endl;
         printResult("Recoverable", analysis.recoverable);
         printResult("Cascadeless", analysis.avoids_cascading_aborts);
@@ -3460,6 +3469,9 @@ private:
 
         analysis.conflict_edges = graph.edges();
         analysis.conflict_serializable = !graph.hasCycle();
+        if (!analysis.conflict_serializable) {
+            analysis.cycle = graph.cycle();
+        }
         analyzeRecoveryProperties(analysis);
         return analysis;
     }
@@ -3559,6 +3571,21 @@ private:
     static void printResult(const std::string& label, bool value) {
         std::cout << "      " << label << ": "
                   << (value ? "yes" : "no") << std::endl;
+    }
+
+    static std::string serialOrderLabel(const std::vector<int>& order) {
+        if (order.empty()) {
+            return "none";
+        }
+
+        std::string label;
+        for (int txn_id : order) {
+            if (!label.empty()) {
+                label += " -> ";
+            }
+            label += "T" + std::to_string(txn_id);
+        }
+        return label;
     }
 
     static std::string recoveryClass(const Analysis& analysis) {

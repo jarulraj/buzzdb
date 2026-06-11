@@ -3482,6 +3482,10 @@ public:
         return graph.hasCycle();
     }
 
+    std::vector<int> cycle() const {
+        return graph.cycle();
+    }
+
     std::vector<int> topologicalOrder() const {
         return graph.topologicalOrder();
     }
@@ -3503,6 +3507,7 @@ class ScheduleAnalyzer {
     struct Analysis {
         std::vector<ConflictEdge> conflict_edges;
         std::vector<int> serial_order;
+        std::vector<int> cycle;
         bool conflict_serializable = true;
         bool recoverable = true;
         bool avoids_cascading_aborts = true;
@@ -3533,6 +3538,9 @@ public:
         if (analysis.conflict_serializable) {
             std::cout << "      Topological order: "
                       << serialOrderLabel(analysis.serial_order) << std::endl;
+        } else if (!analysis.cycle.empty()) {
+            std::cout << "      Serialization graph cycle: "
+                      << serialOrderLabel(analysis.cycle) << std::endl;
         }
         std::cout << "      Recovery class: " << recoveryClass(analysis) << std::endl;
         printResult("Recoverable", analysis.recoverable);
@@ -3566,6 +3574,8 @@ private:
         analysis.conflict_serializable = !graph.hasCycle();
         if (analysis.conflict_serializable) {
             analysis.serial_order = graph.topologicalOrder();
+        } else {
+            analysis.cycle = graph.cycle();
         }
         analyzeRecoveryProperties(analysis);
         return analysis;
@@ -6045,7 +6055,8 @@ private:
         }
 
         if (result.deadlock) {
-            log("deadlock detected: " + cycleLabel(result.cycle));
+            log("deadlock detected; waits-for graph cycle: " +
+                cycleLabel(result.cycle));
             log("T" + std::to_string(txn_id) +
                 " selected as deadlock victim");
             return false;

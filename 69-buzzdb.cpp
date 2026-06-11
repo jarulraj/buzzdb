@@ -3539,9 +3539,8 @@ public:
             std::cout << "      Topological order: "
                       << serialOrderLabel(analysis.serial_order) << std::endl;
         } else if (!analysis.cycle.empty()) {
-            std::cout << "      Cycle: "
+            std::cout << "      Serialization graph cycle: "
                       << serialOrderLabel(analysis.cycle) << std::endl;
-            std::cout << "      Meaning: the graph requires both directions, so no serial order exists." << std::endl;
         }
         std::cout << "      Recovery class: " << recoveryClass(analysis) << std::endl;
         printResult("Recoverable", analysis.recoverable);
@@ -6102,7 +6101,7 @@ private:
 
         if (result.deadlock) {
             log("deadlock detected during " + request_label +
-                ": " + cycleLabel(result.cycle));
+                "; waits-for graph cycle: " + cycleLabel(result.cycle));
             log("T" + std::to_string(txn_id) +
                 " selected as deadlock victim");
             return false;
