@@ -264,7 +264,7 @@ constexpr TableId SYS_TABLES_ID = 1;
 constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
 constexpr uint32_t BUZZDB_MAGIC = 0x425A4442;
-constexpr uint16_t BUZZDB_VERSION = 67;
+constexpr uint16_t BUZZDB_VERSION = 68;
 constexpr uint16_t BUZZDB_MIN_COMPATIBLE_VERSION = 59;
 constexpr size_t MAX_SYSTEM_TABLE_PAGES = 16;
 const std::string log_filename = "buzzdb.log";
@@ -2639,7 +2639,7 @@ void RecoveryManager::recover() {
         input >> record_lsn >> type >> txn_id;
         if (!(input >> prev_lsn)) {
             throw std::runtime_error(
-                "buzzdb.log was written by an older WAL format; remove it before running v67."
+                "buzzdb.log was written by an older WAL format; remove it before running v68."
             );
         }
         if (txn_id > 0) {
@@ -2713,7 +2713,7 @@ void RecoveryManager::recover() {
         input >> record_lsn >> type >> txn_id;
         if (!(input >> prev_lsn)) {
             throw std::runtime_error(
-                "buzzdb.log was written by an older WAL format; remove it before running v67."
+                "buzzdb.log was written by an older WAL format; remove it before running v68."
             );
         }
         if (txn_id > 0) {
@@ -3609,51 +3609,90 @@ class LockManager {
     };
 
 public:
-    bool waitForShared(int txn_id,
-                       const std::string& resource,
-                       std::chrono::milliseconds timeout,
-                       std::string& reason) {
-        std::unique_lock<std::mutex> guard(latch);
-        auto ready = [&]() {
-            auto& state = locks[resource];
-            return state.exclusive_holder == 0 ||
-                   state.exclusive_holder == txn_id;
-        };
-        if (!lock_cv.wait_for(guard, timeout, ready)) {
-            auto& state = locks[resource];
-            reason = "X lock is held by T" + std::to_string(state.exclusive_holder);
-            return false;
-        }
+    struct LockRequestResult {
+        bool granted = false;
+        bool deadlock = false;
+        bool timed_out = false;
+        std::string reason;
+        std::vector<int> blockers;
+        std::vector<int> cycle;
+    };
 
-        addSharedHolder(locks[resource], txn_id);
-        return true;
+    void setWaitObserver(
+        std::function<void(int, const std::vector<int>&)> observer) {
+        wait_observer = std::move(observer);
     }
 
-    bool waitForExclusive(int txn_id,
-                          const std::string& resource,
-                          std::chrono::milliseconds timeout,
-                          std::string& reason) {
+    LockRequestResult waitForShared(int txn_id,
+                                    const std::string& resource,
+                                    std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> guard(latch);
-        auto ready = [&]() {
-            auto& state = locks[resource];
-            return (state.exclusive_holder == 0 ||
-                    state.exclusive_holder == txn_id) &&
-                   !hasOtherSharedHolder(state, txn_id);
-        };
-        if (!lock_cv.wait_for(guard, timeout, ready)) {
-            reason = incompatibleHolderLabel(locks[resource], txn_id);
-            return false;
+        LockRequestResult result;
+        while (!canGrantShared(txn_id, resource)) {
+            auto blockers = blockersForShared(txn_id, resource);
+            setWaitEdges(txn_id, blockers);
+            notifyWaitObserver(txn_id, blockers);
+            result.blockers = blockers;
+            result.cycle = findCycleFrom(txn_id);
+            if (!result.cycle.empty()) {
+                result.deadlock = true;
+                result.reason = "waits-for cycle detected";
+                removeWaitEdges(txn_id);
+                return result;
+            }
+
+            if (lock_cv.wait_for(guard, timeout) == std::cv_status::timeout) {
+                result.timed_out = true;
+                result.reason = incompatibleHolderLabel(locks[resource], txn_id);
+                removeWaitEdges(txn_id);
+                return result;
+            }
         }
 
+        removeWaitEdges(txn_id);
+        addSharedHolder(locks[resource], txn_id);
+        result.granted = true;
+        return result;
+    }
+
+    LockRequestResult waitForExclusive(int txn_id,
+                                       const std::string& resource,
+                                       std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> guard(latch);
+        LockRequestResult result;
+        while (!canGrantExclusive(txn_id, resource)) {
+            auto blockers = blockersForExclusive(txn_id, resource);
+            setWaitEdges(txn_id, blockers);
+            notifyWaitObserver(txn_id, blockers);
+            result.blockers = blockers;
+            result.cycle = findCycleFrom(txn_id);
+            if (!result.cycle.empty()) {
+                result.deadlock = true;
+                result.reason = "waits-for cycle detected";
+                removeWaitEdges(txn_id);
+                return result;
+            }
+
+            if (lock_cv.wait_for(guard, timeout) == std::cv_status::timeout) {
+                result.timed_out = true;
+                result.reason = incompatibleHolderLabel(locks[resource], txn_id);
+                removeWaitEdges(txn_id);
+                return result;
+            }
+        }
+
+        removeWaitEdges(txn_id);
         auto& state = locks[resource];
         removeSharedHolder(state, txn_id);
         state.exclusive_holder = txn_id;
-        return true;
+        result.granted = true;
+        return result;
     }
 
     bool releaseAll(int txn_id) {
         std::lock_guard<std::mutex> guard(latch);
         bool released = false;
+        removeWaitEdges(txn_id);
         for (auto& entry : locks) {
             auto& state = entry.second;
             if (state.exclusive_holder == txn_id) {
@@ -3674,6 +3713,100 @@ private:
     std::mutex latch;
     std::condition_variable lock_cv;
     std::map<std::string, LockState> locks;
+    std::map<int, std::vector<int>> waits_for;
+    std::function<void(int, const std::vector<int>&)> wait_observer;
+
+    bool canGrantShared(int txn_id, const std::string& resource) {
+        auto& state = locks[resource];
+        return state.exclusive_holder == 0 ||
+               state.exclusive_holder == txn_id;
+    }
+
+    bool canGrantExclusive(int txn_id, const std::string& resource) {
+        auto& state = locks[resource];
+        return (state.exclusive_holder == 0 ||
+                state.exclusive_holder == txn_id) &&
+               !hasOtherSharedHolder(state, txn_id);
+    }
+
+    std::vector<int> blockersForShared(int txn_id, const std::string& resource) {
+        std::vector<int> blockers;
+        auto& state = locks[resource];
+        if (state.exclusive_holder != 0 && state.exclusive_holder != txn_id) {
+            blockers.push_back(state.exclusive_holder);
+        }
+        return blockers;
+    }
+
+    std::vector<int> blockersForExclusive(int txn_id, const std::string& resource) {
+        std::vector<int> blockers;
+        auto& state = locks[resource];
+        if (state.exclusive_holder != 0 && state.exclusive_holder != txn_id) {
+            blockers.push_back(state.exclusive_holder);
+        }
+        for (int holder : state.shared_holders) {
+            if (holder != txn_id &&
+                std::find(blockers.begin(), blockers.end(), holder) == blockers.end()) {
+                blockers.push_back(holder);
+            }
+        }
+        return blockers;
+    }
+
+    void setWaitEdges(int txn_id, const std::vector<int>& blockers) {
+        waits_for[txn_id] = blockers;
+    }
+
+    void notifyWaitObserver(int txn_id, const std::vector<int>& blockers) {
+        if (wait_observer) {
+            wait_observer(txn_id, blockers);
+        }
+    }
+
+    void removeWaitEdges(int txn_id) {
+        waits_for.erase(txn_id);
+        for (auto& entry : waits_for) {
+            auto& blockers = entry.second;
+            blockers.erase(
+                std::remove(blockers.begin(), blockers.end(), txn_id),
+                blockers.end()
+            );
+        }
+    }
+
+    std::vector<int> findCycleFrom(int txn_id) const {
+        std::vector<int> path;
+        std::map<int, bool> visited;
+        if (findCycleDfs(txn_id, txn_id, visited, path)) {
+            path.push_back(txn_id);
+            return path;
+        }
+        return {};
+    }
+
+    bool findCycleDfs(int current,
+                      int target,
+                      std::map<int, bool>& visited,
+                      std::vector<int>& path) const {
+        visited[current] = true;
+        path.push_back(current);
+
+        auto it = waits_for.find(current);
+        if (it != waits_for.end()) {
+            for (int next_txn : it->second) {
+                if (next_txn == target) {
+                    return true;
+                }
+                if (!visited[next_txn] &&
+                    findCycleDfs(next_txn, target, visited, path)) {
+                    return true;
+                }
+            }
+        }
+
+        path.pop_back();
+        return false;
+    }
 
     static void addSharedHolder(LockState& state, int txn_id) {
         if (std::find(state.shared_holders.begin(),
@@ -5490,7 +5623,7 @@ public:
             );
         }
         if (recovery_manager.isActive()) {
-            throw std::runtime_error("INSERT inside an undo/redo WAL update transaction is not supported in v67.");
+            throw std::runtime_error("INSERT inside an undo/redo WAL update transaction is not supported in v68.");
         }
 
         auto tuple = std::make_unique<Tuple>();
@@ -5693,7 +5826,7 @@ void resetHold(BuzzDB& db, int id, int seat_id) {
 void resetBookingRows(BuzzDB& db) {
     resetSeat(db, 1, "1A");
     resetSeat(db, 2, "1B");
-    resetHold(db, 1, 2);
+    resetHold(db, 1, 1);
     resetHold(db, 2, 2);
 }
 
@@ -5704,26 +5837,38 @@ class ThreadedBookingRunner {
     };
 
 public:
-    explicit ThreadedBookingRunner(BuzzDB& db) : db(db) {}
+    explicit ThreadedBookingRunner(BuzzDB& db) : db(db) {
+        lock_manager.setWaitObserver(
+            [this](int txn_id, const std::vector<int>& blockers) {
+                printWaitEdges(txn_id, blockers);
+            }
+        );
+    }
 
     void run() {
-        std::cout << "\nThreaded seat booking with strict 2PL" << std::endl;
-        std::cout << "  T1 and T2 run in separate threads and both try seat 1B." << std::endl;
+        std::cout << "\nThreaded seat booking with waits-for deadlock detection" << std::endl;
+        std::cout << "  T1 and T2 run in separate threads and reserve seats in opposite order." << std::endl;
+        std::cout << "  This version uses ordinary X locks only; lock upgrades come next." << std::endl;
+        std::cout << "  The lock manager records waits-for edges and aborts a cycle victim." << std::endl;
         std::cout << "  DB calls are serialized here because the storage layer is not thread-safe yet." << std::endl;
 
         std::thread txn1(
-            &ThreadedBookingRunner::bookSeat,
+            &ThreadedBookingRunner::bookTwoSeats,
             this,
             1,
             "garcia",
+            "seats.seat_no=1A.status",
+            "seats.seat_no=1B.status",
             "holds.id=1.customer",
             std::chrono::milliseconds(2000)
         );
         std::thread txn2(
-            &ThreadedBookingRunner::bookSeat,
+            &ThreadedBookingRunner::bookTwoSeats,
             this,
             2,
             "patel",
+            "seats.seat_no=1B.status",
+            "seats.seat_no=1A.status",
             "holds.id=2.customer",
             std::chrono::milliseconds(200)
         );
@@ -5743,45 +5888,68 @@ private:
     std::mutex history_latch;
     std::mutex read_barrier_latch;
     std::condition_variable read_barrier_cv;
-    int reads_at_barrier = 0;
+    int first_locks_at_barrier = 0;
 
-    void bookSeat(int txn_id,
-                  const std::string& customer,
-                  const std::string& hold_item_name,
-                  std::chrono::milliseconds upgrade_timeout) {
-        const std::string seat_item_name = "seats.seat_no=1B.status";
-        auto seat_item = parseScheduleItem(seat_item_name);
+    void bookTwoSeats(int txn_id,
+                      const std::string& customer,
+                      const std::string& first_seat_item_name,
+                      const std::string& second_seat_item_name,
+                      const std::string& hold_item_name,
+                      std::chrono::milliseconds lock_timeout) {
+        auto first_seat_item = parseScheduleItem(first_seat_item_name);
+        auto second_seat_item = parseScheduleItem(second_seat_item_name);
         auto hold_item = parseScheduleItem(hold_item_name);
-        auto seat_resource = resourceFor(seat_item);
+        auto first_seat_resource = resourceFor(first_seat_item);
+        auto second_seat_resource = resourceFor(second_seat_item);
         auto hold_resource = resourceFor(hold_item);
 
         log("T" + std::to_string(txn_id) + " BEGIN");
-        if (!requestLock(txn_id, "S", seat_resource, upgrade_timeout)) {
+        if (!requestLock(txn_id, "X", first_seat_resource, lock_timeout)) {
             abortTxn(txn_id);
             return;
         }
 
-        auto seat_status = readItem(seat_item);
-        record({txn_id, ScheduleOpType::READ, seat_item_name, ""});
+        auto first_seat_status = readItem(first_seat_item);
+        record({txn_id, ScheduleOpType::READ, first_seat_item_name, ""});
         log("T" + std::to_string(txn_id) +
-            " PROJECT {seats.seat_no}, {seats.status} FROM seats WHERE seat_no=1B -> " +
-            seat_status.value + " at " + tupleIdLabel(seat_status.tuple_id));
+            " PROJECT {seats.seat_no}, {seats.status} FROM seats WHERE seat_no=" +
+            first_seat_item.key_value + " -> " +
+            first_seat_status.value + " at " +
+            tupleIdLabel(first_seat_status.tuple_id));
 
-        waitForBothReads();
+        waitForBothFirstLocks();
         if (txn_id == 2) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
-        if (!requestLock(txn_id, "X", seat_resource, upgrade_timeout)) {
+        if (!requestLock(txn_id, "X", second_seat_resource, lock_timeout)) {
             abortTxn(txn_id);
             return;
         }
 
-        auto old_seat = writeItem(seat_item, "held");
-        record({txn_id, ScheduleOpType::WRITE, seat_item_name, "held"});
+        auto second_seat_status = readItem(second_seat_item);
+        record({txn_id, ScheduleOpType::READ, second_seat_item_name, ""});
         log("T" + std::to_string(txn_id) +
-            " UPDATE seats SET status=held WHERE seat_no=1B: " +
-            old_seat.value + " -> held at " + tupleIdLabel(old_seat.tuple_id));
+            " PROJECT {seats.seat_no}, {seats.status} FROM seats WHERE seat_no=" +
+            second_seat_item.key_value + " -> " +
+            second_seat_status.value + " at " +
+            tupleIdLabel(second_seat_status.tuple_id));
+
+        auto old_first_seat = writeItem(first_seat_item, "held");
+        record({txn_id, ScheduleOpType::WRITE, first_seat_item_name, "held"});
+        log("T" + std::to_string(txn_id) +
+            " UPDATE seats SET status=held WHERE seat_no=" +
+            first_seat_item.key_value + ": " +
+            old_first_seat.value + " -> held at " +
+            tupleIdLabel(old_first_seat.tuple_id));
+
+        auto old_second_seat = writeItem(second_seat_item, "held");
+        record({txn_id, ScheduleOpType::WRITE, second_seat_item_name, "held"});
+        log("T" + std::to_string(txn_id) +
+            " UPDATE seats SET status=held WHERE seat_no=" +
+            second_seat_item.key_value + ": " +
+            old_second_seat.value + " -> held at " +
+            tupleIdLabel(old_second_seat.tuple_id));
 
         if (!requestLock(txn_id, "X", hold_resource, std::chrono::milliseconds(1000))) {
             abortTxn(txn_id);
@@ -5808,26 +5976,32 @@ private:
         log("T" + std::to_string(txn_id) + " requests " + mode +
             " lock on " + resource);
 
-        std::string reason;
-        bool granted = mode == "S" ?
-            lock_manager.waitForShared(txn_id, resource, timeout, reason) :
-            lock_manager.waitForExclusive(txn_id, resource, timeout, reason);
+        auto result = mode == "S" ?
+            lock_manager.waitForShared(txn_id, resource, timeout) :
+            lock_manager.waitForExclusive(txn_id, resource, timeout);
 
-        if (granted) {
+        if (result.granted) {
             log("T" + std::to_string(txn_id) + " " + mode +
                 " lock on " + resource + " granted");
             return true;
         }
 
+        if (result.deadlock) {
+            log("deadlock detected: " + cycleLabel(result.cycle));
+            log("T" + std::to_string(txn_id) +
+                " selected as deadlock victim");
+            return false;
+        }
+
         log("T" + std::to_string(txn_id) + " " + mode +
-            " lock on " + resource + " timed out; " + reason);
+            " lock on " + resource + " timed out; " + result.reason);
         return false;
     }
 
     void abortTxn(int txn_id) {
         record({txn_id, ScheduleOpType::ABORT, "", ""});
         log("T" + std::to_string(txn_id) +
-            " ABORT chosen as lock-wait victim");
+            " ABORT and releases its locks");
         releaseAndLog(txn_id);
     }
 
@@ -5837,14 +6011,21 @@ private:
         }
     }
 
-    void waitForBothReads() {
+    void printWaitEdges(int txn_id, const std::vector<int>& blockers) {
+        for (int blocker : blockers) {
+            log("waits-for edge: T" + std::to_string(txn_id) +
+                " -> T" + std::to_string(blocker));
+        }
+    }
+
+    void waitForBothFirstLocks() {
         std::unique_lock<std::mutex> guard(read_barrier_latch);
-        reads_at_barrier++;
-        if (reads_at_barrier == 2) {
+        first_locks_at_barrier++;
+        if (first_locks_at_barrier == 2) {
             read_barrier_cv.notify_all();
             return;
         }
-        read_barrier_cv.wait(guard, [&]() { return reads_at_barrier == 2; });
+        read_barrier_cv.wait(guard, [&]() { return first_locks_at_barrier == 2; });
     }
 
     ItemRead readItem(const ScheduleItemRef& item) {
@@ -5877,11 +6058,14 @@ private:
     }
 
     void printFinalState() {
+        auto seat_1a_status = readItem(parseScheduleItem("seats.seat_no=1A.status"));
         auto seat_status = readItem(parseScheduleItem("seats.seat_no=1B.status"));
         auto hold_1_customer = readItem(parseScheduleItem("holds.id=1.customer"));
         auto hold_2_customer = readItem(parseScheduleItem("holds.id=2.customer"));
 
         std::cout << "  Final booking tuples:" << std::endl;
+        std::cout << "    seats[seat_no=1A].status=" << seat_1a_status.value
+                  << " at " << tupleIdLabel(seat_1a_status.tuple_id) << std::endl;
         std::cout << "    seats[seat_no=1B].status=" << seat_status.value
                   << " at " << tupleIdLabel(seat_status.tuple_id) << std::endl;
         std::cout << "    holds[id=1].customer=" << hold_1_customer.value
@@ -5923,6 +6107,17 @@ private:
     static std::string tupleIdLabel(const TupleId& tuple_id) {
         return "TupleId(page=" + std::to_string(tuple_id.page_id) +
                ", slot=" + std::to_string(tuple_id.slot_id) + ")";
+    }
+
+    static std::string cycleLabel(const std::vector<int>& cycle) {
+        std::string label;
+        for (int txn_id : cycle) {
+            if (!label.empty()) {
+                label += " -> ";
+            }
+            label += "T" + std::to_string(txn_id);
+        }
+        return label;
     }
 
     std::vector<ScheduleOperation> history;
