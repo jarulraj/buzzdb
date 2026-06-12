@@ -3247,6 +3247,7 @@ public:
 
 struct TxnContext {
     int id;
+    std::string label;
     enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
 };
 
@@ -3254,13 +3255,27 @@ using TxnPtr = std::shared_ptr<TxnContext>;
 
 class TransactionManager {
     int next_id = 1;
+    std::mutex latch;
 public:
-    TxnPtr begin() { 
-        std::cout << "Begin Txn ID = " << next_id << std::endl;
-        return std::make_shared<TxnContext>(TxnContext{ next_id++ }); 
+    TxnPtr begin(const std::string& label = "") {
+        std::lock_guard<std::mutex> guard(latch);
+        int txn_id = next_id++;
+        auto txn_label = label.empty() ?
+            "T" + std::to_string(txn_id) :
+            label;
+        std::cout << txn_label << " BEGIN" << std::endl;
+        return std::make_shared<TxnContext>(
+            TxnContext{txn_id, txn_label, TxnContext::RUNNING}
+        );
     }
-    void commit(TxnContext& tx) { tx.state = TxnContext::COMMITTED; }
-    void abort (TxnContext& tx) { tx.state = TxnContext::ABORTED;  }
+    void commit(TxnContext& tx) {
+        std::lock_guard<std::mutex> guard(latch);
+        tx.state = TxnContext::COMMITTED;
+    }
+    void abort (TxnContext& tx) {
+        std::lock_guard<std::mutex> guard(latch);
+        tx.state = TxnContext::ABORTED;
+    }
 };
 
 enum class ScheduleOpType { READ, WRITE, COMMIT, ABORT };
@@ -5264,8 +5279,9 @@ public:
         buffer_manager.printBufferPoolSummary();
     }
 
-    // NEW: helpers
-    TxnPtr begin() { return txn_manager.begin(); }
+    TxnPtr begin(const std::string& label = "") {
+        return txn_manager.begin(label);
+    }
     void commit(const TxnPtr& tx) { txn_manager.commit(*tx); }
     void abort (const TxnPtr& tx) { txn_manager.abort(*tx);  }
 
@@ -5807,10 +5823,10 @@ private:
         auto hold_item = parseScheduleItem(hold_item_name);
         auto seat_resource = resourceFor(seat_item);
         auto hold_resource = resourceFor(hold_item);
+        auto txn = db.begin("T" + std::to_string(txn_id));
 
-        log("T" + std::to_string(txn_id) + " BEGIN");
         if (!requestLock(txn_id, "S", seat_resource, upgrade_timeout)) {
-            abortTxn(txn_id);
+            abortTxn(txn, txn_id);
             return;
         }
 
@@ -5826,7 +5842,7 @@ private:
         }
 
         if (!requestLock(txn_id, "X", seat_resource, upgrade_timeout)) {
-            abortTxn(txn_id);
+            abortTxn(txn, txn_id);
             return;
         }
 
@@ -5837,7 +5853,7 @@ private:
             old_seat.value + " -> held at " + tupleIdLabel(old_seat.tuple_id));
 
         if (!requestLock(txn_id, "X", hold_resource, std::chrono::milliseconds(1000))) {
-            abortTxn(txn_id);
+            abortTxn(txn, txn_id);
             return;
         }
 
@@ -5850,6 +5866,7 @@ private:
             " at " + tupleIdLabel(old_hold.tuple_id));
 
         record({txn_id, ScheduleOpType::COMMIT, "", ""});
+        db.commit(txn);
         log("T" + std::to_string(txn_id) + " COMMIT");
         releaseAndLog(txn_id);
     }
@@ -5877,8 +5894,9 @@ private:
         return false;
     }
 
-    void abortTxn(int txn_id) {
+    void abortTxn(const TxnPtr& txn, int txn_id) {
         record({txn_id, ScheduleOpType::ABORT, "", ""});
+        db.abort(txn);
         log("T" + std::to_string(txn_id) +
             " ABORT chosen as lock-wait victim");
         releaseAndLog(txn_id);

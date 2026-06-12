@@ -3244,6 +3244,7 @@ public:
 
 struct TxnContext {
     int id;
+    std::string label;
     enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
 };
 
@@ -3251,13 +3252,27 @@ using TxnPtr = std::shared_ptr<TxnContext>;
 
 class TransactionManager {
     int next_id = 1;
+    std::mutex latch;
 public:
-    TxnPtr begin() { 
-        std::cout << "Begin Txn ID = " << next_id << std::endl;
-        return std::make_shared<TxnContext>(TxnContext{ next_id++ }); 
+    TxnPtr begin(const std::string& label = "") {
+        std::lock_guard<std::mutex> guard(latch);
+        int txn_id = next_id++;
+        auto txn_label = label.empty() ?
+            "T" + std::to_string(txn_id) :
+            label;
+        std::cout << txn_label << " BEGIN" << std::endl;
+        return std::make_shared<TxnContext>(
+            TxnContext{txn_id, txn_label, TxnContext::RUNNING}
+        );
     }
-    void commit(TxnContext& tx) { tx.state = TxnContext::COMMITTED; }
-    void abort (TxnContext& tx) { tx.state = TxnContext::ABORTED;  }
+    void commit(TxnContext& tx) {
+        std::lock_guard<std::mutex> guard(latch);
+        tx.state = TxnContext::COMMITTED;
+    }
+    void abort (TxnContext& tx) {
+        std::lock_guard<std::mutex> guard(latch);
+        tx.state = TxnContext::ABORTED;
+    }
 };
 
 enum class ScheduleOpType { READ, WRITE, COMMIT, ABORT };
@@ -5184,8 +5199,9 @@ public:
         buffer_manager.printBufferPoolSummary();
     }
 
-    // NEW: helpers
-    TxnPtr begin() { return txn_manager.begin(); }
+    TxnPtr begin(const std::string& label = "") {
+        return txn_manager.begin(label);
+    }
     void commit(const TxnPtr& tx) { txn_manager.commit(*tx); }
     void abort (const TxnPtr& tx) { txn_manager.abort(*tx);  }
 
@@ -5627,18 +5643,21 @@ public:
         for (const auto& operation : schedule) {
             switch (operation.type) {
                 case ScheduleOpType::READ:
+                    txnFor(operation.txn_id);
                     if (!lockAndPrint(operation)) {
                         return false;
                     }
                     readAndPrint(operation.txn_id, operation.item);
                     break;
                 case ScheduleOpType::WRITE:
+                    txnFor(operation.txn_id);
                     if (!lockAndPrint(operation)) {
                         return false;
                     }
                     writeAndPrint(operation);
                     break;
                 case ScheduleOpType::COMMIT:
+                    db.commit(txnFor(operation.txn_id));
                     std::cout << "    T" << operation.txn_id
                               << " COMMIT" << std::endl;
                     releaseAndPrint(operation.txn_id);
@@ -5647,6 +5666,7 @@ public:
                     std::cout << "    T" << operation.txn_id
                               << " ABORT" << std::endl;
                     restoreTxn(operation.txn_id);
+                    db.abort(txnFor(operation.txn_id));
                     releaseAndPrint(operation.txn_id);
                     break;
             }
@@ -5682,7 +5702,18 @@ public:
 private:
     BuzzDB& db;
     LockManager lock_manager;
+    std::map<int, TxnPtr> txns;
     std::map<int, std::vector<UndoRecord>> undo_log;
+
+    TxnPtr txnFor(int txn_id) {
+        auto it = txns.find(txn_id);
+        if (it != txns.end()) {
+            return it->second;
+        }
+        auto txn = db.begin("T" + std::to_string(txn_id));
+        txns[txn_id] = txn;
+        return txn;
+    }
 
     bool lockAndPrint(const ScheduleOperation& operation) {
         auto item = parseScheduleItem(operation.item);
