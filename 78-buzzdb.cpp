@@ -3654,7 +3654,6 @@ public:
     struct LockStats {
         size_t granted_requests = 0;
         size_t row_locks = 0;
-        size_t predicate_locks = 0;
         size_t waits = 0;
         std::map<std::string, size_t> grants_by_mode;
     };
@@ -3862,13 +3861,10 @@ private:
     }
 
     void recordGrant(const std::string& resource, LockMode mode) {
+        (void)resource;
         stats.granted_requests++;
         stats.grants_by_mode[modeName(mode)]++;
-        if (resource.rfind("predicate ", 0) == 0) {
-            stats.predicate_locks++;
-        } else {
-            stats.row_locks++;
-        }
+        stats.row_locks++;
     }
 
     static bool compatible(LockMode requested, LockMode held) {
@@ -3952,6 +3948,8 @@ struct ConcurrencyControlResult {
 class ConcurrencyControlPolicy {
 public:
     virtual ~ConcurrencyControlPolicy() = default;
+    virtual std::string name() const = 0;
+    virtual std::string completionAction() const = 0;
     virtual void begin(int txn_id, const std::string& txn_label) = 0;
     virtual ConcurrencyControlResult beforeAccess(const ConcurrencyControlRequest& request) = 0;
     virtual void commit(int txn_id) = 0;
@@ -3986,6 +3984,14 @@ public:
           log(std::move(log)),
           txn_label(std::move(txn_label)),
           path_label(std::move(path_label)) {}
+
+    std::string name() const override {
+        return "2PL";
+    }
+
+    std::string completionAction() const override {
+        return "release locks";
+    }
 
     ConcurrencyControlResult beforeAccess(const ConcurrencyControlRequest& request) override {
         LockMode mode = modeFor(request.type);
@@ -4040,6 +4046,116 @@ public:
 
     bool releaseReadLocks(int txn_id) override {
         return lock_manager.releaseByMode(txn_id, LockMode::S);
+    }
+};
+
+class TimestampOrderingPolicy : public ConcurrencyControlPolicy {
+    struct TupleTimestamp {
+        uint64_t read_ts = 0;
+        uint64_t write_ts = 0;
+    };
+
+    std::mutex latch;
+    std::function<void(const std::string&)> log;
+    uint64_t next_ts = 1;
+    std::map<int, uint64_t> txn_ts;
+    std::map<TupleId, TupleTimestamp> tuple_ts;
+
+    static std::string accessName(AccessType type) {
+        return type == AccessType::Read ? "read" : "write";
+    }
+
+public:
+    explicit TimestampOrderingPolicy(std::function<void(const std::string&)> log)
+        : log(std::move(log)) {}
+
+    std::string name() const override {
+        return "Timestamp Ordering";
+    }
+
+    std::string completionAction() const override {
+        return "clear timestamp-ordering transaction state";
+    }
+
+    void begin(int txn_id, const std::string& txn_label) override {
+        std::lock_guard<std::mutex> guard(latch);
+        auto timestamp = next_ts++;
+        txn_ts[txn_id] = timestamp;
+        log(txn_label + " timestamp = " + std::to_string(timestamp));
+    }
+
+    ConcurrencyControlResult beforeAccess(const ConcurrencyControlRequest& request) override {
+        std::lock_guard<std::mutex> guard(latch);
+        auto txn_it = txn_ts.find(request.txn_id);
+        if (txn_it == txn_ts.end()) {
+            return {false, false, true,
+                    "transaction has no timestamp-ordering state", {}};
+        }
+
+        uint64_t timestamp = txn_it->second;
+        for (const auto& resource : request.resources) {
+            auto& timestamps = tuple_ts[resource.tuple_id];
+            log(request.txn_label + " TO " + accessName(request.type) +
+                " check on " + resource.label + " with TS " +
+                std::to_string(timestamp) + " (readTS=" +
+                std::to_string(timestamps.read_ts) + ", writeTS=" +
+                std::to_string(timestamps.write_ts) + ")");
+
+            if (request.type == AccessType::Read) {
+                if (timestamp < timestamps.write_ts) {
+                    return {false, false, true,
+                            request.txn_label + " is older than writeTS " +
+                            std::to_string(timestamps.write_ts) +
+                            " on " + resource.label,
+                            {}};
+                }
+                timestamps.read_ts = std::max(timestamps.read_ts, timestamp);
+                log(request.txn_label + " records readTS(" +
+                    resource.label + ")=" +
+                    std::to_string(timestamps.read_ts));
+                continue;
+            }
+
+            if (timestamp < timestamps.read_ts) {
+                return {false, false, true,
+                        request.txn_label + " is older than readTS " +
+                        std::to_string(timestamps.read_ts) +
+                        " on " + resource.label,
+                        {}};
+            }
+            if (timestamp < timestamps.write_ts) {
+                return {false, false, true,
+                        request.txn_label + " is older than writeTS " +
+                        std::to_string(timestamps.write_ts) +
+                        " on " + resource.label,
+                        {}};
+            }
+            timestamps.write_ts = timestamp;
+            log(request.txn_label + " records writeTS(" +
+                resource.label + ")=" +
+                std::to_string(timestamps.write_ts));
+        }
+        return {};
+    }
+
+    void commit(int txn_id) override {
+        std::lock_guard<std::mutex> guard(latch);
+        txn_ts.erase(txn_id);
+    }
+
+    void abort(int txn_id) override {
+        std::lock_guard<std::mutex> guard(latch);
+        txn_ts.erase(txn_id);
+    }
+
+    bool cancel(int txn_id) override {
+        abort(txn_id);
+        return true;
+    }
+
+    bool releaseReadLocks(int txn_id) override {
+        (void)txn_id;
+        return false;
     }
 };
 
@@ -5590,12 +5706,7 @@ public:
                 }
             }
         );
-        concurrency_control_policy = std::make_unique<TwoPhaseLockingPolicy>(
-            concurrency_control_lock_manager,
-            [this](const std::string& line) { logConcurrencyControl(line); },
-            [this](int txn_id) { return txnIdLabel(txn_id); },
-            [this](const std::vector<int>& path) { return txnPathLabel(path); }
-        );
+        useTwoPhaseLockingPolicy();
         recovery_manager.setRestartUndoLockCallback(
             [this](TableId table_id, PageID page_id, size_t slot_id) {
                 return acquireRestartUndoLock(table_id, page_id, slot_id);
@@ -5613,6 +5724,25 @@ public:
     }
 
     bool isNewDatabase() const { return catalog.isNewDatabase(); }
+
+    void useTwoPhaseLockingPolicy() {
+        concurrency_control_policy = std::make_unique<TwoPhaseLockingPolicy>(
+            concurrency_control_lock_manager,
+            [this](const std::string& line) { logConcurrencyControl(line); },
+            [this](int txn_id) { return txnIdLabel(txn_id); },
+            [this](const std::vector<int>& path) { return txnPathLabel(path); }
+        );
+    }
+
+    void useTimestampOrderingPolicy() {
+        concurrency_control_policy = std::make_unique<TimestampOrderingPolicy>(
+            [this](const std::string& line) { logConcurrencyControl(line); }
+        );
+    }
+
+    std::string concurrencyControlPolicyName() const {
+        return concurrency_control_policy->name();
+    }
 
     void setIsolationLevel(IsolationLevel level) {
         isolation_level = level;
@@ -5632,11 +5762,6 @@ public:
         throw std::runtime_error("Unknown isolation level.");
     }
 
-    bool usesPredicateLocksForPhantoms() const {
-        // v75 uses predicate locks only when Serializable needs them.
-        return isolation_level == IsolationLevel::Serializable;
-    }
-
     void resetLockStats() {
         concurrency_control_lock_manager.resetStats();
     }
@@ -5650,9 +5775,11 @@ public:
         std::cout << "  Lock count (" << label << "): "
                   << stats.granted_requests << " granted, "
                   << stats.row_locks << " row, "
-                  << stats.predicate_locks << " predicate, "
                   << stats.waits << " wait event(s)" << std::endl;
         std::cout << "    by mode:";
+        if (stats.grants_by_mode.empty()) {
+            std::cout << " none";
+        }
         for (const auto& entry : stats.grants_by_mode) {
             std::cout << " " << entry.first << "=" << entry.second;
         }
@@ -5682,9 +5809,19 @@ public:
     }
 
     void commit(const TxnPtr& tx) {
+        if (recovery_manager.hasTxn(tx->id)) {
+            LSN commit_lsn = recovery_manager.queueCommit(tx->id);
+            recovery_manager.forceCommitGroupUpTo(commit_lsn);
+            printThreadSafe(
+                "  recovery: forced COMMIT log through LSN " +
+                std::to_string(commit_lsn)
+            );
+            recovery_manager.finishTxn(tx->id);
+        }
         txn_manager.commit(*tx);
         concurrency_control_policy->commit(tx->id);
-        logConcurrencyControl(txnLabel(tx) + " COMMIT; release locks");
+        logConcurrencyControl(txnLabel(tx) + " COMMIT; " +
+              concurrency_control_policy->completionAction());
     }
 
     void abort(const TxnPtr& tx) {
@@ -5694,7 +5831,8 @@ public:
         }
         txn_manager.abort(*tx);
         concurrency_control_policy->abort(tx->id);
-        logConcurrencyControl(txnLabel(tx) + " ABORT; release locks");
+        logConcurrencyControl(txnLabel(tx) + " ABORT; " +
+              concurrency_control_policy->completionAction());
     }
 
     void queueGroupCommit(const TxnPtr& tx) {
@@ -5857,13 +5995,6 @@ public:
         return table_name + "." + column_name + "=" + value;
     }
 
-    // Teaching predicate lock: one equality predicate maps to one resource.
-    static std::string predicateResource(const std::string& table_name,
-                                         const std::string& column_name,
-                                         const std::string& value) {
-        return "predicate " + table_name + "." + column_name + "=" + value;
-    }
-
     static std::string rowLockColumnName(const TableMetadata& metadata) {
         for (const auto& preferred : {"seat_no", "id"}) {
             for (const auto& column : metadata.schema.columns) {
@@ -6000,23 +6131,6 @@ public:
         );
     }
 
-    std::optional<std::string> insertedStatusPredicateResource(
-        const StatementComponents& components,
-        const TableMetadata& metadata) {
-        // This is not a general predicate implication engine.
-        for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
-            if (metadata.schema.columns[i].name == "status" &&
-                i < components.values.size()) {
-                return predicateResource(
-                    components.tableName,
-                    "status",
-                    components.values[i]
-                );
-            }
-        }
-        return std::nullopt;
-    }
-
     std::string txnIdLabel(int txn_id) {
         if (txn_id == RECOVERY_TXN_ID) {
             return "RECOVERY";
@@ -6080,7 +6194,7 @@ public:
         }
         if (result.canceled) {
             logConcurrencyControl(txnLabel(txn) + " access canceled; " + result.reason);
-            txn_manager.abort(*txn);
+            abort(txn);
             return false;
         }
 
@@ -6198,7 +6312,7 @@ public:
 
         if (result.canceled) {
             logConcurrencyControl(txnLabel(txn) + " lock request canceled; " + result.reason);
-            txn_manager.abort(*txn);
+            abort(txn);
             return false;
         }
 
@@ -6220,7 +6334,7 @@ public:
                 components.whereColumn,
                 components.whereValue
             );
-            logConcurrencyControl(txnLabel(txn) + " tuple scan locks " +
+            logConcurrencyControl(txnLabel(txn) + " tuple scan targets " +
                   std::to_string(resources.size()) +
                   " existing row(s) matching " + components.whereColumn +
                   "=" + components.whereValue);
@@ -6235,20 +6349,6 @@ public:
         }
         if (components.type == StatementType::INSERT) {
             auto& metadata = catalog.getTable(components.tableName);
-            if (usesPredicateLocksForPhantoms()) {
-                auto predicate_resource =
-                    insertedStatusPredicateResource(components, metadata);
-                if (predicate_resource &&
-                    !acquireTxnLock(
-                        txn,
-                        LockMode::X,
-                        *predicate_resource,
-                        "INSERT " + components.tableName +
-                        " matching status predicate"
-                    )) {
-                    return false;
-                }
-            }
             if (components.values.size() == metadata.schema.columns.size()) {
                 return acquireTxnLock(
                     txn,
@@ -6283,23 +6383,8 @@ public:
                 components.equalityWhereAttributeName;
             reason += " WHERE " + column_name + "=" + components.equalityWhereValue;
 
-            if (usesPredicateLocksForPhantoms() &&
-                column_name != rowLockColumnName(metadata)) {
-                // Predicate locks are only needed here to block phantoms.
-                return acquireTxnLock(
-                    txn,
-                    LockMode::S,
-                    predicateResource(
-                        components.tableName,
-                        column_name,
-                        components.equalityWhereValue
-                    ),
-                    reason + " predicate"
-                );
-            }
-
             auto resources = tupleResourcesForEquality(components, column_name);
-            logConcurrencyControl(txnLabel(txn) + " tuple scan locks " +
+            logConcurrencyControl(txnLabel(txn) + " tuple scan targets " +
                   std::to_string(resources.size()) +
                   " existing row(s) matching " + column_name + "=" +
                   components.equalityWhereValue);
@@ -6307,7 +6392,7 @@ public:
         }
 
         auto resources = tupleResourcesForTable(components.tableName);
-        logConcurrencyControl(txnLabel(txn) + " full scan locks " +
+        logConcurrencyControl(txnLabel(txn) + " full scan targets " +
               std::to_string(resources.size()) +
               " existing row(s) in " + components.tableName);
         return acquireTxnAccess(txn, AccessType::Read, resources, reason);
@@ -6736,6 +6821,260 @@ void resetBookingRows(BuzzDB& db) {
     resetSeat(db, 4, "1D");
 }
 
+std::string readSeat(BuzzDB& db, const TxnPtr& txn, const std::string& seat_no) {
+    auto rows = db.executeQuery(
+        "PROJECT {seats.seat_no}, {seats.status}, {seats.customer} "
+        "FROM seats WHERE seat_no=" + seat_no,
+        txn,
+        false
+    );
+    if (rows.empty() || rows.front().fields.size() < 3) {
+        return "not read";
+    }
+    return fieldToString(*rows.front().fields[0]) + " " +
+           fieldToString(*rows.front().fields[1]) + " " +
+           fieldToString(*rows.front().fields[2]);
+}
+
+void printSeat(BuzzDB& db, const std::string& seat_no) {
+    auto row = readSeat(db, nullptr, seat_no);
+    std::cout << "  final " << row << std::endl;
+}
+
+enum class ConcurrencyControlPolicyKind {
+    TwoPhaseLocking,
+    TimestampOrdering
+};
+
+void usePolicy(BuzzDB& db, ConcurrencyControlPolicyKind policy_kind) {
+    switch (policy_kind) {
+        case ConcurrencyControlPolicyKind::TwoPhaseLocking:
+            db.useTwoPhaseLockingPolicy();
+            break;
+        case ConcurrencyControlPolicyKind::TimestampOrdering:
+            db.useTimestampOrderingPolicy();
+            break;
+    }
+}
+
+void resetPolicySchedule(BuzzDB& db, ConcurrencyControlPolicyKind policy_kind) {
+    db.setIsolationLevel(IsolationLevel::Serializable);
+    db.setWaitHook({});
+    usePolicy(db, policy_kind);
+    db.resetLockStats();
+}
+
+std::string txnStateName(const TxnPtr& txn) {
+    switch (txn->state) {
+        case TxnContext::RUNNING:
+            return "RUNNING";
+        case TxnContext::COMMITTED:
+            return "COMMITTED";
+        case TxnContext::ABORTED:
+            return "ABORTED";
+    }
+    throw std::runtime_error("Unknown transaction state.");
+}
+
+void runLateOlderReadSchedule(BuzzDB& db,
+                              ConcurrencyControlPolicyKind policy_kind) {
+    resetPolicySchedule(db, policy_kind);
+    std::cout << "\n  Schedule A: younger writer commits before older reader reads 1A" << std::endl;
+
+    auto old_reader = db.beginLoggedTxn("T1_old");
+    auto young_writer = db.beginLoggedTxn("T2_young");
+    db.execute(
+        "UPDATE seats SET status=held, customer=patel WHERE seat_no=1A",
+        young_writer,
+        false
+    );
+    if (young_writer->state == TxnContext::RUNNING) {
+        db.commit(young_writer);
+    }
+
+    auto row = readSeat(db, old_reader, "1A");
+    if (old_reader->state == TxnContext::RUNNING) {
+        std::cout << "  Result: T1_old reads " << row << " and commits." << std::endl;
+        db.commit(old_reader);
+    } else {
+        std::cout << "  Result: T1_old aborts before reading 1A." << std::endl;
+    }
+    std::cout << "  T1_old final state: " << txnStateName(old_reader) << std::endl;
+    std::cout << "  T2_young final state: " << txnStateName(young_writer) << std::endl;
+    printSeat(db, "1A");
+    db.printLockStats(db.concurrencyControlPolicyName() + " Schedule A");
+}
+
+void runLateOlderWriteSchedule(BuzzDB& db,
+                               ConcurrencyControlPolicyKind policy_kind) {
+    resetPolicySchedule(db, policy_kind);
+    std::cout << "\n  Schedule B: younger reader commits before older writer writes 1B" << std::endl;
+
+    auto old_writer = db.beginLoggedTxn("T3_old");
+    auto young_reader = db.beginLoggedTxn("T4_young");
+    auto row = readSeat(db, young_reader, "1B");
+    std::cout << "  T4_young reads " << row << std::endl;
+    if (young_reader->state == TxnContext::RUNNING) {
+        db.commit(young_reader);
+    }
+
+    db.execute(
+        "UPDATE seats SET status=held, customer=garcia WHERE seat_no=1B",
+        old_writer,
+        false
+    );
+    if (old_writer->state == TxnContext::RUNNING) {
+        std::cout << "  Result: T3_old writes 1B and commits." << std::endl;
+        db.commit(old_writer);
+    } else {
+        std::cout << "  Result: T3_old aborts before writing 1B." << std::endl;
+    }
+    std::cout << "  T3_old final state: " << txnStateName(old_writer) << std::endl;
+    std::cout << "  T4_young final state: " << txnStateName(young_reader) << std::endl;
+    printSeat(db, "1B");
+    db.printLockStats(db.concurrencyControlPolicyName() + " Schedule B");
+}
+
+void runCrossedReadWriteSchedule(BuzzDB& db,
+                                 ConcurrencyControlPolicyKind policy_kind) {
+    resetPolicySchedule(db, policy_kind);
+    std::cout << "\n  Schedule C: crossed reads followed by crossed writes" << std::endl;
+    std::cout << "    T1 reads 1C, then wants to write 1D." << std::endl;
+    std::cout << "    T2 reads 1D, then wants to write 1C." << std::endl;
+
+    auto t1 = db.beginLoggedTxn("T1_old");
+    auto t2 = db.beginLoggedTxn("T2_young");
+
+    switch (policy_kind) {
+        case ConcurrencyControlPolicyKind::TwoPhaseLocking: {
+            std::mutex latch;
+            std::condition_variable cv;
+            bool t1_read = false;
+            bool t2_read = false;
+            bool t1_waiting = false;
+
+            db.setWaitHook([&](int txn_id, const std::vector<int>&) {
+                if (txn_id != t1->id) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> guard(latch);
+                    t1_waiting = true;
+                }
+                cv.notify_all();
+            });
+
+            std::thread t1_thread([&]() {
+                auto row = readSeat(db, t1, "1C");
+                printThreadSafe("  T1_old reads " + row);
+                {
+                    std::lock_guard<std::mutex> guard(latch);
+                    t1_read = true;
+                }
+                cv.notify_all();
+                {
+                    std::unique_lock<std::mutex> guard(latch);
+                    cv.wait(guard, [&]() { return t2_read; });
+                }
+                db.execute(
+                    "UPDATE seats SET status=held, customer=garcia WHERE seat_no=1D",
+                    t1,
+                    false
+                );
+                if (t1->state == TxnContext::RUNNING) {
+                    db.commit(t1);
+                }
+            });
+
+            std::thread t2_thread([&]() {
+                {
+                    std::unique_lock<std::mutex> guard(latch);
+                    cv.wait(guard, [&]() { return t1_read; });
+                }
+                auto row = readSeat(db, t2, "1D");
+                printThreadSafe("  T2_young reads " + row);
+                {
+                    std::lock_guard<std::mutex> guard(latch);
+                    t2_read = true;
+                }
+                cv.notify_all();
+                {
+                    std::unique_lock<std::mutex> guard(latch);
+                    cv.wait(guard, [&]() { return t1_waiting; });
+                }
+                db.execute(
+                    "UPDATE seats SET status=held, customer=patel WHERE seat_no=1C",
+                    t2,
+                    false
+                );
+                if (t2->state == TxnContext::RUNNING) {
+                    db.commit(t2);
+                }
+            });
+
+            t1_thread.join();
+            t2_thread.join();
+            break;
+        }
+        case ConcurrencyControlPolicyKind::TimestampOrdering: {
+            auto t1_row = readSeat(db, t1, "1C");
+            std::cout << "  T1_old reads " << t1_row << std::endl;
+            auto t2_row = readSeat(db, t2, "1D");
+            std::cout << "  T2_young reads " << t2_row << std::endl;
+            db.execute(
+                "UPDATE seats SET status=held, customer=garcia WHERE seat_no=1D",
+                t1,
+                false
+            );
+            if (t1->state == TxnContext::ABORTED) {
+                std::cout << "  Result: T1_old aborts instead of waiting." << std::endl;
+            }
+            db.execute(
+                "UPDATE seats SET status=held, customer=patel WHERE seat_no=1C",
+                t2,
+                false
+            );
+            if (t2->state == TxnContext::RUNNING) {
+                db.commit(t2);
+            }
+            break;
+        }
+    }
+
+    std::cout << "  T1_old final state: " << txnStateName(t1) << std::endl;
+    std::cout << "  T2_young final state: " << txnStateName(t2) << std::endl;
+    printSeat(db, "1C");
+    printSeat(db, "1D");
+
+    switch (policy_kind) {
+        case ConcurrencyControlPolicyKind::TwoPhaseLocking:
+            std::cout << "  Interpretation: 2PL blocks, detects the waits-for cycle, aborts one transaction, then lets the other finish." << std::endl;
+            break;
+        case ConcurrencyControlPolicyKind::TimestampOrdering:
+            std::cout << "  Interpretation: TO never waits here; it aborts the older transaction when its write violates readTS." << std::endl;
+            break;
+    }
+    db.printLockStats(db.concurrencyControlPolicyName() + " Schedule C");
+}
+
+void runPolicyComparison(ConcurrencyControlPolicyKind policy_kind) {
+    BuzzDB db;
+    db.createTable("seats", {
+        {"id", INT},
+        {"flight_id", INT},
+        {"seat_no", STRING},
+        {"status", STRING},
+        {"customer", STRING}
+    });
+    resetBookingRows(db);
+    resetPolicySchedule(db, policy_kind);
+
+    std::cout << "\nPolicy: " << db.concurrencyControlPolicyName() << std::endl;
+    runLateOlderReadSchedule(db, policy_kind);
+    runLateOlderWriteSchedule(db, policy_kind);
+    runCrossedReadWriteSchedule(db, policy_kind);
+}
+
 void runTransactionLocking() {
     BuzzDB db;
     db.createTable("seats", {
@@ -6990,6 +7329,10 @@ void runRestartRecoveryDeadlock() {
 }
 
 int main() {
-    runRestartRecoveryDeadlock();
+    std::cout << "\n2PL versus Timestamp Ordering" << std::endl;
+    std::cout << "  The same schedules run under both policies." << std::endl;
+    std::cout << "  2PL may wait and deadlock; TO aborts conflicting timestamp violations instead of waiting." << std::endl;
+    runPolicyComparison(ConcurrencyControlPolicyKind::TwoPhaseLocking);
+    runPolicyComparison(ConcurrencyControlPolicyKind::TimestampOrdering);
     return 0;
 }

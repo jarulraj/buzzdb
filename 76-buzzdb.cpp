@@ -6662,13 +6662,13 @@ void runRestartRecoveryDeadlock() {
 
     std::mutex recovery_latch;
     std::condition_variable recovery_cv;
-    bool app_holds_1b = false;
+    bool post_restart_txn_holds_1b = false;
     bool recovery_holds_1a = false;
-    bool app_waits_for_recovery = false;
-    std::atomic<int> app_txn_id{0};
+    bool post_restart_txn_waits_for_recovery = false;
+    std::atomic<int> post_restart_txn_id{0};
 
     db.setWaitHook([&](int txn_id, const std::vector<int>& blockers) {
-        if (txn_id != app_txn_id.load()) {
+        if (txn_id != post_restart_txn_id.load()) {
             return;
         }
         if (std::find(blockers.begin(), blockers.end(), RECOVERY_TXN_ID) ==
@@ -6677,7 +6677,7 @@ void runRestartRecoveryDeadlock() {
         }
         {
             std::lock_guard<std::mutex> guard(recovery_latch);
-            app_waits_for_recovery = true;
+            post_restart_txn_waits_for_recovery = true;
         }
         recovery_cv.notify_all();
     });
@@ -6697,9 +6697,9 @@ void runRestartRecoveryDeadlock() {
                 if (!recovery_cv.wait_for(
                         guard,
                         std::chrono::seconds(1),
-                        [&]() { return app_waits_for_recovery; })) {
+                        [&]() { return post_restart_txn_waits_for_recovery; })) {
                     throw std::runtime_error(
-                        "Application transaction did not wait on recovery."
+                        "Post-restart transaction did not wait on recovery."
                     );
                 }
             }
@@ -6707,19 +6707,19 @@ void runRestartRecoveryDeadlock() {
         }
     );
 
-    std::thread app_txn([&]() {
+    std::thread post_restart_txn([&]() {
         auto txn = db.begin("Tlive");
-        app_txn_id = txn->id;
+        post_restart_txn_id = txn->id;
         if (!db.acquireTxnLock(
                 txn,
                 LockMode::X,
                 BuzzDB::rowResource("seats", "seat_no", "1B"),
-                "application holds 1B during restart")) {
+                "post-restart transaction holds 1B during restart")) {
             return;
         }
         {
             std::lock_guard<std::mutex> guard(recovery_latch);
-            app_holds_1b = true;
+            post_restart_txn_holds_1b = true;
         }
         recovery_cv.notify_all();
 
@@ -6732,7 +6732,7 @@ void runRestartRecoveryDeadlock() {
             txn,
             LockMode::X,
             BuzzDB::rowResource("seats", "seat_no", "1A"),
-            "application asks for 1A while recovery holds it"
+            "post-restart transaction asks for 1A while recovery holds it"
         );
         if (got_second_lock) {
             db.commit(txn);
@@ -6743,11 +6743,11 @@ void runRestartRecoveryDeadlock() {
 
     {
         std::unique_lock<std::mutex> guard(recovery_latch);
-        recovery_cv.wait(guard, [&]() { return app_holds_1b; });
+        recovery_cv.wait(guard, [&]() { return post_restart_txn_holds_1b; });
     }
 
     db.recovery_manager.recover();
-    app_txn.join();
+    post_restart_txn.join();
 
     auto rows = db.executeQuery(
         "PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats",
