@@ -2697,7 +2697,7 @@ void RecoveryManager::recover() {
         input >> record_lsn >> type >> txn_id;
         if (!(input >> prev_lsn)) {
             throw std::runtime_error(
-                "buzzdb.log was written by an older WAL format; remove it before running v74."
+                "buzzdb.log was written by an older WAL format; remove it before running v75."
             );
         }
         if (txn_id > 0) {
@@ -2771,7 +2771,7 @@ void RecoveryManager::recover() {
         input >> record_lsn >> type >> txn_id;
         if (!(input >> prev_lsn)) {
             throw std::runtime_error(
-                "buzzdb.log was written by an older WAL format; remove it before running v74."
+                "buzzdb.log was written by an older WAL format; remove it before running v75."
             );
         }
         if (txn_id > 0) {
@@ -5405,7 +5405,7 @@ public:
     }
 
     bool usesPredicateLocksForPhantoms() const {
-        // v74 keeps Serializable locking and focuses on commit durability.
+        // v75 uses predicate locks only when Serializable needs them.
         return isolation_level == IsolationLevel::Serializable;
     }
 
@@ -6139,7 +6139,7 @@ public:
                 );
             }
             if (recovery_manager.isActive()) {
-                throw std::runtime_error("INSERT inside an undo/redo WAL update transaction is not supported in v74.");
+                throw std::runtime_error("INSERT inside an undo/redo WAL update transaction is not supported in v75.");
             }
 
             auto tuple = std::make_unique<Tuple>();
@@ -6352,94 +6352,90 @@ void runTransactionLocking() {
     });
     resetBookingRows(db);
 
-    db.setIsolationLevel(IsolationLevel::Serializable);
-    db.resetLockStats();
-
-    std::cout << "\nSerializable locking + group commit" << std::endl;
-    std::cout << "  Serializable locking controls who can see updates." << std::endl;
-    std::cout << "  WAL commit forcing controls when updates are durable." << std::endl;
-    std::cout << "  Group commit batches several COMMIT records into one log fsync." << std::endl;
-    std::cout << "  Workload: 3 committing writers, 1 aborting writer, 1 reader." << std::endl;
-    std::cout << "  Main thread only coordinates the group log force." << std::endl;
+    std::cout << "\nRecoverability and cascading aborts" << std::endl;
+    std::cout << "  The unsafe schedule lets a reader depend on an uncommitted writer." << std::endl;
+    std::cout << "  The strict schedule makes the reader wait for abort cleanup." << std::endl;
 
     auto print = [&](const std::string& line) {
         db.logCC(line);
     };
 
-    auto writer = [&](const std::string& txn_name,
-                      const std::string& seat_no,
-                      const std::string& customer) {
-        auto txn = db.beginLoggedTxn(txn_name);
-        print("  " + txn_name + " EXECUTE UPDATE seats SET status=held "
-              "WHERE seat_no=" + seat_no);
-        db.execute(
-            "UPDATE seats SET status=held, customer=" + customer +
-            " WHERE seat_no=" + seat_no,
+    auto readSeat = [&](const TxnPtr& txn, const std::string& seat_no) {
+        auto rows = db.executeQuery(
+            "PROJECT {seats.seat_no}, {seats.status}, {seats.customer} "
+            "FROM seats WHERE seat_no=" + seat_no,
             txn,
             false
         );
-        db.queueGroupCommit(txn);
+        if (rows.empty() || rows.front().fields.size() < 3) {
+            return std::make_pair(std::string("missing"), std::string("missing"));
+        }
+        return std::make_pair(
+            fieldToString(*rows.front().fields[1]),
+            fieldToString(*rows.front().fields[2])
+        );
     };
 
-    std::thread writer1(writer, "T1", "1A", "garcia");
-    std::thread writer2(writer, "T2", "1B", "patel");
-    std::thread writer3(writer, "T3", "1C", "chen");
-    db.waitForQueuedCommits(3);
-    std::atomic<bool> t4_updated{false};
+    std::cout << "\nUnsafe read-from schedule" << std::endl;
+    db.setIsolationLevel(IsolationLevel::ReadUncommitted);
+    db.resetLockStats();
+    auto t1 = db.beginLoggedTxn("T1");
+    print("  T1 EXECUTE UPDATE seats SET status=held WHERE seat_no=1A");
+    db.execute(
+        "UPDATE seats SET status=held, customer=dirty WHERE seat_no=1A",
+        t1,
+        false
+    );
+    auto t2 = db.begin("T2");
+    auto dirty_read = readSeat(t2, "1A");
+    print("  T2 reads 1A=" + dirty_read.first + "/" +
+          dirty_read.second + " before T1 commits");
+    print("  T2 tries to COMMIT");
+    print("  blocked/unsafe: T2 read from uncommitted T1");
+    print("  If T2 committed here, the schedule would be non-recoverable.");
+    db.abort(t1);
+    print("  T1 ABORT means T2 must ABORT too");
+    db.abort(t2);
+    auto after_abort = readSeat(nullptr, "1A");
+    print("  after cascading abort, 1A=" + after_abort.first + "/" +
+          after_abort.second);
+    db.printLockStats("unsafe read-from schedule");
 
-    std::cout << "\nT4 starts after T3's COMMIT is queued and conflicts on seat 1C" << std::endl;
-    std::thread aborting_writer([&]() {
-        auto txn = db.beginLoggedTxn("T4");
-        print("  T4 EXECUTE UPDATE seats SET status=held WHERE seat_no=1C");
+    std::cout << "\nStrict locking schedule" << std::endl;
+    db.setIsolationLevel(IsolationLevel::Serializable);
+    db.resetLockStats();
+    std::atomic<bool> strict_writer_updated{false};
+    std::thread strict_writer([&]() {
+        auto txn = db.beginLoggedTxn("T1");
+        print("  T1 EXECUTE UPDATE seats SET status=held WHERE seat_no=1A");
         db.execute(
-            "UPDATE seats SET status=held, customer=rollback WHERE seat_no=1C",
+            "UPDATE seats SET status=held, customer=strict WHERE seat_no=1A",
             txn,
             false
         );
-        t4_updated = true;
+        strict_writer_updated = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         db.abort(txn);
     });
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    printThreadSafe("\nBefore group commit: T4 is blocked by T3's X lock");
-    printThreadSafe("  Without group commit: 3 commit log fsyncs");
-    db.flushGroupCommit();
-    printThreadSafe("  With group commit: 1 commit log fsync");
-    while (!t4_updated) {
+    while (!strict_writer_updated) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-
-    std::cout << "\nT5 runs PROJECT over all seats while T4 holds X on 1C" << std::endl;
-    std::thread reader([&]() {
-        auto txn = db.begin("T5");
-        auto rows = db.executeQuery(
-            "PROJECT {seats.seat_no}, {seats.status}, {seats.customer} FROM seats",
-            txn,
-            false
-        );
-        print("  T5 PROJECT all seats:");
-        for (const auto& row : rows) {
-            if (row.fields.size() >= 3) {
-                print("    " + fieldToString(*row.fields[0]) + " " +
-                      fieldToString(*row.fields[1]) + " " +
-                      fieldToString(*row.fields[2]));
-            }
-        }
+    std::thread strict_reader([&]() {
+        auto txn = db.begin("T2");
+        auto clean_read = readSeat(txn, "1A");
+        print("  T2 reads 1A=" + clean_read.first + "/" +
+              clean_read.second + " after T1 abort cleanup");
         db.commit(txn);
     });
-    writer1.join();
-    writer2.join();
-    writer3.join();
-    aborting_writer.join();
-    reader.join();
+    strict_writer.join();
+    strict_reader.join();
 
     std::cout << "\nResult:" << std::endl;
-    std::cout << "  T4 aborts only after undo is logged and applied." << std::endl;
-    std::cout << "  T5 reads only after COMMIT/ABORT cleanup releases locks." << std::endl;
-    std::cout << "  Serializable visibility is preserved." << std::endl;
-    std::cout << "  Commit fsyncs saved: 2" << std::endl;
-    db.printLockStats("serializable group commit");
+    std::cout << "  Unsafe dirty reads create commit dependencies." << std::endl;
+    std::cout << "  If the writer aborts, dependent readers cascade abort." << std::endl;
+    std::cout << "  Strict S/X locking avoids dirty reads and cascading aborts." << std::endl;
+    db.printLockStats("strict locking schedule");
 }
 
 int main() {
