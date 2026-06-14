@@ -5933,23 +5933,6 @@ void resetSeat(BuzzDB& db, int id, const std::string& seat_no) {
     }
 }
 
-void resetHold(BuzzDB& db, int id, int seat_id) {
-    std::string hold_id = std::to_string(id);
-    if (rowExists(db, "holds", "id", hold_id)) {
-        executeQuiet(
-            db,
-            "UPDATE holds SET customer=unassigned, status=open "
-            "WHERE id=" + hold_id
-        );
-    } else {
-        executeQuiet(
-            db,
-            "INSERT holds|" + hold_id + "|1|" +
-            std::to_string(seat_id) + "|unassigned|open"
-        );
-    }
-}
-
 void resetBookingRows(BuzzDB& db) {
     resetSeat(db, 1, "1A");
     resetSeat(db, 2, "1B");
