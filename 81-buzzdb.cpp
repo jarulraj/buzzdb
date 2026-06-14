@@ -3578,56 +3578,58 @@ public:
     virtual void abort(int txn_id) = 0;
 };
 
-class SnapshotMVCCPolicy : public ConcurrencyControlPolicy {
+class MVTOPolicy : public ConcurrencyControlPolicy {
     struct TxnState {
-        int snapshot_id = 0;
+        int timestamp = 0;
         bool has_writes = false;
         std::string label;
     };
 
     mutable std::mutex latch;
     std::function<void(const std::string&)> log;
-    int current_commit_id = 0;
+    int next_timestamp = 1;
     std::map<int, TxnState> txns;
-    std::map<int, int> committed_txn_ids;
-    std::vector<int> active_snapshots;
+    std::map<int, int> txn_timestamps;
+    std::vector<int> active_timestamps;
 
-    void removeSnapshot(int snapshot_id) {
+    void removeTimestamp(int timestamp) {
         auto it = std::find(
-            active_snapshots.begin(),
-            active_snapshots.end(),
-            snapshot_id
+            active_timestamps.begin(),
+            active_timestamps.end(),
+            timestamp
         );
-        if (it != active_snapshots.end()) {
-            active_snapshots.erase(it);
+        if (it != active_timestamps.end()) {
+            active_timestamps.erase(it);
         }
     }
 
 public:
-    explicit SnapshotMVCCPolicy(std::function<void(const std::string&)> log)
+    explicit MVTOPolicy(std::function<void(const std::string&)> log)
         : log(std::move(log)) {}
 
     std::string name() const override {
-        return "Snapshot MVCC";
+        return "Multiversion Timestamp Ordering";
     }
 
     std::string completionAction() const override {
-        return "finish MVCC transaction";
+        return "finish MVTO transaction";
     }
 
     void begin(int txn_id, const std::string& txn_label) override {
         std::lock_guard<std::mutex> guard(latch);
-        txns[txn_id] = {current_commit_id, false, txn_label};
-        active_snapshots.push_back(current_commit_id);
-        log(txn_label + " MVCC snapshot_id=" +
-            std::to_string(current_commit_id));
+        int timestamp = next_timestamp++;
+        txns[txn_id] = {timestamp, false, txn_label};
+        txn_timestamps[txn_id] = timestamp;
+        active_timestamps.push_back(timestamp);
+        log(txn_label + " MVTO timestamp=" +
+            std::to_string(timestamp));
     }
 
     void markWrite(int txn_id) {
         std::lock_guard<std::mutex> guard(latch);
         auto txn_it = txns.find(txn_id);
         if (txn_it == txns.end()) {
-            throw std::runtime_error("transaction has no MVCC state");
+            throw std::runtime_error("transaction has no MVTO state");
         }
         txn_it->second.has_writes = true;
     }
@@ -3636,23 +3638,19 @@ public:
         std::lock_guard<std::mutex> guard(latch);
         auto txn_it = txns.find(txn_id);
         if (txn_it == txns.end()) {
-            return {false, "transaction has no MVCC state"};
+            return {false, "transaction has no MVTO state"};
         }
 
         auto state = txn_it->second;
-        removeSnapshot(state.snapshot_id);
-        int commit_id = state.has_writes ?
-            ++current_commit_id :
-            state.snapshot_id;
-        committed_txn_ids[txn_id] = commit_id;
+        removeTimestamp(state.timestamp);
         txns.erase(txn_it);
 
         if (state.has_writes) {
-            log(state.label + " MVCC writer commit_id=" +
-                std::to_string(commit_id));
+            log(state.label + " MVTO writer commits at timestamp=" +
+                std::to_string(state.timestamp));
         } else {
-            log(state.label + " MVCC releases snapshot_id=" +
-                std::to_string(state.snapshot_id));
+            log(state.label + " MVTO releases timestamp=" +
+                std::to_string(state.timestamp));
         }
         return {};
     }
@@ -3663,34 +3661,29 @@ public:
         if (txn_it == txns.end()) {
             return;
         }
-        removeSnapshot(txn_it->second.snapshot_id);
+        removeTimestamp(txn_it->second.timestamp);
         txns.erase(txn_it);
     }
 
-    int snapshotId(int txn_id) const {
+    int timestamp(int txn_id) const {
         std::lock_guard<std::mutex> guard(latch);
         auto txn_it = txns.find(txn_id);
-        if (txn_it == txns.end()) {
-            throw std::runtime_error("transaction has no MVCC snapshot");
+        if (txn_it != txns.end()) {
+            return txn_it->second.timestamp;
         }
-        return txn_it->second.snapshot_id;
+        auto timestamp_it = txn_timestamps.find(txn_id);
+        if (timestamp_it == txn_timestamps.end()) {
+            throw std::runtime_error("transaction has no MVTO timestamp");
+        }
+        return timestamp_it->second;
     }
 
-    int commitId(int txn_id) const {
+    int oldestActiveTimestamp() const {
         std::lock_guard<std::mutex> guard(latch);
-        auto txn_it = committed_txn_ids.find(txn_id);
-        if (txn_it == committed_txn_ids.end()) {
-            throw std::runtime_error("transaction has no MVCC commit id");
+        if (active_timestamps.empty()) {
+            return next_timestamp;
         }
-        return txn_it->second;
-    }
-
-    int oldestActiveSnapshot() const {
-        std::lock_guard<std::mutex> guard(latch);
-        if (active_snapshots.empty()) {
-            return current_commit_id;
-        }
-        return *std::min_element(active_snapshots.begin(), active_snapshots.end());
+        return *std::min_element(active_timestamps.begin(), active_timestamps.end());
     }
 };
 
@@ -5232,7 +5225,7 @@ public:
         : buffer_manager(),
           catalog(buffer_manager),
           recovery_manager(buffer_manager, catalog) {
-        useSnapshotMVCCPolicy();
+        useMVTOPolicy();
         catalog.bootstrap();
         if (catalog.isNewDatabase()) {
             recovery_manager.resetLog();
@@ -5241,46 +5234,42 @@ public:
 
     bool isNewDatabase() const { return catalog.isNewDatabase(); }
 
-    void useSnapshotMVCCPolicy() {
-        concurrency_control_policy = std::make_unique<SnapshotMVCCPolicy>(
+    void useMVTOPolicy() {
+        concurrency_control_policy = std::make_unique<MVTOPolicy>(
             [this](const std::string& line) { logConcurrencyControl(line); }
         );
     }
 
-    SnapshotMVCCPolicy& snapshotMVCCPolicy() {
-        auto* policy = dynamic_cast<SnapshotMVCCPolicy*>(
+    MVTOPolicy& mvtoPolicy() {
+        auto* policy = dynamic_cast<MVTOPolicy*>(
             concurrency_control_policy.get()
         );
         if (policy == nullptr) {
-            throw std::runtime_error("Current concurrency policy is not Snapshot MVCC.");
+            throw std::runtime_error("Current concurrency policy is not MVTO.");
         }
         return *policy;
     }
 
-    const SnapshotMVCCPolicy& snapshotMVCCPolicy() const {
-        auto* policy = dynamic_cast<const SnapshotMVCCPolicy*>(
+    const MVTOPolicy& mvtoPolicy() const {
+        auto* policy = dynamic_cast<const MVTOPolicy*>(
             concurrency_control_policy.get()
         );
         if (policy == nullptr) {
-            throw std::runtime_error("Current concurrency policy is not Snapshot MVCC.");
+            throw std::runtime_error("Current concurrency policy is not MVTO.");
         }
         return *policy;
     }
 
-    int mvccSnapshotId(const TxnPtr& txn) const {
-        return snapshotMVCCPolicy().snapshotId(txn->id);
+    int mvtoTimestamp(const TxnPtr& txn) const {
+        return mvtoPolicy().timestamp(txn->id);
     }
 
-    int mvccCommitId(const TxnPtr& txn) const {
-        return snapshotMVCCPolicy().commitId(txn->id);
+    int oldestMVTOTimestamp() const {
+        return mvtoPolicy().oldestActiveTimestamp();
     }
 
-    int oldestMVCCSnapshot() const {
-        return snapshotMVCCPolicy().oldestActiveSnapshot();
-    }
-
-    void markMVCCWrite(const TxnPtr& txn) {
-        snapshotMVCCPolicy().markWrite(txn->id);
+    void markMVTOWrite(const TxnPtr& txn) {
+        mvtoPolicy().markWrite(txn->id);
     }
 
     std::string concurrencyControlPolicyName() const {
@@ -5985,24 +5974,22 @@ void printSeat(BuzzDB& db, const std::string& seat_no) {
     std::cout << "  final " << row << std::endl;
 }
 
-struct MVCCVersion {
+struct MVTOVersion {
     int version_id = 0;
     int seat_id = 0;
     int value_id = 0;
-    int begin_cid = 0;
-    int end_cid = 0;
+    int wts = 0;
+    int rts = 0;
     int creator_id = 0;
+    bool committed = true;
 };
 
-struct PendingMVCCWrite {
+struct PendingMVTOWrite {
+    int version_id = 0;
     int seat_id = 0;
-    int value_id = 0;
-    int writer_id = 0;
 };
 
-class SnapshotMVCC {
-    static constexpr int INF_CID = 9999;
-
+class MVTO {
     BuzzDB db;
     int run_id = 0;
     int next_version_id = 1;
@@ -6022,7 +6009,7 @@ class SnapshotMVCC {
         if (seat_no == "1B") {
             return 2;
         }
-        throw std::runtime_error("Unknown MVCC seat: " + seat_no);
+        throw std::runtime_error("Unknown MVTO seat: " + seat_no);
     }
 
     static std::string seatName(int seat_id) {
@@ -6047,7 +6034,7 @@ class SnapshotMVCC {
         if (status == "held" && customer == "patel") {
             return 2;
         }
-        throw std::runtime_error("Unknown MVCC value.");
+        throw std::runtime_error("Unknown MVTO value.");
     }
 
     static std::string valueLabel(int value_id) {
@@ -6067,7 +6054,8 @@ class SnapshotMVCC {
         if (txn_label == "bootstrap") {
             return 0;
         }
-        if (txn_label.size() > 1 && txn_label[0] == 'T') {
+        if (txn_label.size() > 1 &&
+            (txn_label[0] == 'T' || txn_label[0] == 'S')) {
             return std::stoi(txn_label.substr(1));
         }
         return -1;
@@ -6079,35 +6067,37 @@ class SnapshotMVCC {
             "T" + std::to_string(txn_id);
     }
 
-    void insertVersion(int seat_id,
+    void insertVersion(int version_id,
+                       int seat_id,
                        int value_id,
-                       int begin_cid,
-                       int end_cid,
-                       int creator_id) {
+                       int wts,
+                       int rts,
+                       int creator_id,
+                       bool committed) {
         executeQuiet(
             db,
-            "INSERT seat_versions|" + std::to_string(nextVersionId()) + "|" +
+            "INSERT seat_versions|" + std::to_string(version_id) + "|" +
             std::to_string(run_id) + "|" + std::to_string(seat_id) + "|" +
-            std::to_string(value_id) + "|" +
-            std::to_string(begin_cid) + "|" + std::to_string(end_cid) + "|" +
-            std::to_string(creator_id)
+            std::to_string(value_id) + "|" + std::to_string(wts) + "|" +
+            std::to_string(rts) + "|" + std::to_string(creator_id) + "|" +
+            std::to_string(committed ? 1 : 0)
         );
     }
 
-    std::vector<MVCCVersion> versions() {
+    std::vector<MVTOVersion> versions() {
         auto rows = db.executeQuery(
             "PROJECT {seat_versions.version_id}, {seat_versions.run_id}, "
             "{seat_versions.seat_id}, {seat_versions.value_id}, "
-            "{seat_versions.begin_cid}, {seat_versions.end_cid}, "
-            "{seat_versions.creator_id} "
+            "{seat_versions.wts}, {seat_versions.rts}, "
+            "{seat_versions.creator_id}, {seat_versions.committed} "
             "FROM seat_versions",
             nullptr,
             false
         );
 
-        std::vector<MVCCVersion> result;
+        std::vector<MVTOVersion> result;
         for (const auto& row : rows) {
-            if (row.fields.size() < 7 ||
+            if (row.fields.size() < 8 ||
                 row.fields[1]->asInt() != run_id) {
                 continue;
             }
@@ -6117,38 +6107,62 @@ class SnapshotMVCC {
                 row.fields[3]->asInt(),
                 row.fields[4]->asInt(),
                 row.fields[5]->asInt(),
-                row.fields[6]->asInt()
+                row.fields[6]->asInt(),
+                row.fields[7]->asInt() != 0
             });
         }
         return result;
     }
 
-    std::optional<MVCCVersion> readVisible(int seat_id,
-                                           int snapshot_id) {
-        std::optional<MVCCVersion> best;
+    std::optional<MVTOVersion> readableVersion(int seat_id,
+                                               int timestamp,
+                                               int txn_id) {
+        std::optional<MVTOVersion> best;
         for (const auto& version : versions()) {
-            if (version.seat_id != seat_id) {
+            if (version.seat_id != seat_id || version.wts > timestamp) {
                 continue;
             }
-            if (version.begin_cid <= snapshot_id &&
-                snapshot_id < version.end_cid &&
-                (!best || version.begin_cid > best->begin_cid)) {
+            if (!version.committed && version.creator_id != txn_id) {
+                continue;
+            }
+            if (!best || version.wts > best->wts) {
                 best = version;
             }
         }
         return best;
     }
 
-    void closeVersion(const MVCCVersion& version, int commit_id) {
+    std::optional<MVTOVersion> previousVersionForWrite(int seat_id,
+                                                       int timestamp) {
+        std::optional<MVTOVersion> best;
+        for (const auto& version : versions()) {
+            if (version.seat_id != seat_id || version.wts >= timestamp) {
+                continue;
+            }
+            if (!best || version.wts > best->wts) {
+                best = version;
+            }
+        }
+        return best;
+    }
+
+    void setRTS(const MVTOVersion& version, int rts) {
         executeQuiet(
             db,
-            "UPDATE seat_versions SET end_cid=" +
-            std::to_string(commit_id) +
+            "UPDATE seat_versions SET rts=" + std::to_string(rts) +
             " WHERE version_id=" + std::to_string(version.version_id)
         );
     }
 
-    void deleteVersion(const MVCCVersion& version) {
+    void markCommitted(const MVTOVersion& version) {
+        executeQuiet(
+            db,
+            "UPDATE seat_versions SET committed=1 WHERE version_id=" +
+            std::to_string(version.version_id)
+        );
+    }
+
+    void deleteVersion(const MVTOVersion& version) {
         executeQuiet(
             db,
             "DELETE FROM seat_versions WHERE version_id=" +
@@ -6172,7 +6186,7 @@ class SnapshotMVCC {
     }
 
 public:
-    SnapshotMVCC() {
+    MVTO() {
         auto ticks = std::chrono::steady_clock::now()
             .time_since_epoch()
             .count();
@@ -6184,26 +6198,27 @@ public:
             {"run_id", INT},
             {"seat_id", INT},
             {"value_id", INT},
-            {"begin_cid", INT},
-            {"end_cid", INT},
-            {"creator_id", INT}
+            {"wts", INT},
+            {"rts", INT},
+            {"creator_id", INT},
+            {"committed", INT}
         });
-        db.useSnapshotMVCCPolicy();
-        insertVersion(1, 0, 0, INF_CID, 0);
-        insertVersion(2, 0, 0, INF_CID, 0);
+        db.useMVTOPolicy();
+        insertVersion(nextVersionId(), 1, 0, 0, 0, 0, true);
+        insertVersion(nextVersionId(), 2, 0, 0, 0, 0, true);
     }
 
     TxnPtr beginReadOnly(const std::string& txn_label) {
         auto txn = db.begin(txn_label);
-        std::cout << txn_label << " READ ONLY snapshot_id="
-                  << db.mvccSnapshotId(txn) << std::endl;
+        std::cout << txn_label << " READ ONLY ts="
+                  << db.mvtoTimestamp(txn) << std::endl;
         return txn;
     }
 
     TxnPtr beginUpdater(const std::string& txn_label) {
         auto txn = db.begin(txn_label);
-        std::cout << txn_label << " UPDATER snapshot_id="
-                  << db.mvccSnapshotId(txn) << std::endl;
+        std::cout << txn_label << " UPDATER ts="
+                  << db.mvtoTimestamp(txn) << std::endl;
         return txn;
     }
 
@@ -6211,80 +6226,136 @@ public:
         db.commit(txn);
     }
 
-    void readSeat(const TxnPtr& txn,
-                  const std::string& seat_no) {
-        int snapshot_id = db.mvccSnapshotId(txn);
-        auto version = readVisible(seatId(seat_no), snapshot_id);
+    std::optional<MVTOVersion> readSeat(const TxnPtr& txn,
+                                        const std::string& seat_no) {
+        int timestamp = db.mvtoTimestamp(txn);
+        int txn_id = txnId(BuzzDB::txnLabel(txn));
+        auto version = readableVersion(seatId(seat_no), timestamp, txn_id);
         if (!version) {
             std::cout << BuzzDB::txnLabel(txn) << " reads " << seat_no
-                      << " at snapshot_id=" << snapshot_id
-                      << " -> not visible" << std::endl;
-            return;
+                      << " at ts=" << timestamp
+                      << " -> no version with wts <= ts" << std::endl;
+            return std::nullopt;
         }
         std::cout << BuzzDB::txnLabel(txn) << " reads " << seat_no
-                  << " at snapshot_id=" << snapshot_id << " -> "
+                  << " at ts=" << timestamp << " -> "
                   << valueLabel(version->value_id)
                   << " from " << versionName(version->version_id)
-                  << " [" << version->begin_cid << ","
-                  << (version->end_cid == INF_CID ?
-                        std::string("inf") :
-                        std::to_string(version->end_cid))
-                  << ")" << std::endl;
+                  << " [wts=" << version->wts
+                  << ", rts=" << version->rts << "]" << std::endl;
+        if (timestamp > version->rts) {
+            setRTS(*version, timestamp);
+            std::cout << "  MVTO interval: bump "
+                      << versionName(version->version_id)
+                      << ".rts to " << timestamp << std::endl;
+        }
+        return version;
     }
 
-    PendingMVCCWrite writeSeat(const TxnPtr& txn,
-                               const std::string& seat_no,
-                               const std::string& status,
-                               const std::string& customer) {
-        db.markMVCCWrite(txn);
+    bool readNoCustomerAssignment(const TxnPtr& txn,
+                                  const std::string& customer) {
         auto txn_label = BuzzDB::txnLabel(txn);
-        std::cout << txn_label << " UPDATE " << seat_no << " -> "
-                  << status << " " << customer
-                  << " (tentative, not snapshot-visible)" << std::endl;
-        return {seatId(seat_no), valueId(status, customer), txnId(txn_label)};
-    }
-
-    int commitWrites(const TxnPtr& txn,
-                     const std::vector<PendingMVCCWrite>& writes) {
-        db.commit(txn);
-        int commit_id = db.mvccCommitId(txn);
-        auto txn_label = BuzzDB::txnLabel(txn);
-        std::cout << txn_label << " publishes versions at commit_id=" << commit_id
+        std::cout << txn_label << " checks predicate: no " << customer
+                  << " seat assignment on BZ101" << std::endl;
+        int customer_hold = valueId("held", customer);
+        auto seat_1a = readSeat(txn, "1A");
+        auto seat_1b = readSeat(txn, "1B");
+        bool has_assignment =
+            (seat_1a && seat_1a->value_id == customer_hold) ||
+            (seat_1b && seat_1b->value_id == customer_hold);
+        std::cout << "  predicate result: "
+                  << (has_assignment ? "assignment exists" : "no assignment")
                   << std::endl;
-        std::cout << "  recovery link: these committed version-table changes "
-                  << "are what WAL redo would replay" << std::endl;
+        return !has_assignment;
+    }
+
+    std::optional<PendingMVTOWrite> writeSeat(const TxnPtr& txn,
+                                              const std::string& seat_no,
+                                              const std::string& status,
+                                              const std::string& customer) {
+        int timestamp = db.mvtoTimestamp(txn);
+        int seat_id = seatId(seat_no);
+        auto txn_label = BuzzDB::txnLabel(txn);
+        auto previous = previousVersionForWrite(seat_id, timestamp);
+        std::cout << txn_label << " requests WRITE " << seat_no
+                  << " at ts=" << timestamp << " -> "
+                  << status << " " << customer << std::endl;
+
+        if (previous && previous->rts > timestamp) {
+            std::cout << "  MVTO rejects write: "
+                      << versionName(previous->version_id)
+                      << ".rts=" << previous->rts
+                      << " is greater than writer ts=" << timestamp
+                      << std::endl;
+            db.abort(txn);
+            return std::nullopt;
+        }
+
+        db.markMVTOWrite(txn);
+        int version_id = nextVersionId();
+        insertVersion(
+            version_id,
+            seat_id,
+            valueId(status, customer),
+            timestamp,
+            timestamp,
+            txnId(txn_label),
+            false
+        );
+        std::cout << "  MVTO accepts write; create active "
+                  << versionName(version_id) << " [wts=rts="
+                  << timestamp << "]" << std::endl;
+        return PendingMVTOWrite{version_id, seat_id};
+    }
+
+    void commitWrites(const TxnPtr& txn,
+                      const std::vector<PendingMVTOWrite>& writes) {
+        db.commit(txn);
+        auto txn_label = BuzzDB::txnLabel(txn);
+        std::cout << txn_label << " certifies " << writes.size()
+                  << " version(s)" << std::endl;
+        std::cout << "  recovery link: committed MVTO versions are the "
+                  << "version-table changes WAL redo would replay" << std::endl;
 
         for (const auto& write : writes) {
-            auto previous = readVisible(write.seat_id, commit_id - 1);
-            if (previous) {
-                closeVersion(*previous, commit_id);
-                std::cout << "  close " << versionName(previous->version_id)
-                          << " at end_cid=" << commit_id << std::endl;
-            }
-            insertVersion(
-                write.seat_id,
-                write.value_id,
-                commit_id,
-                INF_CID,
-                write.writer_id
+            auto chain = versions();
+            auto version_it = std::find_if(
+                chain.begin(),
+                chain.end(),
+                [&](const MVTOVersion& version) {
+                    return version.version_id == write.version_id;
+                }
             );
-            std::cout << "  create committed version for "
-                      << seatName(write.seat_id)
-                      << " begin_cid=" << commit_id << std::endl;
+            if (version_it != chain.end()) {
+                markCommitted(*version_it);
+                std::cout << "  commit " << versionName(write.version_id)
+                          << " for " << seatName(write.seat_id) << std::endl;
+            }
         }
-        return commit_id;
     }
 
     void abortWrites(const TxnPtr& txn,
-                     const std::vector<PendingMVCCWrite>& writes) {
+                     const std::vector<PendingMVTOWrite>& writes) {
         auto txn_label = BuzzDB::txnLabel(txn);
-        std::cout << txn_label << " aborts before publishing versions" << std::endl;
+        std::cout << txn_label << " aborts; destroy active version(s)" << std::endl;
+        auto chain = versions();
+        for (const auto& write : writes) {
+            auto version_it = std::find_if(
+                chain.begin(),
+                chain.end(),
+                [&](const MVTOVersion& version) {
+                    return version.version_id == write.version_id;
+                }
+            );
+            if (version_it != chain.end()) {
+                deleteVersion(*version_it);
+                std::cout << "  remove " << versionName(write.version_id)
+                          << " before it can become visible" << std::endl;
+            }
+        }
         db.abort(txn);
-        std::cout << "  MVCC: discarded " << writes.size()
-                  << " tentative write(s); no seat_versions row was installed"
-                  << std::endl;
-        std::cout << "  recovery link: restart has no committed version row "
-                  << "to redo and no private intent to undo" << std::endl;
+        std::cout << "  recovery link: aborted active versions have no "
+                  << "committed version-table record to redo" << std::endl;
     }
 
     void printVersionChain(const std::string& seat_no) {
@@ -6293,7 +6364,7 @@ public:
             std::remove_if(
                 chain.begin(),
                 chain.end(),
-                [&](const MVCCVersion& version) {
+                [&](const MVTOVersion& version) {
                     return version.seat_id != seatId(seat_no);
                 }
             ),
@@ -6302,40 +6373,60 @@ public:
         std::sort(
             chain.begin(),
             chain.end(),
-            [](const MVCCVersion& lhs, const MVCCVersion& rhs) {
-                return lhs.begin_cid > rhs.begin_cid;
+            [](const MVTOVersion& lhs, const MVTOVersion& rhs) {
+                return lhs.wts > rhs.wts;
             }
         );
 
         std::cout << "Version chain for " << seat_no << ":" << std::endl;
         for (const auto& version : chain) {
             std::cout << "  " << versionName(version.version_id)
-                      << " [" << version.begin_cid << ","
-                      << (version.end_cid == INF_CID ?
-                            std::string("inf") :
-                            std::to_string(version.end_cid))
-                      << ") " << valueLabel(version.value_id)
+                      << " [wts=" << version.wts
+                      << ", rts=" << version.rts << "] "
+                      << valueLabel(version.value_id)
                       << " by " << txnName(version.creator_id)
+                      << (version.committed ? " committed" : " active")
                       << std::endl;
         }
     }
 
     void collectGarbage(const std::string& label) {
-        int oldest_snapshot = db.oldestMVCCSnapshot();
-        std::cout << label << ": oldest_active_snapshot="
-                  << oldest_snapshot << std::endl;
+        int oldest_timestamp = db.oldestMVTOTimestamp();
+        std::cout << label << ": oldest_active_ts="
+                  << oldest_timestamp << std::endl;
+
+        auto chain = versions();
+        std::sort(
+            chain.begin(),
+            chain.end(),
+            [](const MVTOVersion& lhs, const MVTOVersion& rhs) {
+                return lhs.wts < rhs.wts;
+            }
+        );
+
         size_t deleted_count = 0;
-        for (const auto& version : versions()) {
-            if (version.end_cid == INF_CID) {
+        for (const auto& version : chain) {
+            if (!version.committed) {
                 continue;
             }
-            bool reclaimable = version.end_cid <= oldest_snapshot;
-            std::cout << "  " << versionName(version.version_id) << " for "
-                      << seatName(version.seat_id) << " ended at "
-                      << version.end_cid << " -> "
-                      << (reclaimable ? "reclaimable" : "retain")
+            bool has_safe_newer_version = false;
+            for (const auto& newer : chain) {
+                if (newer.seat_id == version.seat_id &&
+                    newer.committed &&
+                    newer.wts > version.wts &&
+                    newer.wts <= oldest_timestamp) {
+                    has_safe_newer_version = true;
+                    break;
+                }
+            }
+
+            std::cout << "  " << versionName(version.version_id)
+                      << " for " << seatName(version.seat_id)
+                      << " [wts=" << version.wts
+                      << ", rts=" << version.rts << "] -> "
+                      << (has_safe_newer_version ? "reclaimable" : "retain")
                       << std::endl;
-            if (reclaimable) {
+            if (has_safe_newer_version) {
                 deleteVersion(version);
                 deleted_count++;
             }
@@ -6345,43 +6436,101 @@ public:
     }
 };
 
-void runSnapshotMVCC() {
-    SnapshotMVCC mvcc;
+void runMVTO(MVTO& mvto) {
+    std::cout << "\nMultiversion Timestamp Ordering" << std::endl;
+    std::cout << "  Reads choose the newest version with wts <= txn timestamp." << std::endl;
+    std::cout << "  Writes are rejected if they would invalidate a later read." << std::endl;
 
-    std::cout << "\nMVCC Storage + Snapshot Reads" << std::endl;
-    std::cout << "  Writes create new committed versions." << std::endl;
-    std::cout << "  A reader keeps using the snapshot_id captured at BEGIN." << std::endl;
+    auto t1 = mvto.beginReadOnly("T1");
+    auto t2 = mvto.beginUpdater("T2");
+    auto t3 = mvto.beginReadOnly("T3");
 
-    auto t1 = mvcc.beginReadOnly("T1");
-    mvcc.readSeat(t1, "1A");
+    std::cout << "\nA later read raises the old version's rts" << std::endl;
+    mvto.readSeat(t3, "1A");
 
-    std::cout << "\nT2 starts updater transaction" << std::endl;
-    auto t2 = mvcc.beginUpdater("T2");
-    auto t2_write = mvcc.writeSeat(t2, "1A", "held", "garcia");
-    mvcc.readSeat(t1, "1A");
-    mvcc.commitWrites(t2, {t2_write});
+    std::cout << "\nAn older writer arrives too late" << std::endl;
+    auto t2_write = mvto.writeSeat(t2, "1A", "held", "garcia");
+    if (!t2_write) {
+        std::cout << "  T2 is aborted by MVTO" << std::endl;
+    }
 
-    std::cout << "\nT4 starts then aborts an updater transaction" << std::endl;
-    auto t4 = mvcc.beginUpdater("T4");
-    auto t4_write = mvcc.writeSeat(t4, "1B", "held", "patel");
-    mvcc.abortWrites(t4, {t4_write});
+    std::cout << "\nA newer writer creates a committed version" << std::endl;
+    auto t4 = mvto.beginUpdater("T4");
+    auto t4_write = mvto.writeSeat(t4, "1B", "held", "garcia");
+    if (t4_write) {
+        mvto.commitWrites(t4, {*t4_write});
+    }
 
-    mvcc.readSeat(t1, "1A");
-    mvcc.readSeat(t1, "1B");
-    mvcc.printVersionChain("1A");
-    mvcc.printVersionChain("1B");
-    mvcc.collectGarbage("GC while T1 is active");
-    mvcc.endReadOnly(t1);
-    mvcc.collectGarbage("GC after T1 commits");
-    mvcc.printVersionChain("1A");
+    std::cout << "\nAn old reader can still read the old version" << std::endl;
+    mvto.readSeat(t1, "1B");
 
-    std::cout << "\nT3 starts after T2 commits" << std::endl;
-    auto t3 = mvcc.beginReadOnly("T3");
-    mvcc.readSeat(t3, "1A");
-    mvcc.endReadOnly(t3);
+    std::cout << "\nAn active version is removed on abort" << std::endl;
+    auto t5 = mvto.beginUpdater("T5");
+    auto t5_write = mvto.writeSeat(t5, "1A", "held", "patel");
+    if (t5_write) {
+        mvto.abortWrites(t5, {*t5_write});
+    }
+
+    mvto.printVersionChain("1A");
+    mvto.printVersionChain("1B");
+    mvto.collectGarbage("GC while T1 and T3 are active");
+    mvto.endReadOnly(t1);
+    mvto.endReadOnly(t3);
+    mvto.collectGarbage("GC after old readers finish");
+    mvto.printVersionChain("1B");
+
+    std::cout << "\nA new reader sees the newer committed version" << std::endl;
+    auto t6 = mvto.beginReadOnly("T6");
+    mvto.readSeat(t6, "1B");
+    mvto.endReadOnly(t6);
+}
+
+void runSSIMotivationSchedule() {
+    MVTO mvto;
+
+    std::cout << "\nWhy Snapshot Isolation Still Needs SSI" << std::endl;
+    std::cout << "  Uses the same seat_versions table: 1A and 1B are"
+              << " versioned seats." << std::endl;
+    std::cout << "  Invariant: one customer cannot have two active seat"
+              << " assignments on BZ101." << std::endl;
+
+    auto s1 = mvto.beginUpdater("S1");
+    auto s2 = mvto.beginUpdater("S2");
+    mvto.readNoCustomerAssignment(s1, "garcia");
+    mvto.readNoCustomerAssignment(s2, "garcia");
+
+    std::cout << "S1 tries to assign 1A to Garcia" << std::endl;
+    auto s1_write = mvto.writeSeat(s1, "1A", "held", "garcia");
+    if (!s1_write) {
+        std::cout << "  MVTO rejects S1 because S2 already read the old 1A"
+                  << " version" << std::endl;
+    }
+
+    std::cout << "S2 tries to assign 1B to Garcia" << std::endl;
+    auto s2_write = mvto.writeSeat(s2, "1B", "held", "garcia");
+    if (s2_write) {
+        mvto.commitWrites(s2, {*s2_write});
+    }
+
+    std::cout << "Plain SI counterpart: both snapshots read no Garcia"
+              << " assignment, then write different seats." << std::endl;
+    std::cout << "Plain SI can commit both because there is no write-write"
+              << " conflict on the same row." << std::endl;
+    std::cout << "Final plain-SI state would be: Garcia assigned 1A and 1B."
+              << std::endl;
+
+    std::cout << "SSI interpretation:" << std::endl;
+    std::cout << "  S1 -> S2: S1 read no Garcia assignment on 1B before"
+              << " S2 wrote 1B" << std::endl;
+    std::cout << "  S2 -> S1: S2 read no Garcia assignment on 1A before"
+              << " S1 wrote 1A" << std::endl;
+    std::cout << "  SSI would see the rw-antidependency cycle and abort one"
+              << " transaction." << std::endl;
 }
 
 int main() {
-    runSnapshotMVCC();
+    MVTO mvto;
+    runMVTO(mvto);
+    runSSIMotivationSchedule();
     return 0;
 }
