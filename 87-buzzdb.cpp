@@ -285,6 +285,18 @@ public:
     }
 };
 
+bool hasReadableFields(const std::unique_ptr<Tuple>& tuple, size_t count) {
+    if (tuple->fields.size() < count) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!tuple->fields[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static constexpr size_t PAGE_SIZE = 4096;  // Regular pages for JOB/query workloads
 static constexpr size_t MAX_SLOTS = 512;   // Fixed number of slots
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
@@ -299,7 +311,11 @@ constexpr TableId INVALID_TABLE_ID = 0;
 constexpr TableId SYS_TABLES_ID = 1;
 constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId SYS_STATS_ID = 3;
+constexpr TableId SYS_STAT_VALUES_ID = 4;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
+constexpr int STAT_KIND_MCV = 1;
+constexpr int STAT_KIND_EQUI_WIDTH = 2;
+constexpr int STAT_KIND_EQUI_DEPTH = 3;
 constexpr uint32_t BUZZDB_MAGIC = 0x425A4442;
 constexpr uint16_t BUZZDB_VERSION = 72;
 constexpr uint16_t BUZZDB_MIN_COMPATIBLE_VERSION = 59;
@@ -919,7 +935,8 @@ private:
         TableId table_id = pageMap[page_id]->getTableId();
         if (table_id == SYS_TABLES_ID ||
             table_id == SYS_COLUMNS_ID ||
-            table_id == SYS_STATS_ID) {
+            table_id == SYS_STATS_ID ||
+            table_id == SYS_STAT_VALUES_ID) {
             return "catalog eviction";
         }
         return "eviction";
@@ -1588,6 +1605,12 @@ struct CreateTableResult {
     bool created;
 };
 
+struct HistogramBucket {
+    int lower = 0;
+    int upper = 0;
+    size_t count = 0;
+};
+
 struct PersistedColumnStats {
     TableId table_id;
     int column_id;
@@ -1597,6 +1620,9 @@ struct PersistedColumnStats {
     bool has_int_range;
     int min_int;
     int max_int;
+    std::map<std::string, size_t> mcv_counts;
+    std::vector<HistogramBucket> equi_width_buckets;
+    std::vector<HistogramBucket> equi_depth_buckets;
 };
 
 // Runtime handle for one table's heap pages; owns no catalog metadata.
@@ -1920,6 +1946,7 @@ public:
         installSystemTables(bootstrap_page);
         next_table_id = bootstrap_page.next_table_id;
         ensureStatsTable();
+        ensureStatValuesTable();
     }
 
     bool isNewDatabase() const {
@@ -1935,7 +1962,8 @@ public:
             TableId table_id = static_cast<TableId>(tuple->fields[0]->asInt());
             if (table_id == SYS_TABLES_ID ||
                 table_id == SYS_COLUMNS_ID ||
-                table_id == SYS_STATS_ID) {
+                table_id == SYS_STATS_ID ||
+                table_id == SYS_STAT_VALUES_ID) {
                 continue;
             }
             table_names.push_back(tuple->fields[1]->asString());
@@ -2013,12 +2041,14 @@ public:
             return;
         }
         ensureStatsTable();
+        ensureStatValuesTable();
 
         std::set<TableId> table_ids;
         for (const auto& record : records) {
             table_ids.insert(record.table_id);
         }
         deleteStatsForTables(table_ids);
+        deleteStatValuesForTables(table_ids);
 
         for (const auto& record : records) {
             auto tuple = std::make_unique<Tuple>();
@@ -2031,18 +2061,24 @@ public:
             tuple->addField(std::make_unique<Field>(record.min_int));
             tuple->addField(std::make_unique<Field>(record.max_int));
             insertSystemTuple(SYS_STATS_ID, std::move(tuple));
+            persistStatValueRows(record);
         }
 
         persistTableRecord(getTable(SYS_STATS_ID));
+        persistTableRecord(getTable(SYS_STAT_VALUES_ID));
     }
 
     std::vector<PersistedColumnStats> loadColumnStats(TableId table_id) {
         ensureStatsTable();
+        ensureStatValuesTable();
         auto& stats_metadata = getTable(SYS_STATS_ID);
         TableHeap stats_heap(stats_metadata, buffer_manager);
         std::vector<PersistedColumnStats> records;
 
         for (auto& tuple : stats_heap.readAllTuples()) {
+            if (!hasReadableFields(tuple, 8)) {
+                continue;
+            }
             if (static_cast<TableId>(tuple->fields[0]->asInt()) != table_id) {
                 continue;
             }
@@ -2054,9 +2090,14 @@ public:
                 static_cast<size_t>(tuple->fields[4]->asInt()),
                 tuple->fields[5]->asInt() != 0,
                 tuple->fields[6]->asInt(),
-                tuple->fields[7]->asInt()
+                tuple->fields[7]->asInt(),
+                {},
+                {},
+                {}
             });
         }
+
+        loadStatValueRows(table_id, records);
         return records;
     }
 
@@ -2218,6 +2259,18 @@ private:
         }};
     }
 
+    static TableSchema statValuesTableSchema() {
+        return TableSchema{{
+            {"table_id", INT},
+            {"column_id", INT},
+            {"stat_kind", INT},
+            {"value_text", STRING},
+            {"lower_int", INT},
+            {"upper_int", INT},
+            {"count", INT}
+        }};
+    }
+
     void initializeNewDatabase() {
         BootstrapPage bootstrap_page;
         initializeBootstrap(bootstrap_page);
@@ -2248,6 +2301,7 @@ private:
         persistTableRecord(columns_metadata);
         persistColumns(columns_metadata);
         ensureStatsTable();
+        ensureStatValuesTable();
     }
 
     void installSystemTables(const BootstrapPage& bootstrap_page) {
@@ -2293,6 +2347,35 @@ private:
         PageID stats_page = buffer_manager.extend(SYS_STATS_ID, "system table create");
         TableMetadata stats_metadata{
             SYS_STATS_ID, "__stats", statsTableSchema(),
+            {stats_page}, stats_page, stats_page, 0, true
+        };
+        auto& cached_metadata = cacheTable(std::move(stats_metadata));
+        persistTableRecord(cached_metadata);
+        persistColumns(cached_metadata);
+    }
+
+    void ensureStatValuesTable() {
+        auto cached = table_names_by_id.find(SYS_STAT_VALUES_ID);
+        if (cached != table_names_by_id.end()) {
+            tables_by_name.at(cached->second).system_table = true;
+            validateSchema(
+                "__stat_values",
+                tables_by_name.at(cached->second).schema,
+                statValuesTableSchema()
+            );
+            return;
+        }
+
+        if (loadTableById(SYS_STAT_VALUES_ID)) {
+            auto& metadata = getTable(SYS_STAT_VALUES_ID);
+            metadata.system_table = true;
+            validateSchema("__stat_values", metadata.schema, statValuesTableSchema());
+            return;
+        }
+
+        PageID stats_page = buffer_manager.extend(SYS_STAT_VALUES_ID, "system table create");
+        TableMetadata stats_metadata{
+            SYS_STAT_VALUES_ID, "__stat_values", statValuesTableSchema(),
             {stats_page}, stats_page, stats_page, 0, true
         };
         auto& cached_metadata = cacheTable(std::move(stats_metadata));
@@ -2438,13 +2521,15 @@ private:
         }
     }
 
-    void deleteStatsForTables(const std::set<TableId>& table_ids) {
-        auto& stats_metadata = getTable(SYS_STATS_ID);
-        TableHeap stats_heap(stats_metadata, buffer_manager);
+    void deleteRowsForTables(TableId system_table_id,
+                             const std::set<TableId>& table_ids,
+                             const std::string& tag) {
+        auto& metadata = getTable(system_table_id);
+        TableHeap heap(metadata, buffer_manager);
         size_t deleted = 0;
 
-        for (PageID page_id : stats_heap.getPageIds()) {
-            auto& page = stats_heap.getPage(page_id);
+        for (PageID page_id : heap.getPageIds()) {
+            auto& page = heap.getPage(page_id);
             char* page_buffer = page->page_data.get();
             Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
             bool page_changed = false;
@@ -2455,9 +2540,12 @@ private:
                 }
                 const char* tuple_data = page_buffer + slot_array[slot_itr].offset;
                 std::istringstream input(
-                    std::string(tuple_data, slot_array[slot_itr].length)
+                std::string(tuple_data, slot_array[slot_itr].length)
                 );
                 auto tuple = Tuple::deserialize(input);
+                if (!hasReadableFields(tuple, 1)) {
+                    continue;
+                }
                 TableId table_id = static_cast<TableId>(tuple->fields[0]->asInt());
                 if (table_ids.find(table_id) == table_ids.end()) {
                     continue;
@@ -2469,13 +2557,120 @@ private:
 
             if (page_changed) {
                 buffer_manager.markDirty(page_id);
-                buffer_manager.flushPage(page_id, "catalog stats");
+                buffer_manager.flushPage(page_id, tag);
             }
         }
 
-        stats_metadata.row_count = deleted > stats_metadata.row_count
+        metadata.row_count = deleted > metadata.row_count
             ? 0
-            : stats_metadata.row_count - deleted;
+            : metadata.row_count - deleted;
+    }
+
+    void deleteStatsForTables(const std::set<TableId>& table_ids) {
+        deleteRowsForTables(SYS_STATS_ID, table_ids, "catalog stats");
+    }
+
+    void deleteStatValuesForTables(const std::set<TableId>& table_ids) {
+        deleteRowsForTables(SYS_STAT_VALUES_ID, table_ids, "catalog stat values");
+    }
+
+    void insertStatValue(TableId table_id,
+                         int column_id,
+                         int stat_kind,
+                         const std::string& value_text,
+                         int lower,
+                         int upper,
+                         size_t count) {
+        auto tuple = std::make_unique<Tuple>();
+        tuple->addField(std::make_unique<Field>(static_cast<int>(table_id)));
+        tuple->addField(std::make_unique<Field>(column_id));
+        tuple->addField(std::make_unique<Field>(stat_kind));
+        tuple->addField(std::make_unique<Field>(
+            value_text.empty() ? "__bucket__" : value_text
+        ));
+        tuple->addField(std::make_unique<Field>(lower));
+        tuple->addField(std::make_unique<Field>(upper));
+        tuple->addField(std::make_unique<Field>(static_cast<int>(count)));
+        insertSystemTuple(SYS_STAT_VALUES_ID, std::move(tuple));
+    }
+
+    void persistStatValueRows(const PersistedColumnStats& record) {
+        for (const auto& value : record.mcv_counts) {
+            insertStatValue(
+                record.table_id,
+                record.column_id,
+                STAT_KIND_MCV,
+                value.first,
+                0,
+                0,
+                value.second
+            );
+        }
+        for (const auto& bucket : record.equi_width_buckets) {
+            insertStatValue(
+                record.table_id,
+                record.column_id,
+                STAT_KIND_EQUI_WIDTH,
+                "",
+                bucket.lower,
+                bucket.upper,
+                bucket.count
+            );
+        }
+        for (const auto& bucket : record.equi_depth_buckets) {
+            insertStatValue(
+                record.table_id,
+                record.column_id,
+                STAT_KIND_EQUI_DEPTH,
+                "",
+                bucket.lower,
+                bucket.upper,
+                bucket.count
+            );
+        }
+    }
+
+    void loadStatValueRows(TableId table_id,
+                           std::vector<PersistedColumnStats>& records) {
+        std::map<int, PersistedColumnStats*> records_by_column;
+        for (auto& record : records) {
+            records_by_column[record.column_id] = &record;
+        }
+
+        auto& values_metadata = getTable(SYS_STAT_VALUES_ID);
+        TableHeap values_heap(values_metadata, buffer_manager);
+        for (auto& tuple : values_heap.readAllTuples()) {
+            if (!hasReadableFields(tuple, 7)) {
+                continue;
+            }
+            if (static_cast<TableId>(tuple->fields[0]->asInt()) != table_id) {
+                continue;
+            }
+            int column_id = tuple->fields[1]->asInt();
+            auto record_it = records_by_column.find(column_id);
+            if (record_it == records_by_column.end()) {
+                continue;
+            }
+
+            int stat_kind = tuple->fields[2]->asInt();
+            auto* record = record_it->second;
+            if (stat_kind == STAT_KIND_MCV) {
+                record->mcv_counts[tuple->fields[3]->asString()] =
+                    static_cast<size_t>(tuple->fields[6]->asInt());
+            } else if (stat_kind == STAT_KIND_EQUI_WIDTH) {
+                record->equi_width_buckets.push_back({
+                    tuple->fields[4]->asInt(),
+                    tuple->fields[5]->asInt(),
+                    static_cast<size_t>(tuple->fields[6]->asInt())
+                });
+            } else if (stat_kind == STAT_KIND_EQUI_DEPTH) {
+                record->equi_depth_buckets.push_back({
+                    tuple->fields[4]->asInt(),
+                    tuple->fields[5]->asInt(),
+                    static_cast<size_t>(tuple->fields[6]->asInt())
+                });
+            }
+        }
     }
 
     bool loadTableByName(const std::string& name) {
@@ -6027,6 +6222,9 @@ struct ColumnStats {
     bool hasIntRange = false;
     int minInt = 0;
     int maxInt = 0;
+    std::map<std::string, size_t> mcvCounts;
+    std::vector<HistogramBucket> equiWidthBuckets;
+    std::vector<HistogramBucket> equiDepthBuckets;
 };
 
 struct TableStats {
@@ -6078,6 +6276,16 @@ double estimateEqualityFilterRows(double input_rows,
     return std::max(1.0, input_rows / static_cast<double>(column_stats.ndv));
 }
 
+double estimateEqualityFilterRowsWithMcv(double input_rows,
+                                         const ColumnStats& column_stats,
+                                         const std::string& value) {
+    auto value_it = column_stats.mcvCounts.find(value);
+    if (value_it != column_stats.mcvCounts.end()) {
+        return static_cast<double>(value_it->second);
+    }
+    return estimateEqualityFilterRows(input_rows, column_stats);
+}
+
 double estimateJoinRows(double left_rows,
                         double right_rows,
                         const ColumnStats& left_stats,
@@ -6095,6 +6303,91 @@ std::string intRangeString(const ColumnStats& stats) {
     }
     return " min=" + std::to_string(stats.minInt) +
            " max=" + std::to_string(stats.maxInt);
+}
+
+std::vector<HistogramBucket> buildEquiWidthBuckets(std::vector<int> values,
+                                                   size_t bucket_count) {
+    std::vector<HistogramBucket> buckets;
+    if (values.empty() || bucket_count == 0) {
+        return buckets;
+    }
+    std::sort(values.begin(), values.end());
+    int min_value = values.front();
+    int max_value = values.back();
+    size_t domain_width = static_cast<size_t>(max_value - min_value) + 1;
+    size_t width = std::max<size_t>(
+        1,
+        (domain_width + bucket_count - 1) / bucket_count
+    );
+
+    for (size_t i = 0; i < bucket_count; i++) {
+        int lower = min_value + static_cast<int>(i * width);
+        if (lower > max_value) {
+            break;
+        }
+        int upper = std::min(max_value, lower + static_cast<int>(width) - 1);
+        buckets.push_back({lower, upper, 0});
+    }
+
+    for (int value : values) {
+        size_t index = std::min(
+            buckets.size() - 1,
+            static_cast<size_t>(value - min_value) / width
+        );
+        buckets[index].count++;
+    }
+    return buckets;
+}
+
+std::vector<HistogramBucket> buildEquiDepthBuckets(std::vector<int> values,
+                                                   size_t bucket_count) {
+    std::vector<HistogramBucket> buckets;
+    if (values.empty() || bucket_count == 0) {
+        return buckets;
+    }
+    std::sort(values.begin(), values.end());
+    bucket_count = std::min(bucket_count, values.size());
+    for (size_t i = 0; i < bucket_count; i++) {
+        size_t begin = i * values.size() / bucket_count;
+        size_t end = ((i + 1) * values.size() / bucket_count) - 1;
+        buckets.push_back({
+            values[begin],
+            values[end],
+            end - begin + 1
+        });
+    }
+    return buckets;
+}
+
+double estimateRangeRowsUniform(const ColumnStats& stats,
+                                int lower,
+                                int upper,
+                                double input_rows) {
+    if (!stats.hasIntRange || upper < stats.minInt || lower > stats.maxInt) {
+        return 1.0;
+    }
+    int overlap_lower = std::max(lower, stats.minInt);
+    int overlap_upper = std::min(upper, stats.maxInt);
+    double overlap = static_cast<double>(overlap_upper - overlap_lower + 1);
+    double domain = static_cast<double>(stats.maxInt - stats.minInt + 1);
+    return std::max(1.0, input_rows * overlap / domain);
+}
+
+double estimateRangeRowsFromBuckets(const std::vector<HistogramBucket>& buckets,
+                                    int lower,
+                                    int upper) {
+    double estimate = 0.0;
+    for (const auto& bucket : buckets) {
+        if (upper < bucket.lower || lower > bucket.upper) {
+            continue;
+        }
+        int overlap_lower = std::max(lower, bucket.lower);
+        int overlap_upper = std::min(upper, bucket.upper);
+        double overlap = static_cast<double>(overlap_upper - overlap_lower + 1);
+        double width = static_cast<double>(bucket.upper - bucket.lower + 1);
+        estimate += static_cast<double>(bucket.count) * overlap / width;
+    }
+    return std::max(1.0, estimate);
 }
 
 double qError(double estimate, double actual) {
@@ -6132,6 +6425,30 @@ std::map<std::string, std::set<std::string>> neededColumnsByTable(
     return needed_columns;
 }
 
+constexpr size_t HISTOGRAM_BUCKET_COUNT = 5;
+constexpr size_t MCV_VALUE_LIMIT = 10;
+
+std::map<std::string, size_t> topKValueCounts(
+    const std::map<std::string, size_t>& value_counts,
+    size_t limit) {
+    std::vector<std::pair<std::string, size_t>> values(
+        value_counts.begin(),
+        value_counts.end()
+    );
+    std::sort(values.begin(), values.end(), [](const auto& left, const auto& right) {
+        if (left.second != right.second) {
+            return left.second > right.second;
+        }
+        return left.first < right.first;
+    });
+
+    std::map<std::string, size_t> top_values;
+    for (size_t i = 0; i < values.size() && i < limit; i++) {
+        top_values[values[i].first] = values[i].second;
+    }
+    return top_values;
+}
+
 TableStats analyzeTableStats(TableMetadata& metadata,
                              BufferManager& buffer_manager) {
     TableStats table_stats;
@@ -6140,6 +6457,10 @@ TableStats analyzeTableStats(TableMetadata& metadata,
     std::vector<std::unordered_set<std::string>> distinct_values(
         metadata.schema.columns.size()
     );
+    std::vector<std::map<std::string, size_t>> value_counts(
+        metadata.schema.columns.size()
+    );
+    std::vector<std::vector<int>> int_values(metadata.schema.columns.size());
     TableHeap table(metadata, buffer_manager);
     ScanOperator scan(table);
     scan.open();
@@ -6147,11 +6468,14 @@ TableStats analyzeTableStats(TableMetadata& metadata,
         auto tuple = scan.getOutput();
         table_stats.rowCount++;
         for (size_t i = 0; i < tuple.size(); i++) {
-            distinct_values[i].insert(fieldToString(*tuple[i]));
+            auto value_text = fieldToString(*tuple[i]);
+            auto column_name = statsColumnName(metadata, i);
+            auto& column_stats = table_stats.columns[column_name];
+            distinct_values[i].insert(value_text);
+            value_counts[i][value_text]++;
             if (tuple[i]->getType() == INT) {
                 auto value = tuple[i]->asInt();
-                auto column_name = statsColumnName(metadata, i);
-                auto& column_stats = table_stats.columns[column_name];
+                int_values[i].push_back(value);
                 if (!column_stats.hasIntRange) {
                     column_stats.minInt = value;
                     column_stats.maxInt = value;
@@ -6170,6 +6494,20 @@ TableStats analyzeTableStats(TableMetadata& metadata,
         auto& column_stats = table_stats.columns[column_name];
         column_stats.type = metadata.schema.columns[i].type;
         column_stats.ndv = distinct_values[i].size();
+        column_stats.mcvCounts = topKValueCounts(
+            value_counts[i],
+            MCV_VALUE_LIMIT
+        );
+        if (column_stats.type == INT) {
+            column_stats.equiWidthBuckets = buildEquiWidthBuckets(
+                int_values[i],
+                HISTOGRAM_BUCKET_COUNT
+            );
+            column_stats.equiDepthBuckets = buildEquiDepthBuckets(
+                int_values[i],
+                HISTOGRAM_BUCKET_COUNT
+            );
+        }
     }
     return table_stats;
 }
@@ -6189,29 +6527,13 @@ std::vector<PersistedColumnStats> makePersistedStats(
             column_stats.ndv,
             column_stats.hasIntRange,
             column_stats.minInt,
-            column_stats.maxInt
+            column_stats.maxInt,
+            column_stats.mcvCounts,
+            column_stats.equiWidthBuckets,
+            column_stats.equiDepthBuckets
         });
     }
     return records;
-}
-
-StatisticsCatalog analyzeQueryTables(const QueryComponents& components,
-                                     Catalog& catalog,
-                                     BufferManager& buffer_manager) {
-    StatisticsCatalog stats;
-    std::set<std::string> analyzed_tables;
-
-    for (const auto& table_name : writtenJoinOrder(components)) {
-        std::string actual_table = actualTableName(components, table_name);
-        if (analyzed_tables.find(actual_table) != analyzed_tables.end()) {
-            continue;
-        }
-        analyzed_tables.insert(actual_table);
-
-        auto& metadata = catalog.getTable(actual_table);
-        stats.tables[actual_table] = analyzeTableStats(metadata, buffer_manager);
-    }
-    return stats;
 }
 
 StatisticsCatalog loadQueryTableStats(const QueryComponents& components,
@@ -6250,6 +6572,9 @@ StatisticsCatalog loadQueryTableStats(const QueryComponents& components,
             column_stats.hasIntRange = record.has_int_range;
             column_stats.minInt = record.min_int;
             column_stats.maxInt = record.max_int;
+            column_stats.mcvCounts = record.mcv_counts;
+            column_stats.equiWidthBuckets = record.equi_width_buckets;
+            column_stats.equiDepthBuckets = record.equi_depth_buckets;
         }
         stats.tables[actual_table] = std::move(table_stats);
     }
@@ -6258,16 +6583,23 @@ StatisticsCatalog loadQueryTableStats(const QueryComponents& components,
 
 double estimateRowsAfterTableFilters(const StatisticsCatalog& stats,
                                      const QueryComponents& components,
-                                     const std::string& table_name) {
+                                     const std::string& table_name,
+                                     bool use_mcv = true) {
     double rows = static_cast<double>(
         tableStatsFor(stats, components, table_name).rowCount
     );
     for (const auto& filter : components.filters) {
         if (filter.column.tableName == table_name) {
-            rows = estimateEqualityFilterRows(
-                rows,
-                columnStatsFor(stats, components, filter.column)
-            );
+            const auto& column_stats = columnStatsFor(stats, components, filter.column);
+            if (use_mcv) {
+                rows = estimateEqualityFilterRowsWithMcv(
+                    rows,
+                    column_stats,
+                    filter.value
+                );
+            } else {
+                rows = estimateEqualityFilterRows(rows, column_stats);
+            }
         }
     }
     return rows;
@@ -6301,11 +6633,84 @@ size_t countFilterRows(const QueryComponents& components,
     return count;
 }
 
+size_t countRangeRows(const QueryComponents& components,
+                      const ColumnRef& column,
+                      int lower,
+                      int upper,
+                      Catalog& catalog,
+                      BufferManager& buffer_manager) {
+    auto& metadata = catalog.getTable(actualTableName(components, column.tableName));
+    TableHeap table(metadata, buffer_manager);
+    ScanOperator scan(table);
+    size_t count = 0;
+    scan.open();
+    while (scan.next()) {
+        auto tuple = scan.getOutput();
+        if (column.attributeIndex < 0 ||
+            static_cast<size_t>(column.attributeIndex) >= tuple.size()) {
+            throw std::runtime_error("Range validation column is out of range.");
+        }
+        const auto& field = tuple[static_cast<size_t>(column.attributeIndex)];
+        if (field->getType() == INT &&
+            field->asInt() >= lower &&
+            field->asInt() <= upper) {
+            count++;
+        }
+    }
+    scan.close();
+    return count;
+}
+
+std::string topValueString(const ColumnStats& stats, size_t limit = 3) {
+    std::vector<std::pair<std::string, size_t>> values(
+        stats.mcvCounts.begin(),
+        stats.mcvCounts.end()
+    );
+    std::sort(values.begin(), values.end(), [](const auto& left, const auto& right) {
+        return left.second > right.second;
+    });
+
+    std::ostringstream out;
+    for (size_t i = 0; i < values.size() && i < limit; i++) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << values[i].first << "=" << values[i].second;
+    }
+    return out.str();
+}
+
+size_t maxValueCount(const ColumnStats& stats) {
+    size_t max_count = 0;
+    for (const auto& value : stats.mcvCounts) {
+        max_count = std::max(max_count, value.second);
+    }
+    return max_count;
+}
+
+std::string bucketSummary(const std::vector<HistogramBucket>& buckets) {
+    std::ostringstream out;
+    for (size_t i = 0; i < buckets.size(); i++) {
+        if (i > 0) {
+            out << " ";
+        }
+        out << "[" << buckets[i].lower << "-" << buckets[i].upper
+            << ":" << buckets[i].count << "]";
+    }
+    return out.str();
+}
+
 void printAnalyzeStats(const QueryComponents& components,
                        const StatisticsCatalog& stats) {
     auto needed_columns = neededColumnsByTable(components);
+    std::map<std::string, std::set<std::string>> filtered_columns;
+    for (const auto& filter : components.filters) {
+        filtered_columns[filter.column.tableName].insert(filter.column.columnName);
+    }
     std::cout << "\nANALYZE stats for query tables:" << std::endl;
     std::cout << "  # ndv = number of distinct values" << std::endl;
+    std::cout << "  # mcv = top " << MCV_VALUE_LIMIT
+              << " most common values" << std::endl;
     for (const auto& table_name : writtenJoinOrder(components)) {
         const auto& table_stats = tableStatsFor(stats, components, table_name);
         std::cout << "  " << tableLabel(components, table_name)
@@ -6320,38 +6725,171 @@ void printAnalyzeStats(const QueryComponents& components,
                       << " ndv=" << column_it->second.ndv
                       << intRangeString(column_it->second)
                       << std::endl;
+            if (column_it->second.type == STRING &&
+                column_it->second.ndv > 1 &&
+                maxValueCount(column_it->second) > 1 &&
+                filtered_columns[table_name].find(column_name) !=
+                    filtered_columns[table_name].end()) {
+                std::cout << "      mcv: "
+                          << topValueString(column_it->second)
+                          << std::endl;
+            }
         }
     }
 }
 
-double printCardinalityEstimates(const QueryComponents& components,
-                                 const StatisticsCatalog& stats) {
-    std::cout << "\nEstimated cardinalities:" << std::endl;
-    std::map<std::string, double> table_rows;
+struct RangeValidation {
+    ColumnRef column;
+    int lower = 0;
+    int upper = 0;
+};
+
+std::vector<RangeValidation> chooseRangeValidations(
+    const QueryComponents& components,
+    const StatisticsCatalog& stats,
+    Catalog& catalog) {
+    std::vector<RangeValidation> validations;
+    std::vector<std::pair<std::string, std::string>> preferred_columns = {
+        {"t", "id"},
+        {"mc", "company_id"},
+        {"mi", "info_type_id"}
+    };
+
+    for (const auto& preferred : preferred_columns) {
+        const auto& table_stats = tableStatsFor(stats, components, preferred.first);
+        auto column_it = table_stats.columns.find(preferred.second);
+        if (column_it == table_stats.columns.end() ||
+            !column_it->second.hasIntRange ||
+            column_it->second.minInt == column_it->second.maxInt) {
+            continue;
+        }
+
+        ColumnRef column{preferred.first, preferred.second, -1};
+        resolveColumnRef(column, catalog, components);
+        int span = column_it->second.maxInt - column_it->second.minInt;
+        int lower = column_it->second.minInt + span / 4;
+        int upper = column_it->second.minInt + span / 2;
+        validations.push_back({column, lower, upper});
+    }
+    return validations;
+}
+
+void printHistogramRangeValidation(const QueryComponents& components,
+                                   const StatisticsCatalog& stats,
+                                   Catalog& catalog,
+                                   BufferManager& buffer_manager) {
+    auto validations = chooseRangeValidations(components, stats, catalog);
+    if (validations.empty()) {
+        return;
+    }
+
+    std::cout << "\nHistogram range validation:" << std::endl;
+    for (const auto& validation : validations) {
+        const auto& table_stats = tableStatsFor(
+            stats,
+            components,
+            validation.column.tableName
+        );
+        const auto& column_stats = columnStatsFor(stats, components, validation.column);
+        auto base_rows = static_cast<double>(table_stats.rowCount);
+        auto uniform_estimate = estimateRangeRowsUniform(
+            column_stats,
+            validation.lower,
+            validation.upper,
+            base_rows
+        );
+        auto width_estimate = estimateRangeRowsFromBuckets(
+            column_stats.equiWidthBuckets,
+            validation.lower,
+            validation.upper
+        );
+        auto depth_estimate = estimateRangeRowsFromBuckets(
+            column_stats.equiDepthBuckets,
+            validation.lower,
+            validation.upper
+        );
+        auto actual = countRangeRows(
+            components,
+            validation.column,
+            validation.lower,
+            validation.upper,
+            catalog,
+            buffer_manager
+        );
+
+        std::cout << "  " << columnLabel(validation.column)
+                  << " BETWEEN " << validation.lower
+                  << " AND " << validation.upper
+                  << ": uniform=" << formatEstimate(uniform_estimate)
+                  << " q-error="
+                  << formatQError(uniform_estimate, static_cast<double>(actual))
+                  << " equi-width=" << formatEstimate(width_estimate)
+                  << " q-error="
+                  << formatQError(width_estimate, static_cast<double>(actual))
+                  << " equi-depth=" << formatEstimate(depth_estimate)
+                  << " q-error="
+                  << formatQError(depth_estimate, static_cast<double>(actual))
+                  << " actual=" << actual
+                  << std::endl;
+        std::cout << "    equi-width buckets: "
+                  << bucketSummary(column_stats.equiWidthBuckets)
+                  << std::endl;
+        std::cout << "    equi-depth buckets: "
+                  << bucketSummary(column_stats.equiDepthBuckets)
+                  << std::endl;
+    }
+}
+
+std::pair<double, double> printCardinalityEstimates(const QueryComponents& components,
+                                                    const StatisticsCatalog& stats) {
+    std::cout << "\nEstimated cardinalities with top-k MCV filters:" << std::endl;
+    std::map<std::string, double> uniform_table_rows;
+    std::map<std::string, double> mcv_table_rows;
     for (const auto& table_name : writtenJoinOrder(components)) {
         auto base_rows = static_cast<double>(
             tableStatsFor(stats, components, table_name).rowCount
         );
-        auto filtered_rows = estimateRowsAfterTableFilters(stats, components, table_name);
-        table_rows[table_name] = filtered_rows;
+        auto uniform_rows = estimateRowsAfterTableFilters(
+            stats,
+            components,
+            table_name,
+            false
+        );
+        auto mcv_rows = estimateRowsAfterTableFilters(
+            stats,
+            components,
+            table_name
+        );
+        uniform_table_rows[table_name] = uniform_rows;
+        mcv_table_rows[table_name] = mcv_rows;
         std::cout << "  " << table_name << " scan/filter: "
-                  << formatEstimate(filtered_rows)
+                  << "uniform=" << formatEstimate(uniform_rows)
+                  << " mcv=" << formatEstimate(mcv_rows)
                   << " from " << formatEstimate(base_rows)
                   << std::endl;
     }
 
-    double current_rows = table_rows[components.tableName];
+    double uniform_rows = uniform_table_rows[components.tableName];
+    double mcv_rows = mcv_table_rows[components.tableName];
     std::set<std::string> seen_tables{components.tableName};
     for (const auto& join : components.joins) {
-        current_rows = estimateJoinRows(
-            current_rows,
-            table_rows[join.tableName],
+        uniform_rows = estimateJoinRows(
+            uniform_rows,
+            uniform_table_rows[join.tableName],
+            columnStatsFor(stats, components, join.left),
+            columnStatsFor(stats, components, join.right)
+        );
+        mcv_rows = estimateJoinRows(
+            mcv_rows,
+            mcv_table_rows[join.tableName],
             columnStatsFor(stats, components, join.left),
             columnStatsFor(stats, components, join.right)
         );
         seen_tables.insert(join.tableName);
         std::cout << "  join " << joinLabel(join) << ": "
-                  << formatEstimate(current_rows) << std::endl;
+                  << "uniform=" << formatEstimate(uniform_rows)
+                  << " mcv=" << formatEstimate(mcv_rows)
+                  << std::endl;
     }
     for (const auto& equality : components.columnEqualities) {
         std::cout << "  predicate "
@@ -6364,9 +6902,11 @@ double printCardinalityEstimates(const QueryComponents& components,
                   << ": graph edge, not an independent selectivity factor"
                   << std::endl;
     }
-    std::cout << "  final join body estimate: "
-              << formatEstimate(current_rows) << std::endl;
-    return current_rows;
+    std::cout << "  final join body estimate: uniform="
+              << formatEstimate(uniform_rows)
+              << " mcv=" << formatEstimate(mcv_rows)
+              << std::endl;
+    return {uniform_rows, mcv_rows};
 }
 
 std::unique_ptr<IPredicate> makeScanFilterPredicate(const QueryComponents& components,
@@ -7646,16 +8186,22 @@ public:
         resolveQueryColumns(components, catalog);
         auto stats = loadQueryTableStats(components, catalog);
         printAnalyzeStats(components, stats);
-        auto final_estimate = printCardinalityEstimates(components, stats);
+        auto final_estimates = printCardinalityEstimates(components, stats);
+        printHistogramRangeValidation(components, stats, catalog, buffer_manager);
 
         std::cout << "\nActual validation:" << std::endl;
         for (const auto& filter : components.filters) {
             auto base_rows = static_cast<double>(
                 tableStatsFor(stats, components, filter.column.tableName).rowCount
             );
-            auto estimate = estimateEqualityFilterRows(
+            auto uniform_estimate = estimateEqualityFilterRows(
                 base_rows,
                 columnStatsFor(stats, components, filter.column)
+            );
+            auto mcv_estimate = estimateEqualityFilterRowsWithMcv(
+                base_rows,
+                columnStatsFor(stats, components, filter.column),
+                filter.value
             );
             auto actual = countFilterRows(
                 components,
@@ -7665,22 +8211,31 @@ public:
             );
             std::cout << "  " << columnLabel(filter.column)
                       << " = " << filter.value
-                      << ": estimate=" << formatEstimate(estimate)
+                      << ": uniform=" << formatEstimate(uniform_estimate)
+                      << " q-error="
+                      << formatQError(uniform_estimate, static_cast<double>(actual))
+                      << " mcv=" << formatEstimate(mcv_estimate)
                       << " actual=" << actual
                       << " q-error="
-                      << formatQError(estimate, static_cast<double>(actual))
+                      << formatQError(mcv_estimate, static_cast<double>(actual))
                       << std::endl;
         }
 
         auto join_body_rows = executeQuery(join_body_query, txn, false);
-        std::cout << "  final join body: estimate="
-                  << formatEstimate(final_estimate)
-                  << " actual=" << join_body_rows.size()
+        std::cout << "  final join body: uniform="
+                  << formatEstimate(final_estimates.first)
                   << " q-error="
                   << formatQError(
-                         final_estimate,
+                         final_estimates.first,
                          static_cast<double>(join_body_rows.size())
                      )
+                  << " mcv=" << formatEstimate(final_estimates.second)
+                  << " q-error="
+                  << formatQError(
+                         final_estimates.second,
+                         static_cast<double>(join_body_rows.size())
+                     )
+                  << " actual=" << join_body_rows.size()
                   << std::endl;
     }
 
@@ -7869,7 +8424,7 @@ int main(int argc, char* argv[]) {
     db.execute("ANALYZE");
 
     auto query_txn = db.begin("Q1");
-    std::cout << "\nQuery optimization baseline" << std::endl;
+    std::cout << "\nQuery optimization with histograms" << std::endl;
     std::cout << "  Workload: JOB 13d-shaped 9-table company/rating/release-date join" << std::endl;
     db.explainQuery(jobJoinQuery());
     db.printStatsAndEstimates(jobJoinQuery(), jobJoinBodyQuery(), query_txn);
