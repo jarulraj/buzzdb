@@ -6,17 +6,21 @@ This creates TWO outputs by default:
   - imdb.txt        : small teaching/demo dataset
   - imdb_large.txt  : larger dataset for later course modules
 
-Both outputs use the same simplified v47 schema:
+The small output keeps the simplified v47 schema:
   - kind_type
   - title
   - company_type
   - company_name
   - movie_companies
 
+The large output adds more JOB-style tables for query optimization:
+  - info_type, movie_info, movie_info_idx
+  - keyword, movie_keyword
+  - role_type, name, char_name, cast_info
+
 The script uses movie_info_idx.csv internally to prefer popular movies when
-rating/vote metadata is detectable, but it does NOT emit movie_info_idx or
-movie_info rows. This keeps the early-course schema small while still allowing a
-larger later-course database.
+rating/vote metadata is detectable. The large output also emits a bounded number
+of rows from the larger fact tables for each selected movie.
 
 Output format expected by the v47 loader:
   table_name|field1|field2|...
@@ -37,15 +41,23 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 DEFAULT_URL = "https://event.cwi.nl/da/job/imdb.tgz"
+MAX_OUTPUT_STRING_LENGTH = 120
 
 NEEDED_FILES = {
     "title.csv",
     "kind_type.csv",
     "info_type.csv",
     "movie_info_idx.csv",
+    "movie_info.csv",
     "company_name.csv",
     "company_type.csv",
     "movie_companies.csv",
+    "keyword.csv",
+    "movie_keyword.csv",
+    "role_type.csv",
+    "name.csv",
+    "char_name.csv",
+    "cast_info.csv",
 }
 
 TITLE = {
@@ -72,6 +84,13 @@ MOVIE_INFO_IDX = {
     "info": 3,
 }
 
+MOVIE_INFO = {
+    "id": 0,
+    "movie_id": 1,
+    "info_type_id": 2,
+    "info": 3,
+}
+
 COMPANY_NAME = {
     "id": 0,
     "name": 1,
@@ -89,6 +108,41 @@ MOVIE_COMPANIES = {
     "company_id": 2,
     "company_type_id": 3,
     "note": 4,
+}
+
+KEYWORD = {
+    "id": 0,
+    "keyword": 1,
+}
+
+MOVIE_KEYWORD = {
+    "id": 0,
+    "movie_id": 1,
+    "keyword_id": 2,
+}
+
+ROLE_TYPE = {
+    "id": 0,
+    "role": 1,
+}
+
+NAME = {
+    "id": 0,
+    "name": 1,
+    "gender": 4,
+}
+
+CHAR_NAME = {
+    "id": 0,
+    "name": 1,
+}
+
+CAST_INFO = {
+    "id": 0,
+    "person_id": 1,
+    "movie_id": 2,
+    "person_role_id": 3,
+    "role_id": 6,
 }
 
 
@@ -109,6 +163,8 @@ def clean_string(value: str) -> str:
     value = re.sub(r"\s+", "_", value)
     value = re.sub(r"[^A-Za-z0-9_\-.,:\[\]\(\)&]+", "_", value)
     value = re.sub(r"_+", "_", value).strip("_")
+    if len(value) > MAX_OUTPUT_STRING_LENGTH:
+        value = value[:MAX_OUTPUT_STRING_LENGTH].rstrip("_.-,")
     return value or "unknown"
 
 
@@ -120,6 +176,11 @@ def parse_int(value: str) -> Optional[int]:
         return int(value)
     except ValueError:
         return None
+
+
+def int_or_zero(value: str) -> int:
+    parsed = parse_int(value)
+    return parsed if parsed is not None else 0
 
 
 def parse_number(value: str) -> Optional[float]:
@@ -429,6 +490,90 @@ def filter_movie_companies(
     return rows
 
 
+def filter_rows_by_movie(
+    path: Path,
+    movie_col: int,
+    selected_movie_ids: Set[int],
+    max_per_movie: int,
+    min_columns: int,
+) -> List[List[str]]:
+    rows: List[List[str]] = []
+    counts: Dict[int, int] = {}
+
+    for row in read_csv_rows(path):
+        if len(row) <= min_columns:
+            continue
+
+        movie_id = parse_int(row[movie_col])
+        if movie_id is None or movie_id not in selected_movie_ids:
+            continue
+
+        current = counts.get(movie_id, 0)
+        if max_per_movie >= 0 and current >= max_per_movie:
+            continue
+
+        rows.append(row)
+        counts[movie_id] = current + 1
+
+    return rows
+
+
+def filter_movie_info(
+    path: Path,
+    selected_movie_ids: Set[int],
+    max_per_movie: int,
+) -> List[List[str]]:
+    return filter_rows_by_movie(
+        path,
+        MOVIE_INFO["movie_id"],
+        selected_movie_ids,
+        max_per_movie,
+        max(MOVIE_INFO.values()),
+    )
+
+
+def filter_movie_info_idx(
+    path: Path,
+    selected_movie_ids: Set[int],
+    max_per_movie: int,
+) -> List[List[str]]:
+    return filter_rows_by_movie(
+        path,
+        MOVIE_INFO_IDX["movie_id"],
+        selected_movie_ids,
+        max_per_movie,
+        max(MOVIE_INFO_IDX.values()),
+    )
+
+
+def filter_movie_keywords(
+    path: Path,
+    selected_movie_ids: Set[int],
+    max_per_movie: int,
+) -> List[List[str]]:
+    return filter_rows_by_movie(
+        path,
+        MOVIE_KEYWORD["movie_id"],
+        selected_movie_ids,
+        max_per_movie,
+        max(MOVIE_KEYWORD.values()),
+    )
+
+
+def filter_cast_info(
+    path: Path,
+    selected_movie_ids: Set[int],
+    max_per_movie: int,
+) -> List[List[str]]:
+    return filter_rows_by_movie(
+        path,
+        CAST_INFO["movie_id"],
+        selected_movie_ids,
+        max_per_movie,
+        max(CAST_INFO.values()),
+    )
+
+
 def load_company_name_rows(path: Path, needed_company_ids: Set[int]) -> List[List[str]]:
     rows: List[List[str]] = []
 
@@ -443,14 +588,38 @@ def load_company_name_rows(path: Path, needed_company_ids: Set[int]) -> List[Lis
     return rows
 
 
+def load_rows_by_id(path: Path, id_col: int, needed_ids: Set[int]) -> List[List[str]]:
+    rows: List[List[str]] = []
+
+    for row in read_csv_rows(path):
+        if len(row) <= id_col:
+            continue
+
+        row_id = parse_int(row[id_col])
+        if row_id is not None and row_id in needed_ids:
+            rows.append(row)
+
+    return rows
+
+
 def emit_imdb_txt(
     output: Path,
     selected_titles: Sequence[List[str]],
     kind_type: Dict[int, str],
+    info_type: Dict[int, str],
     company_type: Dict[int, str],
+    role_type: Dict[int, str],
     movie_company_rows: Sequence[List[str]],
     company_name_rows: Sequence[List[str]],
+    movie_info_rows: Sequence[List[str]],
+    movie_info_idx_rows: Sequence[List[str]],
+    movie_keyword_rows: Sequence[List[str]],
+    keyword_rows: Sequence[List[str]],
+    cast_info_rows: Sequence[List[str]],
+    name_rows: Sequence[List[str]],
+    char_name_rows: Sequence[List[str]],
     sort_description: str,
+    extended_schema: bool,
 ) -> None:
     used_kind_ids = {
         parse_int(row[TITLE["kind_id"]])
@@ -469,10 +638,37 @@ def emit_imdb_txt(
         for company_type_id in used_company_type_ids
         if company_type_id is not None
     }
+    used_info_type_ids = {
+        parse_int(row[MOVIE_INFO["info_type_id"]])
+        for row in movie_info_rows
+        if len(row) > MOVIE_INFO["info_type_id"]
+    } | {
+        parse_int(row[MOVIE_INFO_IDX["info_type_id"]])
+        for row in movie_info_idx_rows
+        if len(row) > MOVIE_INFO_IDX["info_type_id"]
+    }
+    used_info_type_ids = {
+        info_type_id
+        for info_type_id in used_info_type_ids
+        if info_type_id is not None
+    }
+    used_role_type_ids = {
+        parse_int(row[CAST_INFO["role_id"]])
+        for row in cast_info_rows
+        if len(row) > CAST_INFO["role_id"]
+    }
+    used_role_type_ids = {
+        role_type_id
+        for role_type_id in used_role_type_ids
+        if role_type_id is not None
+    }
 
     with output.open("w", encoding="utf-8") as out:
         out.write("# Generated from Join Order Benchmark IMDb CSV data.\n")
-        out.write("# Simplified v47 schema: no movie_info or movie_info_idx output tables.\n")
+        if extended_schema:
+            out.write("# Large optimizer schema: title/company/info/keyword/cast tables.\n")
+        else:
+            out.write("# Simplified v47 schema: no movie_info or movie_info_idx output tables.\n")
         out.write("# Format: table_name|field1|field2|...\n")
         out.write(f"# Selection: {sort_description}\n\n")
 
@@ -487,6 +683,21 @@ def emit_imdb_txt(
             )
         out.write("\n")
 
+        if extended_schema:
+            for info_type_id in sorted(used_info_type_ids):
+                out.write(
+                    f"info_type|{info_type_id}|"
+                    f"{clean_string(info_type.get(info_type_id, 'unknown'))}\n"
+                )
+            out.write("\n")
+
+            for role_type_id in sorted(used_role_type_ids):
+                out.write(
+                    f"role_type|{role_type_id}|"
+                    f"{clean_string(role_type.get(role_type_id, 'unknown'))}\n"
+                )
+            out.write("\n")
+
         for row in company_name_rows:
             out.write(
                 f"company_name|{row[COMPANY_NAME['id']]}|"
@@ -494,6 +705,32 @@ def emit_imdb_txt(
                 f"{clean_string(row[COMPANY_NAME['country_code']])}\n"
             )
         out.write("\n")
+
+        if extended_schema:
+            for row in name_rows:
+                gender = "unknown"
+                if len(row) > NAME["gender"]:
+                    gender = clean_string(row[NAME["gender"]])
+                out.write(
+                    f"name|{row[NAME['id']]}|"
+                    f"{clean_string(row[NAME['name']])}|"
+                    f"{gender}\n"
+                )
+            out.write("\n")
+
+            for row in char_name_rows:
+                out.write(
+                    f"char_name|{row[CHAR_NAME['id']]}|"
+                    f"{clean_string(row[CHAR_NAME['name']])}\n"
+                )
+            out.write("\n")
+
+            for row in keyword_rows:
+                out.write(
+                    f"keyword|{row[KEYWORD['id']]}|"
+                    f"{clean_string(row[KEYWORD['keyword']])}\n"
+                )
+            out.write("\n")
 
         for row in selected_titles:
             out.write(
@@ -517,22 +754,74 @@ def emit_imdb_txt(
                 f"{note}\n"
             )
 
+        if extended_schema:
+            out.write("\n")
+            for row in movie_info_rows:
+                out.write(
+                    f"movie_info|{row[MOVIE_INFO['id']]}|"
+                    f"{row[MOVIE_INFO['movie_id']]}|"
+                    f"{row[MOVIE_INFO['info_type_id']]}|"
+                    f"{clean_string(row[MOVIE_INFO['info']])}\n"
+                )
+
+            out.write("\n")
+            for row in movie_info_idx_rows:
+                out.write(
+                    f"movie_info_idx|{row[MOVIE_INFO_IDX['id']]}|"
+                    f"{row[MOVIE_INFO_IDX['movie_id']]}|"
+                    f"{row[MOVIE_INFO_IDX['info_type_id']]}|"
+                    f"{clean_string(row[MOVIE_INFO_IDX['info']])}\n"
+                )
+
+            out.write("\n")
+            for row in movie_keyword_rows:
+                out.write(
+                    f"movie_keyword|{row[MOVIE_KEYWORD['id']]}|"
+                    f"{row[MOVIE_KEYWORD['movie_id']]}|"
+                    f"{row[MOVIE_KEYWORD['keyword_id']]}\n"
+                )
+
+            out.write("\n")
+            for row in cast_info_rows:
+                out.write(
+                    f"cast_info|{row[CAST_INFO['id']]}|"
+                    f"{row[CAST_INFO['person_id']]}|"
+                    f"{row[CAST_INFO['movie_id']]}|"
+                    f"{int_or_zero(row[CAST_INFO['person_role_id']])}|"
+                    f"{row[CAST_INFO['role_id']]}\n"
+                )
+
 
 def build_output(
     output: Path,
     title_csv: Path,
     movie_companies_csv: Path,
     company_name_csv: Path,
+    movie_info_csv: Path,
+    movie_info_idx_csv: Path,
+    keyword_csv: Path,
+    movie_keyword_csv: Path,
+    role_type_csv: Path,
+    name_csv: Path,
+    char_name_csv: Path,
+    cast_info_csv: Path,
     kind_type: Dict[int, str],
+    info_type: Dict[int, str],
     company_type: Dict[int, str],
+    role_type: Dict[int, str],
     movie_kind_ids: Set[int],
     movie_ids_with_companies: Set[int],
     popularity_metrics: Dict[int, Tuple[int, float, int]],
     limit: int,
     min_votes: int,
     max_companies_per_movie: int,
+    max_info_per_movie: int,
+    max_info_idx_per_movie: int,
+    max_keywords_per_movie: int,
+    max_cast_per_movie: int,
     sort: str,
     label: str,
+    extended_schema: bool,
 ) -> None:
     selected_titles = select_titles(
         title_csv,
@@ -579,6 +868,64 @@ def build_output(
     needed_company_ids = {company_id for company_id in needed_company_ids if company_id is not None}
 
     company_name_rows = load_company_name_rows(company_name_csv, needed_company_ids)
+    movie_info_rows: List[List[str]] = []
+    movie_info_idx_rows: List[List[str]] = []
+    movie_keyword_rows: List[List[str]] = []
+    keyword_rows: List[List[str]] = []
+    cast_info_rows: List[List[str]] = []
+    name_rows: List[List[str]] = []
+    char_name_rows: List[List[str]] = []
+
+    if extended_schema:
+        movie_info_rows = filter_movie_info(
+            movie_info_csv,
+            selected_movie_ids,
+            max_info_per_movie,
+        )
+        movie_info_idx_rows = filter_movie_info_idx(
+            movie_info_idx_csv,
+            selected_movie_ids,
+            max_info_idx_per_movie,
+        )
+        movie_keyword_rows = filter_movie_keywords(
+            movie_keyword_csv,
+            selected_movie_ids,
+            max_keywords_per_movie,
+        )
+        cast_info_rows = filter_cast_info(
+            cast_info_csv,
+            selected_movie_ids,
+            max_cast_per_movie,
+        )
+
+        needed_keyword_ids = {
+            parse_int(row[MOVIE_KEYWORD["keyword_id"]])
+            for row in movie_keyword_rows
+            if len(row) > MOVIE_KEYWORD["keyword_id"]
+        }
+        needed_keyword_ids = {
+            keyword_id for keyword_id in needed_keyword_ids if keyword_id is not None
+        }
+        needed_person_ids = {
+            parse_int(row[CAST_INFO["person_id"]])
+            for row in cast_info_rows
+            if len(row) > CAST_INFO["person_id"]
+        }
+        needed_person_ids = {
+            person_id for person_id in needed_person_ids if person_id is not None
+        }
+        needed_char_ids = {
+            parse_int(row[CAST_INFO["person_role_id"]])
+            for row in cast_info_rows
+            if len(row) > CAST_INFO["person_role_id"]
+        }
+        needed_char_ids = {
+            char_id for char_id in needed_char_ids if char_id is not None
+        }
+
+        keyword_rows = load_rows_by_id(keyword_csv, KEYWORD["id"], needed_keyword_ids)
+        name_rows = load_rows_by_id(name_csv, NAME["id"], needed_person_ids)
+        char_name_rows = load_rows_by_id(char_name_csv, CHAR_NAME["id"], needed_char_ids)
 
     sort_description = (
         "popular movies using movie_info_idx internally"
@@ -590,15 +937,33 @@ def build_output(
         output,
         selected_titles,
         kind_type,
+        info_type,
         company_type,
+        role_type,
         movie_company_rows,
         company_name_rows,
+        movie_info_rows,
+        movie_info_idx_rows,
+        movie_keyword_rows,
+        keyword_rows,
+        cast_info_rows,
+        name_rows,
+        char_name_rows,
         sort_description,
+        extended_schema,
     )
 
     log(f"[{label}] wrote {len(selected_titles)} titles to {output}")
     log(f"[{label}] included {len(company_name_rows)} company_name rows")
     log(f"[{label}] included {len(movie_company_rows)} movie_companies rows")
+    if extended_schema:
+        log(f"[{label}] included {len(movie_info_rows)} movie_info rows")
+        log(f"[{label}] included {len(movie_info_idx_rows)} movie_info_idx rows")
+        log(f"[{label}] included {len(movie_keyword_rows)} movie_keyword rows")
+        log(f"[{label}] included {len(keyword_rows)} keyword rows")
+        log(f"[{label}] included {len(cast_info_rows)} cast_info rows")
+        log(f"[{label}] included {len(name_rows)} name rows")
+        log(f"[{label}] included {len(char_name_rows)} char_name rows")
 
 
 def main() -> None:
@@ -619,6 +984,10 @@ def main() -> None:
     parser.add_argument("--large-min-votes", type=int, default=0)
     parser.add_argument("--large-max-companies-per-movie", type=int, default=8,
                         help="Use -1 to keep all movie_companies rows for each selected movie.")
+    parser.add_argument("--large-max-info-per-movie", type=int, default=6)
+    parser.add_argument("--large-max-info-idx-per-movie", type=int, default=4)
+    parser.add_argument("--large-max-keywords-per-movie", type=int, default=5)
+    parser.add_argument("--large-max-cast-per-movie", type=int, default=8)
 
     parser.add_argument("--sort", choices=["popular", "recent"], default="popular")
 
@@ -634,6 +1003,7 @@ def main() -> None:
     kind_type = load_id_name_table(csv_dir / "kind_type.csv", KIND_TYPE["id"], KIND_TYPE["kind"])
     info_type = load_id_name_table(csv_dir / "info_type.csv", INFO_TYPE["id"], INFO_TYPE["info"])
     company_type = load_id_name_table(csv_dir / "company_type.csv", COMPANY_TYPE["id"], COMPANY_TYPE["kind"])
+    role_type = load_id_name_table(csv_dir / "role_type.csv", ROLE_TYPE["id"], ROLE_TYPE["role"])
 
     movie_kind_ids = find_movie_kind_ids(kind_type)
     movie_ids_with_companies = load_movie_ids_with_companies(csv_dir / "movie_companies.csv")
@@ -645,16 +1015,31 @@ def main() -> None:
             csv_dir / "title.csv",
             csv_dir / "movie_companies.csv",
             csv_dir / "company_name.csv",
+            csv_dir / "movie_info.csv",
+            csv_dir / "movie_info_idx.csv",
+            csv_dir / "keyword.csv",
+            csv_dir / "movie_keyword.csv",
+            csv_dir / "role_type.csv",
+            csv_dir / "name.csv",
+            csv_dir / "char_name.csv",
+            csv_dir / "cast_info.csv",
             kind_type,
+            info_type,
             company_type,
+            role_type,
             movie_kind_ids,
             movie_ids_with_companies,
             popularity_metrics,
             args.small_limit,
             args.small_min_votes,
             args.small_max_companies_per_movie,
+            0,
+            0,
+            0,
+            0,
             args.sort,
             "small",
+            False,
         )
 
     if args.mode in {"large", "both"}:
@@ -663,16 +1048,31 @@ def main() -> None:
             csv_dir / "title.csv",
             csv_dir / "movie_companies.csv",
             csv_dir / "company_name.csv",
+            csv_dir / "movie_info.csv",
+            csv_dir / "movie_info_idx.csv",
+            csv_dir / "keyword.csv",
+            csv_dir / "movie_keyword.csv",
+            csv_dir / "role_type.csv",
+            csv_dir / "name.csv",
+            csv_dir / "char_name.csv",
+            csv_dir / "cast_info.csv",
             kind_type,
+            info_type,
             company_type,
+            role_type,
             movie_kind_ids,
             movie_ids_with_companies,
             popularity_metrics,
             args.large_limit,
             args.large_min_votes,
             args.large_max_companies_per_movie,
+            args.large_max_info_per_movie,
+            args.large_max_info_idx_per_movie,
+            args.large_max_keywords_per_movie,
+            args.large_max_cast_per_movie,
             args.sort,
             "large",
+            True,
         )
 
 
