@@ -81,9 +81,6 @@ public:
             return *this;
         }
         type = other.type;
-        if (data_length != other.data_length) {
-            data = std::make_unique<char[]>(other.data_length);
-        }
         data_length = other.data_length;
         std::memcpy(data.get(), other.data.get(), data_length);
         return *this;
@@ -4754,6 +4751,15 @@ public:
 
 };
 
+std::vector<std::unique_ptr<Field>> cloneTupleFields(
+    const std::vector<std::unique_ptr<Field>>& fields) {
+    std::vector<std::unique_ptr<Field>> cloned;
+    for (const auto& field : fields) {
+        cloned.push_back(field->clone());
+    }
+    return cloned;
+}
+
 enum class PhysicalJoinKind {
     NestedLoopJoin,
     HashJoin,
@@ -4840,7 +4846,7 @@ public:
             return false;
         }
 
-        currentOutput = cloneFields(tuples[output_index++]);
+        currentOutput = cloneTupleFields(tuples[output_index++]);
         has_next = true;
         return true;
     }
@@ -4857,17 +4863,7 @@ public:
         if (!has_next) {
             return {};
         }
-        return cloneFields(currentOutput);
-    }
-
-private:
-    static std::vector<std::unique_ptr<Field>> cloneFields(
-        const std::vector<std::unique_ptr<Field>>& fields) {
-        std::vector<std::unique_ptr<Field>> cloned;
-        for (const auto& field : fields) {
-            cloned.push_back(field->clone());
-        }
-        return cloned;
+        return cloneTupleFields(currentOutput);
     }
 };
 
@@ -5087,7 +5083,7 @@ public:
         while (true) {
             if (has_match_group && matchingRightTupleIndex < matchingRightTupleEnd) {
                 const auto& right_tuple = rightTuples[matchingRightTupleIndex++];
-                currentOutput = cloneFields(currentLeftTuple);
+                currentOutput = cloneTupleFields(currentLeftTuple);
                 for (const auto& field : right_tuple) {
                     currentOutput.push_back(field->clone());
                 }
@@ -5150,17 +5146,7 @@ public:
         if (!has_next) {
             return {};
         }
-        return cloneFields(currentOutput);
-    }
-
-private:
-    static std::vector<std::unique_ptr<Field>> cloneFields(
-        const std::vector<std::unique_ptr<Field>>& fields) {
-        std::vector<std::unique_ptr<Field>> cloned;
-        for (const auto& field : fields) {
-            cloned.push_back(field->clone());
-        }
-        return cloned;
+        return cloneTupleFields(currentOutput);
     }
 };
 
@@ -5222,7 +5208,7 @@ public:
                     continue;
                 }
 
-                currentOutput = cloneFields(currentLeftTuple);
+                currentOutput = cloneTupleFields(currentLeftTuple);
                 for (const auto& field : right_tuple) {
                     currentOutput.push_back(field->clone());
                 }
@@ -5253,15 +5239,6 @@ public:
         return outputCopy;
     }
 
-private:
-    static std::vector<std::unique_ptr<Field>> cloneFields(
-        const std::vector<std::unique_ptr<Field>>& fields) {
-        std::vector<std::unique_ptr<Field>> cloned;
-        for (const auto& field : fields) {
-            cloned.push_back(field->clone());
-        }
-        return cloned;
-    }
 };
 
 enum class AggrFuncType { COUNT, MAX, MIN, SUM };
@@ -7099,10 +7076,6 @@ std::vector<RangeValidation> chooseRangeValidations(
     };
 
     for (const auto& preferred : preferred_columns) {
-        if (components.tableAliases.find(preferred.first) ==
-            components.tableAliases.end()) {
-            continue;
-        }
         const auto& table_stats = tableStatsFor(stats, components, preferred.first);
         auto column_it = table_stats.columns.find(preferred.second);
         if (column_it == table_stats.columns.end() ||
@@ -7260,8 +7233,10 @@ struct PhysicalJoinCostStep {
     JoinClause join;
     double leftRows = 0.0;
     double leftPages = 0.0;
+    double leftTotalCost = 0.0;
     double rightRows = 0.0;
     double rightPages = 0.0;
+    double rightAccessCost = 0.0;
     double outputRows = 0.0;
     double outputPages = 0.0;
     double nestedLoopCost = 0.0;
@@ -7292,6 +7267,10 @@ double pagesAfterFilters(const TableStats& table_stats, double filtered_rows) {
     return std::max(1.0, static_cast<double>(table_stats.pageCount) * page_fraction);
 }
 
+double fileScanCost(const TableStats& table_stats) {
+    return std::max(1.0, static_cast<double>(table_stats.pageCount));
+}
+
 double joinedOutputPages(double output_rows,
                          double left_rows,
                          double left_pages,
@@ -7307,10 +7286,19 @@ double joinedOutputPages(double output_rows,
 }
 
 double sortCost(double pages) {
-    if (pages <= 1.0) {
-        return pages;
-    }
-    return pages * std::log2(pages);
+    return 4.0 * std::max(1.0, pages);
+}
+
+double tupleCompareCost(double rows) {
+    return 0.01 * std::max(1.0, rows);
+}
+
+double tupleHashCost(double rows) {
+    return 0.05 * std::max(1.0, rows);
+}
+
+double tupleMaterializationCost(double rows) {
+    return 0.10 * std::max(1.0, rows);
 }
 
 PhysicalJoinKind chooseCheapestJoin(const PhysicalJoinCostStep& step) {
@@ -7344,6 +7332,7 @@ PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
                                               const JoinClause& join,
                                               double current_rows,
                                               double current_pages,
+                                              double current_total_cost,
                                               bool ordered_output_required = false) {
     const auto& right_stats = tableStatsFor(stats, components, join.tableName);
     double right_rows = estimateRowsAfterTableFilters(
@@ -7370,20 +7359,25 @@ PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
     step.join = join;
     step.leftRows = current_rows;
     step.leftPages = current_pages;
+    step.leftTotalCost = current_total_cost;
     step.rightRows = right_rows;
     step.rightPages = right_pages;
+    step.rightAccessCost = fileScanCost(right_stats);
     step.outputRows = output_rows;
     step.outputPages = output_pages;
-    // Sort-merge can satisfy an ordered parent without a final output sort.
+    // Charge the simple operators for the tuple work they actually do.
     double final_sort_cost = ordered_output_required ? sortCost(output_pages) : 0.0;
     step.orderedOutputRequired = ordered_output_required;
-    step.nestedLoopCost =
-        current_pages + current_rows * right_pages + output_pages + final_sort_cost;
-    step.hashJoinCost =
-        current_pages + right_pages + output_pages + 0.1 * right_pages + final_sort_cost;
-    step.sortMergeCost =
+    step.nestedLoopCost = current_total_cost + step.rightAccessCost +
+        tupleCompareCost(current_rows * right_rows) +
+        tupleMaterializationCost(output_rows) + final_sort_cost;
+    step.hashJoinCost = current_total_cost + step.rightAccessCost +
+        tupleHashCost(current_rows + right_rows) +
+        tupleMaterializationCost(output_rows) + final_sort_cost;
+    step.sortMergeCost = current_total_cost + step.rightAccessCost +
         sortCost(current_pages) + sortCost(right_pages) +
-        current_pages + right_pages + output_pages;
+        tupleCompareCost(current_rows + right_rows) +
+        tupleMaterializationCost(output_rows);
     step.chosen = chooseCheapestJoin(step);
     return step;
 }
@@ -7396,6 +7390,7 @@ PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
         const auto& base_stats = tableStatsFor(stats, components, components.tableName);
         plan.finalRows = estimateRowsAfterTableFilters(stats, components, components.tableName);
         plan.finalPages = pagesAfterFilters(base_stats, plan.finalRows);
+        plan.totalCost = fileScanCost(base_stats);
         return plan;
     }
 
@@ -7406,6 +7401,7 @@ PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
         components.tableName
     );
     double current_pages = pagesAfterFilters(base_stats, current_rows);
+    double current_total_cost = fileScanCost(base_stats);
 
     for (const auto& join : components.joins) {
         auto step = estimatePhysicalJoinStep(
@@ -7414,14 +7410,16 @@ PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
             join,
             current_rows,
             current_pages,
+            current_total_cost,
             ordered_output_required
         );
 
         plan.joinKinds.push_back(step.chosen);
-        plan.totalCost += costForKind(step, step.chosen);
+        plan.totalCost = costForKind(step, step.chosen);
         plan.steps.push_back(step);
         current_rows = step.outputRows;
         current_pages = step.outputPages;
+        current_total_cost = plan.totalCost;
     }
 
     plan.finalRows = current_rows;
@@ -7470,6 +7468,7 @@ PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
     std::set<std::string> joined_tables;
     double current_rows = 0.0;
     double current_pages = 0.0;
+    double current_total_cost = 0.0;
 
     std::optional<std::pair<std::string, PhysicalJoinCostStep>> best_first_join;
     for (const auto& edge : edges) {
@@ -7486,12 +7485,14 @@ PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
                 start_table
             );
             double start_pages = pagesAfterFilters(start_stats, start_rows);
+            double start_total_cost = fileScanCost(start_stats);
             auto step = estimatePhysicalJoinStep(
                 components,
                 stats,
                 *oriented,
                 start_rows,
                 start_pages,
+                start_total_cost,
                 ordered_output_required
             );
             if (!best_first_join ||
@@ -7515,7 +7516,7 @@ PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
     planned.joins.clear();
     planned.joins.push_back(best_first_join->second.join);
     physical_plan.joinKinds.push_back(best_first_join->second.chosen);
-    physical_plan.totalCost += costForKind(
+    physical_plan.totalCost = costForKind(
         best_first_join->second,
         best_first_join->second.chosen
     );
@@ -7524,6 +7525,7 @@ PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
     joined_tables.insert(best_first_join->second.join.tableName);
     current_rows = best_first_join->second.outputRows;
     current_pages = best_first_join->second.outputPages;
+    current_total_cost = physical_plan.totalCost;
 
     while (joined_tables.size() < table_names.size()) {
         std::optional<PhysicalJoinCostStep> best_step;
@@ -7538,6 +7540,7 @@ PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
                 *oriented,
                 current_rows,
                 current_pages,
+                current_total_cost,
                 ordered_output_required
             );
             if (!best_step ||
@@ -7557,11 +7560,12 @@ PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
 
         planned.joins.push_back(best_step->join);
         physical_plan.joinKinds.push_back(best_step->chosen);
-        physical_plan.totalCost += costForKind(*best_step, best_step->chosen);
+        physical_plan.totalCost = costForKind(*best_step, best_step->chosen);
         physical_plan.steps.push_back(*best_step);
         joined_tables.insert(best_step->join.tableName);
         current_rows = best_step->outputRows;
         current_pages = best_step->outputPages;
+        current_total_cost = physical_plan.totalCost;
     }
 
     physical_plan.finalRows = current_rows;
@@ -7604,9 +7608,13 @@ void printPhysicalJoinCosts(const QueryComponents& components,
     }
 
     std::cout << "\nPhysical join costing for cost-based order:" << std::endl;
-    std::cout << "  # cost is estimated page work; nested loop uses left_rows * right_pages"
+    std::cout << "  # cost is relative operator work for this tuple-at-a-time BuzzDB executor"
               << std::endl;
-    std::cout << "  # if ordered output is required, Hash/NL include a final Sort"
+    std::cout << "  # NestedLoopJoin materializes the right side once, then compares left_rows * right_rows"
+              << std::endl;
+    std::cout << "  # HashJoin scans/builds the right side once, then probes with the left stream"
+              << std::endl;
+    std::cout << "  # SortMergeJoin uses in-memory Sort operators before merge"
               << std::endl;
     std::cout << "  chosen join order: "
               << joinStrings(writtenJoinOrder(components), " -> ")
@@ -7616,9 +7624,13 @@ void printPhysicalJoinCosts(const QueryComponents& components,
         std::cout << "    inputs: left rows/pages="
                   << formatEstimate(step.leftRows) << "/"
                   << formatEstimate(step.leftPages)
+                  << " left total="
+                  << formatEstimate(step.leftTotalCost)
                   << " right rows/pages="
                   << formatEstimate(step.rightRows) << "/"
                   << formatEstimate(step.rightPages)
+                  << " right access="
+                  << formatEstimate(step.rightAccessCost)
                   << std::endl;
         std::cout << "    output rows/pages="
                   << formatEstimate(step.outputRows) << "/"
@@ -9219,14 +9231,6 @@ std::string jobJoinBodyQuery() {
         "AND {miidx.movie_id} = {mc.movie_id}";
 }
 
-std::string sortedRatingJoinQuery() {
-    return
-        "PROJECT {t.id}, {t.title}, {miidx.info} "
-        "FROM title AS t "
-        "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
-        "WHERE {miidx.info_type_id} = 101";
-}
-
 void printSampleRows(const QueryTable& rows, size_t limit) {
     for (size_t row_index = 0; row_index < rows.size() && row_index < limit; row_index++) {
         std::cout << "  ";
@@ -9235,41 +9239,6 @@ void printSampleRows(const QueryTable& rows, size_t limit) {
         }
         std::cout << std::endl;
     }
-}
-
-bool queryTablesEqual(const QueryTable& left, const QueryTable& right) {
-    if (left.size() != right.size()) {
-        return false;
-    }
-    for (size_t row_index = 0; row_index < left.size(); row_index++) {
-        if (left[row_index].fields.size() != right[row_index].fields.size()) {
-            return false;
-        }
-        for (size_t field_index = 0;
-             field_index < left[row_index].fields.size();
-             field_index++) {
-            if (!(*left[row_index].fields[field_index] ==
-                  *right[row_index].fields[field_index])) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool queryTableSortedByColumn(const QueryTable& rows, size_t column_index) {
-    for (size_t row_index = 1; row_index < rows.size(); row_index++) {
-        if (column_index >= rows[row_index - 1].fields.size() ||
-            column_index >= rows[row_index].fields.size()) {
-            throw std::runtime_error("Sort check column is out of range.");
-        }
-        if (compareFields(
-                *rows[row_index - 1].fields[column_index],
-                *rows[row_index].fields[column_index]) > 0) {
-            return false;
-        }
-    }
-    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -9305,59 +9274,6 @@ int main(int argc, char* argv[]) {
     std::cout << "  Output rows: " << rows.size() << std::endl;
     std::cout << "  Sample rows:" << std::endl;
     printSampleRows(rows, 5);
-
-    std::cout << "\nSmaller sorted-output join" << std::endl;
-    std::cout << "  Workload: title/rating join where ordered output makes sort-merge cheaper"
-              << std::endl;
-    db.explainQuery(sortedRatingJoinQuery());
-    db.printStatsAndEstimates(
-        sortedRatingJoinQuery(),
-        sortedRatingJoinQuery(),
-        query_txn,
-        true
-    );
-
-    std::cout << "\nForced physical plan timing for smaller query:" << std::endl;
-    std::cout << "  Hash plan: Project(Sort(HashJoin(Scan(t), Scan(miidx))))"
-              << std::endl;
-    auto hash_sort_start = std::chrono::steady_clock::now();
-    auto hash_sort_rows = db.executeQuery(
-        sortedRatingJoinQuery(),
-        query_txn,
-        false,
-        {PhysicalJoinKind::HashJoin},
-        {0}
-    );
-    auto hash_sort_end = std::chrono::steady_clock::now();
-
-    std::cout << "  Sort-merge plan: "
-              << "Project(SortMergeJoin(Sort(Scan(t)), Sort(Scan(miidx))))"
-              << std::endl;
-    auto sort_merge_start = std::chrono::steady_clock::now();
-    auto sort_merge_rows = db.executeQuery(
-        sortedRatingJoinQuery(),
-        query_txn,
-        false,
-        {PhysicalJoinKind::SortMergeJoin}
-    );
-    auto sort_merge_end = std::chrono::steady_clock::now();
-
-    std::cout << "  Hash+Sort rows: " << hash_sort_rows.size() << std::endl;
-    std::cout << "  SortMerge rows: " << sort_merge_rows.size() << std::endl;
-    std::cout << "  Same cardinality: "
-              << (hash_sort_rows.size() == sort_merge_rows.size() ? "yes" : "no")
-              << std::endl;
-    std::cout << "  Same ordered output rows: "
-              << (queryTablesEqual(hash_sort_rows, sort_merge_rows) ? "yes" : "no")
-              << std::endl;
-    std::cout << "  Hash+Sort output sorted by t.id: "
-              << (queryTableSortedByColumn(hash_sort_rows, 0) ? "yes" : "no")
-              << std::endl;
-    std::cout << "  SortMerge output sorted by t.id: "
-              << (queryTableSortedByColumn(sort_merge_rows, 0) ? "yes" : "no")
-              << std::endl;
-    std::cout << "  Sample rows:" << std::endl;
-    printSampleRows(sort_merge_rows, 5);
     db.commit(query_txn);
     std::cout << "\nTiming:" << std::endl;
     if (seed_database) {
@@ -9367,12 +9283,6 @@ int main(int argc, char* argv[]) {
         std::cout << "  Load: skipped; database already exists" << std::endl;
     }
     std::cout << "  JOB query: " << elapsedMs(query_start, query_end)
-              << " ms" << std::endl;
-    std::cout << "  Hash+Sort smaller query: "
-              << elapsedMs(hash_sort_start, hash_sort_end)
-              << " ms" << std::endl;
-    std::cout << "  SortMerge smaller query: "
-              << elapsedMs(sort_merge_start, sort_merge_end)
               << " ms" << std::endl;
 
     return 0;

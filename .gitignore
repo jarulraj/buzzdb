@@ -37,9 +37,10 @@ page.dat
 buzzdb.dat
 buzzdb.log
 buzzdb.master
-pgm.txt
+pgm.txtGi
 pgm.cpp
 
 myenv/*
 job_imdb_data/*
 imdb_large.txt
+refs/*
