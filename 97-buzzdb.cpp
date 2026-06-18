@@ -7196,19 +7196,7 @@ void printHistogramRangeValidation(const QueryComponents& components,
 
     std::cout << "\nHistogram range validation:" << std::endl;
     for (const auto& validation : validations) {
-        const auto& table_stats = tableStatsFor(
-            stats,
-            components,
-            validation.column.tableName
-        );
         const auto& column_stats = columnStatsFor(stats, components, validation.column);
-        auto base_rows = static_cast<double>(table_stats.rowCount);
-        auto uniform_estimate = estimateRangeRowsUniform(
-            column_stats,
-            validation.lower,
-            validation.upper,
-            base_rows
-        );
         auto width_estimate = estimateRangeRowsFromBuckets(
             column_stats.equiWidthBuckets,
             validation.lower,
@@ -7231,10 +7219,7 @@ void printHistogramRangeValidation(const QueryComponents& components,
         std::cout << "  " << columnLabel(validation.column)
                   << " BETWEEN " << validation.lower
                   << " AND " << validation.upper
-                  << ": uniform=" << formatEstimate(uniform_estimate)
-                  << " q-error="
-                  << formatQError(uniform_estimate, static_cast<double>(actual))
-                  << " equi-width=" << formatEstimate(width_estimate)
+                  << ": equi-width=" << formatEstimate(width_estimate)
                   << " q-error="
                   << formatQError(width_estimate, static_cast<double>(actual))
                   << " equi-depth=" << formatEstimate(depth_estimate)
@@ -7251,45 +7236,29 @@ void printHistogramRangeValidation(const QueryComponents& components,
     }
 }
 
-std::pair<double, double> printCardinalityEstimates(const QueryComponents& components,
-                                                    const StatisticsCatalog& stats) {
+double printCardinalityEstimates(const QueryComponents& components,
+                                 const StatisticsCatalog& stats) {
     std::cout << "\nEstimated cardinalities with top-k MCV filters:" << std::endl;
-    std::map<std::string, double> uniform_table_rows;
     std::map<std::string, double> mcv_table_rows;
     for (const auto& table_name : writtenJoinOrder(components)) {
         auto base_rows = static_cast<double>(
             tableStatsFor(stats, components, table_name).rowCount
-        );
-        auto uniform_rows = estimateRowsAfterTableFilters(
-            stats,
-            components,
-            table_name,
-            false
         );
         auto mcv_rows = estimateRowsAfterTableFilters(
             stats,
             components,
             table_name
         );
-        uniform_table_rows[table_name] = uniform_rows;
         mcv_table_rows[table_name] = mcv_rows;
         std::cout << "  " << table_name << " scan/filter: "
-                  << "uniform=" << formatEstimate(uniform_rows)
-                  << " mcv=" << formatEstimate(mcv_rows)
+                  << "rows=" << formatEstimate(mcv_rows)
                   << " from " << formatEstimate(base_rows)
                   << std::endl;
     }
 
-    double uniform_rows = uniform_table_rows[components.tableName];
     double mcv_rows = mcv_table_rows[components.tableName];
     std::set<std::string> seen_tables{components.tableName};
     for (const auto& join : components.joins) {
-        uniform_rows = estimateJoinRows(
-            uniform_rows,
-            uniform_table_rows[join.tableName],
-            columnStatsFor(stats, components, join.left),
-            columnStatsFor(stats, components, join.right)
-        );
         mcv_rows = estimateJoinRows(
             mcv_rows,
             mcv_table_rows[join.tableName],
@@ -7298,8 +7267,7 @@ std::pair<double, double> printCardinalityEstimates(const QueryComponents& compo
         );
         seen_tables.insert(join.tableName);
         std::cout << "  join " << joinLabel(join) << ": "
-                  << "uniform=" << formatEstimate(uniform_rows)
-                  << " mcv=" << formatEstimate(mcv_rows)
+                  << "rows=" << formatEstimate(mcv_rows)
                   << std::endl;
     }
     for (const auto& equality : components.columnEqualities) {
@@ -7313,11 +7281,10 @@ std::pair<double, double> printCardinalityEstimates(const QueryComponents& compo
                   << ": graph edge, not an independent selectivity factor"
                   << std::endl;
     }
-    std::cout << "  final join body estimate: uniform="
-              << formatEstimate(uniform_rows)
-              << " mcv=" << formatEstimate(mcv_rows)
+    std::cout << "  final join body estimate: "
+              << formatEstimate(mcv_rows)
               << std::endl;
-    return {uniform_rows, mcv_rows};
+    return mcv_rows;
 }
 
 struct PhysicalJoinCostStep {
@@ -7610,31 +7577,6 @@ PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components
         tupleMaterializationCost(output_rows);
     step.chosen = chooseCheapestJoin(step);
     return step;
-}
-
-void applyTrueOutputRows(PhysicalJoinCostStep& step, double output_rows) {
-    step.outputRows = std::max(1.0, output_rows);
-    step.outputPages = joinedOutputPages(
-        step.outputRows,
-        step.leftRows,
-        step.leftPages,
-        step.rightRows,
-        step.rightPages
-    );
-    double final_sort_cost = step.orderedOutputRequired
-        ? sortCost(step.outputPages)
-        : 0.0;
-    step.nestedLoopCost = step.leftTotalCost + step.rightAccessCost +
-        tupleCompareCost(step.leftRows * step.rightRows) +
-        tupleMaterializationCost(step.outputRows) + final_sort_cost;
-    step.hashJoinCost = step.leftTotalCost + step.rightAccessCost +
-        tupleHashCost(step.leftRows + step.rightRows) +
-        tupleMaterializationCost(step.outputRows) + final_sort_cost;
-    step.sortMergeCost = step.leftTotalCost + step.rightAccessCost +
-        sortCost(step.leftPages) + sortCost(step.rightPages) +
-        tupleCompareCost(step.leftRows + step.rightRows) +
-        tupleMaterializationCost(step.outputRows);
-    step.chosen = chooseCheapestJoin(step);
 }
 
 PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
@@ -8092,8 +8034,7 @@ bool isConnectedMask(uint64_t mask, const std::vector<uint64_t>& adjacency) {
 
 PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
                                            const StatisticsCatalog& stats,
-                                           bool ordered_output_required = false,
-                                           const std::map<uint64_t, double>* true_rows_by_mask = nullptr) {
+                                           bool ordered_output_required = false) {
     auto table_names = writtenJoinOrder(components);
     if (table_names.size() <= 1 || table_names.size() >= 63) {
         return {components, choosePhysicalJoinPlan(
@@ -8112,23 +8053,6 @@ PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
             stats,
             table_names[table_index]
         );
-        if (true_rows_by_mask) {
-            auto actual = true_rows_by_mask->find(table_mask);
-            if (actual != true_rows_by_mask->end()) {
-                const auto& table_stats = tableStatsFor(
-                    stats,
-                    components,
-                    table_names[table_index]
-                );
-                best[table_mask]->physicalPlan.finalRows = std::max(1.0, actual->second);
-                best[table_mask]->physicalPlan.finalPages = pagesAfterFilters(
-                    table_stats,
-                    best[table_mask]->physicalPlan.finalRows
-                );
-                best[table_mask]->planRoot->rows = best[table_mask]->physicalPlan.finalRows;
-                best[table_mask]->planRoot->pages = best[table_mask]->physicalPlan.finalPages;
-            }
-        }
     }
 
     auto edges = joinGraphEdges(components);
@@ -8179,12 +8103,6 @@ PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
                     best[right_mask]->physicalPlan.totalCost,
                     ordered_output_required
                 );
-                if (true_rows_by_mask) {
-                    auto actual = true_rows_by_mask->find(mask);
-                    if (actual != true_rows_by_mask->end()) {
-                        applyTrueOutputRows(step, actual->second);
-                    }
-                }
                 candidates_considered++;
 
                 auto joined = std::make_shared<JoinPlanNode>();
@@ -9034,6 +8952,56 @@ PlannedQuery chooseJoinOrderPlan(const QueryComponents& components,
         ordered_output_required,
         components.tableName
     );
+}
+
+struct PlanTraitSet {
+    bool orderedOutputRequired = false;
+
+    std::string describe() const {
+        return orderedOutputRequired ? "ordered output" : "none";
+    }
+};
+
+struct OptimizerResult {
+    QueryComponents logicalQuery;
+    PlannedQuery plannedQuery;
+    JoinOrderAlgorithm algorithm = JoinOrderAlgorithm::ConnectedSubgraphDP;
+    PlanTraitSet requiredTraits;
+};
+
+class Optimizer {
+    const StatisticsCatalog& stats;
+    JoinOrderAlgorithm algorithm;
+    PlanTraitSet requiredTraits;
+
+public:
+    Optimizer(const StatisticsCatalog& stats,
+              JoinOrderAlgorithm algorithm =
+                  JoinOrderAlgorithm::ConnectedSubgraphDP,
+              PlanTraitSet requiredTraits = {})
+        : stats(stats),
+          algorithm(algorithm),
+          requiredTraits(requiredTraits) {}
+
+    OptimizerResult optimize(const QueryComponents& components) const {
+        PlannedQuery planned_query = chooseJoinOrderPlan(
+            components,
+            stats,
+            algorithm,
+            requiredTraits.orderedOutputRequired
+        );
+
+        return {components, planned_query, algorithm, requiredTraits};
+    }
+};
+
+void printOptimizerSummary(const OptimizerResult& result) {
+    std::cout << "\nOptimizer boundary:" << std::endl;
+    std::cout << "  framework: rule-ready optimizer boundary" << std::endl;
+    std::cout << "  search: "
+              << joinOrderAlgorithmName(result.algorithm) << std::endl;
+    std::cout << "  required traits: "
+              << result.requiredTraits.describe() << std::endl;
 }
 
 std::string physicalPlanTreeString(const QueryComponents& components,
@@ -10409,14 +10377,13 @@ public:
                     auto cache_key = query + "#" +
                         joinOrderAlgorithmName(join_order_algorithm);
                     auto cached = planned_query_cache.find(cache_key);
-                    auto planned_query = cached != planned_query_cache.end()
-                        ? cached->second
-                        : chooseJoinOrderPlan(
-                              components,
-                              loadQueryTableStats(components, catalog),
-                              join_order_algorithm
-                          );
-                    if (cached == planned_query_cache.end()) {
+                    PlannedQuery planned_query;
+                    if (cached != planned_query_cache.end()) {
+                        planned_query = cached->second;
+                    } else {
+                        auto stats = loadQueryTableStats(components, catalog);
+                        Optimizer optimizer(stats, join_order_algorithm);
+                        planned_query = optimizer.optimize(components).plannedQuery;
                         planned_query_cache[cache_key] = planned_query;
                     }
                     planned_components = planned_query.components;
@@ -10491,12 +10458,9 @@ public:
                            bool ordered_output_required = false) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
-        return chooseJoinOrderPlan(
-            components,
-            loadQueryTableStats(components, catalog),
-            algorithm,
-            ordered_output_required
-        );
+        auto stats = loadQueryTableStats(components, catalog);
+        Optimizer optimizer(stats, algorithm, {ordered_output_required});
+        return optimizer.optimize(components).plannedQuery;
     }
 
     void printStatsAndEstimates(const std::string& query,
@@ -10507,14 +10471,16 @@ public:
         resolveQueryColumns(components, catalog);
         auto stats = loadQueryTableStats(components, catalog);
         printAnalyzeStats(components, stats);
-        auto final_estimates = printCardinalityEstimates(components, stats);
+        auto final_estimate = printCardinalityEstimates(components, stats);
         auto default_algorithm = JoinOrderAlgorithm::ConnectedSubgraphDP;
-        auto planned_query = chooseJoinOrderPlan(
-            components,
+        Optimizer optimizer(
             stats,
             default_algorithm,
-            ordered_output_required
+            {ordered_output_required}
         );
+        auto optimizer_result = optimizer.optimize(components);
+        printOptimizerSummary(optimizer_result);
+        auto planned_query = optimizer_result.plannedQuery;
         planned_query_cache[
             query + "#" +
             joinOrderAlgorithmName(default_algorithm)
@@ -10534,16 +10500,10 @@ public:
             std::cout << "  Connected subgraph/complement pairs: "
                       << planned_query.dpCrossProductsPruned << std::endl;
         }
-        printHistogramRangeValidation(components, stats, catalog, buffer_manager);
-
         std::cout << "\nActual validation:" << std::endl;
         for (const auto& filter : components.filters) {
             auto base_rows = static_cast<double>(
                 tableStatsFor(stats, components, filter.column.tableName).rowCount
-            );
-            auto uniform_estimate = estimateEqualityFilterRows(
-                base_rows,
-                columnStatsFor(stats, components, filter.column)
             );
             auto mcv_estimate = estimateEqualityFilterRowsWithMcv(
                 base_rows,
@@ -10558,10 +10518,7 @@ public:
             );
             std::cout << "  " << columnLabel(filter.column)
                       << " = " << filter.value
-                      << ": uniform=" << formatEstimate(uniform_estimate)
-                      << " q-error="
-                      << formatQError(uniform_estimate, static_cast<double>(actual))
-                      << " mcv=" << formatEstimate(mcv_estimate)
+                      << ": estimate=" << formatEstimate(mcv_estimate)
                       << " actual=" << actual
                       << " q-error="
                       << formatQError(mcv_estimate, static_cast<double>(actual))
@@ -10573,25 +10530,17 @@ public:
         planned_query_cache[
             join_body_query + "#" +
             joinOrderAlgorithmName(default_algorithm)
-        ] =
-            chooseJoinOrderPlan(
-                join_body_components,
+        ] = Optimizer(
                 stats,
                 default_algorithm,
-                ordered_output_required
-            );
+                {ordered_output_required}
+            ).optimize(join_body_components).plannedQuery;
         auto join_body_rows = executeQuery(join_body_query, txn, false);
-        std::cout << "  final join body: uniform="
-                  << formatEstimate(final_estimates.first)
+        std::cout << "  final join body: estimate="
+                  << formatEstimate(final_estimate)
                   << " q-error="
                   << formatQError(
-                         final_estimates.first,
-                         static_cast<double>(join_body_rows.size())
-                     )
-                  << " mcv=" << formatEstimate(final_estimates.second)
-                  << " q-error="
-                  << formatQError(
-                         final_estimates.second,
+                         final_estimate,
                          static_cast<double>(join_body_rows.size())
                      )
                   << " actual=" << join_body_rows.size()
@@ -10751,103 +10700,6 @@ std::string jobJoinBodyQuery() {
 	        "AND {miidx.movie_id} = {mc.movie_id}";
 }
 
-bool maskHasTable(const std::vector<std::string>& table_names,
-                  uint64_t mask,
-                  const std::string& table_name) {
-    for (size_t i = 0; i < table_names.size(); i++) {
-        if ((mask & (1ULL << i)) != 0 && table_names[i] == table_name) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::vector<std::string> orderedTablesForMask(
-    const std::vector<std::string>& table_names,
-    uint64_t mask) {
-    std::vector<std::string> tables;
-    for (size_t i = 0; i < table_names.size(); i++) {
-        if ((mask & (1ULL << i)) != 0) {
-            tables.push_back(table_names[i]);
-        }
-    }
-    return tables;
-}
-
-std::string joinEdgeKey(const JoinClause& edge) {
-    return columnLabel(edge.left) + "=" + columnLabel(edge.right);
-}
-
-std::optional<QueryComponents> subsetQueryForMask(
-    const QueryComponents& full_query,
-    const std::vector<std::string>& table_names,
-    uint64_t mask) {
-    auto subset_tables = orderedTablesForMask(table_names, mask);
-    if (subset_tables.empty()) {
-        return std::nullopt;
-    }
-
-    QueryComponents subset = full_query;
-    subset.tableName = subset_tables.front();
-    subset.baseTableName = actualTableName(full_query, subset.tableName);
-    subset.joins.clear();
-    subset.filters.clear();
-    subset.columnEqualities.clear();
-    subset.selectColumns = {ColumnRef{subset.tableName, "", 0}};
-    subset.selectAggregates.clear();
-
-    for (const auto& filter : full_query.filters) {
-        if (maskHasTable(table_names, mask, filter.column.tableName)) {
-            subset.filters.push_back(filter);
-        }
-    }
-
-    auto edges = joinGraphEdges(full_query);
-    std::set<std::string> joined{subset.tableName};
-    std::set<std::string> used_edges;
-    while (joined.size() < subset_tables.size()) {
-        bool added = false;
-        for (const auto& edge : edges) {
-            if (!maskHasTable(table_names, mask, edge.left.tableName) ||
-                !maskHasTable(table_names, mask, edge.right.tableName)) {
-                continue;
-            }
-
-            bool left_joined = joined.find(edge.left.tableName) != joined.end();
-            bool right_joined = joined.find(edge.right.tableName) != joined.end();
-            if (left_joined == right_joined) {
-                continue;
-            }
-
-            std::string new_table = left_joined
-                ? edge.right.tableName
-                : edge.left.tableName;
-            auto join = edge;
-            join.tableName = new_table;
-            join.actualTableName = actualTableName(full_query, new_table);
-            subset.joins.push_back(join);
-            used_edges.insert(joinEdgeKey(edge));
-            joined.insert(new_table);
-            added = true;
-            break;
-        }
-        if (!added) {
-            return std::nullopt;
-        }
-    }
-
-    for (const auto& edge : edges) {
-        if (!maskHasTable(table_names, mask, edge.left.tableName) ||
-            !maskHasTable(table_names, mask, edge.right.tableName) ||
-            used_edges.find(joinEdgeKey(edge)) != used_edges.end()) {
-            continue;
-        }
-        subset.columnEqualities.push_back({edge.left, edge.right});
-    }
-
-    return subset;
-}
-
 void printSampleRows(const QueryTable& rows, size_t limit) {
     for (size_t row_index = 0; row_index < rows.size() && row_index < limit; row_index++) {
         std::cout << "  ";
@@ -10857,34 +10709,6 @@ void printSampleRows(const QueryTable& rows, size_t limit) {
         std::cout << std::endl;
     }
 }
-
-StatisticsCatalog withoutMcvStats(StatisticsCatalog stats) {
-    for (auto& table : stats.tables) {
-        for (auto& column : table.second.columns) {
-            column.second.mcvCounts.clear();
-        }
-    }
-    return stats;
-}
-
-struct CardinalityExperimentRun {
-    std::string label;
-    size_t output_rows = 0;
-    long elapsed_ms = 0;
-    double estimated_cost = 0.0;
-    double estimated_join_rows = 0.0;
-    std::string prettyPlan;
-    size_t dpStatesKept = 0;
-    size_t dpCandidatesConsidered = 0;
-    size_t dpCrossProductsPruned = 0;
-    QueryTable sample_rows;
-};
-
-struct EstimatorMode {
-    std::string label;
-    StatisticsCatalog stats;
-    const std::map<uint64_t, double>* trueRowsByMask = nullptr;
-};
 
 int main(int argc, char* argv[]) {
     BuzzDB db;
@@ -10916,108 +10740,43 @@ int main(int argc, char* argv[]) {
     auto query_components = parseQuery(jobJoinQuery());
     resolveQueryColumns(query_components, db.catalog);
     auto mcv_stats = loadQueryTableStats(query_components, db.catalog);
-    auto uniform_stats = withoutMcvStats(mcv_stats);
+    auto optimizer_result = Optimizer(
+        mcv_stats,
+        JoinOrderAlgorithm::ConnectedSubgraphDP
+    ).optimize(query_components);
+    auto plan = optimizer_result.plannedQuery;
+    db.clearBufferPool();
+    auto query_start = std::chrono::steady_clock::now();
+    auto rows = db.executePlanSnapshot(
+        makePlanSnapshot(0, plan),
+        query_txn,
+        false
+    );
+    auto query_end = std::chrono::steady_clock::now();
 
-    auto table_names = writtenJoinOrder(query_components);
-    uint64_t full_mask = (1ULL << table_names.size()) - 1ULL;
-    std::cout << "\nBuilding true-cardinality oracle:" << std::endl;
-    auto oracle_start = std::chrono::steady_clock::now();
-    std::map<uint64_t, double> true_rows_by_mask;
-    for (uint64_t mask = 1; mask <= full_mask; mask++) {
-        auto subset = subsetQueryForMask(query_components, table_names, mask);
-        if (!subset) {
-            continue;
-        }
-        auto subset_plan = chooseConnectedSubgraphDPPlan(*subset, mcv_stats);
-        auto subset_rows = db.executePlanSnapshot(
-            makePlanSnapshot(0, subset_plan),
-            query_txn,
-            false
-        );
-        true_rows_by_mask[mask] = static_cast<double>(subset_rows.size());
+    std::cout << "\nDCopt execution with MCV stats:" << std::endl;
+    std::cout << "  Buffer pool is cleared before timed execution."
+              << std::endl;
+    std::cout << "  elapsed: " << elapsedMs(query_start, query_end)
+              << " ms" << std::endl;
+    std::cout << "  estimated cost: "
+              << formatEstimate(plan.physicalPlan.totalCost) << std::endl;
+    std::cout << "  estimated join rows: "
+              << formatEstimate(plan.physicalPlan.finalRows) << std::endl;
+    std::cout << "  output rows: " << rows.size() << std::endl;
+    if (plan.planRoot) {
+        std::cout << "  plan:" << std::endl;
+        std::cout << prettyJoinPlanTree(plan.planRoot, "    ");
     }
-    auto oracle_end = std::chrono::steady_clock::now();
-    const double actual_join_rows = true_rows_by_mask[full_mask];
-    std::cout << "  counted " << true_rows_by_mask.size()
-              << " connected subplans in "
-              << elapsedMs(oracle_start, oracle_end) << " ms"
-              << std::endl;
-
-    std::vector<CardinalityExperimentRun> runs;
-    std::cout << "\nDP cardinality-estimation experiment:" << std::endl;
-    std::cout << "  Buffer pool is cleared before each timed join execution."
-              << std::endl;
-    std::cout << "  Actual join-body rows: "
-              << static_cast<size_t>(actual_join_rows)
-              << std::endl;
-    std::vector<EstimatorMode> stat_modes = {
-        {"MCV-aware stats", mcv_stats, nullptr},
-        {"Uniform-only stats", uniform_stats, nullptr},
-        {"True-cardinality oracle", mcv_stats, &true_rows_by_mask}
-    };
-    for (const auto& mode : stat_modes) {
-        auto plan = mode.trueRowsByMask
-            ? chooseConnectedSubgraphDPPlan(
-                  query_components,
-                  mode.stats,
-                  false,
-                  mode.trueRowsByMask
-              )
-	            : chooseJoinOrderPlan(
-	                  query_components,
-	                  mode.stats,
-	                  JoinOrderAlgorithm::ConnectedSubgraphDP
-	              );
-        db.clearBufferPool();
-        auto start = std::chrono::steady_clock::now();
-        auto rows = db.executePlanSnapshot(
-            makePlanSnapshot(0, plan),
-            query_txn,
-            false
-        );
-        auto end = std::chrono::steady_clock::now();
-        runs.push_back({
-            mode.label,
-            rows.size(),
-            elapsedMs(start, end),
-            plan.physicalPlan.totalCost,
-            plan.physicalPlan.finalRows,
-            plan.planRoot ? prettyJoinPlanTree(plan.planRoot, "      ") : "",
-            plan.dpStatesKept,
-            plan.dpCandidatesConsidered,
-            plan.dpCrossProductsPruned,
-            std::move(rows)
-        });
-    }
-
-    for (const auto& run : runs) {
-        std::cout << "  " << run.label
-                  << ": " << run.elapsed_ms << " ms"
-                  << ", estimated cost=" << formatEstimate(run.estimated_cost)
-                  << ", estimated join rows="
-                  << formatEstimate(run.estimated_join_rows)
-                  << ", actual join rows="
-                  << static_cast<size_t>(actual_join_rows)
-                  << ", q-error="
-                  << formatQError(run.estimated_join_rows, actual_join_rows)
-                  << ", output rows=" << run.output_rows << std::endl;
-        if (!run.prettyPlan.empty()) {
-            std::cout << "    plan:" << std::endl;
-            std::cout << run.prettyPlan;
-        }
-        if (run.dpStatesKept > 0) {
-            std::cout << "    DP states kept: " << run.dpStatesKept
-                      << ", candidates considered: "
-                      << run.dpCandidatesConsidered
-                      << ", connected pairs: "
-                      << run.dpCrossProductsPruned;
-            std::cout << std::endl;
-        }
+    if (plan.dpStatesKept > 0) {
+        std::cout << "  DP states kept: " << plan.dpStatesKept
+                  << ", candidates considered: "
+                  << plan.dpCandidatesConsidered
+                  << ", connected pairs: "
+                  << plan.dpCrossProductsPruned << std::endl;
     }
     std::cout << "  Sample rows:" << std::endl;
-    if (!runs.empty()) {
-        printSampleRows(runs.front().sample_rows, 5);
-    }
+    printSampleRows(rows, 5);
     db.commit(query_txn);
     std::cout << "\nTiming:" << std::endl;
     if (seed_database) {
