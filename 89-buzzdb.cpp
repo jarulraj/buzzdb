@@ -82,6 +82,7 @@ public:
         }
         type = other.type;
         data_length = other.data_length;
+        data = std::make_unique<char[]>(data_length);
         std::memcpy(data.get(), other.data.get(), data_length);
         return *this;
     }
@@ -231,6 +232,10 @@ void printQueryTable(const QueryTable& rows) {
 class Tuple {
 public:
     std::vector<std::unique_ptr<Field>> fields;
+
+    Tuple() = default;
+    Tuple(Tuple&& other) noexcept = default;
+    Tuple& operator=(Tuple&& other) noexcept = default;
 
     void addField(std::unique_ptr<Field> field) {
         fields.push_back(std::move(field));
@@ -4356,10 +4361,10 @@ class Operator {
     /// Destroys the operator.
     virtual void close() = 0;
 
-    /// This returns the pointers to the Fields of the generated tuple. When
-    /// `next()` returns true, the Fields will contain the values for the
-    /// next tuple. Each `Field` pointer in the vector stands for one attribute of the tuple.
-    virtual std::vector<std::unique_ptr<Field>> getOutput() = 0;
+    /// This returns the generated tuple. When `next()` returns true, the
+    /// referenced Tuple will contain the values for the next tuple. The
+    /// reference is borrowed and is only valid until next()/close().
+    virtual const Tuple& getOutput() const = 0;
 
     virtual std::optional<TupleId> getTupleId() const {
         return std::nullopt;
@@ -4396,6 +4401,51 @@ class BinaryOperator : public Operator {
     ~BinaryOperator() override = default;
 };
 
+static const Field& tupleField(const Tuple& tuple, size_t index) {
+    if (index >= tuple.fields.size()) {
+        throw std::runtime_error("Tuple field index out of range.");
+    }
+    return *tuple.fields[index];
+}
+
+static void clearTuple(Tuple& tuple) {
+    tuple.fields.clear();
+}
+
+static void appendClonedFields(Tuple& dest, const Tuple& src) {
+    for (const auto& field : src.fields) {
+        dest.addField(field->clone());
+    }
+}
+
+static void appendProjectedFields(Tuple& dest,
+                                  const Tuple& src,
+                                  const std::vector<size_t>& attrs) {
+    for (size_t attr_index : attrs) {
+        if (attr_index >= src.fields.size()) {
+            throw std::runtime_error("Projection attribute index out of range.");
+        }
+        dest.addField(src.fields[attr_index]->clone());
+    }
+}
+
+static void makeConcatenatedTuple(Tuple& dest,
+                                  const Tuple& left,
+                                  const Tuple& right) {
+    clearTuple(dest);
+    appendClonedFields(dest, left);
+    appendClonedFields(dest, right);
+}
+
+std::vector<std::unique_ptr<Field>> cloneTupleFields(const Tuple& tuple) {
+    std::vector<std::unique_ptr<Field>> cloned;
+    cloned.reserve(tuple.fields.size());
+    for (const auto& field : tuple.fields) {
+        cloned.push_back(field->clone());
+    }
+    return cloned;
+}
+
 class ScanOperator : public Operator {
 private:
     TableHeap& tableHeap;
@@ -4428,11 +4478,11 @@ public:
         currentTupleId.reset();
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        if (currentTuple) {
-            return std::move(currentTuple->fields);
+    const Tuple& getOutput() const override {
+        if (!currentTuple) {
+            throw std::runtime_error("ScanOperator::getOutput called without a current tuple.");
         }
-        return {}; // Return an empty vector if no tuple is available
+        return *currentTuple;
     }
 
     std::optional<TupleId> getTupleId() const override {
@@ -4482,30 +4532,32 @@ private:
 class IPredicate {
 public:
     virtual ~IPredicate() = default;
-    virtual bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const = 0;
+    virtual bool check(const Tuple& tuple) const = 0;
 };
 
-void printTuple(const std::vector<std::unique_ptr<Field>>& tupleFields) {
+void printTuple(const Tuple& tuple) {
     std::cout << "Tuple: [";
-    for (const auto& field : tupleFields) {
-        field->print(); // Assuming `print()` is a method that prints field content
+    for (const auto& field : tuple.fields) {
+        field->print();
         std::cout << " ";
     }
     std::cout << "]";
 }
 
-class SimplePredicate: public IPredicate {
+class SimplePredicate : public IPredicate {
 public:
     enum OperandType { DIRECT, INDIRECT };
-    enum ComparisonOperator { EQ, NE, GT, GE, LT, LE }; // Renamed from PredicateType
+    enum ComparisonOperator { EQ, NE, GT, GE, LT, LE };
 
     struct Operand {
         std::unique_ptr<Field> directValue;
-        size_t index;
+        size_t index = 0;
         OperandType type;
 
-        Operand(std::unique_ptr<Field> value) : directValue(std::move(value)), type(DIRECT) {}
-        Operand(size_t idx) : index(idx), type(INDIRECT) {}
+        explicit Operand(std::unique_ptr<Field> value)
+            : directValue(std::move(value)), type(DIRECT) {}
+        explicit Operand(size_t idx)
+            : index(idx), type(INDIRECT) {}
     };
 
     Operand left_operand;
@@ -4513,29 +4565,18 @@ public:
     ComparisonOperator comparison_operator;
 
     SimplePredicate(Operand left, Operand right, ComparisonOperator op)
-        : left_operand(std::move(left)), right_operand(std::move(right)), comparison_operator(op) {}
+        : left_operand(std::move(left)),
+          right_operand(std::move(right)),
+          comparison_operator(op) {}
 
-    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
-        const Field* leftField = nullptr;
-        const Field* rightField = nullptr;
-
-        if (left_operand.type == DIRECT) {
-            leftField = left_operand.directValue.get();
-        } else if (left_operand.type == INDIRECT) {
-            leftField = tupleFields[left_operand.index].get();
-        }
-
-        if (right_operand.type == DIRECT) {
-            rightField = right_operand.directValue.get();
-        } else if (right_operand.type == INDIRECT) {
-            rightField = tupleFields[right_operand.index].get();
-        }
+    bool check(const Tuple& tuple) const override {
+        const Field* leftField = resolveOperand(left_operand, tuple);
+        const Field* rightField = resolveOperand(right_operand, tuple);
 
         if (leftField == nullptr || rightField == nullptr) {
             std::cerr << "Error: Invalid field reference.\n";
             return false;
         }
-
         if (leftField->getType() != rightField->getType()) {
             std::cerr << "Error: Comparing fields of different types.\n";
             return false;
@@ -4543,32 +4584,29 @@ public:
 
         // Perform comparison based on field type
         switch (leftField->getType()) {
-            case FieldType::INT: {
-                int left_val = leftField->asInt();
-                int right_val = rightField->asInt();
-                return compare(left_val, right_val);
-            }
-            case FieldType::FLOAT: {
-                float left_val = leftField->asFloat();
-                float right_val = rightField->asFloat();
-                return compare(left_val, right_val);
-            }
-            case FieldType::STRING: {
-                std::string left_val = leftField->asString();
-                std::string right_val = rightField->asString();
-                return compare(left_val, right_val);
-            }
-            default:
-                std::cerr << "Invalid field type\n";
-                return false;
+            case FieldType::INT:
+                return compare(leftField->asInt(), rightField->asInt());
+            case FieldType::FLOAT:
+                return compare(leftField->asFloat(), rightField->asFloat());
+            case FieldType::STRING:
+                return compare(leftField->asString(), rightField->asString());
         }
+        return false;
     }
 
-
 private:
+    static const Field* resolveOperand(const Operand& operand, const Tuple& tuple) {
+        if (operand.type == DIRECT) {
+            return operand.directValue.get();
+        }
+        if (operand.index >= tuple.fields.size()) {
+            return nullptr;
+        }
+        return tuple.fields[operand.index].get();
+    }
 
     // Compares two values of the same type
-    template<typename T>
+    template <typename T>
     bool compare(const T& left_val, const T& right_val) const {
         switch (comparison_operator) {
             case ComparisonOperator::EQ: return left_val == right_val;
@@ -4577,8 +4615,8 @@ private:
             case ComparisonOperator::GE: return left_val >= right_val;
             case ComparisonOperator::LT: return left_val < right_val;
             case ComparisonOperator::LE: return left_val <= right_val;
-            default: std::cerr << "Invalid predicate type\n"; return false;
         }
+        return false;
     }
 };
 
@@ -4591,106 +4629,90 @@ private:
     LogicOperator logic_operator;
 
 public:
-    ComplexPredicate(LogicOperator op) : logic_operator(op) {}
+    explicit ComplexPredicate(LogicOperator op) : logic_operator(op) {}
 
     void addPredicate(std::unique_ptr<IPredicate> predicate) {
         predicates.push_back(std::move(predicate));
     }
 
-    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
-        
+    bool check(const Tuple& tuple) const override {
         if (logic_operator == AND) {
             for (const auto& pred : predicates) {
-                if (!pred->check(tupleFields)) {
+                if (!pred->check(tuple)) {
                     return false; // If any predicate fails, the AND condition fails
                 }
             }
             return true; // All predicates passed
-        } else if (logic_operator == OR) {
+        }
+
+        if (logic_operator == OR) {
             for (const auto& pred : predicates) {
-                if (pred->check(tupleFields)) {
+                if (pred->check(tuple)) {
                     return true; // If any predicate passes, the OR condition passes
                 }
             }
             return false; // No predicates passed
         }
+
         return false;
     }
-
-
 };
-
 
 class SelectOperator : public UnaryOperator {
 private:
     std::unique_ptr<IPredicate> predicate;
-    bool has_next;
-    std::vector<std::unique_ptr<Field>> currentOutput; // Store the current output here
+    const Tuple* currentOutput = nullptr;  // borrowed from child
     std::optional<TupleId> currentTupleId;
 
 public:
     SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate)
-        : UnaryOperator(input), predicate(std::move(predicate)), has_next(false) {}
+        : UnaryOperator(input), predicate(std::move(predicate)) {}
 
     void open() override {
         input->setTxnContext(txn_);
         input->open();
-        has_next = false;
-        currentOutput.clear(); // Ensure currentOutput is cleared at the beginning
+        currentOutput = nullptr;
         currentTupleId.reset();
     }
 
     bool next() override {
         while (input->next()) {
-            const auto& output = input->getOutput(); // Temporarily hold the output
+            const Tuple& output = input->getOutput();
             if (predicate->check(output)) {
                 // If the predicate is satisfied, store the output in the member variable
-                currentOutput.clear(); // Clear previous output
-                for (const auto& field : output) {
-                    // Assuming Field class has a clone method or copy constructor to duplicate fields
-                    currentOutput.push_back(field->clone());
-                }
+                currentOutput = &output;
                 currentTupleId = input->getTupleId();
-                has_next = true;
                 return true;
             }
         }
-        has_next = false;
-        currentOutput.clear(); // Clear output if no more tuples satisfy the predicate
+
+        currentOutput = nullptr;
         currentTupleId.reset();
         return false;
     }
 
     void close() override {
         input->close();
-        currentOutput.clear(); // Ensure currentOutput is cleared at the end
+        currentOutput = nullptr;
         currentTupleId.reset();
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        if (has_next) {
-            // Since currentOutput already holds the desired output, simply return it
-            // Need to create a deep copy to return since we're returning by value
-            std::vector<std::unique_ptr<Field>> outputCopy;
-            for (const auto& field : currentOutput) {
-                outputCopy.push_back(field->clone()); // Clone each field
-            }
-            return outputCopy;
-        } else {
-            return {}; // Return an empty vector if no matching tuple is found
+    const Tuple& getOutput() const override {
+        if (!currentOutput) {
+            throw std::runtime_error("SelectOperator::getOutput called without a current tuple.");
         }
+        return *currentOutput;
     }
 
     std::optional<TupleId> getTupleId() const override {
-        return has_next ? currentTupleId : std::nullopt;
+        return currentOutput ? currentTupleId : std::nullopt;
     }
-
 };
 
 class ProjectionOperator : public UnaryOperator {
 private:
     std::vector<size_t> projected_attrs;
-    std::vector<std::unique_ptr<Field>> currentOutput;
+    Tuple currentOutput;
     std::optional<TupleId> currentTupleId;
     bool has_next = false;
 
@@ -4701,64 +4723,45 @@ public:
     void open() override {
         input->setTxnContext(txn_);
         input->open();
-        currentOutput.clear();
+        clearTuple(currentOutput);
         currentTupleId.reset();
         has_next = false;
     }
 
     bool next() override {
         if (!input->next()) {
-            currentOutput.clear();
+            clearTuple(currentOutput);
             currentTupleId.reset();
             has_next = false;
             return false;
         }
 
-        auto input_tuple = input->getOutput();
+        const Tuple& input_tuple = input->getOutput();
         currentTupleId = input->getTupleId();
-        currentOutput.clear();
-        for (auto attr_index : projected_attrs) {
-            if (attr_index >= input_tuple.size()) {
-                throw std::runtime_error("Projection attribute index out of range.");
-            }
-            currentOutput.push_back(input_tuple[attr_index]->clone());
-        }
+        clearTuple(currentOutput);
+        appendProjectedFields(currentOutput, input_tuple, projected_attrs);
         has_next = true;
         return true;
     }
 
     void close() override {
         input->close();
-        currentOutput.clear();
+        clearTuple(currentOutput);
         currentTupleId.reset();
         has_next = false;
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        std::vector<std::unique_ptr<Field>> outputCopy;
+    const Tuple& getOutput() const override {
         if (!has_next) {
-            return outputCopy;
+            throw std::runtime_error("ProjectionOperator::getOutput called without a current tuple.");
         }
-        for (const auto& field : currentOutput) {
-            outputCopy.push_back(field->clone());
-        }
-        return outputCopy;
+        return currentOutput;
     }
 
     std::optional<TupleId> getTupleId() const override {
         return has_next ? currentTupleId : std::nullopt;
     }
-
 };
-
-std::vector<std::unique_ptr<Field>> cloneTupleFields(
-    const std::vector<std::unique_ptr<Field>>& fields) {
-    std::vector<std::unique_ptr<Field>> cloned;
-    for (const auto& field : fields) {
-        cloned.push_back(field->clone());
-    }
-    return cloned;
-}
 
 enum class PhysicalJoinKind {
     NestedLoopJoin,
@@ -4804,10 +4807,9 @@ int compareFields(const Field& lhs, const Field& rhs) {
 class SortOperator : public UnaryOperator {
 private:
     std::vector<size_t> sort_attrs;
-    std::vector<std::vector<std::unique_ptr<Field>>> tuples;
-    std::vector<std::unique_ptr<Field>> currentOutput;
+    std::vector<std::unique_ptr<Tuple>> tuples;
+    const Tuple* currentOutput = nullptr;
     size_t output_index = 0;
-    bool has_next = false;
 
 public:
     SortOperator(Operator& input, std::vector<size_t> sort_attrs)
@@ -4817,53 +4819,50 @@ public:
         input->setTxnContext(txn_);
         input->open();
         tuples.clear();
+
         while (input->next()) {
-            tuples.push_back(input->getOutput());
+            tuples.push_back(input->getOutput().clone());
         }
+
         std::stable_sort(tuples.begin(), tuples.end(),
                          [&](const auto& left, const auto& right) {
-                             for (auto attr_index : sort_attrs) {
-                                 if (attr_index >= left.size() ||
-                                     attr_index >= right.size()) {
-                                     throw std::runtime_error("Sort attribute index out of range.");
-                                 }
-                                 int cmp = compareFields(*left[attr_index], *right[attr_index]);
+                             for (size_t attr_index : sort_attrs) {
+                                 int cmp = compareFields(
+                                     tupleField(*left, attr_index),
+                                     tupleField(*right, attr_index)
+                                 );
                                  if (cmp != 0) {
                                      return cmp < 0;
                                  }
                              }
                              return false;
                          });
-        currentOutput.clear();
+
         output_index = 0;
-        has_next = false;
+        currentOutput = nullptr;
     }
 
     bool next() override {
         if (output_index >= tuples.size()) {
-            currentOutput.clear();
-            has_next = false;
+            currentOutput = nullptr;
             return false;
         }
-
-        currentOutput = cloneTupleFields(tuples[output_index++]);
-        has_next = true;
+        currentOutput = tuples[output_index++].get();
         return true;
     }
 
     void close() override {
         input->close();
         tuples.clear();
-        currentOutput.clear();
         output_index = 0;
-        has_next = false;
+        currentOutput = nullptr;
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        if (!has_next) {
-            return {};
+    const Tuple& getOutput() const override {
+        if (!currentOutput) {
+            throw std::runtime_error("SortOperator::getOutput called without a current tuple.");
         }
-        return cloneTupleFields(currentOutput);
+        return *currentOutput;
     }
 };
 
@@ -4893,7 +4892,6 @@ private:
             if (type != other.type) {
                 return false;
             }
-
             switch (type) {
                 case INT:
                     return int_value == other.int_value;
@@ -4924,12 +4922,13 @@ private:
     size_t right_attr_index;
     std::unordered_map<
         HashJoinKey,
-        std::vector<std::vector<std::unique_ptr<Field>>>,
+        std::vector<std::unique_ptr<Tuple>>,
         HashJoinKeyHasher
     > hashTable;
-    std::vector<std::unique_ptr<Field>> currentLeftTuple;
-    std::vector<std::unique_ptr<Field>> currentOutput;
-    const std::vector<std::vector<std::unique_ptr<Field>>>* matchingRightTuples = nullptr;
+
+    const Tuple* currentLeftTuple = nullptr;  // borrowed from left child
+    Tuple currentOutput;
+    const std::vector<std::unique_ptr<Tuple>>* matchingRightTuples = nullptr;
     size_t matchingRightTupleIndex = 0;
     bool has_left_tuple = false;
     bool has_next = false;
@@ -4946,19 +4945,17 @@ public:
         input_right->setTxnContext(txn_);
         input_left->open();
         input_right->open();
+
         hashTable.clear();
         while (input_right->next()) {
-            auto right_tuple = input_right->getOutput();
-            if (right_attr_index >= right_tuple.size()) {
-                throw std::runtime_error("Hash join right attribute index out of range.");
-            }
-            hashTable[HashJoinKey(*right_tuple[right_attr_index])].push_back(
-                cloneFields(right_tuple)
-            );
+            const Tuple& right_tuple = input_right->getOutput();
+            const Field& key_field = tupleField(right_tuple, right_attr_index);
+            hashTable[HashJoinKey(key_field)].push_back(right_tuple.clone());
         }
         input_right->close();
-        currentLeftTuple.clear();
-        currentOutput.clear();
+
+        currentLeftTuple = nullptr;
+        clearTuple(currentOutput);
         matchingRightTuples = nullptr;
         matchingRightTupleIndex = 0;
         has_left_tuple = false;
@@ -4966,22 +4963,22 @@ public:
     }
 
     bool next() override {
-        currentOutput.clear();
+        clearTuple(currentOutput);
         has_next = false;
+
         while (true) {
             while (!has_left_tuple ||
                    matchingRightTuples == nullptr ||
                    matchingRightTupleIndex >= matchingRightTuples->size()) {
                 if (!input_left->next()) {
+                    currentLeftTuple = nullptr;
                     return false;
                 }
 
-                currentLeftTuple = input_left->getOutput();
-                if (left_attr_index >= currentLeftTuple.size()) {
-                    throw std::runtime_error("Hash join left attribute index out of range.");
-                }
+                currentLeftTuple = &input_left->getOutput();
+                const Field& left_key = tupleField(*currentLeftTuple, left_attr_index);
+                auto matches = hashTable.find(HashJoinKey(left_key));
 
-                auto matches = hashTable.find(HashJoinKey(*currentLeftTuple[left_attr_index]));
                 if (matches == hashTable.end()) {
                     has_left_tuple = false;
                     matchingRightTuples = nullptr;
@@ -4994,11 +4991,8 @@ public:
                 has_left_tuple = true;
             }
 
-            const auto& right_tuple = (*matchingRightTuples)[matchingRightTupleIndex++];
-            currentOutput = cloneFields(currentLeftTuple);
-            for (const auto& field : right_tuple) {
-                currentOutput.push_back(field->clone());
-            }
+            const Tuple& right_tuple = *(*matchingRightTuples)[matchingRightTupleIndex++];
+            makeConcatenatedTuple(currentOutput, *currentLeftTuple, right_tuple);
             has_next = true;
             return true;
         }
@@ -5007,33 +5001,19 @@ public:
     void close() override {
         input_left->close();
         hashTable.clear();
-        currentLeftTuple.clear();
-        currentOutput.clear();
+        currentLeftTuple = nullptr;
+        clearTuple(currentOutput);
         matchingRightTuples = nullptr;
         matchingRightTupleIndex = 0;
         has_left_tuple = false;
         has_next = false;
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        std::vector<std::unique_ptr<Field>> outputCopy;
+    const Tuple& getOutput() const override {
         if (!has_next) {
-            return outputCopy;
+            throw std::runtime_error("HashJoinOperator::getOutput called without a current tuple.");
         }
-        for (const auto& field : currentOutput) {
-            outputCopy.push_back(field->clone());
-        }
-        return outputCopy;
-    }
-
-private:
-    static std::vector<std::unique_ptr<Field>> cloneFields(
-        const std::vector<std::unique_ptr<Field>>& fields) {
-        std::vector<std::unique_ptr<Field>> cloned;
-        for (const auto& field : fields) {
-            cloned.push_back(field->clone());
-        }
-        return cloned;
+        return currentOutput;
     }
 };
 
@@ -5041,9 +5021,9 @@ class SortMergeJoinOperator : public BinaryOperator {
 private:
     size_t left_attr_index;
     size_t right_attr_index;
-    std::vector<std::vector<std::unique_ptr<Field>>> rightTuples;
-    std::vector<std::unique_ptr<Field>> currentLeftTuple;
-    std::vector<std::unique_ptr<Field>> currentOutput;
+    std::vector<std::unique_ptr<Tuple>> rightTuples;
+    const Tuple* currentLeftTuple = nullptr;  // borrowed from left child
+    Tuple currentOutput;
     size_t rightCursor = 0;
     size_t matchingRightTupleIndex = 0;
     size_t matchingRightTupleEnd = 0;
@@ -5063,13 +5043,15 @@ public:
         input_right->setTxnContext(txn_);
         input_left->open();
         input_right->open();
+
         rightTuples.clear();
         while (input_right->next()) {
-            rightTuples.push_back(input_right->getOutput());
+            rightTuples.push_back(input_right->getOutput().clone());
         }
         input_right->close();
-        currentLeftTuple.clear();
-        currentOutput.clear();
+
+        currentLeftTuple = nullptr;
+        clearTuple(currentOutput);
         rightCursor = 0;
         matchingRightTupleIndex = 0;
         matchingRightTupleEnd = 0;
@@ -5078,37 +5060,29 @@ public:
     }
 
     bool next() override {
-        currentOutput.clear();
+        clearTuple(currentOutput);
         has_next = false;
+
         while (true) {
             if (has_match_group && matchingRightTupleIndex < matchingRightTupleEnd) {
-                const auto& right_tuple = rightTuples[matchingRightTupleIndex++];
-                currentOutput = cloneTupleFields(currentLeftTuple);
-                for (const auto& field : right_tuple) {
-                    currentOutput.push_back(field->clone());
-                }
+                const Tuple& right_tuple = *rightTuples[matchingRightTupleIndex++];
+                makeConcatenatedTuple(currentOutput, *currentLeftTuple, right_tuple);
                 has_next = true;
                 return true;
             }
 
             if (!input_left->next()) {
+                currentLeftTuple = nullptr;
                 return false;
             }
 
-            currentLeftTuple = input_left->getOutput();
+            currentLeftTuple = &input_left->getOutput();
             has_match_group = false;
+            const Field& left_key = tupleField(*currentLeftTuple, left_attr_index);
 
-            if (left_attr_index >= currentLeftTuple.size()) {
-                throw std::runtime_error("Sort-merge join left attribute index out of range.");
-            }
-
-            const auto& left_key = *currentLeftTuple[left_attr_index];
             while (rightCursor < rightTuples.size()) {
-                const auto& right_tuple = rightTuples[rightCursor];
-                if (right_attr_index >= right_tuple.size()) {
-                    throw std::runtime_error("Sort-merge join right attribute index out of range.");
-                }
-                if (compareFields(*right_tuple[right_attr_index], left_key) >= 0) {
+                const Tuple& right_tuple = *rightTuples[rightCursor];
+                if (compareFields(tupleField(right_tuple, right_attr_index), left_key) >= 0) {
                     break;
                 }
                 rightCursor++;
@@ -5116,7 +5090,7 @@ public:
 
             size_t group_end = rightCursor;
             while (group_end < rightTuples.size() &&
-                   compareFields(*rightTuples[group_end][right_attr_index], left_key) == 0) {
+                   compareFields(tupleField(*rightTuples[group_end], right_attr_index), left_key) == 0) {
                 group_end++;
             }
 
@@ -5133,8 +5107,8 @@ public:
     void close() override {
         input_left->close();
         rightTuples.clear();
-        currentLeftTuple.clear();
-        currentOutput.clear();
+        currentLeftTuple = nullptr;
+        clearTuple(currentOutput);
         rightCursor = 0;
         matchingRightTupleIndex = 0;
         matchingRightTupleEnd = 0;
@@ -5142,11 +5116,11 @@ public:
         has_next = false;
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
+    const Tuple& getOutput() const override {
         if (!has_next) {
-            return {};
+            throw std::runtime_error("SortMergeJoinOperator::getOutput called without a current tuple.");
         }
-        return cloneTupleFields(currentOutput);
+        return currentOutput;
     }
 };
 
@@ -5154,9 +5128,9 @@ class NestedLoopJoinOperator : public BinaryOperator {
 private:
     size_t left_attr_index;
     size_t right_attr_index;
-    std::vector<std::vector<std::unique_ptr<Field>>> rightTuples;
-    std::vector<std::unique_ptr<Field>> currentLeftTuple;
-    std::vector<std::unique_ptr<Field>> currentOutput;
+    std::vector<std::unique_ptr<Tuple>> rightTuples;
+    const Tuple* currentLeftTuple = nullptr;  // borrowed from left child
+    Tuple currentOutput;
     size_t rightTupleIndex = 0;
     bool has_left_tuple = false;
     bool has_next = false;
@@ -5174,47 +5148,47 @@ public:
         input_right->setTxnContext(txn_);
         input_left->open();
         input_right->open();
+
         rightTuples.clear();
         while (input_right->next()) {
-            rightTuples.push_back(input_right->getOutput());
+            rightTuples.push_back(input_right->getOutput().clone());
         }
         input_right->close();
-        currentLeftTuple.clear();
-        currentOutput.clear();
+
+        currentLeftTuple = nullptr;
+        clearTuple(currentOutput);
         rightTupleIndex = 0;
         has_left_tuple = false;
         has_next = false;
     }
 
     bool next() override {
-        currentOutput.clear();
+        clearTuple(currentOutput);
         has_next = false;
+
         while (true) {
             if (!has_left_tuple) {
                 if (!input_left->next()) {
+                    currentLeftTuple = nullptr;
                     return false;
                 }
-                currentLeftTuple = input_left->getOutput();
+                currentLeftTuple = &input_left->getOutput();
                 rightTupleIndex = 0;
                 has_left_tuple = true;
             }
+
             while (rightTupleIndex < rightTuples.size()) {
-                const auto& right_tuple = rightTuples[rightTupleIndex++];
-                if (left_attr_index >= currentLeftTuple.size() ||
-                    right_attr_index >= right_tuple.size()) {
-                    throw std::runtime_error("Nested loop join attribute index out of range.");
-                }
-                if (!(*currentLeftTuple[left_attr_index] == *right_tuple[right_attr_index])) {
+                const Tuple& right_tuple = *rightTuples[rightTupleIndex++];
+                if (!(tupleField(*currentLeftTuple, left_attr_index) ==
+                      tupleField(right_tuple, right_attr_index))) {
                     continue;
                 }
 
-                currentOutput = cloneTupleFields(currentLeftTuple);
-                for (const auto& field : right_tuple) {
-                    currentOutput.push_back(field->clone());
-                }
+                makeConcatenatedTuple(currentOutput, *currentLeftTuple, right_tuple);
                 has_next = true;
                 return true;
             }
+
             has_left_tuple = false;
         }
     }
@@ -5222,70 +5196,56 @@ public:
     void close() override {
         input_left->close();
         rightTuples.clear();
-        currentLeftTuple.clear();
-        currentOutput.clear();
+        currentLeftTuple = nullptr;
+        clearTuple(currentOutput);
+        rightTupleIndex = 0;
         has_left_tuple = false;
         has_next = false;
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        std::vector<std::unique_ptr<Field>> outputCopy;
+    const Tuple& getOutput() const override {
         if (!has_next) {
-            return outputCopy;
+            throw std::runtime_error("NestedLoopJoinOperator::getOutput called without a current tuple.");
         }
-        for (const auto& field : currentOutput) {
-            outputCopy.push_back(field->clone());
-        }
-        return outputCopy;
+        return currentOutput;
     }
-
 };
 
 enum class AggrFuncType { COUNT, MAX, MIN, SUM };
 
 struct AggrFunc {
     AggrFuncType func;
-    size_t attr_index; // Index of the attribute to aggregate
+    size_t attr_index;
 };
 
 class HashAggregationOperator : public UnaryOperator {
 private:
     std::vector<size_t> group_by_attrs;
     std::vector<AggrFunc> aggr_funcs;
-    std::vector<Tuple> output_tuples; // Use your Tuple class for output
+    std::vector<Tuple> output_tuples;
     size_t output_tuples_index = 0;
+    const Tuple* currentOutput = nullptr;
 
     struct FieldVectorHasher {
         std::size_t operator()(const std::vector<Field>& fields) const {
             std::size_t hash = 0;
             for (const auto& field : fields) {
-                std::hash<std::string> hasher;
                 std::size_t fieldHash = 0;
-
                 // Depending on the type, hash the corresponding data
-                switch (field.type) {
-                    case INT: {
+                switch (field.getType()) {
+                    case INT:
                         // Convert integer data to string and hash
-                        int value = *reinterpret_cast<const int*>(field.data.get());
-                        fieldHash = hasher(std::to_string(value));
+                        fieldHash = std::hash<int>{}(field.asInt());
                         break;
-                    }
-                    case FLOAT: {
+                    case FLOAT:
                         // Convert float data to string and hash
-                        float value = *reinterpret_cast<const float*>(field.data.get());
-                        fieldHash = hasher(std::to_string(value));
+                        fieldHash = std::hash<float>{}(field.asFloat());
                         break;
-                    }
-                    case STRING: {
+                    case STRING:
                         // Directly hash the string data
-                        std::string value(field.data.get(), field.data_length - 1); // Exclude null-terminator
-                        fieldHash = hasher(value);
+                        fieldHash = std::hash<std::string>{}(field.asString());
                         break;
-                    }
-                    default:
-                        throw std::runtime_error("Unsupported field type for hashing.");
                 }
-
                 // Combine the hash of the current field with the hash so far
                 hash ^= fieldHash + 0x9e3779b9 + (hash << 6) + (hash >> 2);
             }
@@ -5293,44 +5253,44 @@ private:
         }
     };
 
-
 public:
-    HashAggregationOperator(Operator& input, std::vector<size_t> group_by_attrs, std::vector<AggrFunc> aggr_funcs)
-        : UnaryOperator(input), group_by_attrs(group_by_attrs), aggr_funcs(aggr_funcs) {}
+    HashAggregationOperator(Operator& input,
+                            std::vector<size_t> group_by_attrs,
+                            std::vector<AggrFunc> aggr_funcs)
+        : UnaryOperator(input),
+          group_by_attrs(std::move(group_by_attrs)),
+          aggr_funcs(std::move(aggr_funcs)) {}
 
     void open() override {
         input->setTxnContext(txn_);
-        input->open(); // Ensure the input operator is opened
+        input->open();
         output_tuples_index = 0;
         output_tuples.clear();
+        currentOutput = nullptr;
 
         // Assume a hash map to aggregate tuples based on group_by_attrs
         std::unordered_map<std::vector<Field>, std::vector<Field>, FieldVectorHasher> hash_table;
 
         while (input->next()) {
-            const auto& tuple = input->getOutput(); // Assume getOutput returns a reference to the current tuple
+            const Tuple& tuple = input->getOutput();
 
             // Extract group keys and initialize aggregation values
             std::vector<Field> group_keys;
-            for (auto& index : group_by_attrs) {
-                if (index >= tuple.size()) {
-                    throw std::runtime_error("GROUP BY attribute index out of range.");
-                }
-                group_keys.push_back(*tuple[index]); // Deep copy the Field object for group key
+            group_keys.reserve(group_by_attrs.size());
+            for (size_t index : group_by_attrs) {
+                group_keys.emplace_back(tupleField(tuple, index));
             }
 
             auto group_it = hash_table.find(group_keys);
             if (group_it == hash_table.end()) {
                 std::vector<Field> aggr_values;
+                aggr_values.reserve(aggr_funcs.size());
                 for (const auto& aggr_func : aggr_funcs) {
-                    if (aggr_func.attr_index >= tuple.size()) {
-                        throw std::runtime_error("Aggregation attribute index out of range.");
-                    }
                     aggr_values.push_back(
-                        initialAggregate(aggr_func, *tuple[aggr_func.attr_index])
+                        initialAggregate(aggr_func, tupleField(tuple, aggr_func.attr_index))
                     );
                 }
-                hash_table[group_keys] = aggr_values;
+                hash_table.emplace(std::move(group_keys), std::move(aggr_values));
                 continue;
             }
 
@@ -5339,7 +5299,7 @@ public:
                 aggr_values[i] = updateAggregate(
                     aggr_funcs[i],
                     aggr_values[i],
-                    *tuple[aggr_funcs[i].attr_index]
+                    tupleField(tuple, aggr_funcs[i].attr_index)
                 );
             }
         }
@@ -5348,53 +5308,43 @@ public:
         for (const auto& entry : hash_table) {
             const auto& group_keys = entry.first;
             const auto& aggr_values = entry.second;
+
             Tuple output_tuple;
             // Assuming Tuple has a method to add Fields
             for (const auto& key : group_keys) {
-                output_tuple.addField(std::make_unique<Field>(key)); // Add group keys to the tuple
+                output_tuple.addField(std::make_unique<Field>(key));
             }
             for (const auto& value : aggr_values) {
-                output_tuple.addField(std::make_unique<Field>(value)); // Add aggregated values to the tuple
+                output_tuple.addField(std::make_unique<Field>(value));
             }
             output_tuples.push_back(std::move(output_tuple));
         }
     }
 
     bool next() override {
-        if (output_tuples_index < output_tuples.size()) {
-            output_tuples_index++;
-            return true;
+        if (output_tuples_index >= output_tuples.size()) {
+            currentOutput = nullptr;
+            return false;
         }
-        return false;
+        currentOutput = &output_tuples[output_tuples_index++];
+        return true;
     }
 
     void close() override {
         input->close();
+        output_tuples.clear();
+        output_tuples_index = 0;
+        currentOutput = nullptr;
     }
 
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        std::vector<std::unique_ptr<Field>> outputCopy;
-
-        if (output_tuples_index == 0 || output_tuples_index > output_tuples.size()) {
-            // If there is no current tuple because next() hasn't been called yet or we're past the last tuple,
-            // return an empty vector.
-            return outputCopy; // This will be an empty vector
+    const Tuple& getOutput() const override {
+        if (!currentOutput) {
+            throw std::runtime_error("HashAggregationOperator::getOutput called without a current tuple.");
         }
-
-        // Assuming that output_tuples stores Tuple objects and each Tuple has a vector of Field objects or similar
-        const auto& currentTuple = output_tuples[output_tuples_index - 1]; // Adjust for 0-based indexing after increment in next()
-
-        // Assuming the Tuple class provides a way to access its fields, e.g., a method or a public member
-        for (const auto& field : currentTuple.fields) {
-            outputCopy.push_back(field->clone()); // Use the clone method to create a deep copy of each field
-        }
-
-        return outputCopy;
+        return *currentOutput;
     }
-
 
 private:
-
     Field initialAggregate(const AggrFunc& aggrFunc, const Field& newValue) {
         if (aggrFunc.func == AggrFuncType::COUNT) {
             return Field(1);
@@ -5459,7 +5409,125 @@ private:
         throw std::runtime_error(
             "Invalid operation or unsupported Field type.");
     }
+};
 
+class InsertOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    std::unique_ptr<Tuple> tupleToInsert;
+    Tuple emptyOutput;
+
+public:
+    explicit InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+
+    void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
+        tupleToInsert = std::move(tuple);
+    }
+
+    void open() override {}
+
+    bool next() override {
+        if (!tupleToInsert) {
+            return false;
+        }
+        return insertTupleIntoTable(tableHeap, std::move(tupleToInsert));
+    }
+
+    void close() override {}
+
+    const Tuple& getOutput() const override {
+        return emptyOutput;
+    }
+};
+
+class UpdateOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    size_t whereColumn;
+    Field whereValue;
+    std::vector<std::pair<size_t, Field>> assignments;
+    RecoveryManager* recoveryManager = nullptr;
+    bool executed = false;
+    size_t updatedCount = 0;
+    Tuple emptyOutput;
+
+public:
+    UpdateOperator(TableHeap& tableHeap,
+                   size_t whereColumn,
+                   const Field& whereValue,
+                   std::vector<std::pair<size_t, Field>> assignments,
+                   RecoveryManager* recoveryManager = nullptr)
+        : tableHeap(tableHeap),
+          whereColumn(whereColumn),
+          whereValue(whereValue),
+          assignments(std::move(assignments)),
+          recoveryManager(recoveryManager) {}
+
+    void open() override {
+        executed = false;
+        updatedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        updatedCount = tableHeap.updateTuples(
+            whereColumn,
+            whereValue,
+            assignments,
+            recoveryManager,
+            txn_ ? txn_->id : 0
+        );
+        executed = true;
+        return updatedCount > 0;
+    }
+
+    void close() override {}
+
+    const Tuple& getOutput() const override {
+        return emptyOutput;
+    }
+};
+
+class DeleteOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    size_t whereColumn;
+    Field whereValue;
+    bool executed = false;
+    size_t deletedCount = 0;
+    Tuple emptyOutput;
+
+public:
+    DeleteOperator(TableHeap& tableHeap,
+                   size_t whereColumn,
+                   const Field& whereValue)
+        : tableHeap(tableHeap),
+          whereColumn(whereColumn),
+          whereValue(whereValue) {}
+
+    void open() override {
+        executed = false;
+        deletedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        deletedCount = tableHeap.deleteTuples(whereColumn, whereValue);
+        executed = true;
+        return deletedCount > 0;
+    }
+
+    void close() override {}
+
+    const Tuple& getOutput() const override {
+        return emptyOutput;
+    }
 };
 
 struct ColumnRef {
@@ -6785,16 +6853,16 @@ TableStats analyzeTableStats(TableMetadata& metadata,
     ScanOperator scan(table);
     scan.open();
     while (scan.next()) {
-        auto tuple = scan.getOutput();
+        const auto& tuple = scan.getOutput();
         table_stats.rowCount++;
-        for (size_t i = 0; i < tuple.size(); i++) {
-            auto value_text = fieldToString(*tuple[i]);
+        for (size_t i = 0; i < tuple.fields.size(); i++) {
+            auto value_text = fieldToString(*tuple.fields[i]);
             auto column_name = statsColumnName(metadata, i);
             auto& column_stats = table_stats.columns[column_name];
             distinct_values[i].insert(value_text);
             value_counts[i][value_text]++;
-            if (tuple[i]->getType() == INT) {
-                auto value = tuple[i]->asInt();
+            if (tuple.fields[i]->getType() == INT) {
+                auto value = tuple.fields[i]->asInt();
                 int_values[i].push_back(value);
                 if (!column_stats.hasIntRange) {
                     column_stats.minInt = value;
@@ -6944,7 +7012,7 @@ size_t countFilterRows(const QueryComponents& components,
     size_t count = 0;
     scan.open();
     while (scan.next()) {
-        auto tuple = scan.getOutput();
+        const auto& tuple = scan.getOutput();
         if (predicate.check(tuple)) {
             count++;
         }
@@ -6965,15 +7033,15 @@ size_t countRangeRows(const QueryComponents& components,
     size_t count = 0;
     scan.open();
     while (scan.next()) {
-        auto tuple = scan.getOutput();
+        const auto& tuple = scan.getOutput();
         if (column.attributeIndex < 0 ||
-            static_cast<size_t>(column.attributeIndex) >= tuple.size()) {
+            static_cast<size_t>(column.attributeIndex) >= tuple.fields.size()) {
             throw std::runtime_error("Range validation column is out of range.");
         }
-        const auto& field = tuple[static_cast<size_t>(column.attributeIndex)];
-        if (field->getType() == INT &&
-            field->asInt() >= lower &&
-            field->asInt() <= upper) {
+        const Field& field = *tuple.fields[static_cast<size_t>(column.attributeIndex)];
+        if (field.getType() == INT &&
+            field.asInt() >= lower &&
+            field.asInt() <= upper) {
             count++;
         }
     }
@@ -7261,9 +7329,8 @@ struct PlannedQuery {
 
 enum class JoinOrderAlgorithm {
     Written,
-    GreedyMinRows,
-    GreedyMinCost,
-    GreedyOperatorOrdering,
+    GreedyJoinOrdering2,
+    GreedyJoinOrdering3,
     LargestIntermediateFirst
 };
 
@@ -7271,16 +7338,14 @@ std::string joinOrderAlgorithmName(JoinOrderAlgorithm algorithm) {
     switch (algorithm) {
         case JoinOrderAlgorithm::Written:
             return "Written order";
-        case JoinOrderAlgorithm::GreedyMinRows:
-            return "Greedy-1 min output rows";
-        case JoinOrderAlgorithm::GreedyMinCost:
-            return "Greedy-2 min local cost";
-        case JoinOrderAlgorithm::GreedyOperatorOrdering:
-            return "GOO best first pair";
+        case JoinOrderAlgorithm::GreedyJoinOrdering2:
+            return "GreedyJoinOrdering-2";
+        case JoinOrderAlgorithm::GreedyJoinOrdering3:
+            return "GreedyJoinOrdering-3";
         case JoinOrderAlgorithm::LargestIntermediateFirst:
             return "Largest-first stress order";
     }
-    return "GOO best first pair";
+    return "GreedyJoinOrdering-3";
 }
 
 double pagesAfterFilters(const TableStats& table_stats, double filtered_rows) {
@@ -7474,9 +7539,15 @@ std::optional<JoinClause> orientJoinEdge(const JoinClause& edge,
     return oriented;
 }
 
-PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
-                                       const StatisticsCatalog& stats,
-                                       bool ordered_output_required = false) {
+PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
+                                      const StatisticsCatalog& stats,
+                                      JoinOrderAlgorithm algorithm,
+                                      bool ordered_output_required,
+                                      const std::string& start_table);
+
+PlannedQuery chooseGreedyJoinOrdering3Plan(const QueryComponents& components,
+                                           const StatisticsCatalog& stats,
+                                           bool ordered_output_required = false) {
     auto table_names = writtenJoinOrder(components);
     if (table_names.size() <= 1) {
         return {components, choosePhysicalJoinPlan(
@@ -7486,128 +7557,42 @@ PlannedQuery chooseGreedyCostBasedPlan(const QueryComponents& components,
         )};
     }
 
-    auto edges = joinGraphEdges(components);
-    QueryComponents planned = components;
-    PhysicalJoinPlan physical_plan;
-    std::set<std::string> joined_tables;
-    double current_rows = 0.0;
-    double current_pages = 0.0;
-    double current_total_cost = 0.0;
-
-    std::optional<std::pair<std::string, PhysicalJoinCostStep>> best_first_join;
-    for (const auto& edge : edges) {
-        for (const auto& start_table : {edge.left.tableName, edge.right.tableName}) {
-            std::set<std::string> start_set{start_table};
-            auto oriented = orientJoinEdge(edge, start_set, components);
-            if (!oriented) {
-                continue;
-            }
-            const auto& start_stats = tableStatsFor(stats, components, start_table);
-            double start_rows = estimateRowsAfterTableFilters(
-                stats,
-                components,
-                start_table
-            );
-            double start_pages = pagesAfterFilters(start_stats, start_rows);
-            double start_total_cost = fileScanCost(start_stats);
-            auto step = estimatePhysicalJoinStep(
-                components,
-                stats,
-                *oriented,
-                start_rows,
-                start_pages,
-                start_total_cost,
-                ordered_output_required
-            );
-            if (!best_first_join ||
-                costForKind(step, step.chosen) <
-                    costForKind(best_first_join->second, best_first_join->second.chosen)) {
-                best_first_join = {start_table, std::move(step)};
-            }
-        }
-    }
-
-    if (!best_first_join) {
-        return {components, choosePhysicalJoinPlan(
+    std::optional<PlannedQuery> best_plan;
+    double best_score = 0.0;
+    double best_cost = 0.0;
+    for (const auto& start_table : table_names) {
+        auto candidate = chooseAnchoredGreedyPlan(
             components,
             stats,
-            ordered_output_required
-        )};
+            JoinOrderAlgorithm::GreedyJoinOrdering2,
+            ordered_output_required,
+            start_table
+        );
+        double score = candidate.physicalPlan.steps.empty()
+            ? candidate.physicalPlan.finalRows
+            : candidate.physicalPlan.steps.back().outputRows;
+        double cost = candidate.physicalPlan.totalCost;
+        if (!best_plan ||
+            score < best_score ||
+            (score == best_score && cost < best_cost)) {
+            best_plan = candidate;
+            best_score = score;
+            best_cost = cost;
+        }
     }
 
-    planned.tableName = best_first_join->first;
-    planned.baseTableName = actualTableName(components, planned.tableName);
-    planned.joins.clear();
-    planned.joins.push_back(best_first_join->second.join);
-    physical_plan.joinKinds.push_back(best_first_join->second.chosen);
-    physical_plan.totalCost = costForKind(
-        best_first_join->second,
-        best_first_join->second.chosen
-    );
-    physical_plan.steps.push_back(best_first_join->second);
-    joined_tables.insert(planned.tableName);
-    joined_tables.insert(best_first_join->second.join.tableName);
-    current_rows = best_first_join->second.outputRows;
-    current_pages = best_first_join->second.outputPages;
-    current_total_cost = physical_plan.totalCost;
-
-    while (joined_tables.size() < table_names.size()) {
-        std::optional<PhysicalJoinCostStep> best_step;
-        for (const auto& edge : edges) {
-            auto oriented = orientJoinEdge(edge, joined_tables, components);
-            if (!oriented) {
-                continue;
-            }
-            auto step = estimatePhysicalJoinStep(
-                components,
-                stats,
-                *oriented,
-                current_rows,
-                current_pages,
-                current_total_cost,
-                ordered_output_required
-            );
-            if (!best_step ||
-                costForKind(step, step.chosen) <
-                    costForKind(*best_step, best_step->chosen)) {
-                best_step = std::move(step);
-            }
-        }
-
-        if (!best_step) {
-            return {components, choosePhysicalJoinPlan(
-                components,
-                stats,
-                ordered_output_required
-            )};
-        }
-
-        planned.joins.push_back(best_step->join);
-        physical_plan.joinKinds.push_back(best_step->chosen);
-        physical_plan.totalCost = costForKind(*best_step, best_step->chosen);
-        physical_plan.steps.push_back(*best_step);
-        joined_tables.insert(best_step->join.tableName);
-        current_rows = best_step->outputRows;
-        current_pages = best_step->outputPages;
-        current_total_cost = physical_plan.totalCost;
-    }
-
-    physical_plan.finalRows = current_rows;
-    physical_plan.finalPages = current_pages;
-    return {planned, physical_plan};
+    return *best_plan;
 }
 
 double joinOrderStepScore(const PhysicalJoinCostStep& step,
                           JoinOrderAlgorithm algorithm) {
     switch (algorithm) {
-        case JoinOrderAlgorithm::GreedyMinRows:
+        case JoinOrderAlgorithm::GreedyJoinOrdering2:
             return step.outputRows;
-        case JoinOrderAlgorithm::GreedyMinCost:
-            return costForKind(step, step.chosen);
         case JoinOrderAlgorithm::LargestIntermediateFirst:
             return -step.outputRows;
         case JoinOrderAlgorithm::Written:
-        case JoinOrderAlgorithm::GreedyOperatorOrdering:
+        case JoinOrderAlgorithm::GreedyJoinOrdering3:
             return costForKind(step, step.chosen);
     }
     return costForKind(step, step.chosen);
@@ -7616,7 +7601,8 @@ double joinOrderStepScore(const PhysicalJoinCostStep& step,
 PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
                                       const StatisticsCatalog& stats,
                                       JoinOrderAlgorithm algorithm,
-                                      bool ordered_output_required = false) {
+                                      bool ordered_output_required,
+                                      const std::string& start_table) {
     auto table_names = writtenJoinOrder(components);
     if (table_names.size() <= 1) {
         return {components, choosePhysicalJoinPlan(
@@ -7629,19 +7615,22 @@ PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
     auto edges = joinGraphEdges(components);
     QueryComponents planned = components;
     planned.joins.clear();
+    planned.tableName = start_table;
+    planned.baseTableName = actualTableName(components, start_table);
     PhysicalJoinPlan physical_plan;
-    std::set<std::string> joined_tables{components.tableName};
+    std::set<std::string> all_tables(table_names.begin(), table_names.end());
+    std::set<std::string> joined_tables{start_table};
 
-    const auto& base_stats = tableStatsFor(stats, components, components.tableName);
+    const auto& base_stats = tableStatsFor(stats, components, start_table);
     double current_rows = estimateRowsAfterTableFilters(
         stats,
         components,
-        components.tableName
+        start_table
     );
     double current_pages = pagesAfterFilters(base_stats, current_rows);
     double current_total_cost = fileScanCost(base_stats);
 
-    while (joined_tables.size() < table_names.size()) {
+    while (joined_tables.size() < all_tables.size()) {
         std::optional<PhysicalJoinCostStep> best_step;
         double best_score = 0.0;
         for (const auto& edge : edges) {
@@ -7699,8 +7688,8 @@ PlannedQuery chooseJoinOrderPlan(const QueryComponents& components,
             ordered_output_required
         )};
     }
-    if (algorithm == JoinOrderAlgorithm::GreedyOperatorOrdering) {
-        return chooseGreedyCostBasedPlan(
+    if (algorithm == JoinOrderAlgorithm::GreedyJoinOrdering3) {
+        return chooseGreedyJoinOrdering3Plan(
             components,
             stats,
             ordered_output_required
@@ -7710,7 +7699,8 @@ PlannedQuery chooseJoinOrderPlan(const QueryComponents& components,
         components,
         stats,
         algorithm,
-        ordered_output_required
+        ordered_output_required,
+        components.tableName
     );
 }
 
@@ -7748,7 +7738,7 @@ void printPhysicalJoinCosts(const QueryComponents& components,
         return;
     }
 
-    std::cout << "\nPhysical join costing for cost-based order:" << std::endl;
+    std::cout << "\nPhysical join costing for GreedyJoinOrdering-3 order:" << std::endl;
     std::cout << "  # cost is relative operator work for this tuple-at-a-time BuzzDB executor"
               << std::endl;
     std::cout << "  # NestedLoopJoin materializes the right side once, then compares left_rows * right_rows"
@@ -8061,7 +8051,7 @@ QueryTable executeQuery(const QueryComponents& components,
     rootOp->open();
     QueryTable result;
     while (rootOp->next()) {
-        result.push_back({rootOp->getOutput(), rootOp->getTupleId()});
+        result.push_back({cloneTupleFields(rootOp->getOutput()), rootOp->getTupleId()});
     }
     rootOp->close();
     if (print_tuples) {
@@ -8069,126 +8059,6 @@ QueryTable executeQuery(const QueryComponents& components,
     }
     return result;
 }
-
-class InsertOperator : public Operator {
-private:
-    TableHeap& tableHeap;
-    std::unique_ptr<Tuple> tupleToInsert;
-
-public:
-    InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
-
-    // Set the tuple to be inserted by this operator.
-    void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
-        tupleToInsert = std::move(tuple);
-    }
-
-    void open() override {
-        // Not used in this context
-    }
-
-    bool next() override {
-        if (!tupleToInsert) return false; // No tuple to insert
-        return insertTupleIntoTable(tableHeap, std::move(tupleToInsert));
-    }
-
-    void close() override {
-        // Not used in this context
-    }
-
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        return {}; // Return empty vector
-    }
-};
-
-class UpdateOperator : public Operator {
-private:
-    TableHeap& tableHeap;
-    size_t whereColumn;
-    Field whereValue;
-    std::vector<std::pair<size_t, Field>> assignments;
-    RecoveryManager* recoveryManager = nullptr;
-    bool executed = false;
-    size_t updatedCount = 0;
-
-public:
-    UpdateOperator(TableHeap& tableHeap,
-                   size_t whereColumn,
-                   const Field& whereValue,
-                   std::vector<std::pair<size_t, Field>> assignments,
-                   RecoveryManager* recoveryManager = nullptr)
-        : tableHeap(tableHeap),
-          whereColumn(whereColumn),
-          whereValue(whereValue),
-          assignments(std::move(assignments)),
-          recoveryManager(recoveryManager) {}
-
-    void open() override {
-        executed = false;
-        updatedCount = 0;
-    }
-
-    bool next() override {
-        if (executed) {
-            return false;
-        }
-
-        updatedCount = tableHeap.updateTuples(
-            whereColumn,
-            whereValue,
-            assignments,
-            recoveryManager,
-            txn_ ? txn_->id : 0
-        );
-        executed = true;
-        return updatedCount > 0;
-    }
-
-    void close() override {}
-
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        return {};
-    }
-};
-
-class DeleteOperator : public Operator {
-private:
-    TableHeap& tableHeap;
-    size_t whereColumn;
-    Field whereValue;
-    bool executed = false;
-    size_t deletedCount = 0;
-
-public:
-    DeleteOperator(TableHeap& tableHeap,
-                   size_t whereColumn,
-                   const Field& whereValue)
-        : tableHeap(tableHeap),
-          whereColumn(whereColumn),
-          whereValue(whereValue) {}
-
-    void open() override {
-        executed = false;
-        deletedCount = 0;
-    }
-
-    bool next() override {
-        if (executed) {
-            return false;
-        }
-
-        deletedCount = tableHeap.deleteTuples(whereColumn, whereValue);
-        executed = true;
-        return deletedCount > 0;
-    }
-
-    void close() override {}
-
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        return {};
-    }
-};
-
 
 class BuzzDB {
 public:
@@ -9084,7 +8954,7 @@ public:
                             const std::vector<PhysicalJoinKind>& forced_join_kinds = {},
                             const std::vector<size_t>& final_sort_attrs = {},
                             JoinOrderAlgorithm join_order_algorithm =
-                                JoinOrderAlgorithm::GreedyOperatorOrdering) {
+                                JoinOrderAlgorithm::GreedyJoinOrdering3) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
         if (!acquireQueryLocks(txn, components)) {
@@ -9170,12 +9040,12 @@ public:
         auto planned_query = chooseJoinOrderPlan(
             components,
             stats,
-            JoinOrderAlgorithm::GreedyOperatorOrdering,
+            JoinOrderAlgorithm::GreedyJoinOrdering3,
             ordered_output_required
         );
         planned_query_cache[
             query + "#" +
-            joinOrderAlgorithmName(JoinOrderAlgorithm::GreedyOperatorOrdering)
+            joinOrderAlgorithmName(JoinOrderAlgorithm::GreedyJoinOrdering3)
         ] = planned_query;
         printPhysicalJoinCosts(
             planned_query.components,
@@ -9219,12 +9089,12 @@ public:
         resolveQueryColumns(join_body_components, catalog);
         planned_query_cache[
             join_body_query + "#" +
-            joinOrderAlgorithmName(JoinOrderAlgorithm::GreedyOperatorOrdering)
+            joinOrderAlgorithmName(JoinOrderAlgorithm::GreedyJoinOrdering3)
         ] =
             chooseJoinOrderPlan(
                 join_body_components,
                 stats,
-                JoinOrderAlgorithm::GreedyOperatorOrdering,
+                JoinOrderAlgorithm::GreedyJoinOrdering3,
                 ordered_output_required
             );
         auto join_body_rows = executeQuery(join_body_query, txn, false);
@@ -9447,9 +9317,8 @@ int main(int argc, char* argv[]) {
     std::vector<JoinOrderAlgorithm> algorithms = {
         JoinOrderAlgorithm::Written,
         JoinOrderAlgorithm::LargestIntermediateFirst,
-        JoinOrderAlgorithm::GreedyMinRows,
-        JoinOrderAlgorithm::GreedyMinCost,
-        JoinOrderAlgorithm::GreedyOperatorOrdering
+        JoinOrderAlgorithm::GreedyJoinOrdering2,
+        JoinOrderAlgorithm::GreedyJoinOrdering3
     };
     std::vector<JoinOrderRun> runs;
     std::cout << "\nJoin-order algorithm comparison:" << std::endl;
