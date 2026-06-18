@@ -1075,6 +1075,16 @@ public:
         }
     }
 
+    void clearBufferPool() {
+        if (!pin_count.empty()) {
+            throw std::runtime_error("Cannot clear buffer pool while pages are pinned.");
+        }
+        flushAllPages("clear buffer pool");
+        pageMap.clear();
+        dirty_pages.clear();
+        policy = std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY);
+    }
+
     void setDeferStableStorageForces(bool defer) {
         storage_manager.setDeferStableStorageForces(defer);
     }
@@ -8536,6 +8546,10 @@ public:
         buffer_manager.printBufferPoolSummary();
     }
 
+    void clearBufferPool() {
+        buffer_manager.clearBufferPool();
+    }
+
     TxnPtr begin(const std::string& label = "") {
         auto txn = txn_manager.begin(label);
         std::lock_guard<std::mutex> guard(txn_label_latch);
@@ -9712,8 +9726,11 @@ int main(int argc, char* argv[]) {
     };
     std::vector<JoinOrderRun> runs;
     std::cout << "\nJoin-order algorithm comparison:" << std::endl;
+    std::cout << "  Buffer pool is cleared before each timed join execution."
+              << std::endl;
     for (auto algorithm : algorithms) {
         auto plan = db.planQuery(jobJoinQuery(), algorithm);
+        db.clearBufferPool();
         auto start = std::chrono::steady_clock::now();
         auto rows = db.executeQuery(
             jobJoinQuery(),

@@ -4791,6 +4791,18 @@ std::string physicalJoinKindName(PhysicalJoinKind kind) {
     return "HashJoin";
 }
 
+std::string physicalJoinKindShortName(PhysicalJoinKind kind) {
+    switch (kind) {
+        case PhysicalJoinKind::NestedLoopJoin:
+            return "NLJ";
+        case PhysicalJoinKind::HashJoin:
+            return "HJ";
+        case PhysicalJoinKind::SortMergeJoin:
+            return "SMJ";
+    }
+    return "HJ";
+}
+
 int compareFields(const Field& lhs, const Field& rhs) {
     if (lhs.getType() != rhs.getType()) {
         throw std::runtime_error("Cannot compare fields of different types.");
@@ -7332,15 +7344,35 @@ struct PhysicalJoinPlan {
     double totalCost = 0.0;
 };
 
+struct JoinPlanNode {
+    bool isLeaf = true;
+    std::string tableName;
+    std::shared_ptr<JoinPlanNode> left;
+    std::shared_ptr<JoinPlanNode> right;
+    JoinClause join;
+    PhysicalJoinKind joinKind = PhysicalJoinKind::HashJoin;
+    std::vector<std::string> tables;
+    double rows = 0.0;
+    double pages = 0.0;
+    double totalCost = 0.0;
+};
+
 struct PlannedQuery {
     QueryComponents components;
     PhysicalJoinPlan physicalPlan;
+    std::shared_ptr<JoinPlanNode> planRoot;
+    std::string planDescription;
+    size_t dpStatesKept = 0;
+    size_t dpCandidatesConsidered = 0;
+    size_t dpCrossProductsPruned = 0;
 };
 
 enum class JoinOrderAlgorithm {
     Written,
     GreedyJoinOrdering2,
     GreedyJoinOrdering3,
+    GreedyOperatorOrdering,
+    SelingerDP,
     LargestIntermediateFirst
 };
 
@@ -7352,10 +7384,14 @@ std::string joinOrderAlgorithmName(JoinOrderAlgorithm algorithm) {
             return "GreedyJoinOrdering-2";
         case JoinOrderAlgorithm::GreedyJoinOrdering3:
             return "GreedyJoinOrdering-3";
+        case JoinOrderAlgorithm::GreedyOperatorOrdering:
+            return "GOO bushy";
+        case JoinOrderAlgorithm::SelingerDP:
+            return "Selinger DP left-deep";
         case JoinOrderAlgorithm::LargestIntermediateFirst:
             return "Largest-first stress order";
     }
-    return "GreedyJoinOrdering-3";
+    return "GOO bushy";
 }
 
 double pagesAfterFilters(const TableStats& table_stats, double filtered_rows) {
@@ -7481,6 +7517,56 @@ PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
     return step;
 }
 
+PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components,
+                                               const StatisticsCatalog& stats,
+                                               const JoinClause& join,
+                                               double left_rows,
+                                               double left_pages,
+                                               double left_total_cost,
+                                               double right_rows,
+                                               double right_pages,
+                                               double right_total_cost,
+                                               bool ordered_output_required = false) {
+    double output_rows = estimateJoinRows(
+        left_rows,
+        right_rows,
+        columnStatsFor(stats, components, join.left),
+        columnStatsFor(stats, components, join.right)
+    );
+    double output_pages = joinedOutputPages(
+        output_rows,
+        left_rows,
+        left_pages,
+        right_rows,
+        right_pages
+    );
+
+    PhysicalJoinCostStep step;
+    step.join = join;
+    step.leftRows = left_rows;
+    step.leftPages = left_pages;
+    step.leftTotalCost = left_total_cost;
+    step.rightRows = right_rows;
+    step.rightPages = right_pages;
+    step.rightAccessCost = right_total_cost;
+    step.outputRows = output_rows;
+    step.outputPages = output_pages;
+    double final_sort_cost = ordered_output_required ? sortCost(output_pages) : 0.0;
+    step.orderedOutputRequired = ordered_output_required;
+    step.nestedLoopCost = left_total_cost + right_total_cost +
+        tupleCompareCost(left_rows * right_rows) +
+        tupleMaterializationCost(output_rows) + final_sort_cost;
+    step.hashJoinCost = left_total_cost + right_total_cost +
+        tupleHashCost(left_rows + right_rows) +
+        tupleMaterializationCost(output_rows) + final_sort_cost;
+    step.sortMergeCost = left_total_cost + right_total_cost +
+        sortCost(left_pages) + sortCost(right_pages) +
+        tupleCompareCost(left_rows + right_rows) +
+        tupleMaterializationCost(output_rows);
+    step.chosen = chooseCheapestJoin(step);
+    return step;
+}
+
 PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
                                         const StatisticsCatalog& stats,
                                         bool ordered_output_required = false) {
@@ -7549,6 +7635,341 @@ std::optional<JoinClause> orientJoinEdge(const JoinClause& edge,
     return oriented;
 }
 
+bool planContainsTable(const JoinPlanNode& node, const std::string& table_name) {
+    return std::find(node.tables.begin(), node.tables.end(), table_name) !=
+        node.tables.end();
+}
+
+std::optional<JoinClause> joinEdgeBetweenPlans(const JoinPlanNode& left,
+                                               const JoinPlanNode& right,
+                                               const std::vector<JoinClause>& edges) {
+    for (const auto& edge : edges) {
+        bool left_has_left = planContainsTable(left, edge.left.tableName);
+        bool left_has_right = planContainsTable(left, edge.right.tableName);
+        bool right_has_left = planContainsTable(right, edge.left.tableName);
+        bool right_has_right = planContainsTable(right, edge.right.tableName);
+        if ((left_has_left && right_has_right) ||
+            (left_has_right && right_has_left)) {
+            return edge;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string joinPlanTreeString(const std::shared_ptr<JoinPlanNode>& node) {
+    if (!node) {
+        return "";
+    }
+    if (node->isLeaf) {
+        return node->tableName;
+    }
+    std::string left_tree = joinPlanTreeString(node->left);
+    std::string right_tree = joinPlanTreeString(node->right);
+    if (node->joinKind == PhysicalJoinKind::SortMergeJoin) {
+        return "SortMergeJoin(Sort(" + left_tree + "), Sort(" + right_tree + "))";
+    }
+    return physicalJoinKindName(node->joinKind) + "(" +
+        left_tree + ", " + right_tree + ")";
+}
+
+std::string joinPlanTableGroup(const std::shared_ptr<JoinPlanNode>& node) {
+    if (!node) {
+        return "{}";
+    }
+    if (node->isLeaf) {
+        return node->tableName;
+    }
+    return "{" + joinStrings(node->tables, ",") + "}";
+}
+
+void appendJoinPlanTree(const std::shared_ptr<JoinPlanNode>& node,
+                        const std::string& base_indent,
+                        size_t depth,
+                        std::ostringstream& out) {
+    if (!node) {
+        return;
+    }
+    out << base_indent << std::string(depth * 2, ' ');
+    if (node->isLeaf) {
+        out << node->tableName << "\n";
+        return;
+    }
+
+    out << physicalJoinKindShortName(node->joinKind) << " "
+        << joinPlanTableGroup(node->left) << " ⋈ "
+        << joinPlanTableGroup(node->right) << "\n";
+    if (node->left && !node->left->isLeaf) {
+        appendJoinPlanTree(node->left, base_indent, depth + 1, out);
+    }
+    if (node->right && !node->right->isLeaf) {
+        appendJoinPlanTree(node->right, base_indent, depth + 1, out);
+    }
+}
+
+std::string prettyJoinPlanTree(const std::shared_ptr<JoinPlanNode>& node,
+                               const std::string& indent = "") {
+    std::ostringstream out;
+    appendJoinPlanTree(node, indent, 0, out);
+    return out.str();
+}
+
+size_t bitCount(uint64_t mask) {
+    size_t count = 0;
+    while (mask != 0) {
+        count += mask & 1ULL;
+        mask >>= 1ULL;
+    }
+    return count;
+}
+
+std::set<std::string> tablesForMask(const std::vector<std::string>& table_names,
+                                    uint64_t mask) {
+    std::set<std::string> tables;
+    for (size_t i = 0; i < table_names.size(); i++) {
+        if ((mask & (1ULL << i)) != 0) {
+            tables.insert(table_names[i]);
+        }
+    }
+    return tables;
+}
+
+PlannedQuery makeBasePlanForTable(const QueryComponents& components,
+                                  const StatisticsCatalog& stats,
+                                  const std::string& table_name) {
+    QueryComponents planned = components;
+    planned.joins.clear();
+    planned.tableName = table_name;
+    planned.baseTableName = actualTableName(components, table_name);
+
+    const auto& base_stats = tableStatsFor(stats, components, table_name);
+    PhysicalJoinPlan physical_plan;
+    physical_plan.finalRows = estimateRowsAfterTableFilters(
+        stats,
+        components,
+        table_name
+    );
+    physical_plan.finalPages = pagesAfterFilters(
+        base_stats,
+        physical_plan.finalRows
+    );
+    physical_plan.totalCost = fileScanCost(base_stats);
+    return {planned, physical_plan};
+}
+
+PlannedQuery chooseGreedyJoinOrdering3Plan(const QueryComponents& components,
+                                           const StatisticsCatalog& stats,
+                                           bool ordered_output_required);
+
+PlannedQuery chooseGreedyOperatorOrderingPlan(const QueryComponents& components,
+                                              const StatisticsCatalog& stats,
+                                              bool ordered_output_required = false) {
+    auto table_names = writtenJoinOrder(components);
+    if (table_names.size() <= 1) {
+        return {components, choosePhysicalJoinPlan(
+            components,
+            stats,
+            ordered_output_required
+        )};
+    }
+
+    std::vector<std::shared_ptr<JoinPlanNode>> fragments;
+    for (const auto& table_name : table_names) {
+        const auto& table_stats = tableStatsFor(stats, components, table_name);
+        double rows = estimateRowsAfterTableFilters(stats, components, table_name);
+        auto node = std::make_shared<JoinPlanNode>();
+        node->isLeaf = true;
+        node->tableName = table_name;
+        node->tables = {table_name};
+        node->rows = rows;
+        node->pages = pagesAfterFilters(table_stats, rows);
+        node->totalCost = fileScanCost(table_stats);
+        fragments.push_back(node);
+    }
+
+    auto edges = joinGraphEdges(components);
+    PhysicalJoinPlan physical_plan;
+    while (fragments.size() > 1) {
+        std::optional<PhysicalJoinCostStep> best_step;
+        size_t best_left = 0;
+        size_t best_right = 0;
+        JoinClause best_edge;
+
+        for (size_t i = 0; i < fragments.size(); i++) {
+            for (size_t j = i + 1; j < fragments.size(); j++) {
+                auto edge = joinEdgeBetweenPlans(*fragments[i], *fragments[j], edges);
+                if (!edge) {
+                    continue;
+                }
+                auto step = estimatePhysicalJoinTrees(
+                    components,
+                    stats,
+                    *edge,
+                    fragments[i]->rows,
+                    fragments[i]->pages,
+                    fragments[i]->totalCost,
+                    fragments[j]->rows,
+                    fragments[j]->pages,
+                    fragments[j]->totalCost,
+                    ordered_output_required
+                );
+                if (!best_step ||
+                    step.outputRows < best_step->outputRows ||
+                    (step.outputRows == best_step->outputRows &&
+                     costForKind(step, step.chosen) <
+                        costForKind(*best_step, best_step->chosen))) {
+                    best_step = step;
+                    best_left = i;
+                    best_right = j;
+                    best_edge = *edge;
+                }
+            }
+        }
+
+        if (!best_step) {
+            return chooseGreedyJoinOrdering3Plan(
+                components,
+                stats,
+                ordered_output_required
+            );
+        }
+
+        auto joined = std::make_shared<JoinPlanNode>();
+        joined->isLeaf = false;
+        joined->left = fragments[best_left];
+        joined->right = fragments[best_right];
+        joined->join = best_edge;
+        joined->joinKind = best_step->chosen;
+        joined->tables = joined->left->tables;
+        joined->tables.insert(
+            joined->tables.end(),
+            joined->right->tables.begin(),
+            joined->right->tables.end()
+        );
+        joined->rows = best_step->outputRows;
+        joined->pages = best_step->outputPages;
+        joined->totalCost = costForKind(*best_step, best_step->chosen);
+
+        physical_plan.joinKinds.push_back(best_step->chosen);
+        physical_plan.steps.push_back(*best_step);
+        physical_plan.totalCost = joined->totalCost;
+        physical_plan.finalRows = joined->rows;
+        physical_plan.finalPages = joined->pages;
+
+        fragments[best_left] = joined;
+        fragments.erase(fragments.begin() + static_cast<long>(best_right));
+    }
+
+    QueryComponents planned = components;
+    PlannedQuery query{planned, physical_plan, fragments.front()};
+    query.planDescription = joinPlanTreeString(query.planRoot);
+    return query;
+}
+
+PlannedQuery chooseSelingerDPPlan(const QueryComponents& components,
+                                  const StatisticsCatalog& stats,
+                                  bool ordered_output_required = false) {
+    auto table_names = writtenJoinOrder(components);
+    if (table_names.size() <= 1 || table_names.size() >= 63) {
+        return {components, choosePhysicalJoinPlan(
+            components,
+            stats,
+            ordered_output_required
+        )};
+    }
+
+    const uint64_t full_mask = (1ULL << table_names.size()) - 1ULL;
+    std::vector<std::optional<PlannedQuery>> best(full_mask + 1ULL);
+    for (size_t table_index = 0; table_index < table_names.size(); table_index++) {
+        best[1ULL << table_index] = makeBasePlanForTable(
+            components,
+            stats,
+            table_names[table_index]
+        );
+    }
+
+    auto edges = joinGraphEdges(components);
+    size_t candidates_considered = 0;
+    size_t cross_products_pruned = 0;
+
+    for (size_t size = 2; size <= table_names.size(); size++) {
+        for (uint64_t mask = 1; mask <= full_mask; mask++) {
+            if (bitCount(mask) != size - 1 || !best[mask]) {
+                continue;
+            }
+
+            auto joined_tables = tablesForMask(table_names, mask);
+            for (size_t right_index = 0; right_index < table_names.size(); right_index++) {
+                uint64_t right_bit = 1ULL << right_index;
+                if ((mask & right_bit) != 0) {
+                    continue;
+                }
+
+                std::optional<PhysicalJoinCostStep> best_step;
+                for (const auto& edge : edges) {
+                    auto oriented = orientJoinEdge(edge, joined_tables, components);
+                    if (!oriented || oriented->tableName != table_names[right_index]) {
+                        continue;
+                    }
+                    auto step = estimatePhysicalJoinStep(
+                        components,
+                        stats,
+                        *oriented,
+                        best[mask]->physicalPlan.finalRows,
+                        best[mask]->physicalPlan.finalPages,
+                        best[mask]->physicalPlan.totalCost,
+                        ordered_output_required
+                    );
+                    candidates_considered++;
+                    if (!best_step ||
+                        costForKind(step, step.chosen) <
+                            costForKind(*best_step, best_step->chosen)) {
+                        best_step = step;
+                    }
+                }
+
+                if (!best_step) {
+                    cross_products_pruned++;
+                    continue;
+                }
+
+                auto candidate = *best[mask];
+                candidate.components.joins.push_back(best_step->join);
+                candidate.physicalPlan.joinKinds.push_back(best_step->chosen);
+                candidate.physicalPlan.steps.push_back(*best_step);
+                candidate.physicalPlan.totalCost =
+                    costForKind(*best_step, best_step->chosen);
+                candidate.physicalPlan.finalRows = best_step->outputRows;
+                candidate.physicalPlan.finalPages = best_step->outputPages;
+
+                uint64_t new_mask = mask | right_bit;
+                if (!best[new_mask] ||
+                    candidate.physicalPlan.totalCost <
+                        best[new_mask]->physicalPlan.totalCost) {
+                    best[new_mask] = candidate;
+                }
+            }
+        }
+    }
+
+    if (!best[full_mask]) {
+        return chooseGreedyJoinOrdering3Plan(
+            components,
+            stats,
+            ordered_output_required
+        );
+    }
+
+    auto result = *best[full_mask];
+    result.dpCandidatesConsidered = candidates_considered;
+    result.dpCrossProductsPruned = cross_products_pruned;
+    for (const auto& plan : best) {
+        if (plan) {
+            result.dpStatesKept++;
+        }
+    }
+    return result;
+}
+
 PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
                                       const StatisticsCatalog& stats,
                                       JoinOrderAlgorithm algorithm,
@@ -7603,6 +8024,8 @@ double joinOrderStepScore(const PhysicalJoinCostStep& step,
             return -step.outputRows;
         case JoinOrderAlgorithm::Written:
         case JoinOrderAlgorithm::GreedyJoinOrdering3:
+        case JoinOrderAlgorithm::GreedyOperatorOrdering:
+        case JoinOrderAlgorithm::SelingerDP:
             return costForKind(step, step.chosen);
     }
     return costForKind(step, step.chosen);
@@ -7705,6 +8128,20 @@ PlannedQuery chooseJoinOrderPlan(const QueryComponents& components,
             ordered_output_required
         );
     }
+    if (algorithm == JoinOrderAlgorithm::GreedyOperatorOrdering) {
+        return chooseGreedyOperatorOrderingPlan(
+            components,
+            stats,
+            ordered_output_required
+        );
+    }
+    if (algorithm == JoinOrderAlgorithm::SelingerDP) {
+        return chooseSelingerDPPlan(
+            components,
+            stats,
+            ordered_output_required
+        );
+    }
     return chooseAnchoredGreedyPlan(
         components,
         stats,
@@ -7743,12 +8180,15 @@ std::string physicalPlanTreeString(const QueryComponents& components,
 }
 
 void printPhysicalJoinCosts(const QueryComponents& components,
-                            const PhysicalJoinPlan& plan) {
+                            const PhysicalJoinPlan& plan,
+                            const std::string& plan_label,
+                            const std::string& plan_description = "",
+                            const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
     if (plan.steps.empty()) {
         return;
     }
 
-    std::cout << "\nPhysical join costing for GreedyJoinOrdering-3 order:" << std::endl;
+    std::cout << "\nPhysical join costing for " << plan_label << ":" << std::endl;
     std::cout << "  # cost is relative operator work for this tuple-at-a-time BuzzDB executor"
               << std::endl;
     std::cout << "  # NestedLoopJoin materializes the right side once, then compares left_rows * right_rows"
@@ -7757,9 +8197,18 @@ void printPhysicalJoinCosts(const QueryComponents& components,
               << std::endl;
     std::cout << "  # SortMergeJoin uses in-memory Sort operators before merge"
               << std::endl;
-    std::cout << "  chosen join order: "
-              << joinStrings(writtenJoinOrder(components), " -> ")
-              << std::endl;
+    if (plan_description.empty()) {
+        std::cout << "  chosen join order: "
+                  << joinStrings(writtenJoinOrder(components), " -> ")
+                  << std::endl;
+    } else if (plan_root) {
+        std::cout << "  chosen join tree:" << std::endl;
+        std::cout << prettyJoinPlanTree(plan_root, "    ");
+    } else {
+        std::cout << "  chosen join tree: "
+                  << plan_description
+                  << std::endl;
+    }
     for (const auto& step : plan.steps) {
         std::cout << "  " << joinLabel(step.join) << std::endl;
         std::cout << "    inputs: left rows/pages="
@@ -7791,9 +8240,6 @@ void printPhysicalJoinCosts(const QueryComponents& components,
                   << physicalJoinKindName(step.chosen)
                   << std::endl;
     }
-    std::cout << "  chosen physical plan: "
-              << physicalPlanTreeString(components, plan.joinKinds)
-              << std::endl;
     std::cout << "  estimated plan cost: "
               << formatEstimate(plan.totalCost)
               << " final rows/pages="
@@ -7844,7 +8290,8 @@ QueryTable executeQuery(const QueryComponents& components,
                         const TxnPtr& txn = nullptr,
                         bool print_tuples = true,
                         const std::vector<PhysicalJoinKind>& join_kinds = {},
-                        const std::vector<size_t>& final_sort_attrs = {}) {
+                        const std::vector<size_t>& final_sort_attrs = {},
+                        const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
     std::map<std::string, size_t> table_offsets;
     std::map<std::string, size_t> table_widths;
     std::vector<std::unique_ptr<TableHeap>> heaps;
@@ -7871,53 +8318,140 @@ QueryTable executeQuery(const QueryComponents& components,
         return *scans.back();
     };
 
-    Operator* rootOp = &addScan(components.tableName);
-    table_offsets[components.tableName] = 0;
-    size_t output_width = table_widths[components.tableName];
-
-    size_t join_index = 0;
-    for (const auto& join : components.joins) {
-        auto& right_scan = addScan(join.tableName);
-        size_t left_attr_index;
-        size_t right_attr_index;
-        if (table_offsets.find(join.left.tableName) != table_offsets.end() &&
-            join.right.tableName == join.tableName) {
-            left_attr_index = table_offsets[join.left.tableName] + join.left.attributeIndex;
-            right_attr_index = join.right.attributeIndex;
-        } else if (table_offsets.find(join.right.tableName) != table_offsets.end() &&
-                   join.left.tableName == join.tableName) {
-            left_attr_index = table_offsets[join.right.tableName] + join.right.attributeIndex;
-            right_attr_index = join.left.attributeIndex;
-        } else {
-            throw std::runtime_error("JOIN must connect a new table to an earlier table.");
+    auto tableOffsetIn = [&](const std::vector<std::string>& tables,
+                             const std::string& table_name) {
+        size_t offset = 0;
+        for (const auto& table : tables) {
+            if (table == table_name) {
+                return offset;
+            }
+            offset += table_widths[table];
         }
-        auto join_kind = join_index < join_kinds.size()
-            ? join_kinds[join_index]
-            : PhysicalJoinKind::HashJoin;
+        throw std::runtime_error("JOIN table is not in this subtree.");
+    };
+
+    auto addJoinOperator = [&](Operator& left_op,
+                               Operator& right_op,
+                               size_t left_attr_index,
+                               size_t right_attr_index,
+                               PhysicalJoinKind join_kind) -> Operator& {
         if (join_kind == PhysicalJoinKind::NestedLoopJoin) {
             nestedLoopJoinOpBuffers.push_back(std::make_unique<NestedLoopJoinOperator>(
-                *rootOp, right_scan, left_attr_index, right_attr_index));
-            rootOp = nestedLoopJoinOpBuffers.back().get();
-        } else if (join_kind == PhysicalJoinKind::SortMergeJoin) {
+                left_op, right_op, left_attr_index, right_attr_index));
+            return *nestedLoopJoinOpBuffers.back();
+        }
+        if (join_kind == PhysicalJoinKind::SortMergeJoin) {
             sortOpBuffers.push_back(std::make_unique<SortOperator>(
-                *rootOp, std::vector<size_t>{left_attr_index}));
+                left_op, std::vector<size_t>{left_attr_index}));
             Operator* sorted_left = sortOpBuffers.back().get();
 
             sortOpBuffers.push_back(std::make_unique<SortOperator>(
-                right_scan, std::vector<size_t>{right_attr_index}));
+                right_op, std::vector<size_t>{right_attr_index}));
             Operator* sorted_right = sortOpBuffers.back().get();
 
             sortMergeJoinOpBuffers.push_back(std::make_unique<SortMergeJoinOperator>(
                 *sorted_left, *sorted_right, left_attr_index, right_attr_index));
-            rootOp = sortMergeJoinOpBuffers.back().get();
-        } else {
-            hashJoinOpBuffers.push_back(std::make_unique<HashJoinOperator>(
-                *rootOp, right_scan, left_attr_index, right_attr_index));
-            rootOp = hashJoinOpBuffers.back().get();
+            return *sortMergeJoinOpBuffers.back();
         }
-        table_offsets[join.tableName] = output_width;
-        output_width += table_widths[join.tableName];
-        join_index++;
+        hashJoinOpBuffers.push_back(std::make_unique<HashJoinOperator>(
+            left_op, right_op, left_attr_index, right_attr_index));
+        return *hashJoinOpBuffers.back();
+    };
+
+    struct BuiltPlanOperator {
+        Operator* op = nullptr;
+        std::vector<std::string> tables;
+        size_t width = 0;
+    };
+
+    std::function<BuiltPlanOperator(const std::shared_ptr<JoinPlanNode>&)> buildPlanNode =
+        [&](const std::shared_ptr<JoinPlanNode>& node) -> BuiltPlanOperator {
+            if (node->isLeaf) {
+                Operator& scan = addScan(node->tableName);
+                return {&scan, {node->tableName}, table_widths[node->tableName]};
+            }
+
+            auto left = buildPlanNode(node->left);
+            auto right = buildPlanNode(node->right);
+            size_t left_attr_index;
+            size_t right_attr_index;
+            if (std::find(left.tables.begin(), left.tables.end(), node->join.left.tableName) !=
+                    left.tables.end() &&
+                std::find(right.tables.begin(), right.tables.end(), node->join.right.tableName) !=
+                    right.tables.end()) {
+                left_attr_index = tableOffsetIn(left.tables, node->join.left.tableName) +
+                    static_cast<size_t>(node->join.left.attributeIndex);
+                right_attr_index = tableOffsetIn(right.tables, node->join.right.tableName) +
+                    static_cast<size_t>(node->join.right.attributeIndex);
+            } else if (std::find(left.tables.begin(), left.tables.end(), node->join.right.tableName) !=
+                           left.tables.end() &&
+                       std::find(right.tables.begin(), right.tables.end(), node->join.left.tableName) !=
+                           right.tables.end()) {
+                left_attr_index = tableOffsetIn(left.tables, node->join.right.tableName) +
+                    static_cast<size_t>(node->join.right.attributeIndex);
+                right_attr_index = tableOffsetIn(right.tables, node->join.left.tableName) +
+                    static_cast<size_t>(node->join.left.attributeIndex);
+            } else {
+                throw std::runtime_error("GOO join edge does not connect the two subtrees.");
+            }
+
+            Operator& join_op = addJoinOperator(
+                *left.op,
+                *right.op,
+                left_attr_index,
+                right_attr_index,
+                node->joinKind
+            );
+            left.tables.insert(left.tables.end(), right.tables.begin(), right.tables.end());
+            return {&join_op, left.tables, left.width + right.width};
+        };
+
+    Operator* rootOp = nullptr;
+    size_t output_width = 0;
+    if (plan_root) {
+        auto built = buildPlanNode(plan_root);
+        rootOp = built.op;
+        output_width = built.width;
+        size_t offset = 0;
+        for (const auto& table_name : built.tables) {
+            table_offsets[table_name] = offset;
+            offset += table_widths[table_name];
+        }
+    } else {
+        rootOp = &addScan(components.tableName);
+        table_offsets[components.tableName] = 0;
+        output_width = table_widths[components.tableName];
+
+        size_t join_index = 0;
+        for (const auto& join : components.joins) {
+            auto& right_scan = addScan(join.tableName);
+            size_t left_attr_index;
+            size_t right_attr_index;
+            if (table_offsets.find(join.left.tableName) != table_offsets.end() &&
+                join.right.tableName == join.tableName) {
+                left_attr_index = table_offsets[join.left.tableName] + join.left.attributeIndex;
+                right_attr_index = join.right.attributeIndex;
+            } else if (table_offsets.find(join.right.tableName) != table_offsets.end() &&
+                       join.left.tableName == join.tableName) {
+                left_attr_index = table_offsets[join.right.tableName] + join.right.attributeIndex;
+                right_attr_index = join.left.attributeIndex;
+            } else {
+                throw std::runtime_error("JOIN must connect a new table to an earlier table.");
+            }
+            auto join_kind = join_index < join_kinds.size()
+                ? join_kinds[join_index]
+                : PhysicalJoinKind::HashJoin;
+            rootOp = &addJoinOperator(
+                *rootOp,
+                right_scan,
+                left_attr_index,
+                right_attr_index,
+                join_kind
+            );
+            table_offsets[join.tableName] = output_width;
+            output_width += table_widths[join.tableName];
+            join_index++;
+        }
     }
 
     // Buffer for optional operators to ensure lifetime
@@ -8968,7 +9502,7 @@ public:
                             const std::vector<PhysicalJoinKind>& forced_join_kinds = {},
                             const std::vector<size_t>& final_sort_attrs = {},
                             JoinOrderAlgorithm join_order_algorithm =
-                                JoinOrderAlgorithm::GreedyJoinOrdering3) {
+                                JoinOrderAlgorithm::GreedyOperatorOrdering) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
         if (!acquireQueryLocks(txn, components)) {
@@ -8981,6 +9515,7 @@ public:
         (void)queryColumns;
         std::vector<PhysicalJoinKind> join_kinds;
         QueryComponents planned_components = components;
+        std::shared_ptr<JoinPlanNode> planned_root;
         if (!components.joins.empty()) {
             if (!forced_join_kinds.empty()) {
                 join_kinds = forced_join_kinds;
@@ -9001,6 +9536,7 @@ public:
                     }
                     planned_components = planned_query.components;
                     join_kinds = planned_query.physicalPlan.joinKinds;
+                    planned_root = planned_query.planRoot;
                 } catch (const std::exception&) {
                     join_kinds.clear();
                 }
@@ -9008,7 +9544,9 @@ public:
         }
         if (print_tuples) {
             std::cout << "QUERY "
-                      << physicalPlanTreeString(planned_components, join_kinds)
+                      << (planned_root
+                          ? joinPlanTreeString(planned_root)
+                          : physicalPlanTreeString(planned_components, join_kinds))
                       << std::endl;
         }
         auto result = ::executeQuery(
@@ -9018,7 +9556,8 @@ public:
             txn,
             print_tuples,
             join_kinds,
-            final_sort_attrs
+            final_sort_attrs,
+            planned_root
         );
         return result;
     }
@@ -9051,20 +9590,32 @@ public:
         auto stats = loadQueryTableStats(components, catalog);
         printAnalyzeStats(components, stats);
         auto final_estimates = printCardinalityEstimates(components, stats);
+        auto default_algorithm = JoinOrderAlgorithm::SelingerDP;
         auto planned_query = chooseJoinOrderPlan(
             components,
             stats,
-            JoinOrderAlgorithm::GreedyJoinOrdering3,
+            default_algorithm,
             ordered_output_required
         );
         planned_query_cache[
             query + "#" +
-            joinOrderAlgorithmName(JoinOrderAlgorithm::GreedyJoinOrdering3)
+            joinOrderAlgorithmName(default_algorithm)
         ] = planned_query;
         printPhysicalJoinCosts(
             planned_query.components,
-            planned_query.physicalPlan
+            planned_query.physicalPlan,
+            joinOrderAlgorithmName(default_algorithm),
+            planned_query.planDescription,
+            planned_query.planRoot
         );
+        if (planned_query.dpStatesKept > 0) {
+            std::cout << "  DP states kept: "
+                      << planned_query.dpStatesKept << std::endl;
+            std::cout << "  DP candidates considered: "
+                      << planned_query.dpCandidatesConsidered << std::endl;
+            std::cout << "  Cross products pruned: "
+                      << planned_query.dpCrossProductsPruned << std::endl;
+        }
         printHistogramRangeValidation(components, stats, catalog, buffer_manager);
 
         std::cout << "\nActual validation:" << std::endl;
@@ -9103,12 +9654,12 @@ public:
         resolveQueryColumns(join_body_components, catalog);
         planned_query_cache[
             join_body_query + "#" +
-            joinOrderAlgorithmName(JoinOrderAlgorithm::GreedyJoinOrdering3)
+            joinOrderAlgorithmName(default_algorithm)
         ] =
             chooseJoinOrderPlan(
                 join_body_components,
                 stats,
-                JoinOrderAlgorithm::GreedyJoinOrdering3,
+                default_algorithm,
                 ordered_output_required
             );
         auto join_body_rows = executeQuery(join_body_query, txn, false);
@@ -9298,6 +9849,10 @@ struct JoinOrderRun {
     long elapsed_ms = 0;
     double estimated_cost = 0.0;
     std::string order;
+    std::string prettyPlan;
+    size_t dpStatesKept = 0;
+    size_t dpCandidatesConsidered = 0;
+    size_t dpCrossProductsPruned = 0;
     QueryTable sample_rows;
 };
 
@@ -9332,7 +9887,9 @@ int main(int argc, char* argv[]) {
         JoinOrderAlgorithm::Written,
         JoinOrderAlgorithm::LargestIntermediateFirst,
         JoinOrderAlgorithm::GreedyJoinOrdering2,
-        JoinOrderAlgorithm::GreedyJoinOrdering3
+        JoinOrderAlgorithm::GreedyJoinOrdering3,
+        JoinOrderAlgorithm::SelingerDP,
+        JoinOrderAlgorithm::GreedyOperatorOrdering
     };
     std::vector<JoinOrderRun> runs;
     std::cout << "\nJoin-order algorithm comparison:" << std::endl;
@@ -9356,7 +9913,13 @@ int main(int argc, char* argv[]) {
             rows.size(),
             elapsedMs(start, end),
             plan.physicalPlan.totalCost,
-            joinStrings(writtenJoinOrder(plan.components), " -> "),
+            plan.planDescription.empty()
+                ? joinStrings(writtenJoinOrder(plan.components), " -> ")
+                : plan.planDescription,
+            plan.planRoot ? prettyJoinPlanTree(plan.planRoot, "      ") : "",
+            plan.dpStatesKept,
+            plan.dpCandidatesConsidered,
+            plan.dpCrossProductsPruned,
             std::move(rows)
         });
     }
@@ -9366,7 +9929,20 @@ int main(int argc, char* argv[]) {
                   << ": " << run.elapsed_ms << " ms"
                   << ", estimated cost=" << formatEstimate(run.estimated_cost)
                   << ", rows=" << run.output_rows << std::endl;
-        std::cout << "    order: " << run.order << std::endl;
+        if (run.prettyPlan.empty()) {
+            std::cout << "    plan: " << run.order << std::endl;
+        } else {
+            std::cout << "    plan:" << std::endl;
+            std::cout << run.prettyPlan;
+        }
+        if (run.dpStatesKept > 0) {
+            std::cout << "    DP states kept: " << run.dpStatesKept
+                      << ", candidates considered: "
+                      << run.dpCandidatesConsidered
+                      << ", cross products pruned: "
+                      << run.dpCrossProductsPruned
+                      << std::endl;
+        }
     }
     std::cout << "  Sample rows:" << std::endl;
     if (!runs.empty()) {
