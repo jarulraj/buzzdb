@@ -7386,6 +7386,7 @@ enum class JoinOrderAlgorithm {
     SelingerDP,
     BushyDP,
     ConnectedSubgraphDP,
+    IKKBZ,
     LargestIntermediateFirst
 };
 
@@ -7405,6 +7406,8 @@ std::string joinOrderAlgorithmName(JoinOrderAlgorithm algorithm) {
             return "DPsize bushy";
         case JoinOrderAlgorithm::ConnectedSubgraphDP:
             return "DPccp connected-subgraph";
+        case JoinOrderAlgorithm::IKKBZ:
+            return "IKKBZ";
         case JoinOrderAlgorithm::LargestIntermediateFirst:
             return "Largest-first stress order";
     }
@@ -8304,6 +8307,350 @@ PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
     return result;
 }
 
+struct IKKBZSequence {
+    std::vector<std::string> tables;
+    std::vector<std::pair<std::string, double>> ranks;
+    double transfer = 1.0;
+    double cost = 0.0;
+    double rank = 0.0;
+    size_t compounds = 0;
+};
+
+double ikkbzRank(double transfer, double cost) {
+    if (cost <= 0.0) {
+        return 0.0;
+    }
+    double rank = (transfer - 1.0) / cost;
+    return std::abs(rank) < 0.000001 ? 0.0 : rank;
+}
+
+std::vector<JoinClause> resolvedJoinGraphEdges(const QueryComponents& components) {
+    auto table_names = writtenJoinOrder(components);
+    std::set<std::string> query_tables(table_names.begin(), table_names.end());
+    std::vector<JoinClause> resolved_edges;
+    for (const auto& edge : joinGraphEdges(components)) {
+        if (query_tables.find(edge.left.tableName) != query_tables.end() &&
+            query_tables.find(edge.right.tableName) != query_tables.end()) {
+            resolved_edges.push_back(edge);
+        }
+    }
+    return resolved_edges;
+}
+
+double edgeSelectivity(const QueryComponents& components,
+                       const StatisticsCatalog& stats,
+                       const JoinClause& edge) {
+    double left_rows = estimateRowsAfterTableFilters(
+        stats,
+        components,
+        edge.left.tableName
+    );
+    double right_rows = estimateRowsAfterTableFilters(
+        stats,
+        components,
+        edge.right.tableName
+    );
+    double joined_rows = estimateJoinRows(
+        left_rows,
+        right_rows,
+        columnStatsFor(stats, components, edge.left),
+        columnStatsFor(stats, components, edge.right)
+    );
+    return joined_rows / std::max(1.0, left_rows * right_rows);
+}
+
+std::optional<JoinClause> edgeBetweenTables(const std::vector<JoinClause>& edges,
+                                            const std::string& left_table,
+                                            const std::string& right_table) {
+    for (const auto& edge : edges) {
+        if ((edge.left.tableName == left_table &&
+             edge.right.tableName == right_table) ||
+            (edge.left.tableName == right_table &&
+             edge.right.tableName == left_table)) {
+            return edge;
+        }
+    }
+    return std::nullopt;
+}
+
+std::map<std::string, std::vector<std::string>> buildIKKBZPrecedenceTree(
+    const std::vector<std::string>& table_names,
+    const std::vector<JoinClause>& edges,
+    const std::string& root) {
+    std::map<std::string, std::vector<std::string>> graph;
+    for (const auto& edge : edges) {
+        graph[edge.left.tableName].push_back(edge.right.tableName);
+        graph[edge.right.tableName].push_back(edge.left.tableName);
+    }
+
+    std::map<std::string, std::vector<std::string>> children;
+    std::set<std::string> seen{root};
+    std::vector<std::string> frontier{root};
+    for (size_t pos = 0; pos < frontier.size(); pos++) {
+        auto neighbors = graph[frontier[pos]];
+        std::sort(neighbors.begin(), neighbors.end());
+        for (const auto& neighbor : neighbors) {
+            if (seen.insert(neighbor).second) {
+                children[frontier[pos]].push_back(neighbor);
+                frontier.push_back(neighbor);
+            }
+        }
+    }
+
+    if (seen.size() != table_names.size()) {
+        children.clear();
+    }
+    return children;
+}
+
+IKKBZSequence mergeIKKBZSequences(const IKKBZSequence& left,
+                                  const IKKBZSequence& right,
+                                  bool compound) {
+    IKKBZSequence merged;
+    merged.tables = left.tables;
+    merged.tables.insert(
+        merged.tables.end(),
+        right.tables.begin(),
+        right.tables.end()
+    );
+    merged.ranks = left.ranks;
+    merged.ranks.insert(
+        merged.ranks.end(),
+        right.ranks.begin(),
+        right.ranks.end()
+    );
+    merged.transfer = left.transfer * right.transfer;
+    merged.cost = left.cost + left.transfer * right.cost;
+    merged.rank = ikkbzRank(merged.transfer, merged.cost);
+    merged.compounds = left.compounds + right.compounds + (compound ? 1 : 0);
+    return merged;
+}
+
+IKKBZSequence buildIKKBZSequenceForSubtree(
+    const QueryComponents& components,
+    const StatisticsCatalog& stats,
+    const std::vector<JoinClause>& edges,
+    const std::map<std::string, std::vector<std::string>>& children,
+    const std::string& table,
+    const std::optional<std::string>& parent_table) {
+    const auto& table_stats = tableStatsFor(stats, components, table);
+    double rows = estimateRowsAfterTableFilters(stats, components, table);
+    double transfer = std::max(1.0, rows);
+    double cost = 0.0;
+
+    if (parent_table) {
+        auto edge = edgeBetweenTables(edges, *parent_table, table);
+        if (edge) {
+            transfer = std::max(0.000001, edgeSelectivity(components, stats, *edge) * rows);
+        }
+        cost = fileScanCost(table_stats);
+    }
+
+    IKKBZSequence sequence;
+    sequence.tables = {table};
+    sequence.transfer = transfer;
+    sequence.cost = cost;
+    sequence.rank = ikkbzRank(transfer, cost);
+    sequence.ranks.push_back({table, sequence.rank});
+
+    std::vector<IKKBZSequence> child_sequences;
+    auto child_it = children.find(table);
+    if (child_it != children.end()) {
+        for (const auto& child : child_it->second) {
+            child_sequences.push_back(buildIKKBZSequenceForSubtree(
+                components,
+                stats,
+                edges,
+                children,
+                child,
+                table
+            ));
+        }
+    }
+
+    std::sort(
+        child_sequences.begin(),
+        child_sequences.end(),
+        [](const auto& left, const auto& right) {
+            return left.rank < right.rank;
+        }
+    );
+
+    for (const auto& child_sequence : child_sequences) {
+        bool contradictory = sequence.rank > child_sequence.rank;
+        sequence = mergeIKKBZSequences(sequence, child_sequence, contradictory);
+    }
+    return sequence;
+}
+
+std::optional<PhysicalJoinCostStep> bestStepForNextTable(
+    const QueryComponents& components,
+    const StatisticsCatalog& stats,
+    const std::vector<JoinClause>& edges,
+    const std::set<std::string>& joined_tables,
+    const std::string& next_table,
+    double current_rows,
+    double current_pages,
+    double current_total_cost,
+    bool ordered_output_required) {
+    std::optional<PhysicalJoinCostStep> best_step;
+    for (const auto& edge : edges) {
+        auto oriented = orientJoinEdge(edge, joined_tables, components);
+        if (!oriented || oriented->tableName != next_table) {
+            continue;
+        }
+        auto step = estimatePhysicalJoinStep(
+            components,
+            stats,
+            *oriented,
+            current_rows,
+            current_pages,
+            current_total_cost,
+            ordered_output_required
+        );
+        if (!best_step ||
+            costForKind(step, step.chosen) <
+                costForKind(*best_step, best_step->chosen)) {
+            best_step = step;
+        }
+    }
+    return best_step;
+}
+
+std::optional<PlannedQuery> chooseFixedLeftDeepOrderPlan(
+    const QueryComponents& components,
+    const StatisticsCatalog& stats,
+    const std::vector<std::string>& order,
+    bool ordered_output_required) {
+    auto table_names = writtenJoinOrder(components);
+    if (order.size() != table_names.size() ||
+        std::set<std::string>(order.begin(), order.end()).size() != order.size()) {
+        return std::nullopt;
+    }
+
+    QueryComponents planned = components;
+    planned.joins.clear();
+    planned.tableName = order.front();
+    planned.baseTableName = actualTableName(components, order.front());
+
+    const auto& base_stats = tableStatsFor(stats, components, order.front());
+    double current_rows = estimateRowsAfterTableFilters(
+        stats,
+        components,
+        order.front()
+    );
+    double current_pages = pagesAfterFilters(base_stats, current_rows);
+    double current_total_cost = fileScanCost(base_stats);
+    std::set<std::string> joined_tables{order.front()};
+    auto edges = joinGraphEdges(components);
+
+    PhysicalJoinPlan physical_plan;
+    for (size_t i = 1; i < order.size(); i++) {
+        auto step = bestStepForNextTable(
+            components,
+            stats,
+            edges,
+            joined_tables,
+            order[i],
+            current_rows,
+            current_pages,
+            current_total_cost,
+            ordered_output_required
+        );
+        if (!step) {
+            return std::nullopt;
+        }
+
+        planned.joins.push_back(step->join);
+        physical_plan.joinKinds.push_back(step->chosen);
+        physical_plan.steps.push_back(*step);
+        physical_plan.totalCost = costForKind(*step, step->chosen);
+        joined_tables.insert(order[i]);
+        current_rows = step->outputRows;
+        current_pages = step->outputPages;
+        current_total_cost = physical_plan.totalCost;
+    }
+
+    physical_plan.finalRows = current_rows;
+    physical_plan.finalPages = current_pages;
+    return PlannedQuery{planned, physical_plan};
+}
+
+std::string formatIKKBZRanks(const std::vector<std::pair<std::string, double>>& ranks) {
+    std::vector<std::string> labels;
+    for (const auto& [table, rank] : ranks) {
+        double display_rank = std::abs(rank) < 0.05 ? 0.0 : rank;
+        labels.push_back(table + "=" + formatEstimate(display_rank));
+    }
+    return joinStrings(labels, ", ");
+}
+
+PlannedQuery chooseIKKBZPlan(const QueryComponents& components,
+                             const StatisticsCatalog& stats,
+                             bool ordered_output_required = false) {
+    auto table_names = writtenJoinOrder(components);
+    if (table_names.size() <= 1) {
+        return {components, choosePhysicalJoinPlan(
+            components,
+            stats,
+            ordered_output_required
+        )};
+    }
+
+    auto precedence_edges = resolvedJoinGraphEdges(components);
+    std::optional<PlannedQuery> best_plan;
+    std::string best_root;
+    std::vector<std::string> best_order;
+    std::vector<std::pair<std::string, double>> best_ranks;
+    size_t best_compounds = 0;
+    for (const auto& root : table_names) {
+        auto children = buildIKKBZPrecedenceTree(table_names, precedence_edges, root);
+        if (children.empty()) {
+            continue;
+        }
+
+        auto sequence = buildIKKBZSequenceForSubtree(
+            components,
+            stats,
+            precedence_edges,
+            children,
+            root,
+            std::nullopt
+        );
+        auto candidate = chooseFixedLeftDeepOrderPlan(
+            components,
+            stats,
+            sequence.tables,
+            ordered_output_required
+        );
+        if (!candidate) {
+            continue;
+        }
+        if (!best_plan ||
+            candidate->physicalPlan.totalCost <
+                best_plan->physicalPlan.totalCost) {
+            best_plan = *candidate;
+            best_root = root;
+            best_order = sequence.tables;
+            best_ranks = sequence.ranks;
+            best_compounds = sequence.compounds;
+        }
+    }
+
+    if (!best_plan) {
+        return chooseGreedyJoinOrdering3Plan(
+            components,
+            stats,
+            ordered_output_required
+        );
+    }
+    best_plan->planDescription = "root=" + best_root +
+        "; compounds=" + std::to_string(best_compounds) +
+        "; order: " + joinStrings(best_order, " -> ") +
+        "; ranks: " + formatIKKBZRanks(best_ranks);
+    return *best_plan;
+}
+
 PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
                                       const StatisticsCatalog& stats,
                                       JoinOrderAlgorithm algorithm,
@@ -8362,6 +8709,7 @@ double joinOrderStepScore(const PhysicalJoinCostStep& step,
         case JoinOrderAlgorithm::SelingerDP:
         case JoinOrderAlgorithm::BushyDP:
         case JoinOrderAlgorithm::ConnectedSubgraphDP:
+        case JoinOrderAlgorithm::IKKBZ:
             return costForKind(step, step.chosen);
     }
     return costForKind(step, step.chosen);
@@ -8487,6 +8835,13 @@ PlannedQuery chooseJoinOrderPlan(const QueryComponents& components,
     }
     if (algorithm == JoinOrderAlgorithm::ConnectedSubgraphDP) {
         return chooseConnectedSubgraphDPPlan(
+            components,
+            stats,
+            ordered_output_required
+        );
+    }
+    if (algorithm == JoinOrderAlgorithm::IKKBZ) {
+        return chooseIKKBZPlan(
             components,
             stats,
             ordered_output_required
@@ -10241,6 +10596,7 @@ int main(int argc, char* argv[]) {
         JoinOrderAlgorithm::SelingerDP,
         JoinOrderAlgorithm::BushyDP,
         JoinOrderAlgorithm::ConnectedSubgraphDP,
+        JoinOrderAlgorithm::IKKBZ,
         JoinOrderAlgorithm::GreedyOperatorOrdering
     };
     std::vector<JoinOrderRun> runs;

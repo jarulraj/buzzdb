@@ -7362,6 +7362,17 @@ struct PlannedQuery {
     PhysicalJoinPlan physicalPlan;
     std::shared_ptr<JoinPlanNode> planRoot;
     std::string planDescription;
+
+    PlannedQuery() = default;
+
+    PlannedQuery(QueryComponents components,
+                 PhysicalJoinPlan physicalPlan,
+                 std::shared_ptr<JoinPlanNode> planRoot = nullptr,
+                 std::string planDescription = "")
+        : components(std::move(components)),
+          physicalPlan(std::move(physicalPlan)),
+          planRoot(std::move(planRoot)),
+          planDescription(std::move(planDescription)) {}
 };
 
 enum class JoinOrderAlgorithm {

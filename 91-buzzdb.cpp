@@ -7365,6 +7365,17 @@ struct PlannedQuery {
     size_t dpStatesKept = 0;
     size_t dpCandidatesConsidered = 0;
     size_t dpCrossProductsPruned = 0;
+
+    PlannedQuery() = default;
+
+    PlannedQuery(QueryComponents components,
+                 PhysicalJoinPlan physicalPlan,
+                 std::shared_ptr<JoinPlanNode> planRoot = nullptr,
+                 std::string planDescription = "")
+        : components(std::move(components)),
+          physicalPlan(std::move(physicalPlan)),
+          planRoot(std::move(planRoot)),
+          planDescription(std::move(planDescription)) {}
 };
 
 enum class JoinOrderAlgorithm {
