@@ -6004,23 +6004,124 @@ std::vector<int> deriveQueryColumns(const QueryComponents& components,
     return columns;
 }
 
+enum class LogicalOperatorKind {
+    Scan,
+    Select,
+    Project,
+    Aggregate
+};
+
+class OperatorImplementationRule {
+public:
+    virtual ~OperatorImplementationRule() = default;
+    virtual std::string name() const = 0;
+    virtual LogicalOperatorKind logicalKind() const = 0;
+    virtual std::string physicalName() const = 0;
+};
+
+class ScanImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "ScanImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Scan;
+    }
+
+    std::string physicalName() const override {
+        return "Scan";
+    }
+};
+
+class SelectImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "SelectImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Select;
+    }
+
+    std::string physicalName() const override {
+        return "Select";
+    }
+};
+
+class ProjectImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "ProjectImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Project;
+    }
+
+    std::string physicalName() const override {
+        return "Project";
+    }
+};
+
+class AggregateImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "AggregateImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Aggregate;
+    }
+
+    std::string physicalName() const override {
+        return "HashAggregate";
+    }
+};
+
+const std::vector<std::shared_ptr<OperatorImplementationRule>>&
+operatorImplementationRules() {
+    static std::vector<std::shared_ptr<OperatorImplementationRule>> rules = {
+        std::make_shared<ScanImplementationRule>(),
+        std::make_shared<SelectImplementationRule>(),
+        std::make_shared<ProjectImplementationRule>(),
+        std::make_shared<AggregateImplementationRule>()
+    };
+    return rules;
+}
+
+std::string physicalOperatorNameFor(LogicalOperatorKind logical_kind) {
+    for (const auto& rule : operatorImplementationRules()) {
+        if (rule->logicalKind() == logical_kind) {
+            return rule->physicalName();
+        }
+    }
+    throw std::runtime_error("No implementation rule for logical operator.");
+}
+
 std::string operatorTreeString(const QueryComponents& components) {
-    std::string tree = "Scan(" + components.tableName + ")";
+    std::string tree = physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+        "(" + components.tableName + ")";
     for (const auto& join : components.joins) {
-        tree = "HashJoin(" + tree + ", Scan(" + join.tableName + "))";
+        tree = "HashJoin(" + tree + ", " +
+            physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+            "(" + join.tableName + "))";
     }
     if (components.whereCondition ||
         components.equalityWhereCondition ||
         !components.columnEqualities.empty()) {
-        tree = "Select(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Select) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components) || components.sumOperation || components.groupBy) {
-        tree = "HashAggregate(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Aggregate) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components)) {
         return tree;
     }
-    return "Project(" + tree + ")";
+    return physicalOperatorNameFor(LogicalOperatorKind::Project) +
+        "(" + tree + ")";
 }
 
 std::string aggregateName(AggrFuncType aggregate_type) {
@@ -7652,6 +7753,7 @@ struct PhysicalJoinCostStep {
     double sortMergeCost = 0.0;
     bool orderedOutputRequired = false;
     PhysicalJoinKind chosen = PhysicalJoinKind::HashJoin;
+    std::string chosenImplementationRule;
 };
 
 struct PhysicalJoinPlan {
@@ -7798,28 +7900,94 @@ double tupleMaterializationCost(double rows) {
     return 0.10 * std::max(1.0, rows);
 }
 
-PhysicalJoinKind chooseCheapestJoin(const PhysicalJoinCostStep& step) {
-    PhysicalJoinKind chosen = PhysicalJoinKind::HashJoin;
-    double best_cost = step.hashJoinCost;
+struct JoinImplementationChoice {
+    PhysicalJoinKind kind = PhysicalJoinKind::HashJoin;
+    double cost = 0.0;
+    std::string ruleName;
+};
 
-    if (step.nestedLoopCost < best_cost) {
-        best_cost = step.nestedLoopCost;
-        chosen = PhysicalJoinKind::NestedLoopJoin;
+class JoinImplementationRule {
+public:
+    virtual ~JoinImplementationRule() = default;
+    virtual std::string name() const = 0;
+    virtual PhysicalJoinKind kind() const = 0;
+    virtual double estimateCost(const PhysicalJoinCostStep& step) const = 0;
+};
+
+class NestedLoopJoinImplementationRule : public JoinImplementationRule {
+public:
+    std::string name() const override {
+        return "NestedLoopJoinImplementationRule";
     }
-    if (step.sortMergeCost < best_cost) {
-        chosen = PhysicalJoinKind::SortMergeJoin;
+
+    PhysicalJoinKind kind() const override {
+        return PhysicalJoinKind::NestedLoopJoin;
     }
-    return chosen;
+
+    double estimateCost(const PhysicalJoinCostStep& step) const override {
+        return step.nestedLoopCost;
+    }
+};
+
+class HashJoinImplementationRule : public JoinImplementationRule {
+public:
+    std::string name() const override {
+        return "HashJoinImplementationRule";
+    }
+
+    PhysicalJoinKind kind() const override {
+        return PhysicalJoinKind::HashJoin;
+    }
+
+    double estimateCost(const PhysicalJoinCostStep& step) const override {
+        return step.hashJoinCost;
+    }
+};
+
+class SortMergeJoinImplementationRule : public JoinImplementationRule {
+public:
+    std::string name() const override {
+        return "SortMergeJoinImplementationRule";
+    }
+
+    PhysicalJoinKind kind() const override {
+        return PhysicalJoinKind::SortMergeJoin;
+    }
+
+    double estimateCost(const PhysicalJoinCostStep& step) const override {
+        return step.sortMergeCost;
+    }
+};
+
+const std::vector<std::shared_ptr<JoinImplementationRule>>&
+joinImplementationRules() {
+    static std::vector<std::shared_ptr<JoinImplementationRule>> rules = {
+        std::make_shared<NestedLoopJoinImplementationRule>(),
+        std::make_shared<HashJoinImplementationRule>(),
+        std::make_shared<SortMergeJoinImplementationRule>()
+    };
+    return rules;
+}
+
+JoinImplementationChoice chooseCheapestJoinImplementation(
+    const PhysicalJoinCostStep& step) {
+    JoinImplementationChoice best;
+    bool found = false;
+    for (const auto& rule : joinImplementationRules()) {
+        double cost = rule->estimateCost(step);
+        if (!found || cost < best.cost) {
+            best = {rule->kind(), cost, rule->name()};
+            found = true;
+        }
+    }
+    return best;
 }
 
 double costForKind(const PhysicalJoinCostStep& step, PhysicalJoinKind kind) {
-    switch (kind) {
-        case PhysicalJoinKind::NestedLoopJoin:
-            return step.nestedLoopCost;
-        case PhysicalJoinKind::HashJoin:
-            return step.hashJoinCost;
-        case PhysicalJoinKind::SortMergeJoin:
-            return step.sortMergeCost;
+    for (const auto& rule : joinImplementationRules()) {
+        if (rule->kind() == kind) {
+            return rule->estimateCost(step);
+        }
     }
     return step.hashJoinCost;
 }
@@ -7875,7 +8043,9 @@ PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
         sortCost(current_pages) + sortCost(right_pages) +
         tupleCompareCost(current_rows + right_rows) +
         tupleMaterializationCost(output_rows);
-    step.chosen = chooseCheapestJoin(step);
+    auto choice = chooseCheapestJoinImplementation(step);
+    step.chosen = choice.kind;
+    step.chosenImplementationRule = choice.ruleName;
     return step;
 }
 
@@ -7925,7 +8095,9 @@ PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components
         sortCost(left_pages) + sortCost(right_pages) +
         tupleCompareCost(left_rows + right_rows) +
         tupleMaterializationCost(output_rows);
-    step.chosen = chooseCheapestJoin(step);
+    auto choice = chooseCheapestJoinImplementation(step);
+    step.chosen = choice.kind;
+    step.chosenImplementationRule = choice.ruleName;
     return step;
 }
 
@@ -9366,6 +9538,10 @@ void printOptimizerSummary(const OptimizerResult& result) {
               << result.requiredTraits.describe() << std::endl;
     std::cout << "  logical rule fires: "
               << result.firedRules.size() << std::endl;
+    std::cout << "  physical implementation rules: "
+              << operatorImplementationRules().size() +
+                    joinImplementationRules().size()
+              << std::endl;
     std::cout << "  memo before rules: "
               << result.memoStats.initialGroups << " group(s), "
               << result.memoStats.initialExpressions << " expression(s)"
@@ -9379,12 +9555,14 @@ void printOptimizerSummary(const OptimizerResult& result) {
 
 std::string physicalPlanTreeString(const QueryComponents& components,
                                    const std::vector<PhysicalJoinKind>& join_kinds) {
-    std::string tree = "Scan(" + components.tableName + ")";
+    std::string tree = physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+        "(" + components.tableName + ")";
     for (size_t i = 0; i < components.joins.size(); i++) {
         auto kind = i < join_kinds.size()
             ? join_kinds[i]
             : PhysicalJoinKind::HashJoin;
-        std::string right_tree = "Scan(" + components.joins[i].tableName + ")";
+        std::string right_tree = physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+            "(" + components.joins[i].tableName + ")";
         if (kind == PhysicalJoinKind::SortMergeJoin) {
             tree = "SortMergeJoin(Sort(" + tree + "), Sort(" + right_tree + "))";
         } else {
@@ -9394,15 +9572,18 @@ std::string physicalPlanTreeString(const QueryComponents& components,
     if (components.whereCondition ||
         components.equalityWhereCondition ||
         !components.columnEqualities.empty()) {
-        tree = "Select(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Select) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components) || components.sumOperation || components.groupBy) {
-        tree = "HashAggregate(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Aggregate) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components)) {
         return tree;
     }
-    return "Project(" + tree + ")";
+    return physicalOperatorNameFor(LogicalOperatorKind::Project) +
+        "(" + tree + ")";
 }
 
 void printPhysicalJoinCosts(const QueryComponents& components,
@@ -9422,6 +9603,8 @@ void printPhysicalJoinCosts(const QueryComponents& components,
     std::cout << "  # HashJoin scans/builds the right side once, then probes with the left stream"
               << std::endl;
     std::cout << "  # SortMergeJoin uses in-memory Sort operators before merge"
+              << std::endl;
+    std::cout << "  # Implementation rules generate and cost these physical alternatives"
               << std::endl;
     if (plan_description.empty()) {
         std::cout << "  chosen join order: "
@@ -9463,7 +9646,11 @@ void printPhysicalJoinCosts(const QueryComponents& components,
         }
         std::cout << std::endl;
         std::cout << "    chosen: "
-                  << physicalJoinKindName(step.chosen)
+                  << physicalJoinKindName(step.chosen);
+        if (!step.chosenImplementationRule.empty()) {
+            std::cout << " via " << step.chosenImplementationRule;
+        }
+        std::cout
                   << std::endl;
     }
     std::cout << "  estimated plan cost: "

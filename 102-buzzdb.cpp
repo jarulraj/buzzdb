@@ -6004,23 +6004,124 @@ std::vector<int> deriveQueryColumns(const QueryComponents& components,
     return columns;
 }
 
+enum class LogicalOperatorKind {
+    Scan,
+    Select,
+    Project,
+    Aggregate
+};
+
+class OperatorImplementationRule {
+public:
+    virtual ~OperatorImplementationRule() = default;
+    virtual std::string name() const = 0;
+    virtual LogicalOperatorKind logicalKind() const = 0;
+    virtual std::string physicalName() const = 0;
+};
+
+class ScanImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "ScanImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Scan;
+    }
+
+    std::string physicalName() const override {
+        return "Scan";
+    }
+};
+
+class SelectImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "SelectImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Select;
+    }
+
+    std::string physicalName() const override {
+        return "Select";
+    }
+};
+
+class ProjectImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "ProjectImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Project;
+    }
+
+    std::string physicalName() const override {
+        return "Project";
+    }
+};
+
+class AggregateImplementationRule : public OperatorImplementationRule {
+public:
+    std::string name() const override {
+        return "AggregateImplementationRule";
+    }
+
+    LogicalOperatorKind logicalKind() const override {
+        return LogicalOperatorKind::Aggregate;
+    }
+
+    std::string physicalName() const override {
+        return "HashAggregate";
+    }
+};
+
+const std::vector<std::shared_ptr<OperatorImplementationRule>>&
+operatorImplementationRules() {
+    static std::vector<std::shared_ptr<OperatorImplementationRule>> rules = {
+        std::make_shared<ScanImplementationRule>(),
+        std::make_shared<SelectImplementationRule>(),
+        std::make_shared<ProjectImplementationRule>(),
+        std::make_shared<AggregateImplementationRule>()
+    };
+    return rules;
+}
+
+std::string physicalOperatorNameFor(LogicalOperatorKind logical_kind) {
+    for (const auto& rule : operatorImplementationRules()) {
+        if (rule->logicalKind() == logical_kind) {
+            return rule->physicalName();
+        }
+    }
+    throw std::runtime_error("No implementation rule for logical operator.");
+}
+
 std::string operatorTreeString(const QueryComponents& components) {
-    std::string tree = "Scan(" + components.tableName + ")";
+    std::string tree = physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+        "(" + components.tableName + ")";
     for (const auto& join : components.joins) {
-        tree = "HashJoin(" + tree + ", Scan(" + join.tableName + "))";
+        tree = "HashJoin(" + tree + ", " +
+            physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+            "(" + join.tableName + "))";
     }
     if (components.whereCondition ||
         components.equalityWhereCondition ||
         !components.columnEqualities.empty()) {
-        tree = "Select(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Select) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components) || components.sumOperation || components.groupBy) {
-        tree = "HashAggregate(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Aggregate) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components)) {
         return tree;
     }
-    return "Project(" + tree + ")";
+    return physicalOperatorNameFor(LogicalOperatorKind::Project) +
+        "(" + tree + ")";
 }
 
 std::string aggregateName(AggrFuncType aggregate_type) {
@@ -7637,21 +7738,66 @@ double printCardinalityEstimates(const QueryComponents& components,
     return mcv_rows;
 }
 
+struct PhysicalTraitSet {
+    std::string orderedBy;
+
+    static PhysicalTraitSet unordered() {
+        return {""};
+    }
+
+    static PhysicalTraitSet orderedByColumn(const std::string& column) {
+        return {column};
+    }
+
+    bool isOrdered() const {
+        return !orderedBy.empty();
+    }
+
+    bool satisfies(const PhysicalTraitSet& required) const {
+        return !required.isOrdered() || orderedBy == required.orderedBy;
+    }
+
+    std::string describe() const {
+        return isOrdered() ? "ordered by " + orderedBy : "unordered";
+    }
+};
+
+class SortEnforcerRule {
+public:
+    std::string name() const {
+        return "SortEnforcerRule";
+    }
+
+    double cost(double pages) const;
+
+    PhysicalTraitSet provides(const PhysicalTraitSet& required) const {
+        return required;
+    }
+};
+
 struct PhysicalJoinCostStep {
     JoinClause join;
     double leftRows = 0.0;
     double leftPages = 0.0;
     double leftTotalCost = 0.0;
+    PhysicalTraitSet leftTrait = PhysicalTraitSet::unordered();
     double rightRows = 0.0;
     double rightPages = 0.0;
     double rightAccessCost = 0.0;
+    PhysicalTraitSet rightTrait = PhysicalTraitSet::unordered();
     double outputRows = 0.0;
     double outputPages = 0.0;
     double nestedLoopCost = 0.0;
     double hashJoinCost = 0.0;
     double sortMergeCost = 0.0;
-    bool orderedOutputRequired = false;
+    PhysicalTraitSet requiredOutputTrait = PhysicalTraitSet::unordered();
+    PhysicalTraitSet providedOutputTrait = PhysicalTraitSet::unordered();
+    PhysicalTraitSet sortMergeLeftTrait = PhysicalTraitSet::unordered();
+    PhysicalTraitSet sortMergeRightTrait = PhysicalTraitSet::unordered();
+    double sortMergeLeftEnforcerCost = 0.0;
+    double sortMergeRightEnforcerCost = 0.0;
     PhysicalJoinKind chosen = PhysicalJoinKind::HashJoin;
+    std::string chosenImplementationRule;
 };
 
 struct PhysicalJoinPlan {
@@ -7660,6 +7806,7 @@ struct PhysicalJoinPlan {
     double finalRows = 0.0;
     double finalPages = 0.0;
     double totalCost = 0.0;
+    PhysicalTraitSet outputTrait = PhysicalTraitSet::unordered();
 };
 
 struct JoinPlanNode {
@@ -7673,6 +7820,7 @@ struct JoinPlanNode {
     double rows = 0.0;
     double pages = 0.0;
     double totalCost = 0.0;
+    PhysicalTraitSet outputTrait = PhysicalTraitSet::unordered();
 };
 
 struct PlanSnapshot {
@@ -7786,6 +7934,10 @@ double sortCost(double pages) {
     return 4.0 * std::max(1.0, pages);
 }
 
+double SortEnforcerRule::cost(double pages) const {
+    return sortCost(pages);
+}
+
 double tupleCompareCost(double rows) {
     return 0.01 * std::max(1.0, rows);
 }
@@ -7798,30 +7950,137 @@ double tupleMaterializationCost(double rows) {
     return 0.10 * std::max(1.0, rows);
 }
 
-PhysicalJoinKind chooseCheapestJoin(const PhysicalJoinCostStep& step) {
-    PhysicalJoinKind chosen = PhysicalJoinKind::HashJoin;
-    double best_cost = step.hashJoinCost;
+struct JoinImplementationChoice {
+    PhysicalJoinKind kind = PhysicalJoinKind::HashJoin;
+    double cost = 0.0;
+    std::string ruleName;
+    PhysicalTraitSet providedTrait = PhysicalTraitSet::unordered();
+};
 
-    if (step.nestedLoopCost < best_cost) {
-        best_cost = step.nestedLoopCost;
-        chosen = PhysicalJoinKind::NestedLoopJoin;
+class JoinImplementationRule {
+public:
+    virtual ~JoinImplementationRule() = default;
+    virtual std::string name() const = 0;
+    virtual PhysicalJoinKind kind() const = 0;
+    virtual double estimateCost(const PhysicalJoinCostStep& step) const = 0;
+    virtual PhysicalTraitSet providedTrait(const PhysicalJoinCostStep& step) const {
+        (void)step;
+        return PhysicalTraitSet::unordered();
     }
-    if (step.sortMergeCost < best_cost) {
-        chosen = PhysicalJoinKind::SortMergeJoin;
+};
+
+class NestedLoopJoinImplementationRule : public JoinImplementationRule {
+public:
+    std::string name() const override {
+        return "NestedLoopJoinImplementationRule";
     }
-    return chosen;
+
+    PhysicalJoinKind kind() const override {
+        return PhysicalJoinKind::NestedLoopJoin;
+    }
+
+    double estimateCost(const PhysicalJoinCostStep& step) const override {
+        return step.nestedLoopCost;
+    }
+};
+
+class HashJoinImplementationRule : public JoinImplementationRule {
+public:
+    std::string name() const override {
+        return "HashJoinImplementationRule";
+    }
+
+    PhysicalJoinKind kind() const override {
+        return PhysicalJoinKind::HashJoin;
+    }
+
+    double estimateCost(const PhysicalJoinCostStep& step) const override {
+        return step.hashJoinCost;
+    }
+};
+
+class SortMergeJoinImplementationRule : public JoinImplementationRule {
+public:
+    std::string name() const override {
+        return "SortMergeJoinImplementationRule";
+    }
+
+    PhysicalJoinKind kind() const override {
+        return PhysicalJoinKind::SortMergeJoin;
+    }
+
+    double estimateCost(const PhysicalJoinCostStep& step) const override {
+        return step.sortMergeCost;
+    }
+
+    PhysicalTraitSet providedTrait(const PhysicalJoinCostStep& step) const override {
+        return step.sortMergeLeftTrait;
+    }
+};
+
+const std::vector<std::shared_ptr<JoinImplementationRule>>&
+joinImplementationRules() {
+    static std::vector<std::shared_ptr<JoinImplementationRule>> rules = {
+        std::make_shared<NestedLoopJoinImplementationRule>(),
+        std::make_shared<HashJoinImplementationRule>(),
+        std::make_shared<SortMergeJoinImplementationRule>()
+    };
+    return rules;
+}
+
+JoinImplementationChoice chooseCheapestJoinImplementation(
+    const PhysicalJoinCostStep& step) {
+    JoinImplementationChoice best;
+    bool found = false;
+    for (const auto& rule : joinImplementationRules()) {
+        double cost = rule->estimateCost(step);
+        if (!found || cost < best.cost) {
+            best = {rule->kind(), cost, rule->name(), rule->providedTrait(step)};
+            found = true;
+        }
+    }
+    return best;
 }
 
 double costForKind(const PhysicalJoinCostStep& step, PhysicalJoinKind kind) {
-    switch (kind) {
-        case PhysicalJoinKind::NestedLoopJoin:
-            return step.nestedLoopCost;
-        case PhysicalJoinKind::HashJoin:
-            return step.hashJoinCost;
-        case PhysicalJoinKind::SortMergeJoin:
-            return step.sortMergeCost;
+    for (const auto& rule : joinImplementationRules()) {
+        if (rule->kind() == kind) {
+            return rule->estimateCost(step);
+        }
     }
     return step.hashJoinCost;
+}
+
+double enforcerCostForTrait(const PhysicalTraitSet& provided,
+                            const PhysicalTraitSet& required,
+                            double pages) {
+    if (provided.satisfies(required)) {
+        return 0.0;
+    }
+    SortEnforcerRule rule;
+    return rule.cost(pages);
+}
+
+PhysicalTraitSet requiredTraitFromFlag(bool ordered_output_required) {
+    return ordered_output_required
+        ? PhysicalTraitSet::orderedByColumn("final output")
+        : PhysicalTraitSet::unordered();
+}
+
+PhysicalTraitSet baseTraitForJoinKind(PhysicalJoinKind kind,
+                                      const PhysicalJoinCostStep& step) {
+    if (kind == PhysicalJoinKind::SortMergeJoin) {
+        return step.sortMergeLeftTrait;
+    }
+    return PhysicalTraitSet::unordered();
+}
+
+PhysicalTraitSet finalTraitForJoinKind(PhysicalJoinKind kind,
+                                       const PhysicalJoinCostStep& step) {
+    auto base_trait = baseTraitForJoinKind(kind, step);
+    return base_trait.satisfies(step.requiredOutputTrait)
+        ? base_trait
+        : step.requiredOutputTrait;
 }
 
 PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
@@ -7830,7 +8089,10 @@ PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
                                               double current_rows,
                                               double current_pages,
                                               double current_total_cost,
-                                              bool ordered_output_required = false) {
+                                              PhysicalTraitSet current_trait =
+                                                  PhysicalTraitSet::unordered(),
+                                              PhysicalTraitSet required_output_trait =
+                                                  PhysicalTraitSet::unordered()) {
     const auto& right_stats = tableStatsFor(stats, components, join.tableName);
     double right_rows = estimateRowsAfterTableFilters(
         stats,
@@ -7857,25 +8119,57 @@ PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
     step.leftRows = current_rows;
     step.leftPages = current_pages;
     step.leftTotalCost = current_total_cost;
+    step.leftTrait = current_trait;
     step.rightRows = right_rows;
     step.rightPages = right_pages;
     step.rightAccessCost = fileScanCost(right_stats);
+    step.rightTrait = PhysicalTraitSet::unordered();
     step.outputRows = output_rows;
     step.outputPages = output_pages;
+    step.requiredOutputTrait = required_output_trait;
+    step.sortMergeLeftTrait = PhysicalTraitSet::orderedByColumn(columnLabel(join.left));
+    step.sortMergeRightTrait = PhysicalTraitSet::orderedByColumn(columnLabel(join.right));
+    step.sortMergeLeftEnforcerCost = enforcerCostForTrait(
+        step.leftTrait,
+        step.sortMergeLeftTrait,
+        current_pages
+    );
+    step.sortMergeRightEnforcerCost = enforcerCostForTrait(
+        step.rightTrait,
+        step.sortMergeRightTrait,
+        right_pages
+    );
+
     // Charge the simple operators for the tuple work they actually do.
-    double final_sort_cost = ordered_output_required ? sortCost(output_pages) : 0.0;
-    step.orderedOutputRequired = ordered_output_required;
     step.nestedLoopCost = current_total_cost + step.rightAccessCost +
         tupleCompareCost(current_rows * right_rows) +
-        tupleMaterializationCost(output_rows) + final_sort_cost;
+        tupleMaterializationCost(output_rows);
     step.hashJoinCost = current_total_cost + step.rightAccessCost +
         tupleHashCost(current_rows + right_rows) +
-        tupleMaterializationCost(output_rows) + final_sort_cost;
+        tupleMaterializationCost(output_rows);
     step.sortMergeCost = current_total_cost + step.rightAccessCost +
-        sortCost(current_pages) + sortCost(right_pages) +
+        step.sortMergeLeftEnforcerCost + step.sortMergeRightEnforcerCost +
         tupleCompareCost(current_rows + right_rows) +
         tupleMaterializationCost(output_rows);
-    step.chosen = chooseCheapestJoin(step);
+    step.nestedLoopCost += enforcerCostForTrait(
+        baseTraitForJoinKind(PhysicalJoinKind::NestedLoopJoin, step),
+        required_output_trait,
+        output_pages
+    );
+    step.hashJoinCost += enforcerCostForTrait(
+        baseTraitForJoinKind(PhysicalJoinKind::HashJoin, step),
+        required_output_trait,
+        output_pages
+    );
+    step.sortMergeCost += enforcerCostForTrait(
+        baseTraitForJoinKind(PhysicalJoinKind::SortMergeJoin, step),
+        required_output_trait,
+        output_pages
+    );
+    auto choice = chooseCheapestJoinImplementation(step);
+    step.chosen = choice.kind;
+    step.chosenImplementationRule = choice.ruleName;
+    step.providedOutputTrait = finalTraitForJoinKind(choice.kind, step);
     return step;
 }
 
@@ -7885,10 +8179,13 @@ PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components
                                                double left_rows,
                                                double left_pages,
                                                double left_total_cost,
+                                               PhysicalTraitSet left_trait,
                                                double right_rows,
                                                double right_pages,
                                                double right_total_cost,
-                                               bool ordered_output_required = false) {
+                                               PhysicalTraitSet right_trait,
+                                               PhysicalTraitSet required_output_trait =
+                                                   PhysicalTraitSet::unordered()) {
     double output_rows = estimateJoinRows(
         left_rows,
         right_rows,
@@ -7908,24 +8205,55 @@ PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components
     step.leftRows = left_rows;
     step.leftPages = left_pages;
     step.leftTotalCost = left_total_cost;
+    step.leftTrait = left_trait;
     step.rightRows = right_rows;
     step.rightPages = right_pages;
     step.rightAccessCost = right_total_cost;
+    step.rightTrait = right_trait;
     step.outputRows = output_rows;
     step.outputPages = output_pages;
-    double final_sort_cost = ordered_output_required ? sortCost(output_pages) : 0.0;
-    step.orderedOutputRequired = ordered_output_required;
+    step.requiredOutputTrait = required_output_trait;
+    step.sortMergeLeftTrait = PhysicalTraitSet::orderedByColumn(columnLabel(join.left));
+    step.sortMergeRightTrait = PhysicalTraitSet::orderedByColumn(columnLabel(join.right));
+    step.sortMergeLeftEnforcerCost = enforcerCostForTrait(
+        step.leftTrait,
+        step.sortMergeLeftTrait,
+        left_pages
+    );
+    step.sortMergeRightEnforcerCost = enforcerCostForTrait(
+        step.rightTrait,
+        step.sortMergeRightTrait,
+        right_pages
+    );
     step.nestedLoopCost = left_total_cost + right_total_cost +
         tupleCompareCost(left_rows * right_rows) +
-        tupleMaterializationCost(output_rows) + final_sort_cost;
+        tupleMaterializationCost(output_rows);
     step.hashJoinCost = left_total_cost + right_total_cost +
         tupleHashCost(left_rows + right_rows) +
-        tupleMaterializationCost(output_rows) + final_sort_cost;
+        tupleMaterializationCost(output_rows);
     step.sortMergeCost = left_total_cost + right_total_cost +
-        sortCost(left_pages) + sortCost(right_pages) +
+        step.sortMergeLeftEnforcerCost + step.sortMergeRightEnforcerCost +
         tupleCompareCost(left_rows + right_rows) +
         tupleMaterializationCost(output_rows);
-    step.chosen = chooseCheapestJoin(step);
+    step.nestedLoopCost += enforcerCostForTrait(
+        baseTraitForJoinKind(PhysicalJoinKind::NestedLoopJoin, step),
+        required_output_trait,
+        output_pages
+    );
+    step.hashJoinCost += enforcerCostForTrait(
+        baseTraitForJoinKind(PhysicalJoinKind::HashJoin, step),
+        required_output_trait,
+        output_pages
+    );
+    step.sortMergeCost += enforcerCostForTrait(
+        baseTraitForJoinKind(PhysicalJoinKind::SortMergeJoin, step),
+        required_output_trait,
+        output_pages
+    );
+    auto choice = chooseCheapestJoinImplementation(step);
+    step.chosen = choice.kind;
+    step.chosenImplementationRule = choice.ruleName;
+    step.providedOutputTrait = finalTraitForJoinKind(choice.kind, step);
     return step;
 }
 
@@ -7938,6 +8266,7 @@ PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
         plan.finalRows = estimateRowsAfterTableFilters(stats, components, components.tableName);
         plan.finalPages = pagesAfterFilters(base_stats, plan.finalRows);
         plan.totalCost = fileScanCost(base_stats);
+        plan.outputTrait = PhysicalTraitSet::unordered();
         return plan;
     }
 
@@ -7949,8 +8278,13 @@ PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
     );
     double current_pages = pagesAfterFilters(base_stats, current_rows);
     double current_total_cost = fileScanCost(base_stats);
+    PhysicalTraitSet current_trait = PhysicalTraitSet::unordered();
 
-    for (const auto& join : components.joins) {
+    for (size_t join_index = 0; join_index < components.joins.size(); join_index++) {
+        const auto& join = components.joins[join_index];
+        auto required_trait = join_index + 1 == components.joins.size()
+            ? requiredTraitFromFlag(ordered_output_required)
+            : PhysicalTraitSet::unordered();
         auto step = estimatePhysicalJoinStep(
             components,
             stats,
@@ -7958,7 +8292,8 @@ PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
             current_rows,
             current_pages,
             current_total_cost,
-            ordered_output_required
+            current_trait,
+            required_trait
         );
 
         plan.joinKinds.push_back(step.chosen);
@@ -7967,10 +8302,12 @@ PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
         current_rows = step.outputRows;
         current_pages = step.outputPages;
         current_total_cost = plan.totalCost;
+        current_trait = step.providedOutputTrait;
     }
 
     plan.finalRows = current_rows;
     plan.finalPages = current_pages;
+    plan.outputTrait = current_trait;
     return plan;
 }
 
@@ -8115,6 +8452,7 @@ PlannedQuery makeBasePlanForTable(const QueryComponents& components,
         physical_plan.finalRows
     );
     physical_plan.totalCost = fileScanCost(base_stats);
+    physical_plan.outputTrait = PhysicalTraitSet::unordered();
 
     auto node = std::make_shared<JoinPlanNode>();
     node->isLeaf = true;
@@ -8123,6 +8461,7 @@ PlannedQuery makeBasePlanForTable(const QueryComponents& components,
     node->rows = physical_plan.finalRows;
     node->pages = physical_plan.finalPages;
     node->totalCost = physical_plan.totalCost;
+    node->outputTrait = physical_plan.outputTrait;
     return {planned, physical_plan, node};
 }
 
@@ -8177,10 +8516,12 @@ PlannedQuery chooseGreedyOperatorOrderingPlan(const QueryComponents& components,
                     fragments[i]->rows,
                     fragments[i]->pages,
                     fragments[i]->totalCost,
+                    fragments[i]->outputTrait,
                     fragments[j]->rows,
                     fragments[j]->pages,
                     fragments[j]->totalCost,
-                    ordered_output_required
+                    fragments[j]->outputTrait,
+                    requiredTraitFromFlag(ordered_output_required)
                 );
                 if (!best_step ||
                     step.outputRows < best_step->outputRows ||
@@ -8218,12 +8559,14 @@ PlannedQuery chooseGreedyOperatorOrderingPlan(const QueryComponents& components,
         joined->rows = best_step->outputRows;
         joined->pages = best_step->outputPages;
         joined->totalCost = costForKind(*best_step, best_step->chosen);
+        joined->outputTrait = best_step->providedOutputTrait;
 
         physical_plan.joinKinds.push_back(best_step->chosen);
         physical_plan.steps.push_back(*best_step);
-        physical_plan.totalCost = joined->totalCost;
-        physical_plan.finalRows = joined->rows;
-        physical_plan.finalPages = joined->pages;
+    physical_plan.totalCost = joined->totalCost;
+    physical_plan.finalRows = joined->rows;
+    physical_plan.finalPages = joined->pages;
+    physical_plan.outputTrait = joined->outputTrait;
 
         fragments[best_left] = joined;
         fragments.erase(fragments.begin() + static_cast<long>(best_right));
@@ -8287,7 +8630,10 @@ PlannedQuery chooseSelingerDPPlan(const QueryComponents& components,
                         best[mask]->physicalPlan.finalRows,
                         best[mask]->physicalPlan.finalPages,
                         best[mask]->physicalPlan.totalCost,
-                        ordered_output_required
+                        best[mask]->physicalPlan.outputTrait,
+                        (mask | right_bit) == full_mask
+                            ? requiredTraitFromFlag(ordered_output_required)
+                            : PhysicalTraitSet::unordered()
                     );
                     candidates_considered++;
                     if (!best_step ||
@@ -8310,6 +8656,7 @@ PlannedQuery chooseSelingerDPPlan(const QueryComponents& components,
                     costForKind(*best_step, best_step->chosen);
                 candidate.physicalPlan.finalRows = best_step->outputRows;
                 candidate.physicalPlan.finalPages = best_step->outputPages;
+                candidate.physicalPlan.outputTrait = best_step->providedOutputTrait;
 
                 uint64_t new_mask = mask | right_bit;
                 if (!best[new_mask] ||
@@ -8448,10 +8795,14 @@ PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
                     best[left_mask]->physicalPlan.finalRows,
                     best[left_mask]->physicalPlan.finalPages,
                     best[left_mask]->physicalPlan.totalCost,
+                    best[left_mask]->physicalPlan.outputTrait,
                     best[right_mask]->physicalPlan.finalRows,
                     best[right_mask]->physicalPlan.finalPages,
                     best[right_mask]->physicalPlan.totalCost,
-                    ordered_output_required
+                    best[right_mask]->physicalPlan.outputTrait,
+                    mask == full_mask
+                        ? requiredTraitFromFlag(ordered_output_required)
+                        : PhysicalTraitSet::unordered()
                 );
                 candidates_considered++;
 
@@ -8470,6 +8821,7 @@ PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
                 joined->rows = step.outputRows;
                 joined->pages = step.outputPages;
                 joined->totalCost = costForKind(step, step.chosen);
+                joined->outputTrait = step.providedOutputTrait;
 
                 PhysicalJoinPlan physical_plan;
                 physical_plan.steps = best[left_mask]->physicalPlan.steps;
@@ -8489,6 +8841,7 @@ PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
                 physical_plan.totalCost = joined->totalCost;
                 physical_plan.finalRows = joined->rows;
                 physical_plan.finalPages = joined->pages;
+                physical_plan.outputTrait = joined->outputTrait;
 
                 PlannedQuery candidate{components, physical_plan, joined};
                 candidate.planDescription = joinPlanTreeString(joined);
@@ -8705,7 +9058,8 @@ std::optional<PhysicalJoinCostStep> bestStepForNextTable(
     double current_rows,
     double current_pages,
     double current_total_cost,
-    bool ordered_output_required) {
+    PhysicalTraitSet current_trait,
+    PhysicalTraitSet required_output_trait) {
     std::optional<PhysicalJoinCostStep> best_step;
     for (const auto& edge : edges) {
         auto oriented = orientJoinEdge(edge, joined_tables, components);
@@ -8719,7 +9073,8 @@ std::optional<PhysicalJoinCostStep> bestStepForNextTable(
             current_rows,
             current_pages,
             current_total_cost,
-            ordered_output_required
+            current_trait,
+            required_output_trait
         );
         if (!best_step ||
             costForKind(step, step.chosen) <
@@ -8754,6 +9109,7 @@ std::optional<PlannedQuery> chooseFixedLeftDeepOrderPlan(
     );
     double current_pages = pagesAfterFilters(base_stats, current_rows);
     double current_total_cost = fileScanCost(base_stats);
+    PhysicalTraitSet current_trait = PhysicalTraitSet::unordered();
     std::set<std::string> joined_tables{order.front()};
     auto edges = joinGraphEdges(components);
 
@@ -8768,7 +9124,10 @@ std::optional<PlannedQuery> chooseFixedLeftDeepOrderPlan(
             current_rows,
             current_pages,
             current_total_cost,
-            ordered_output_required
+            current_trait,
+            i + 1 == order.size()
+                ? requiredTraitFromFlag(ordered_output_required)
+                : PhysicalTraitSet::unordered()
         );
         if (!step) {
             return std::nullopt;
@@ -8782,10 +9141,12 @@ std::optional<PlannedQuery> chooseFixedLeftDeepOrderPlan(
         current_rows = step->outputRows;
         current_pages = step->outputPages;
         current_total_cost = physical_plan.totalCost;
+        current_trait = step->providedOutputTrait;
     }
 
     physical_plan.finalRows = current_rows;
     physical_plan.finalPages = current_pages;
+    physical_plan.outputTrait = current_trait;
     return PlannedQuery{planned, physical_plan};
 }
 
@@ -9194,6 +9555,7 @@ PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
     );
     double current_pages = pagesAfterFilters(base_stats, current_rows);
     double current_total_cost = fileScanCost(base_stats);
+    PhysicalTraitSet current_trait = PhysicalTraitSet::unordered();
 
     while (joined_tables.size() < all_tables.size()) {
         std::optional<PhysicalJoinCostStep> best_step;
@@ -9210,7 +9572,10 @@ PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
                 current_rows,
                 current_pages,
                 current_total_cost,
-                ordered_output_required
+                current_trait,
+                joined_tables.size() + 1 == all_tables.size()
+                    ? requiredTraitFromFlag(ordered_output_required)
+                    : PhysicalTraitSet::unordered()
             );
             double score = joinOrderStepScore(step, algorithm);
             if (!best_step || score < best_score) {
@@ -9235,10 +9600,12 @@ PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
         current_rows = best_step->outputRows;
         current_pages = best_step->outputPages;
         current_total_cost = physical_plan.totalCost;
+        current_trait = best_step->providedOutputTrait;
     }
 
     physical_plan.finalRows = current_rows;
     physical_plan.finalPages = current_pages;
+    physical_plan.outputTrait = current_trait;
     return {planned, physical_plan};
 }
 
@@ -9305,10 +9672,10 @@ PlannedQuery chooseJoinOrderPlan(const QueryComponents& components,
 }
 
 struct PlanTraitSet {
-    bool orderedOutputRequired = false;
+    PhysicalTraitSet requiredOutputTrait = PhysicalTraitSet::unordered();
 
     std::string describe() const {
-        return orderedOutputRequired ? "ordered output" : "none";
+        return requiredOutputTrait.describe();
     }
 };
 
@@ -9342,7 +9709,7 @@ public:
             components,
             stats,
             algorithm,
-            requiredTraits.orderedOutputRequired
+            requiredTraits.requiredOutputTrait.isOrdered()
         );
 
         return {
@@ -9366,6 +9733,10 @@ void printOptimizerSummary(const OptimizerResult& result) {
               << result.requiredTraits.describe() << std::endl;
     std::cout << "  logical rule fires: "
               << result.firedRules.size() << std::endl;
+    std::cout << "  physical implementation rules: "
+              << operatorImplementationRules().size() +
+                    joinImplementationRules().size()
+              << std::endl;
     std::cout << "  memo before rules: "
               << result.memoStats.initialGroups << " group(s), "
               << result.memoStats.initialExpressions << " expression(s)"
@@ -9379,12 +9750,14 @@ void printOptimizerSummary(const OptimizerResult& result) {
 
 std::string physicalPlanTreeString(const QueryComponents& components,
                                    const std::vector<PhysicalJoinKind>& join_kinds) {
-    std::string tree = "Scan(" + components.tableName + ")";
+    std::string tree = physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+        "(" + components.tableName + ")";
     for (size_t i = 0; i < components.joins.size(); i++) {
         auto kind = i < join_kinds.size()
             ? join_kinds[i]
             : PhysicalJoinKind::HashJoin;
-        std::string right_tree = "Scan(" + components.joins[i].tableName + ")";
+        std::string right_tree = physicalOperatorNameFor(LogicalOperatorKind::Scan) +
+            "(" + components.joins[i].tableName + ")";
         if (kind == PhysicalJoinKind::SortMergeJoin) {
             tree = "SortMergeJoin(Sort(" + tree + "), Sort(" + right_tree + "))";
         } else {
@@ -9394,15 +9767,18 @@ std::string physicalPlanTreeString(const QueryComponents& components,
     if (components.whereCondition ||
         components.equalityWhereCondition ||
         !components.columnEqualities.empty()) {
-        tree = "Select(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Select) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components) || components.sumOperation || components.groupBy) {
-        tree = "HashAggregate(" + tree + ")";
+        tree = physicalOperatorNameFor(LogicalOperatorKind::Aggregate) +
+            "(" + tree + ")";
     }
     if (hasAggregateProjection(components)) {
         return tree;
     }
-    return "Project(" + tree + ")";
+    return physicalOperatorNameFor(LogicalOperatorKind::Project) +
+        "(" + tree + ")";
 }
 
 void printPhysicalJoinCosts(const QueryComponents& components,
@@ -9422,6 +9798,8 @@ void printPhysicalJoinCosts(const QueryComponents& components,
     std::cout << "  # HashJoin scans/builds the right side once, then probes with the left stream"
               << std::endl;
     std::cout << "  # SortMergeJoin uses in-memory Sort operators before merge"
+              << std::endl;
+    std::cout << "  # Implementation rules generate and cost these physical alternatives"
               << std::endl;
     if (plan_description.empty()) {
         std::cout << "  chosen join order: "
@@ -9452,18 +9830,36 @@ void printPhysicalJoinCosts(const QueryComponents& components,
                   << formatEstimate(step.outputRows) << "/"
                   << formatEstimate(step.outputPages)
                   << std::endl;
+        std::cout << "    required output trait: "
+                  << step.requiredOutputTrait.describe()
+                  << "; chosen provides "
+                  << step.providedOutputTrait.describe()
+                  << std::endl;
         std::cout << "    NestedLoopJoin cost="
                   << formatEstimate(step.nestedLoopCost)
                   << " HashJoin cost="
                   << formatEstimate(step.hashJoinCost)
                   << " SortMergeJoin cost="
                   << formatEstimate(step.sortMergeCost);
-        if (step.orderedOutputRequired) {
-            std::cout << " (Sort inputs; no final Sort)";
-        }
         std::cout << std::endl;
+        if (step.sortMergeLeftEnforcerCost > 0.0 ||
+            step.sortMergeRightEnforcerCost > 0.0) {
+            std::cout << "    SortMerge traits: left requires "
+                      << step.sortMergeLeftTrait.describe()
+                      << ", right requires "
+                      << step.sortMergeRightTrait.describe()
+                      << "; enforcer cost left="
+                      << formatEstimate(step.sortMergeLeftEnforcerCost)
+                      << " right="
+                      << formatEstimate(step.sortMergeRightEnforcerCost)
+                      << std::endl;
+        }
         std::cout << "    chosen: "
-                  << physicalJoinKindName(step.chosen)
+                  << physicalJoinKindName(step.chosen);
+        if (!step.chosenImplementationRule.empty()) {
+            std::cout << " via " << step.chosenImplementationRule;
+        }
+        std::cout
                   << std::endl;
     }
     std::cout << "  estimated plan cost: "
@@ -10832,7 +11228,11 @@ public:
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
         auto stats = loadQueryTableStats(components, catalog);
-        Optimizer optimizer(stats, algorithm, {ordered_output_required});
+        Optimizer optimizer(
+            stats,
+            algorithm,
+            {requiredTraitFromFlag(ordered_output_required)}
+        );
         return optimizer.optimize(components).plannedQuery;
     }
 
@@ -10849,7 +11249,7 @@ public:
         Optimizer optimizer(
             stats,
             default_algorithm,
-            {ordered_output_required}
+            {requiredTraitFromFlag(ordered_output_required)}
         );
         auto optimizer_result = optimizer.optimize(components);
         printOptimizerSummary(optimizer_result);
@@ -10906,7 +11306,7 @@ public:
         ] = Optimizer(
                 stats,
                 default_algorithm,
-                {ordered_output_required}
+                {requiredTraitFromFlag(ordered_output_required)}
             ).optimize(join_body_components).plannedQuery;
         auto join_body_rows = executeQuery(join_body_query, txn, false);
         std::cout << "  final join body: estimate="
