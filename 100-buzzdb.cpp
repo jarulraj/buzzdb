@@ -6263,37 +6263,6 @@ std::string logicalPredicateLabel(const LogicalPredicate& predicate) {
     return "UNKNOWN";
 }
 
-struct RuleFire {
-    std::string ruleName;
-    std::string detail;
-};
-
-struct LogicalRewriteResult {
-    std::unique_ptr<LogicalPlanNode> plan;
-    std::vector<RuleFire> firedRules;
-};
-
-struct MemoRewriteStats {
-    size_t initialGroups = 0;
-    size_t initialExpressions = 0;
-    size_t finalGroups = 0;
-    size_t finalExpressions = 0;
-};
-
-struct LogicalRewriteContext {
-    const QueryComponents& components;
-    std::vector<bool> equalityUsed;
-    std::vector<RuleFire> firedRules;
-
-    explicit LogicalRewriteContext(const QueryComponents& components)
-        : components(components),
-          equalityUsed(components.columnEqualities.size(), false) {}
-
-    void fire(const std::string& rule_name, const std::string& detail) {
-        firedRules.push_back({rule_name, detail});
-    }
-};
-
 std::vector<std::string> logicalExpressionLabels(const LogicalPlanNode& node) {
     std::vector<std::string> expressions;
     if (node.kind == LogicalPlanNode::Kind::SCAN) {
@@ -6399,123 +6368,20 @@ std::vector<LogicalPredicate> logicalFilterPredicates(const QueryComponents& com
     return predicates;
 }
 
-class LogicalRewriteRule {
-public:
-    virtual ~LogicalRewriteRule() = default;
-
-    virtual void applyToScan(const std::string& table_name,
-                             std::vector<LogicalPredicate>& predicates,
-                             LogicalRewriteContext& context) const {
-        (void)table_name;
-        (void)predicates;
-        (void)context;
-    }
-
-    virtual void applyToJoin(const JoinClause& join,
-                             const std::set<std::string>& tables_after_join,
-                             std::vector<LogicalPredicate>& predicates,
-                             LogicalRewriteContext& context) const {
-        (void)join;
-        (void)tables_after_join;
-        (void)predicates;
-        (void)context;
-    }
-
-    virtual void applyResidual(std::vector<LogicalPredicate>& predicates,
-                               LogicalRewriteContext& context) const {
-        (void)predicates;
-        (void)context;
-    }
-};
-
-class PushFilterIntoScanRule : public LogicalRewriteRule {
-public:
-    void applyToScan(const std::string& table_name,
-                     std::vector<LogicalPredicate>& predicates,
-                     LogicalRewriteContext& context) const override {
-        for (const auto& filter : context.components.filters) {
-            if (filter.column.tableName != table_name) {
-                continue;
-            }
-
-            LogicalPredicate predicate{
+std::vector<LogicalPredicate> logicalFiltersForTable(const QueryComponents& components,
+                                                     const std::string& table_name) {
+    std::vector<LogicalPredicate> predicates;
+    for (const auto& filter : components.filters) {
+        if (filter.column.tableName == table_name) {
+            predicates.push_back({
                 LogicalPredicate::Kind::COLUMN_EQ_LITERAL,
                 filter.column,
                 {},
                 filter.value
-            };
-            predicates.push_back(predicate);
-            context.fire(
-                "PushFilterIntoScanRule",
-                logicalPredicateLabel(predicate) + " -> " + table_name
-            );
+            });
         }
     }
-};
-
-class AttachJoinPredicateRule : public LogicalRewriteRule {
-public:
-    void applyToJoin(const JoinClause& join,
-                     const std::set<std::string>& tables_after_join,
-                     std::vector<LogicalPredicate>& predicates,
-                     LogicalRewriteContext& context) const override {
-        for (size_t i = 0; i < context.components.columnEqualities.size(); i++) {
-            const auto& equality = context.components.columnEqualities[i];
-            bool left_seen = tables_after_join.find(equality.left.tableName) !=
-                tables_after_join.end();
-            bool right_seen = tables_after_join.find(equality.right.tableName) !=
-                tables_after_join.end();
-            if (context.equalityUsed[i] || !left_seen || !right_seen) {
-                continue;
-            }
-
-            LogicalPredicate predicate{
-                LogicalPredicate::Kind::COLUMN_EQ_COLUMN,
-                equality.left,
-                equality.right,
-                ""
-            };
-            predicates.push_back(predicate);
-            context.equalityUsed[i] = true;
-            context.fire(
-                "AttachJoinPredicateRule",
-                logicalPredicateLabel(predicate) + " -> " + join.tableName + " join"
-            );
-        }
-    }
-};
-
-class ResidualPredicateRule : public LogicalRewriteRule {
-public:
-    void applyResidual(std::vector<LogicalPredicate>& predicates,
-                       LogicalRewriteContext& context) const override {
-        for (size_t i = 0; i < context.components.columnEqualities.size(); i++) {
-            if (context.equalityUsed[i]) {
-                continue;
-            }
-
-            LogicalPredicate predicate{
-                LogicalPredicate::Kind::COLUMN_EQ_COLUMN,
-                context.components.columnEqualities[i].left,
-                context.components.columnEqualities[i].right,
-                ""
-            };
-            predicates.push_back(predicate);
-            context.fire(
-                "ResidualPredicateRule",
-                logicalPredicateLabel(predicate) + " stays above join tree"
-            );
-        }
-    }
-};
-
-const std::vector<std::shared_ptr<LogicalRewriteRule>>& logicalRewriteRules() {
-    static std::vector<std::shared_ptr<LogicalRewriteRule>> rules = {
-        std::make_shared<PushFilterIntoScanRule>(),
-        std::make_shared<AttachJoinPredicateRule>(),
-        std::make_shared<ResidualPredicateRule>()
-    };
-    return rules;
+    return predicates;
 }
 
 std::unique_ptr<LogicalPlanNode> scanNode(const QueryComponents& components,
@@ -6528,13 +6394,9 @@ std::unique_ptr<LogicalPlanNode> scanNode(const QueryComponents& components,
 }
 
 std::unique_ptr<LogicalPlanNode> rewrittenScanNode(const QueryComponents& components,
-                                                   const std::string& table_name,
-                                                   LogicalRewriteContext& context) {
+                                                   const std::string& table_name) {
     auto scan = scanNode(components, table_name);
-    std::vector<LogicalPredicate> filters;
-    for (const auto& rule : logicalRewriteRules()) {
-        rule->applyToScan(table_name, filters, context);
-    }
+    auto filters = logicalFiltersForTable(components, table_name);
     if (filters.empty()) {
         return scan;
     }
@@ -6587,11 +6449,16 @@ std::unique_ptr<LogicalPlanNode> buildLogicalPlan(const QueryComponents& compone
     return root;
 }
 
-std::unique_ptr<LogicalPlanNode> buildRewrittenLogicalPlan(
-    const QueryComponents& components,
-    LogicalRewriteContext& context) {
-    auto root = rewrittenScanNode(components, components.tableName, context);
+bool predicateTablesSeen(const ColumnEqualityClause& equality,
+                         const std::set<std::string>& table_names) {
+    return table_names.find(equality.left.tableName) != table_names.end() &&
+           table_names.find(equality.right.tableName) != table_names.end();
+}
+
+std::unique_ptr<LogicalPlanNode> buildRewrittenLogicalPlan(const QueryComponents& components) {
+    auto root = rewrittenScanNode(components, components.tableName);
     std::set<std::string> seen_tables{components.tableName};
+    std::vector<bool> equality_used(components.columnEqualities.size(), false);
 
     for (const auto& join : components.joins) {
         auto join_node = std::make_unique<LogicalPlanNode>();
@@ -6605,26 +6472,35 @@ std::unique_ptr<LogicalPlanNode> buildRewrittenLogicalPlan(
 
         auto tables_after_join = seen_tables;
         tables_after_join.insert(join.tableName);
-        for (const auto& rule : logicalRewriteRules()) {
-            rule->applyToJoin(
-                join,
-                tables_after_join,
-                join_node->predicates,
-                context
-            );
+        for (size_t i = 0; i < components.columnEqualities.size(); i++) {
+            if (!equality_used[i] &&
+                predicateTablesSeen(components.columnEqualities[i], tables_after_join)) {
+                join_node->predicates.push_back({
+                    LogicalPredicate::Kind::COLUMN_EQ_COLUMN,
+                    components.columnEqualities[i].left,
+                    components.columnEqualities[i].right,
+                    ""
+                });
+                equality_used[i] = true;
+            }
         }
 
         join_node->inputs.push_back(std::move(root));
-        join_node->inputs.push_back(
-            rewrittenScanNode(components, join.tableName, context)
-        );
+        join_node->inputs.push_back(rewrittenScanNode(components, join.tableName));
         root = std::move(join_node);
         seen_tables.insert(join.tableName);
     }
 
     std::vector<LogicalPredicate> residual_predicates;
-    for (const auto& rule : logicalRewriteRules()) {
-        rule->applyResidual(residual_predicates, context);
+    for (size_t i = 0; i < components.columnEqualities.size(); i++) {
+        if (!equality_used[i]) {
+            residual_predicates.push_back({
+                LogicalPredicate::Kind::COLUMN_EQ_COLUMN,
+                components.columnEqualities[i].left,
+                components.columnEqualities[i].right,
+                ""
+            });
+        }
     }
     if (!residual_predicates.empty()) {
         auto filter_node = std::make_unique<LogicalPlanNode>();
@@ -6650,14 +6526,6 @@ std::unique_ptr<LogicalPlanNode> buildRewrittenLogicalPlan(
     return root;
 }
 
-LogicalRewriteResult applyLogicalRewriteRules(const QueryComponents& components) {
-    LogicalRewriteResult result;
-    LogicalRewriteContext context(components);
-    result.plan = buildRewrittenLogicalPlan(components, context);
-    result.firedRules = std::move(context.firedRules);
-    return result;
-}
-
 void printLogicalPlanNode(const LogicalPlanNode& node, size_t indent = 2) {
     auto expressions = logicalExpressionLabels(node);
     std::cout << std::string(indent, ' ') << logicalNodeName(node.kind);
@@ -6670,34 +6538,42 @@ void printLogicalPlanNode(const LogicalPlanNode& node, size_t indent = 2) {
     }
 }
 
-void printRuleTrace(const std::vector<RuleFire>& fired_rules) {
-    std::cout << "\nLogical rules fired:" << std::endl;
-    if (fired_rules.empty()) {
-        std::cout << "  none" << std::endl;
-        return;
-    }
-
-    for (const auto& fire : fired_rules) {
-        std::cout << "  " << fire.ruleName << ": "
-                  << fire.detail << std::endl;
-    }
-}
-
 struct MemoExpression {
     std::string op;
     std::vector<int> inputs;
     std::vector<std::string> details;
 };
 
+struct RuleFire {
+    std::string ruleName;
+    std::string detail;
+};
+
+struct MemoTransformationStats {
+    size_t initialGroups = 0;
+    size_t initialExpressions = 0;
+    size_t finalGroups = 0;
+    size_t finalExpressions = 0;
+    std::vector<RuleFire> firedRules;
+};
+
+struct MemoWinner {
+    std::string requiredTrait;
+    std::string expression;
+    double cost = 0.0;
+};
+
 struct MemoGroup {
     int id = 0;
     std::string logicalProperty;
     std::vector<MemoExpression> expressions;
+    std::map<std::string, MemoWinner> winners;
 };
 
 class Memo {
     std::vector<MemoGroup> groups;
     std::map<std::string, int> groupByProperty;
+    int rootGroupId = 0;
 
 public:
     int internGroup(const std::string& logical_property) {
@@ -6707,7 +6583,7 @@ public:
         }
 
         int group_id = static_cast<int>(groups.size() + 1);
-        groups.push_back({group_id, logical_property, {}});
+        groups.push_back({group_id, logical_property, {}, {}});
         groupByProperty[logical_property] = group_id;
         return group_id;
     }
@@ -6722,8 +6598,20 @@ public:
             }
         }
 
-        groups[group_id - 1].expressions.push_back(std::move(expression));
+        expressions.push_back(std::move(expression));
         return true;
+    }
+
+    void setWinner(int group_id, MemoWinner winner) {
+        groups[group_id - 1].winners[winner.requiredTrait] = std::move(winner);
+    }
+
+    void setFinalGroupId(int group_id) {
+        rootGroupId = group_id;
+    }
+
+    int finalGroupId() const {
+        return rootGroupId;
     }
 
     const std::vector<MemoGroup>& allGroups() const {
@@ -6772,6 +6660,38 @@ std::string memoPropertyField(const std::string& name,
         std::vector<std::string>(values.begin(), values.end()),
         "|"
     ) + "}";
+}
+
+std::string memoPropertyForInputs(const std::vector<int>& input_groups,
+                                  const std::vector<std::string>& predicates,
+                                  const Memo& memo) {
+    std::set<std::string> tables;
+    std::set<std::string> all_predicates(predicates.begin(), predicates.end());
+    for (int group_id : input_groups) {
+        const auto& property = memo.allGroups()[group_id - 1].logicalProperty;
+        auto input_tables = memoPropertySet(property, "tables");
+        tables.insert(input_tables.begin(), input_tables.end());
+        auto input_predicates = memoPropertySet(property, "predicates");
+        all_predicates.insert(input_predicates.begin(), input_predicates.end());
+    }
+
+    std::vector<std::string> fields;
+    fields.push_back(memoPropertyField("tables", tables));
+    auto predicate_field = memoPropertyField("predicates", all_predicates);
+    if (!predicate_field.empty()) {
+        fields.push_back(predicate_field);
+    }
+    return joinStrings(fields, " ");
+}
+
+bool predicateMentionsAnyTable(const std::string& predicate,
+                               const std::set<std::string>& tables) {
+    for (const auto& table : tables) {
+        if (predicate.find("{" + table + ".") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string logicalPropertyForNode(const LogicalPlanNode& node,
@@ -6839,32 +6759,152 @@ int addMemoExpression(const LogicalPlanNode& node, Memo& memo) {
 
 Memo buildMemo(const LogicalPlanNode& root) {
     Memo memo;
-    addMemoExpression(root, memo);
+    memo.setFinalGroupId(addMemoExpression(root, memo));
     return memo;
 }
 
-struct MemoRewriteResult {
-    Memo memo;
-    MemoRewriteStats stats;
-    std::unique_ptr<LogicalPlanNode> plan;
-    std::vector<RuleFire> firedRules;
-};
+void recordMemoRule(MemoTransformationStats& stats,
+                    const std::string& rule_name,
+                    const std::string& detail) {
+    stats.firedRules.push_back({rule_name, detail});
+}
 
-MemoRewriteResult buildMemoWithRuleAlternatives(
-    const QueryComponents& components) {
-    MemoRewriteResult result;
-    auto original_plan = buildLogicalPlan(components);
-    addMemoExpression(*original_plan, result.memo);
-    result.stats.initialGroups = result.memo.groupCount();
-    result.stats.initialExpressions = result.memo.expressionCount();
+void applyMemoTransformationRules(Memo& memo, MemoTransformationStats& stats) {
+    stats.initialGroups = memo.groupCount();
+    stats.initialExpressions = memo.expressionCount();
 
-    auto rewrite_result = applyLogicalRewriteRules(components);
-    addMemoExpression(*rewrite_result.plan, result.memo);
-    result.stats.finalGroups = result.memo.groupCount();
-    result.stats.finalExpressions = result.memo.expressionCount();
-    result.plan = std::move(rewrite_result.plan);
-    result.firedRules = std::move(rewrite_result.firedRules);
-    return result;
+    for (size_t pass = 0; pass < 2; pass++) {
+        bool changed = false;
+        auto groups_snapshot = memo.allGroups();
+        for (const auto& group : groups_snapshot) {
+            for (const auto& expression : group.expressions) {
+                if (expression.op != "LogicalJoin" ||
+                    expression.inputs.size() != 2) {
+                    continue;
+                }
+
+                MemoExpression commuted = expression;
+                std::swap(commuted.inputs[0], commuted.inputs[1]);
+                if (memo.addExpression(group.id, std::move(commuted))) {
+                    changed = true;
+                    recordMemoRule(
+                        stats,
+                        "EQJOIN_COMMUTE",
+                        "G" + std::to_string(group.id) + " swaps join inputs"
+                    );
+                }
+
+                int left_group_id = expression.inputs[0];
+                int right_group_id = expression.inputs[1];
+                const auto& left_group =
+                    groups_snapshot[left_group_id - 1];
+                for (const auto& left_expression : left_group.expressions) {
+                    if (left_expression.op != "LogicalJoin" ||
+                        left_expression.inputs.size() != 2) {
+                        continue;
+                    }
+
+                    int a_group_id = left_expression.inputs[0];
+                    int b_group_id = left_expression.inputs[1];
+                    auto a_tables = memoPropertySet(
+                        groups_snapshot[a_group_id - 1].logicalProperty,
+                        "tables"
+                    );
+                    bool top_predicate_uses_a = false;
+                    for (const auto& predicate : expression.details) {
+                        top_predicate_uses_a =
+                            top_predicate_uses_a ||
+                            predicateMentionsAnyTable(predicate, a_tables);
+                    }
+                    if (top_predicate_uses_a) {
+                        continue;
+                    }
+
+                    int bc_group_id = memo.internGroup(
+                        memoPropertyForInputs(
+                            {b_group_id, right_group_id},
+                            expression.details,
+                            memo
+                        )
+                    );
+                    if (memo.addExpression(bc_group_id, {
+                            "LogicalJoin",
+                            {b_group_id, right_group_id},
+                            expression.details
+                        })) {
+                        changed = true;
+                        recordMemoRule(
+                            stats,
+                            "EQJOIN_LTOR",
+                            "G" + std::to_string(group.id) +
+                            " creates G" + std::to_string(bc_group_id)
+                        );
+                    }
+
+                    if (memo.addExpression(group.id, {
+                            "LogicalJoin",
+                            {a_group_id, bc_group_id},
+                            left_expression.details
+                        })) {
+                        changed = true;
+                        recordMemoRule(
+                            stats,
+                            "EQJOIN_LTOR",
+                            "G" + std::to_string(group.id) +
+                            " adds left-to-right association"
+                        );
+                    }
+                }
+            }
+        }
+        if (!changed) {
+            break;
+        }
+    }
+
+    stats.finalGroups = memo.groupCount();
+    stats.finalExpressions = memo.expressionCount();
+}
+
+void applyMemoImplementationRules(Memo& memo, MemoTransformationStats& stats) {
+    auto groups_snapshot = memo.allGroups();
+    for (const auto& group : groups_snapshot) {
+        for (const auto& expression : group.expressions) {
+            if (expression.op == "LogicalScan") {
+                if (memo.addExpression(group.id, {
+                        "Scan",
+                        expression.inputs,
+                        expression.details
+                    })) {
+                    recordMemoRule(
+                        stats,
+                        "GET_TO_SCAN",
+                        "G" + std::to_string(group.id) +
+                        " implements logical scan"
+                    );
+                }
+            } else if (expression.op == "LogicalJoin") {
+                for (const auto& implementation :
+                     {"NestedLoopJoin", "HashJoin", "SortMergeJoin"}) {
+                    if (memo.addExpression(group.id, {
+                            implementation,
+                            expression.inputs,
+                            expression.details
+                        })) {
+                        recordMemoRule(
+                            stats,
+                            "EQJOIN_TO_" + std::string(implementation),
+                            "G" + std::to_string(group.id) +
+                            " implements logical join"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    stats.finalGroups = memo.groupCount();
+    stats.finalExpressions = memo.expressionCount();
 }
 
 void printMemo(const Memo& memo) {
@@ -6888,6 +6928,11 @@ void printMemo(const Memo& memo) {
                 std::cout << " [" << joinStrings(expression.details, ", ") << "]";
             }
             std::cout << std::endl;
+        }
+        for (const auto& winner : group.winners) {
+            std::cout << "    winner[" << winner.first << "] = "
+                      << winner.second.expression
+                      << " cost=" << winner.second.cost << std::endl;
         }
     }
 }
@@ -6962,12 +7007,16 @@ void printNeededColumns(const QueryComponents& components) {
 
 void printLogicalExplanation(const QueryComponents& components) {
     auto logical_plan = buildLogicalPlan(components);
-    auto rewrite_result = applyLogicalRewriteRules(components);
+    auto rewritten_plan = buildRewrittenLogicalPlan(components);
     std::cout << "\nOriginal logical plan:" << std::endl;
     printLogicalPlanNode(*logical_plan);
-    printRuleTrace(rewrite_result.firedRules);
+    std::cout << "\nRewrite rules applied:" << std::endl;
+    std::cout << "  Split conjunctive predicates" << std::endl;
+    std::cout << "  Push single-table selections to scans" << std::endl;
+    std::cout << "  Attach column equality predicates to joins when both sides are available" << std::endl;
+    std::cout << "  Derive table-local needed columns" << std::endl;
     std::cout << "\nRewritten logical plan:" << std::endl;
-    printLogicalPlanNode(*rewrite_result.plan);
+    printLogicalPlanNode(*rewritten_plan);
     printQueryGraph(components);
     std::cout << "  Written join order: "
               << joinStrings(writtenJoinOrder(components), " -> ")
@@ -7720,42 +7769,6 @@ PlanSnapshot makePlanSnapshot(size_t transformations,
     return snapshot;
 }
 
-enum class JoinOrderAlgorithm {
-    Written,
-    GreedyJoinOrdering2,
-    GreedyJoinOrdering3,
-    GreedyOperatorOrdering,
-    SelingerDP,
-    ConnectedSubgraphDP,
-    IKKBZ,
-    SimulatedAnnealing,
-    LargestIntermediateFirst
-};
-
-std::string joinOrderAlgorithmName(JoinOrderAlgorithm algorithm) {
-    switch (algorithm) {
-        case JoinOrderAlgorithm::Written:
-            return "Written order";
-        case JoinOrderAlgorithm::GreedyJoinOrdering2:
-            return "GreedyJoinOrdering-2";
-        case JoinOrderAlgorithm::GreedyJoinOrdering3:
-            return "GreedyJoinOrdering-3";
-        case JoinOrderAlgorithm::GreedyOperatorOrdering:
-            return "GOO";
-        case JoinOrderAlgorithm::SelingerDP:
-            return "Selinger DP left-deep";
-        case JoinOrderAlgorithm::ConnectedSubgraphDP:
-            return "DCopt connected DP";
-        case JoinOrderAlgorithm::IKKBZ:
-            return "IKKBZ";
-        case JoinOrderAlgorithm::SimulatedAnnealing:
-            return "Simulated Annealing";
-        case JoinOrderAlgorithm::LargestIntermediateFirst:
-            return "Largest-first stress order";
-    }
-    return "GOO";
-}
-
 double pagesAfterFilters(const TableStats& table_stats, double filtered_rows) {
     if (table_stats.rowCount == 0 || table_stats.pageCount == 0) {
         return 1.0;
@@ -7798,20 +7811,6 @@ double tupleMaterializationCost(double rows) {
     return 0.10 * std::max(1.0, rows);
 }
 
-PhysicalJoinKind chooseCheapestJoin(const PhysicalJoinCostStep& step) {
-    PhysicalJoinKind chosen = PhysicalJoinKind::HashJoin;
-    double best_cost = step.hashJoinCost;
-
-    if (step.nestedLoopCost < best_cost) {
-        best_cost = step.nestedLoopCost;
-        chosen = PhysicalJoinKind::NestedLoopJoin;
-    }
-    if (step.sortMergeCost < best_cost) {
-        chosen = PhysicalJoinKind::SortMergeJoin;
-    }
-    return chosen;
-}
-
 double costForKind(const PhysicalJoinCostStep& step, PhysicalJoinKind kind) {
     switch (kind) {
         case PhysicalJoinKind::NestedLoopJoin:
@@ -7822,61 +7821,6 @@ double costForKind(const PhysicalJoinCostStep& step, PhysicalJoinKind kind) {
             return step.sortMergeCost;
     }
     return step.hashJoinCost;
-}
-
-PhysicalJoinCostStep estimatePhysicalJoinStep(const QueryComponents& components,
-                                              const StatisticsCatalog& stats,
-                                              const JoinClause& join,
-                                              double current_rows,
-                                              double current_pages,
-                                              double current_total_cost,
-                                              bool ordered_output_required = false) {
-    const auto& right_stats = tableStatsFor(stats, components, join.tableName);
-    double right_rows = estimateRowsAfterTableFilters(
-        stats,
-        components,
-        join.tableName
-    );
-    double right_pages = pagesAfterFilters(right_stats, right_rows);
-    double output_rows = estimateJoinRows(
-        current_rows,
-        right_rows,
-        columnStatsFor(stats, components, join.left),
-        columnStatsFor(stats, components, join.right)
-    );
-    double output_pages = joinedOutputPages(
-        output_rows,
-        current_rows,
-        current_pages,
-        right_rows,
-        right_pages
-    );
-
-    PhysicalJoinCostStep step;
-    step.join = join;
-    step.leftRows = current_rows;
-    step.leftPages = current_pages;
-    step.leftTotalCost = current_total_cost;
-    step.rightRows = right_rows;
-    step.rightPages = right_pages;
-    step.rightAccessCost = fileScanCost(right_stats);
-    step.outputRows = output_rows;
-    step.outputPages = output_pages;
-    // Charge the simple operators for the tuple work they actually do.
-    double final_sort_cost = ordered_output_required ? sortCost(output_pages) : 0.0;
-    step.orderedOutputRequired = ordered_output_required;
-    step.nestedLoopCost = current_total_cost + step.rightAccessCost +
-        tupleCompareCost(current_rows * right_rows) +
-        tupleMaterializationCost(output_rows) + final_sort_cost;
-    step.hashJoinCost = current_total_cost + step.rightAccessCost +
-        tupleHashCost(current_rows + right_rows) +
-        tupleMaterializationCost(output_rows) + final_sort_cost;
-    step.sortMergeCost = current_total_cost + step.rightAccessCost +
-        sortCost(current_pages) + sortCost(right_pages) +
-        tupleCompareCost(current_rows + right_rows) +
-        tupleMaterializationCost(output_rows);
-    step.chosen = chooseCheapestJoin(step);
-    return step;
 }
 
 PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components,
@@ -7925,53 +7869,7 @@ PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components
         sortCost(left_pages) + sortCost(right_pages) +
         tupleCompareCost(left_rows + right_rows) +
         tupleMaterializationCost(output_rows);
-    step.chosen = chooseCheapestJoin(step);
     return step;
-}
-
-PhysicalJoinPlan choosePhysicalJoinPlan(const QueryComponents& components,
-                                        const StatisticsCatalog& stats,
-                                        bool ordered_output_required = false) {
-    PhysicalJoinPlan plan;
-    if (components.joins.empty()) {
-        const auto& base_stats = tableStatsFor(stats, components, components.tableName);
-        plan.finalRows = estimateRowsAfterTableFilters(stats, components, components.tableName);
-        plan.finalPages = pagesAfterFilters(base_stats, plan.finalRows);
-        plan.totalCost = fileScanCost(base_stats);
-        return plan;
-    }
-
-    const auto& base_stats = tableStatsFor(stats, components, components.tableName);
-    double current_rows = estimateRowsAfterTableFilters(
-        stats,
-        components,
-        components.tableName
-    );
-    double current_pages = pagesAfterFilters(base_stats, current_rows);
-    double current_total_cost = fileScanCost(base_stats);
-
-    for (const auto& join : components.joins) {
-        auto step = estimatePhysicalJoinStep(
-            components,
-            stats,
-            join,
-            current_rows,
-            current_pages,
-            current_total_cost,
-            ordered_output_required
-        );
-
-        plan.joinKinds.push_back(step.chosen);
-        plan.totalCost = costForKind(step, step.chosen);
-        plan.steps.push_back(step);
-        current_rows = step.outputRows;
-        current_pages = step.outputPages;
-        current_total_cost = plan.totalCost;
-    }
-
-    plan.finalRows = current_rows;
-    plan.finalPages = current_pages;
-    return plan;
 }
 
 std::vector<JoinClause> joinGraphEdges(const QueryComponents& components) {
@@ -8034,6 +7932,34 @@ std::string joinPlanTreeString(const std::shared_ptr<JoinPlanNode>& node) {
         left_tree + ", " + right_tree + ")";
 }
 
+std::string memoPhysicalJoinName(PhysicalJoinKind kind) {
+    switch (kind) {
+        case PhysicalJoinKind::NestedLoopJoin:
+            return "NestedLoopJoin";
+        case PhysicalJoinKind::HashJoin:
+            return "HashJoin";
+        case PhysicalJoinKind::SortMergeJoin:
+            return "SortMergeJoin";
+    }
+    return "HashJoin";
+}
+
+std::string memoPhysicalPlanExpression(const std::shared_ptr<JoinPlanNode>& node) {
+    if (!node) {
+        return "";
+    }
+    if (node->isLeaf) {
+        return "Scan(" + node->tableName + ")";
+    }
+    auto left = memoPhysicalPlanExpression(node->left);
+    auto right = memoPhysicalPlanExpression(node->right);
+    if (node->joinKind == PhysicalJoinKind::SortMergeJoin) {
+        left = "SORT(" + left + ")";
+        right = "SORT(" + right + ")";
+    }
+    return memoPhysicalJoinName(node->joinKind) + "(" + left + ", " + right + ")";
+}
+
 std::string joinPlanTableGroup(const std::shared_ptr<JoinPlanNode>& node) {
     if (!node) {
         return "{}";
@@ -8075,26 +8001,6 @@ std::string prettyJoinPlanTree(const std::shared_ptr<JoinPlanNode>& node,
     return out.str();
 }
 
-size_t bitCount(uint64_t mask) {
-    size_t count = 0;
-    while (mask != 0) {
-        count += mask & 1ULL;
-        mask >>= 1ULL;
-    }
-    return count;
-}
-
-std::set<std::string> tablesForMask(const std::vector<std::string>& table_names,
-                                    uint64_t mask) {
-    std::set<std::string> tables;
-    for (size_t i = 0; i < table_names.size(); i++) {
-        if ((mask & (1ULL << i)) != 0) {
-            tables.insert(table_names[i]);
-        }
-    }
-    return tables;
-}
-
 PlannedQuery makeBasePlanForTable(const QueryComponents& components,
                                   const StatisticsCatalog& stats,
                                   const std::string& table_name) {
@@ -8126,1246 +8032,308 @@ PlannedQuery makeBasePlanForTable(const QueryComponents& components,
     return {planned, physical_plan, node};
 }
 
-PlannedQuery chooseGreedyJoinOrdering3Plan(const QueryComponents& components,
-                                           const StatisticsCatalog& stats,
-                                           bool ordered_output_required);
-
-PlannedQuery chooseGreedyOperatorOrderingPlan(const QueryComponents& components,
-                                              const StatisticsCatalog& stats,
-                                              bool ordered_output_required = false) {
-    auto table_names = writtenJoinOrder(components);
-    if (table_names.size() <= 1) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-
-    std::vector<std::shared_ptr<JoinPlanNode>> fragments;
-    for (const auto& table_name : table_names) {
-        const auto& table_stats = tableStatsFor(stats, components, table_name);
-        double rows = estimateRowsAfterTableFilters(stats, components, table_name);
-        auto node = std::make_shared<JoinPlanNode>();
-        node->isLeaf = true;
-        node->tableName = table_name;
-        node->tables = {table_name};
-        node->rows = rows;
-        node->pages = pagesAfterFilters(table_stats, rows);
-        node->totalCost = fileScanCost(table_stats);
-        fragments.push_back(node);
-    }
-
-    auto edges = joinGraphEdges(components);
-    PhysicalJoinPlan physical_plan;
-    while (fragments.size() > 1) {
-        std::optional<PhysicalJoinCostStep> best_step;
-        size_t best_left = 0;
-        size_t best_right = 0;
-        JoinClause best_edge;
-
-        for (size_t i = 0; i < fragments.size(); i++) {
-            for (size_t j = i + 1; j < fragments.size(); j++) {
-                auto edge = joinEdgeBetweenPlans(*fragments[i], *fragments[j], edges);
-                if (!edge) {
-                    continue;
-                }
-                auto step = estimatePhysicalJoinTrees(
-                    components,
-                    stats,
-                    *edge,
-                    fragments[i]->rows,
-                    fragments[i]->pages,
-                    fragments[i]->totalCost,
-                    fragments[j]->rows,
-                    fragments[j]->pages,
-                    fragments[j]->totalCost,
-                    ordered_output_required
-                );
-                if (!best_step ||
-                    step.outputRows < best_step->outputRows ||
-                    (step.outputRows == best_step->outputRows &&
-                     costForKind(step, step.chosen) <
-                        costForKind(*best_step, best_step->chosen))) {
-                    best_step = step;
-                    best_left = i;
-                    best_right = j;
-                    best_edge = *edge;
-                }
-            }
-        }
-
-        if (!best_step) {
-            return chooseGreedyJoinOrdering3Plan(
-                components,
-                stats,
-                ordered_output_required
-            );
-        }
-
-        auto joined = std::make_shared<JoinPlanNode>();
-        joined->isLeaf = false;
-        joined->left = fragments[best_left];
-        joined->right = fragments[best_right];
-        joined->join = best_edge;
-        joined->joinKind = best_step->chosen;
-        joined->tables = joined->left->tables;
-        joined->tables.insert(
-            joined->tables.end(),
-            joined->right->tables.begin(),
-            joined->right->tables.end()
-        );
-        joined->rows = best_step->outputRows;
-        joined->pages = best_step->outputPages;
-        joined->totalCost = costForKind(*best_step, best_step->chosen);
-
-        physical_plan.joinKinds.push_back(best_step->chosen);
-        physical_plan.steps.push_back(*best_step);
-        physical_plan.totalCost = joined->totalCost;
-        physical_plan.finalRows = joined->rows;
-        physical_plan.finalPages = joined->pages;
-
-        fragments[best_left] = joined;
-        fragments.erase(fragments.begin() + static_cast<long>(best_right));
-    }
-
-    QueryComponents planned = components;
-    PlannedQuery query{planned, physical_plan, fragments.front()};
-    query.planDescription = joinPlanTreeString(query.planRoot);
-    return query;
-}
-
-PlannedQuery chooseSelingerDPPlan(const QueryComponents& components,
-                                  const StatisticsCatalog& stats,
-                                  bool ordered_output_required = false) {
-    auto table_names = writtenJoinOrder(components);
-    if (table_names.size() <= 1 || table_names.size() >= 63) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-
-    const uint64_t full_mask = (1ULL << table_names.size()) - 1ULL;
-    std::vector<std::optional<PlannedQuery>> best(full_mask + 1ULL);
-    for (size_t table_index = 0; table_index < table_names.size(); table_index++) {
-        best[1ULL << table_index] = makeBasePlanForTable(
-            components,
-            stats,
-            table_names[table_index]
-        );
-    }
-
-    auto edges = joinGraphEdges(components);
-    size_t candidates_considered = 0;
-    size_t cross_products_pruned = 0;
-
-    for (size_t size = 2; size <= table_names.size(); size++) {
-        for (uint64_t mask = 1; mask <= full_mask; mask++) {
-            if (bitCount(mask) != size - 1 || !best[mask]) {
-                continue;
-            }
-
-            auto joined_tables = tablesForMask(table_names, mask);
-            for (size_t right_index = 0; right_index < table_names.size(); right_index++) {
-                uint64_t right_bit = 1ULL << right_index;
-                if ((mask & right_bit) != 0) {
-                    continue;
-                }
-
-                std::optional<PhysicalJoinCostStep> best_step;
-                for (const auto& edge : edges) {
-                    auto oriented = orientJoinEdge(edge, joined_tables, components);
-                    if (!oriented || oriented->tableName != table_names[right_index]) {
-                        continue;
-                    }
-                    auto step = estimatePhysicalJoinStep(
-                        components,
-                        stats,
-                        *oriented,
-                        best[mask]->physicalPlan.finalRows,
-                        best[mask]->physicalPlan.finalPages,
-                        best[mask]->physicalPlan.totalCost,
-                        ordered_output_required
-                    );
-                    candidates_considered++;
-                    if (!best_step ||
-                        costForKind(step, step.chosen) <
-                            costForKind(*best_step, best_step->chosen)) {
-                        best_step = step;
-                    }
-                }
-
-                if (!best_step) {
-                    cross_products_pruned++;
-                    continue;
-                }
-
-                auto candidate = *best[mask];
-                candidate.components.joins.push_back(best_step->join);
-                candidate.physicalPlan.joinKinds.push_back(best_step->chosen);
-                candidate.physicalPlan.steps.push_back(*best_step);
-                candidate.physicalPlan.totalCost =
-                    costForKind(*best_step, best_step->chosen);
-                candidate.physicalPlan.finalRows = best_step->outputRows;
-                candidate.physicalPlan.finalPages = best_step->outputPages;
-
-                uint64_t new_mask = mask | right_bit;
-                if (!best[new_mask] ||
-                    candidate.physicalPlan.totalCost <
-                        best[new_mask]->physicalPlan.totalCost) {
-                    best[new_mask] = candidate;
-                }
-            }
-        }
-    }
-
-    if (!best[full_mask]) {
-        return chooseGreedyJoinOrdering3Plan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-
-    auto result = *best[full_mask];
-    result.planRoot = nullptr;
-    result.planDescription.clear();
-    result.dpCandidatesConsidered = candidates_considered;
-    result.dpCrossProductsPruned = cross_products_pruned;
-    for (const auto& plan : best) {
-        if (plan) {
-            result.dpStatesKept++;
-        }
-    }
-    return result;
-}
-
-std::vector<uint64_t> tableAdjacencyMasks(const std::vector<std::string>& table_names,
-                                          const std::vector<JoinClause>& edges) {
-    std::map<std::string, size_t> table_index;
-    for (size_t i = 0; i < table_names.size(); i++) {
-        table_index[table_names[i]] = i;
-    }
-
-    std::vector<uint64_t> adjacency(table_names.size(), 0);
-    for (const auto& edge : edges) {
-        auto left = table_index.find(edge.left.tableName);
-        auto right = table_index.find(edge.right.tableName);
-        if (left == table_index.end() || right == table_index.end()) {
-            continue;
-        }
-        adjacency[left->second] |= 1ULL << right->second;
-        adjacency[right->second] |= 1ULL << left->second;
-    }
-    return adjacency;
-}
-
-bool isConnectedMask(uint64_t mask, const std::vector<uint64_t>& adjacency) {
-    if (mask == 0) {
-        return false;
-    }
-    uint64_t seen = mask & (~mask + 1ULL);
-    uint64_t frontier = seen;
-    while (frontier != 0) {
-        uint64_t next = 0;
-        for (size_t i = 0; i < adjacency.size(); i++) {
-            if ((frontier & (1ULL << i)) != 0) {
-                next |= adjacency[i] & mask;
-            }
-        }
-        next &= ~seen;
-        seen |= next;
-        frontier = next;
-    }
-    return seen == mask;
-}
-
-PlannedQuery chooseConnectedSubgraphDPPlan(const QueryComponents& components,
-                                           const StatisticsCatalog& stats,
-                                           bool ordered_output_required = false) {
-    auto table_names = writtenJoinOrder(components);
-    if (table_names.size() <= 1 || table_names.size() >= 63) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-
-    const uint64_t full_mask = (1ULL << table_names.size()) - 1ULL;
-    std::vector<std::optional<PlannedQuery>> best(full_mask + 1ULL);
-    for (size_t table_index = 0; table_index < table_names.size(); table_index++) {
-        uint64_t table_mask = 1ULL << table_index;
-        best[table_mask] = makeBasePlanForTable(
-            components,
-            stats,
-            table_names[table_index]
-        );
-    }
-
-    auto edges = joinGraphEdges(components);
-    auto adjacency = tableAdjacencyMasks(table_names, edges);
-    std::vector<bool> connected(full_mask + 1ULL, false);
-    for (uint64_t mask = 1; mask <= full_mask; mask++) {
-        connected[mask] = isConnectedMask(mask, adjacency);
-    }
-
-    size_t candidates_considered = 0;
-    size_t csg_cmp_pairs = 0;
-
-    for (size_t size = 2; size <= table_names.size(); size++) {
-        for (uint64_t mask = 1; mask <= full_mask; mask++) {
-            if (bitCount(mask) != size || !connected[mask]) {
-                continue;
-            }
-
-            for (uint64_t left_mask = (mask - 1ULL) & mask;
-                 left_mask != 0;
-                 left_mask = (left_mask - 1ULL) & mask) {
-                uint64_t right_mask = mask ^ left_mask;
-                if (right_mask == 0 || left_mask > right_mask ||
-                    !connected[left_mask] || !connected[right_mask] ||
-                    !best[left_mask] || !best[right_mask]) {
-                    continue;
-                }
-
-                auto edge = joinEdgeBetweenPlans(
-                    *best[left_mask]->planRoot,
-                    *best[right_mask]->planRoot,
-                    edges
-                );
-                if (!edge) {
-                    continue;
-                }
-                csg_cmp_pairs++;
-
-                auto step = estimatePhysicalJoinTrees(
-                    components,
-                    stats,
-                    *edge,
-                    best[left_mask]->physicalPlan.finalRows,
-                    best[left_mask]->physicalPlan.finalPages,
-                    best[left_mask]->physicalPlan.totalCost,
-                    best[right_mask]->physicalPlan.finalRows,
-                    best[right_mask]->physicalPlan.finalPages,
-                    best[right_mask]->physicalPlan.totalCost,
-                    ordered_output_required
-                );
-                candidates_considered++;
-
-                auto joined = std::make_shared<JoinPlanNode>();
-                joined->isLeaf = false;
-                joined->left = best[left_mask]->planRoot;
-                joined->right = best[right_mask]->planRoot;
-                joined->join = *edge;
-                joined->joinKind = step.chosen;
-                joined->tables = joined->left->tables;
-                joined->tables.insert(
-                    joined->tables.end(),
-                    joined->right->tables.begin(),
-                    joined->right->tables.end()
-                );
-                joined->rows = step.outputRows;
-                joined->pages = step.outputPages;
-                joined->totalCost = costForKind(step, step.chosen);
-
-                PhysicalJoinPlan physical_plan;
-                physical_plan.steps = best[left_mask]->physicalPlan.steps;
-                physical_plan.steps.insert(
-                    physical_plan.steps.end(),
-                    best[right_mask]->physicalPlan.steps.begin(),
-                    best[right_mask]->physicalPlan.steps.end()
-                );
-                physical_plan.steps.push_back(step);
-                physical_plan.joinKinds = best[left_mask]->physicalPlan.joinKinds;
-                physical_plan.joinKinds.insert(
-                    physical_plan.joinKinds.end(),
-                    best[right_mask]->physicalPlan.joinKinds.begin(),
-                    best[right_mask]->physicalPlan.joinKinds.end()
-                );
-                physical_plan.joinKinds.push_back(step.chosen);
-                physical_plan.totalCost = joined->totalCost;
-                physical_plan.finalRows = joined->rows;
-                physical_plan.finalPages = joined->pages;
-
-                PlannedQuery candidate{components, physical_plan, joined};
-                candidate.planDescription = joinPlanTreeString(joined);
-                if (!best[mask] ||
-                    candidate.physicalPlan.totalCost <
-                        best[mask]->physicalPlan.totalCost) {
-                    best[mask] = candidate;
-                }
-            }
-        }
-    }
-
-    if (!best[full_mask]) {
-        return chooseGreedyOperatorOrderingPlan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-
-    auto result = *best[full_mask];
-    result.dpCandidatesConsidered = candidates_considered;
-    result.dpCrossProductsPruned = csg_cmp_pairs;
-    for (const auto& plan : best) {
-        if (plan) {
-            result.dpStatesKept++;
-        }
-    }
-    return result;
-}
-
-struct IKKBZSequence {
-    std::vector<std::string> tables;
-    std::vector<std::pair<std::string, double>> ranks;
-    double transfer = 1.0;
-    double cost = 0.0;
-    double rank = 0.0;
-    size_t compounds = 0;
-};
-
-double ikkbzRank(double transfer, double cost) {
-    if (cost <= 0.0) {
-        return 0.0;
-    }
-    double rank = (transfer - 1.0) / cost;
-    return std::abs(rank) < 0.000001 ? 0.0 : rank;
-}
-
-std::vector<JoinClause> resolvedJoinGraphEdges(const QueryComponents& components) {
-    auto table_names = writtenJoinOrder(components);
-    std::set<std::string> query_tables(table_names.begin(), table_names.end());
-    std::vector<JoinClause> resolved_edges;
-    for (const auto& edge : joinGraphEdges(components)) {
-        if (query_tables.find(edge.left.tableName) != query_tables.end() &&
-            query_tables.find(edge.right.tableName) != query_tables.end()) {
-            resolved_edges.push_back(edge);
-        }
-    }
-    return resolved_edges;
-}
-
-double edgeSelectivity(const QueryComponents& components,
-                       const StatisticsCatalog& stats,
-                       const JoinClause& edge) {
-    double left_rows = estimateRowsAfterTableFilters(
-        stats,
-        components,
-        edge.left.tableName
-    );
-    double right_rows = estimateRowsAfterTableFilters(
-        stats,
-        components,
-        edge.right.tableName
-    );
-    double joined_rows = estimateJoinRows(
-        left_rows,
-        right_rows,
-        columnStatsFor(stats, components, edge.left),
-        columnStatsFor(stats, components, edge.right)
-    );
-    return joined_rows / std::max(1.0, left_rows * right_rows);
-}
-
-std::optional<JoinClause> edgeBetweenTables(const std::vector<JoinClause>& edges,
-                                            const std::string& left_table,
-                                            const std::string& right_table) {
-    for (const auto& edge : edges) {
-        if ((edge.left.tableName == left_table &&
-             edge.right.tableName == right_table) ||
-            (edge.left.tableName == right_table &&
-             edge.right.tableName == left_table)) {
-            return edge;
-        }
-    }
-    return std::nullopt;
-}
-
-std::map<std::string, std::vector<std::string>> buildIKKBZPrecedenceTree(
-    const std::vector<std::string>& table_names,
-    const std::vector<JoinClause>& edges,
-    const std::string& root) {
-    std::map<std::string, std::vector<std::string>> graph;
-    for (const auto& edge : edges) {
-        graph[edge.left.tableName].push_back(edge.right.tableName);
-        graph[edge.right.tableName].push_back(edge.left.tableName);
-    }
-
-    std::map<std::string, std::vector<std::string>> children;
-    std::set<std::string> seen{root};
-    std::vector<std::string> frontier{root};
-    for (size_t pos = 0; pos < frontier.size(); pos++) {
-        auto neighbors = graph[frontier[pos]];
-        std::sort(neighbors.begin(), neighbors.end());
-        for (const auto& neighbor : neighbors) {
-            if (seen.insert(neighbor).second) {
-                children[frontier[pos]].push_back(neighbor);
-                frontier.push_back(neighbor);
-            }
-        }
-    }
-
-    if (seen.size() != table_names.size()) {
-        children.clear();
-    }
-    return children;
-}
-
-IKKBZSequence mergeIKKBZSequences(const IKKBZSequence& left,
-                                  const IKKBZSequence& right,
-                                  bool compound) {
-    IKKBZSequence merged;
-    merged.tables = left.tables;
-    merged.tables.insert(
-        merged.tables.end(),
-        right.tables.begin(),
-        right.tables.end()
-    );
-    merged.ranks = left.ranks;
-    merged.ranks.insert(
-        merged.ranks.end(),
-        right.ranks.begin(),
-        right.ranks.end()
-    );
-    merged.transfer = left.transfer * right.transfer;
-    merged.cost = left.cost + left.transfer * right.cost;
-    merged.rank = ikkbzRank(merged.transfer, merged.cost);
-    merged.compounds = left.compounds + right.compounds + (compound ? 1 : 0);
-    return merged;
-}
-
-IKKBZSequence buildIKKBZSequenceForSubtree(
-    const QueryComponents& components,
-    const StatisticsCatalog& stats,
-    const std::vector<JoinClause>& edges,
-    const std::map<std::string, std::vector<std::string>>& children,
-    const std::string& table,
-    const std::optional<std::string>& parent_table) {
-    const auto& table_stats = tableStatsFor(stats, components, table);
-    double rows = estimateRowsAfterTableFilters(stats, components, table);
-    double transfer = std::max(1.0, rows);
-    double cost = 0.0;
-
-    if (parent_table) {
-        auto edge = edgeBetweenTables(edges, *parent_table, table);
-        if (edge) {
-            transfer = std::max(0.000001, edgeSelectivity(components, stats, *edge) * rows);
-        }
-        cost = fileScanCost(table_stats);
-    }
-
-    IKKBZSequence sequence;
-    sequence.tables = {table};
-    sequence.transfer = transfer;
-    sequence.cost = cost;
-    sequence.rank = ikkbzRank(transfer, cost);
-    sequence.ranks.push_back({table, sequence.rank});
-
-    std::vector<IKKBZSequence> child_sequences;
-    auto child_it = children.find(table);
-    if (child_it != children.end()) {
-        for (const auto& child : child_it->second) {
-            child_sequences.push_back(buildIKKBZSequenceForSubtree(
-                components,
-                stats,
-                edges,
-                children,
-                child,
-                table
-            ));
-        }
-    }
-
-    std::sort(
-        child_sequences.begin(),
-        child_sequences.end(),
-        [](const auto& left, const auto& right) {
-            return left.rank < right.rank;
-        }
-    );
-
-    for (const auto& child_sequence : child_sequences) {
-        bool contradictory = sequence.rank > child_sequence.rank;
-        sequence = mergeIKKBZSequences(sequence, child_sequence, contradictory);
-    }
-    return sequence;
-}
-
-std::optional<PhysicalJoinCostStep> bestStepForNextTable(
-    const QueryComponents& components,
-    const StatisticsCatalog& stats,
-    const std::vector<JoinClause>& edges,
-    const std::set<std::string>& joined_tables,
-    const std::string& next_table,
-    double current_rows,
-    double current_pages,
-    double current_total_cost,
-    bool ordered_output_required) {
-    std::optional<PhysicalJoinCostStep> best_step;
-    for (const auto& edge : edges) {
-        auto oriented = orientJoinEdge(edge, joined_tables, components);
-        if (!oriented || oriented->tableName != next_table) {
-            continue;
-        }
-        auto step = estimatePhysicalJoinStep(
-            components,
-            stats,
-            *oriented,
-            current_rows,
-            current_pages,
-            current_total_cost,
-            ordered_output_required
-        );
-        if (!best_step ||
-            costForKind(step, step.chosen) <
-                costForKind(*best_step, best_step->chosen)) {
-            best_step = step;
-        }
-    }
-    return best_step;
-}
-
-std::optional<PlannedQuery> chooseFixedLeftDeepOrderPlan(
-    const QueryComponents& components,
-    const StatisticsCatalog& stats,
-    const std::vector<std::string>& order,
-    bool ordered_output_required) {
-    auto table_names = writtenJoinOrder(components);
-    if (order.size() != table_names.size() ||
-        std::set<std::string>(order.begin(), order.end()).size() != order.size()) {
-        return std::nullopt;
-    }
-
-    QueryComponents planned = components;
-    planned.joins.clear();
-    planned.tableName = order.front();
-    planned.baseTableName = actualTableName(components, order.front());
-
-    const auto& base_stats = tableStatsFor(stats, components, order.front());
-    double current_rows = estimateRowsAfterTableFilters(
-        stats,
-        components,
-        order.front()
-    );
-    double current_pages = pagesAfterFilters(base_stats, current_rows);
-    double current_total_cost = fileScanCost(base_stats);
-    std::set<std::string> joined_tables{order.front()};
-    auto edges = joinGraphEdges(components);
-
-    PhysicalJoinPlan physical_plan;
-    for (size_t i = 1; i < order.size(); i++) {
-        auto step = bestStepForNextTable(
-            components,
-            stats,
-            edges,
-            joined_tables,
-            order[i],
-            current_rows,
-            current_pages,
-            current_total_cost,
-            ordered_output_required
-        );
-        if (!step) {
-            return std::nullopt;
-        }
-
-        planned.joins.push_back(step->join);
-        physical_plan.joinKinds.push_back(step->chosen);
-        physical_plan.steps.push_back(*step);
-        physical_plan.totalCost = costForKind(*step, step->chosen);
-        joined_tables.insert(order[i]);
-        current_rows = step->outputRows;
-        current_pages = step->outputPages;
-        current_total_cost = physical_plan.totalCost;
-    }
-
-    physical_plan.finalRows = current_rows;
-    physical_plan.finalPages = current_pages;
-    return PlannedQuery{planned, physical_plan};
-}
-
-std::string formatIKKBZRanks(const std::vector<std::pair<std::string, double>>& ranks) {
-    std::vector<std::string> labels;
-    for (const auto& [table, rank] : ranks) {
-        double display_rank = std::abs(rank) < 0.05 ? 0.0 : rank;
-        labels.push_back(table + "=" + formatEstimate(display_rank));
-    }
-    return joinStrings(labels, ", ");
-}
-
-PlannedQuery chooseIKKBZPlan(const QueryComponents& components,
-                             const StatisticsCatalog& stats,
-                             bool ordered_output_required = false) {
-    auto table_names = writtenJoinOrder(components);
-    if (table_names.size() <= 1) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-
-    auto precedence_edges = resolvedJoinGraphEdges(components);
-    std::optional<PlannedQuery> best_plan;
-    std::string best_root;
-    std::vector<std::string> best_order;
-    std::vector<std::pair<std::string, double>> best_ranks;
-    size_t best_compounds = 0;
-    for (const auto& root : table_names) {
-        auto children = buildIKKBZPrecedenceTree(table_names, precedence_edges, root);
-        if (children.empty()) {
-            continue;
-        }
-
-        auto sequence = buildIKKBZSequenceForSubtree(
-            components,
-            stats,
-            precedence_edges,
-            children,
-            root,
-            std::nullopt
-        );
-        auto candidate = chooseFixedLeftDeepOrderPlan(
-            components,
-            stats,
-            sequence.tables,
-            ordered_output_required
-        );
-        if (!candidate) {
-            continue;
-        }
-        if (!best_plan ||
-            candidate->physicalPlan.totalCost <
-                best_plan->physicalPlan.totalCost) {
-            best_plan = *candidate;
-            best_root = root;
-            best_order = sequence.tables;
-            best_ranks = sequence.ranks;
-            best_compounds = sequence.compounds;
-        }
-    }
-
-    if (!best_plan) {
-        return chooseGreedyJoinOrdering3Plan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-    best_plan->planDescription = "root=" + best_root +
-        "; compounds=" + std::to_string(best_compounds) +
-        "; order: " + joinStrings(best_order, " -> ") +
-        "; ranks: " + formatIKKBZRanks(best_ranks);
-    return *best_plan;
-}
-
-bool tableConnectsToJoined(const std::vector<JoinClause>& edges,
-                           const std::set<std::string>& joined_tables,
-                           const std::string& table) {
-    for (const auto& edge : edges) {
-        if ((edge.left.tableName == table &&
-             joined_tables.find(edge.right.tableName) != joined_tables.end()) ||
-            (edge.right.tableName == table &&
-             joined_tables.find(edge.left.tableName) != joined_tables.end())) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool isValidLeftDeepOrder(const std::vector<std::string>& order,
-                          const std::vector<std::string>& table_names,
-                          const std::vector<JoinClause>& edges) {
-    if (order.size() != table_names.size() ||
-        std::set<std::string>(order.begin(), order.end()).size() != order.size()) {
-        return false;
-    }
-    std::set<std::string> expected(table_names.begin(), table_names.end());
-    for (const auto& table : order) {
-        if (expected.find(table) == expected.end()) {
-            return false;
-        }
-    }
-
-    std::set<std::string> joined_tables{order.front()};
-    for (size_t i = 1; i < order.size(); i++) {
-        if (!tableConnectsToJoined(edges, joined_tables, order[i])) {
-            return false;
-        }
-        joined_tables.insert(order[i]);
-    }
-    return true;
-}
-
-std::optional<std::vector<std::string>> randomConnectedOrder(
-    const std::vector<std::string>& table_names,
-    const std::vector<JoinClause>& edges,
-    std::mt19937& rng) {
-    if (table_names.empty()) {
-        return std::nullopt;
-    }
-
-    std::uniform_int_distribution<size_t> root_dist(0, table_names.size() - 1);
-    std::vector<std::string> order{table_names[root_dist(rng)]};
-    std::set<std::string> joined_tables{order.front()};
-    std::set<std::string> remaining(table_names.begin(), table_names.end());
-    remaining.erase(order.front());
-
-    while (!remaining.empty()) {
-        std::vector<std::string> candidates;
-        for (const auto& table : remaining) {
-            if (tableConnectsToJoined(edges, joined_tables, table)) {
-                candidates.push_back(table);
-            }
-        }
-        if (candidates.empty()) {
-            return std::nullopt;
-        }
-
-        std::uniform_int_distribution<size_t> next_dist(0, candidates.size() - 1);
-        auto next_table = candidates[next_dist(rng)];
-        order.push_back(next_table);
-        joined_tables.insert(next_table);
-        remaining.erase(next_table);
-    }
-    return order;
-}
-
-std::optional<std::vector<std::string>> randomNeighborOrder(
-    const std::vector<std::string>& order,
-    const std::vector<std::string>& table_names,
-    const std::vector<JoinClause>& edges,
-    std::mt19937& rng) {
-    if (order.size() < 2) {
-        return std::nullopt;
-    }
-
-    std::uniform_int_distribution<size_t> pos_dist(0, order.size() - 1);
-    std::uniform_int_distribution<int> move_dist(0, 1);
-    for (size_t attempt = 0; attempt < 40; attempt++) {
-        auto candidate = order;
-        size_t first = pos_dist(rng);
-        size_t second = pos_dist(rng);
-        if (first == second) {
-            continue;
-        }
-
-        if (move_dist(rng) == 0) {
-            std::swap(candidate[first], candidate[second]);
-        } else {
-            auto table = candidate[first];
-            candidate.erase(candidate.begin() + static_cast<long>(first));
-            candidate.insert(candidate.begin() + static_cast<long>(second), table);
-        }
-
-        if (isValidLeftDeepOrder(candidate, table_names, edges)) {
-            return candidate;
-        }
-    }
-    return std::nullopt;
-}
-
-PlannedQuery chooseSimulatedAnnealingPlan(const QueryComponents& components,
-                                          const StatisticsCatalog& stats,
-                                          bool ordered_output_required = false) {
-    auto table_names = writtenJoinOrder(components);
-    if (table_names.size() <= 1) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-
-    auto edges = resolvedJoinGraphEdges(components);
-    std::mt19937 rng(95);
-    std::optional<PlannedQuery> current_plan;
-    std::vector<std::string> current_order;
-    for (size_t attempt = 0; attempt < 50 && !current_plan; attempt++) {
-        auto order = randomConnectedOrder(table_names, edges, rng);
-        if (!order) {
-            continue;
-        }
-        auto plan = chooseFixedLeftDeepOrderPlan(
-            components,
-            stats,
-            *order,
-            ordered_output_required
-        );
-        if (plan) {
-            current_plan = *plan;
-            current_order = *order;
-        }
-    }
-
-    if (!current_plan) {
-        return chooseGreedyJoinOrdering3Plan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-
-    auto best_plan = *current_plan;
-    auto best_order = current_order;
-    auto initial_order = current_order;
-    double initial_cost = current_plan->physicalPlan.totalCost;
-    double temperature = std::max(1.0, initial_cost * 0.25);
-    size_t attempted_moves = 0;
-    size_t valid_moves = 0;
-    size_t invalid_moves = 0;
-    size_t improving_moves = 0;
-    size_t worse_moves = 0;
-    size_t rejected_moves = 0;
-    std::vector<PlanSnapshot> checkpoints;
-    std::uniform_real_distribution<double> probability(0.0, 1.0);
-    auto recordCheckpoint = [&]() {
-        if (attempted_moves > 0 && attempted_moves % 100 == 0) {
-            checkpoints.push_back(makePlanSnapshot(attempted_moves, best_plan));
-        }
-    };
-
-    for (size_t outer = 0; outer < 8; outer++) {
-        for (size_t inner = 0; inner < 60; inner++) {
-            attempted_moves++;
-            auto neighbor_order = randomNeighborOrder(
-                current_order,
-                table_names,
-                edges,
-                rng
-            );
-            if (!neighbor_order) {
-                invalid_moves++;
-                recordCheckpoint();
-                continue;
-            }
-
-            auto neighbor_plan = chooseFixedLeftDeepOrderPlan(
-                components,
-                stats,
-                *neighbor_order,
-                ordered_output_required
-            );
-            if (!neighbor_plan) {
-                invalid_moves++;
-                recordCheckpoint();
-                continue;
-            }
-            valid_moves++;
-
-            double delta = neighbor_plan->physicalPlan.totalCost -
-                current_plan->physicalPlan.totalCost;
-            bool accept = delta < 0.0 ||
-                probability(rng) < std::exp(-delta / temperature);
-            if (!accept) {
-                rejected_moves++;
-                recordCheckpoint();
-                continue;
-            }
-
-            if (delta < 0.0) {
-                improving_moves++;
-            } else {
-                worse_moves++;
-            }
-            current_plan = *neighbor_plan;
-            current_order = *neighbor_order;
-            if (current_plan->physicalPlan.totalCost <
-                best_plan.physicalPlan.totalCost) {
-                best_plan = *current_plan;
-                best_order = current_order;
-            }
-            recordCheckpoint();
-        }
-        temperature *= 0.55;
-    }
-
-    best_plan.planDescription =
-        "initial cost=" + formatEstimate(initial_cost) +
-        "; initial order: " + joinStrings(initial_order, " -> ") +
-        "; best order: " + joinStrings(best_order, " -> ") +
-        "; valid transformations=" + std::to_string(valid_moves) +
-        "/" + std::to_string(attempted_moves) +
-        "; invalid transformations=" + std::to_string(invalid_moves) +
-        "; improving moves=" + std::to_string(improving_moves) +
-        "; worse moves=" + std::to_string(worse_moves) +
-        "; rejected valid moves=" + std::to_string(rejected_moves);
-    best_plan.annealingCheckpoints = std::move(checkpoints);
-    return best_plan;
-}
-
-PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
-                                      const StatisticsCatalog& stats,
-                                      JoinOrderAlgorithm algorithm,
-                                      bool ordered_output_required,
-                                      const std::string& start_table);
-
-PlannedQuery chooseGreedyJoinOrdering3Plan(const QueryComponents& components,
-                                           const StatisticsCatalog& stats,
-                                           bool ordered_output_required = false) {
-    auto table_names = writtenJoinOrder(components);
-    if (table_names.size() <= 1) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-
-    std::optional<PlannedQuery> best_plan;
-    double best_score = 0.0;
-    double best_cost = 0.0;
-    for (const auto& start_table : table_names) {
-        auto candidate = chooseAnchoredGreedyPlan(
-            components,
-            stats,
-            JoinOrderAlgorithm::GreedyJoinOrdering2,
-            ordered_output_required,
-            start_table
-        );
-        double score = candidate.physicalPlan.steps.empty()
-            ? candidate.physicalPlan.finalRows
-            : candidate.physicalPlan.steps.back().outputRows;
-        double cost = candidate.physicalPlan.totalCost;
-        if (!best_plan ||
-            score < best_score ||
-            (score == best_score && cost < best_cost)) {
-            best_plan = candidate;
-            best_score = score;
-            best_cost = cost;
-        }
-    }
-
-    return *best_plan;
-}
-
-double joinOrderStepScore(const PhysicalJoinCostStep& step,
-                          JoinOrderAlgorithm algorithm) {
-    switch (algorithm) {
-        case JoinOrderAlgorithm::GreedyJoinOrdering2:
-            return step.outputRows;
-        case JoinOrderAlgorithm::LargestIntermediateFirst:
-            return -step.outputRows;
-        case JoinOrderAlgorithm::Written:
-        case JoinOrderAlgorithm::GreedyJoinOrdering3:
-        case JoinOrderAlgorithm::GreedyOperatorOrdering:
-        case JoinOrderAlgorithm::SelingerDP:
-        case JoinOrderAlgorithm::ConnectedSubgraphDP:
-        case JoinOrderAlgorithm::IKKBZ:
-        case JoinOrderAlgorithm::SimulatedAnnealing:
-            return costForKind(step, step.chosen);
-    }
-    return costForKind(step, step.chosen);
-}
-
-PlannedQuery chooseAnchoredGreedyPlan(const QueryComponents& components,
-                                      const StatisticsCatalog& stats,
-                                      JoinOrderAlgorithm algorithm,
-                                      bool ordered_output_required,
-                                      const std::string& start_table) {
-    auto table_names = writtenJoinOrder(components);
-    if (table_names.size() <= 1) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-
-    auto edges = joinGraphEdges(components);
-    QueryComponents planned = components;
-    planned.joins.clear();
-    planned.tableName = start_table;
-    planned.baseTableName = actualTableName(components, start_table);
-    PhysicalJoinPlan physical_plan;
-    std::set<std::string> all_tables(table_names.begin(), table_names.end());
-    std::set<std::string> joined_tables{start_table};
-
-    const auto& base_stats = tableStatsFor(stats, components, start_table);
-    double current_rows = estimateRowsAfterTableFilters(
-        stats,
-        components,
-        start_table
-    );
-    double current_pages = pagesAfterFilters(base_stats, current_rows);
-    double current_total_cost = fileScanCost(base_stats);
-
-    while (joined_tables.size() < all_tables.size()) {
-        std::optional<PhysicalJoinCostStep> best_step;
-        double best_score = 0.0;
-        for (const auto& edge : edges) {
-            auto oriented = orientJoinEdge(edge, joined_tables, components);
-            if (!oriented) {
-                continue;
-            }
-            auto step = estimatePhysicalJoinStep(
-                components,
-                stats,
-                *oriented,
-                current_rows,
-                current_pages,
-                current_total_cost,
-                ordered_output_required
-            );
-            double score = joinOrderStepScore(step, algorithm);
-            if (!best_step || score < best_score) {
-                best_step = std::move(step);
-                best_score = score;
-            }
-        }
-
-        if (!best_step) {
-            return {components, choosePhysicalJoinPlan(
-                components,
-                stats,
-                ordered_output_required
-            )};
-        }
-
-        planned.joins.push_back(best_step->join);
-        physical_plan.joinKinds.push_back(best_step->chosen);
-        physical_plan.totalCost = costForKind(*best_step, best_step->chosen);
-        physical_plan.steps.push_back(*best_step);
-        joined_tables.insert(best_step->join.tableName);
-        current_rows = best_step->outputRows;
-        current_pages = best_step->outputPages;
-        current_total_cost = physical_plan.totalCost;
-    }
-
-    physical_plan.finalRows = current_rows;
-    physical_plan.finalPages = current_pages;
-    return {planned, physical_plan};
-}
-
-PlannedQuery chooseJoinOrderPlan(const QueryComponents& components,
-                                 const StatisticsCatalog& stats,
-                                 JoinOrderAlgorithm algorithm,
-                                 bool ordered_output_required = false) {
-    if (algorithm == JoinOrderAlgorithm::Written) {
-        return {components, choosePhysicalJoinPlan(
-            components,
-            stats,
-            ordered_output_required
-        )};
-    }
-    if (algorithm == JoinOrderAlgorithm::GreedyJoinOrdering3) {
-        return chooseGreedyJoinOrdering3Plan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-    if (algorithm == JoinOrderAlgorithm::GreedyOperatorOrdering) {
-        return chooseGreedyOperatorOrderingPlan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-    if (algorithm == JoinOrderAlgorithm::SelingerDP) {
-        return chooseSelingerDPPlan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-    if (algorithm == JoinOrderAlgorithm::ConnectedSubgraphDP) {
-        return chooseConnectedSubgraphDPPlan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-    if (algorithm == JoinOrderAlgorithm::IKKBZ) {
-        return chooseIKKBZPlan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-    if (algorithm == JoinOrderAlgorithm::SimulatedAnnealing) {
-        return chooseSimulatedAnnealingPlan(
-            components,
-            stats,
-            ordered_output_required
-        );
-    }
-    return chooseAnchoredGreedyPlan(
-        components,
-        stats,
-        algorithm,
-        ordered_output_required,
-        components.tableName
-    );
-}
-
 struct PlanTraitSet {
     bool orderedOutputRequired = false;
 
     std::string describe() const {
-        return orderedOutputRequired ? "ordered output" : "none";
+        return orderedOutputRequired ? "ordered output" : "unordered";
     }
 };
+
+struct MemoWinnerSearch {
+    int finalGroupId = 0;
+    std::string requiredTrait = "unordered";
+    std::string expression;
+    double cost = 0.0;
+    PlannedQuery plannedQuery;
+};
+
+struct MemoPlanChoice {
+    std::shared_ptr<JoinPlanNode> planRoot;
+    PhysicalJoinPlan physicalPlan;
+};
+
+PhysicalJoinPlan combineMemoJoinPlans(const PhysicalJoinPlan& left_plan,
+                                      const PhysicalJoinPlan& right_plan,
+                                      const PhysicalJoinCostStep& step) {
+    PhysicalJoinPlan plan;
+    plan.joinKinds = left_plan.joinKinds;
+    plan.joinKinds.insert(
+        plan.joinKinds.end(),
+        right_plan.joinKinds.begin(),
+        right_plan.joinKinds.end()
+    );
+    plan.joinKinds.push_back(step.chosen);
+
+    plan.steps = left_plan.steps;
+    plan.steps.insert(
+        plan.steps.end(),
+        right_plan.steps.begin(),
+        right_plan.steps.end()
+    );
+    plan.steps.push_back(step);
+    plan.totalCost = costForKind(step, step.chosen);
+    plan.finalRows = step.outputRows;
+    plan.finalPages = step.outputPages;
+    return plan;
+}
+
+std::optional<PhysicalJoinKind> memoImplementationJoinKind(
+    const std::string& op) {
+    if (op == "NestedLoopJoin") {
+        return PhysicalJoinKind::NestedLoopJoin;
+    }
+    if (op == "HashJoin") {
+        return PhysicalJoinKind::HashJoin;
+    }
+    if (op == "SortMergeJoin") {
+        return PhysicalJoinKind::SortMergeJoin;
+    }
+    return std::nullopt;
+}
+
+std::optional<MemoPlanChoice> chooseMemoGroupPlan(
+    const Memo& memo,
+    const QueryComponents& components,
+    const StatisticsCatalog& stats,
+    int group_id,
+    bool ordered_output_required,
+    const std::vector<JoinClause>& edges,
+    std::map<int, MemoPlanChoice>& winners,
+    std::set<int>& active_groups) {
+    auto cached = winners.find(group_id);
+    if (cached != winners.end()) {
+        return cached->second;
+    }
+    if (active_groups.find(group_id) != active_groups.end()) {
+        return std::nullopt;
+    }
+    active_groups.insert(group_id);
+
+    const auto& group = memo.allGroups()[group_id - 1];
+    std::optional<MemoPlanChoice> best;
+
+    for (const auto& expression : group.expressions) {
+        std::optional<MemoPlanChoice> candidate;
+
+        if (expression.op == "Scan") {
+            auto tables = memoPropertySet(group.logicalProperty, "tables");
+            if (tables.size() == 1) {
+                auto base = makeBasePlanForTable(
+                    components,
+                    stats,
+                    *tables.begin()
+                );
+                candidate = MemoPlanChoice{
+                    base.planRoot,
+                    base.physicalPlan
+                };
+            }
+        } else if ((expression.op == "LogicalFilter" ||
+                    expression.op == "LogicalProject" ||
+                    expression.op == "LogicalAggregate") &&
+                   expression.inputs.size() == 1) {
+            candidate = chooseMemoGroupPlan(
+                memo,
+                components,
+                stats,
+                expression.inputs[0],
+                ordered_output_required,
+                edges,
+                winners,
+                active_groups
+            );
+        } else if (auto join_kind = memoImplementationJoinKind(expression.op);
+                   join_kind && expression.inputs.size() == 2) {
+            auto left = chooseMemoGroupPlan(
+                memo,
+                components,
+                stats,
+                expression.inputs[0],
+                ordered_output_required,
+                edges,
+                winners,
+                active_groups
+            );
+            auto right = chooseMemoGroupPlan(
+                memo,
+                components,
+                stats,
+                expression.inputs[1],
+                ordered_output_required,
+                edges,
+                winners,
+                active_groups
+            );
+            if (left && right) {
+                auto edge = joinEdgeBetweenPlans(
+                    *left->planRoot,
+                    *right->planRoot,
+                    edges
+                );
+                if (edge) {
+                    auto step = estimatePhysicalJoinTrees(
+                        components,
+                        stats,
+                        *edge,
+                        left->planRoot->rows,
+                        left->planRoot->pages,
+                        left->planRoot->totalCost,
+                        right->planRoot->rows,
+                        right->planRoot->pages,
+                        right->planRoot->totalCost,
+                        ordered_output_required
+                    );
+                    step.chosen = *join_kind;
+
+                    auto joined = std::make_shared<JoinPlanNode>();
+                    joined->isLeaf = false;
+                    joined->left = left->planRoot;
+                    joined->right = right->planRoot;
+                    joined->join = *edge;
+                    joined->joinKind = *join_kind;
+                    joined->tables = joined->left->tables;
+                    joined->tables.insert(
+                        joined->tables.end(),
+                        joined->right->tables.begin(),
+                        joined->right->tables.end()
+                    );
+                    joined->rows = step.outputRows;
+                    joined->pages = step.outputPages;
+                    joined->totalCost = costForKind(step, step.chosen);
+
+                    candidate = MemoPlanChoice{
+                        joined,
+                        combineMemoJoinPlans(
+                            left->physicalPlan,
+                            right->physicalPlan,
+                            step
+                        )
+                    };
+                }
+            }
+        }
+
+        if (candidate &&
+            (!best ||
+             candidate->physicalPlan.totalCost <
+                 best->physicalPlan.totalCost)) {
+            best = candidate;
+        }
+    }
+
+    active_groups.erase(group_id);
+    if (best) {
+        winners[group_id] = *best;
+    }
+    return best;
+}
+
+MemoWinnerSearch chooseMemoWinner(Memo& memo,
+                                  const QueryComponents& components,
+                                  const StatisticsCatalog& stats,
+                                  const PlanTraitSet& required_traits) {
+    auto edges = joinGraphEdges(components);
+    std::map<int, MemoPlanChoice> group_winners;
+    std::set<int> active_groups;
+    auto final_choice = chooseMemoGroupPlan(
+        memo,
+        components,
+        stats,
+        memo.finalGroupId(),
+        required_traits.orderedOutputRequired,
+        edges,
+        group_winners,
+        active_groups
+    );
+    if (!final_choice) {
+        throw std::runtime_error("Memo winner search found no physical implementation.");
+    }
+    PlannedQuery planned_query{
+        components,
+        final_choice->physicalPlan,
+        final_choice->planRoot,
+        joinPlanTreeString(final_choice->planRoot)
+    };
+    MemoWinnerSearch winner;
+    winner.finalGroupId = memo.finalGroupId();
+    winner.requiredTrait = required_traits.describe();
+    winner.expression = planned_query.planRoot
+        ? memoPhysicalPlanExpression(planned_query.planRoot)
+        : "Scan(" + planned_query.components.tableName + ")";
+    winner.cost = planned_query.physicalPlan.totalCost;
+    winner.plannedQuery = planned_query;
+    if (winner.finalGroupId != 0) {
+        memo.setWinner(winner.finalGroupId, {
+            winner.requiredTrait,
+            winner.expression,
+            winner.cost
+        });
+    }
+    return winner;
+}
 
 struct OptimizerResult {
     QueryComponents logicalQuery;
     Memo memo;
-    MemoRewriteStats memoStats;
-    std::vector<RuleFire> firedRules;
+    MemoTransformationStats memoStats;
     PlannedQuery plannedQuery;
-    JoinOrderAlgorithm algorithm = JoinOrderAlgorithm::ConnectedSubgraphDP;
     PlanTraitSet requiredTraits;
+    MemoWinnerSearch memoWinner;
 };
 
 class Optimizer {
     const StatisticsCatalog& stats;
-    JoinOrderAlgorithm algorithm;
     PlanTraitSet requiredTraits;
 
 public:
     Optimizer(const StatisticsCatalog& stats,
-              JoinOrderAlgorithm algorithm =
-                  JoinOrderAlgorithm::ConnectedSubgraphDP,
               PlanTraitSet requiredTraits = {})
         : stats(stats),
-          algorithm(algorithm),
           requiredTraits(requiredTraits) {}
 
     OptimizerResult optimize(const QueryComponents& components) const {
-        auto memo_rewrite = buildMemoWithRuleAlternatives(components);
-        PlannedQuery planned_query = chooseJoinOrderPlan(
+        auto rewritten_plan = buildRewrittenLogicalPlan(components);
+        auto memo = buildMemo(*rewritten_plan);
+        MemoTransformationStats memo_stats;
+        applyMemoTransformationRules(memo, memo_stats);
+        applyMemoImplementationRules(memo, memo_stats);
+        auto memo_winner = chooseMemoWinner(
+            memo,
             components,
             stats,
-            algorithm,
-            requiredTraits.orderedOutputRequired
+            requiredTraits
         );
 
         return {
             components,
-            std::move(memo_rewrite.memo),
-            memo_rewrite.stats,
-            std::move(memo_rewrite.firedRules),
-            planned_query,
-            algorithm,
-            requiredTraits
+            memo,
+            memo_stats,
+            memo_winner.plannedQuery,
+            requiredTraits,
+            memo_winner
         };
     }
 };
 
 void printOptimizerSummary(const OptimizerResult& result) {
     std::cout << "\nOptimizer boundary:" << std::endl;
-    std::cout << "  framework: rule-ready optimizer boundary" << std::endl;
-    std::cout << "  search: "
-              << joinOrderAlgorithmName(result.algorithm) << std::endl;
+    std::cout << "  framework: Cascades-style memo optimizer boundary" << std::endl;
+    std::cout << "  search: memo winner search" << std::endl;
     std::cout << "  required traits: "
               << result.requiredTraits.describe() << std::endl;
-    std::cout << "  logical rule fires: "
-              << result.firedRules.size() << std::endl;
+    std::cout << "\nMemo winner search:" << std::endl;
+    std::cout << "  required trait: "
+              << result.memoWinner.requiredTrait << std::endl;
+    std::cout << "  final group: G"
+              << result.memoWinner.finalGroupId << std::endl;
+    std::cout << "  final group winner: "
+              << result.memoWinner.expression << std::endl;
+    std::cout << "  winner cost: "
+              << formatEstimate(result.memoWinner.cost) << std::endl;
+    std::cout << "  executable plan: from memo winner" << std::endl;
+    std::cout << "  memo rule fires: "
+              << result.memoStats.firedRules.size() << std::endl;
     std::cout << "  memo before rules: "
               << result.memoStats.initialGroups << " group(s), "
               << result.memoStats.initialExpressions << " expression(s)"
@@ -9374,6 +8342,14 @@ void printOptimizerSummary(const OptimizerResult& result) {
               << result.memoStats.finalGroups << " group(s), "
               << result.memoStats.finalExpressions << " expression(s)"
               << std::endl;
+    std::map<std::string, size_t> rule_counts;
+    for (const auto& fire : result.memoStats.firedRules) {
+        rule_counts[fire.ruleName]++;
+    }
+    for (const auto& rule_count : rule_counts) {
+        std::cout << "    " << rule_count.first << ": "
+                  << rule_count.second << " expression(s)" << std::endl;
+    }
     printMemo(result.memo);
 }
 
@@ -10726,9 +9702,7 @@ public:
                             const TxnPtr& txn = nullptr,
                             bool print_tuples = true,
                             const std::vector<PhysicalJoinKind>& forced_join_kinds = {},
-                            const std::vector<size_t>& final_sort_attrs = {},
-                            JoinOrderAlgorithm join_order_algorithm =
-                                JoinOrderAlgorithm::GreedyOperatorOrdering) {
+                            const std::vector<size_t>& final_sort_attrs = {}) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
         if (!acquireQueryLocks(txn, components)) {
@@ -10747,15 +9721,14 @@ public:
                 join_kinds = forced_join_kinds;
             } else {
                 try {
-                    auto cache_key = query + "#" +
-                        joinOrderAlgorithmName(join_order_algorithm);
+                    auto cache_key = query + "#memo";
                     auto cached = planned_query_cache.find(cache_key);
                     PlannedQuery planned_query;
                     if (cached != planned_query_cache.end()) {
                         planned_query = cached->second;
                     } else {
                         auto stats = loadQueryTableStats(components, catalog);
-                        Optimizer optimizer(stats, join_order_algorithm);
+                        Optimizer optimizer(stats);
                         planned_query = optimizer.optimize(components).plannedQuery;
                         planned_query_cache[cache_key] = planned_query;
                     }
@@ -10826,18 +9799,7 @@ public:
         printLogicalExplanation(components);
     }
 
-    PlannedQuery planQuery(const std::string& query,
-                           JoinOrderAlgorithm algorithm,
-                           bool ordered_output_required = false) {
-        auto components = parseQuery(query);
-        resolveQueryColumns(components, catalog);
-        auto stats = loadQueryTableStats(components, catalog);
-        Optimizer optimizer(stats, algorithm, {ordered_output_required});
-        return optimizer.optimize(components).plannedQuery;
-    }
-
     void printStatsAndEstimates(const std::string& query,
-                                const std::string& join_body_query,
                                 const TxnPtr& txn = nullptr,
                                 bool ordered_output_required = false) {
         auto components = parseQuery(query);
@@ -10845,23 +9807,15 @@ public:
         auto stats = loadQueryTableStats(components, catalog);
         printAnalyzeStats(components, stats);
         auto final_estimate = printCardinalityEstimates(components, stats);
-        auto default_algorithm = JoinOrderAlgorithm::ConnectedSubgraphDP;
-        Optimizer optimizer(
-            stats,
-            default_algorithm,
-            {ordered_output_required}
-        );
+        Optimizer optimizer(stats, {ordered_output_required});
         auto optimizer_result = optimizer.optimize(components);
         printOptimizerSummary(optimizer_result);
         auto planned_query = optimizer_result.plannedQuery;
-        planned_query_cache[
-            query + "#" +
-            joinOrderAlgorithmName(default_algorithm)
-        ] = planned_query;
+        planned_query_cache[query + "#memo"] = planned_query;
         printPhysicalJoinCosts(
             planned_query.components,
             planned_query.physicalPlan,
-            joinOrderAlgorithmName(default_algorithm),
+            "memo winner search",
             planned_query.planDescription,
             planned_query.planRoot
         );
@@ -10898,26 +9852,25 @@ public:
                       << std::endl;
         }
 
-        auto join_body_components = parseQuery(join_body_query);
-        resolveQueryColumns(join_body_components, catalog);
-        planned_query_cache[
-            join_body_query + "#" +
-            joinOrderAlgorithmName(default_algorithm)
-        ] = Optimizer(
-                stats,
-                default_algorithm,
-                {ordered_output_required}
-            ).optimize(join_body_components).plannedQuery;
-        auto join_body_rows = executeQuery(join_body_query, txn, false);
-        std::cout << "  final join body: estimate="
-                  << formatEstimate(final_estimate)
-                  << " q-error="
-                  << formatQError(
-                         final_estimate,
-                         static_cast<double>(join_body_rows.size())
-                     )
-                  << " actual=" << join_body_rows.size()
-                  << std::endl;
+        auto query_rows = executeQuery(query, txn, false);
+        if (hasAggregateProjection(components) ||
+            components.sumOperation ||
+            components.groupBy) {
+            std::cout << "  estimated join rows before aggregation: "
+                      << formatEstimate(final_estimate) << std::endl;
+            std::cout << "  query output rows: "
+                      << query_rows.size() << std::endl;
+        } else {
+            std::cout << "  final join body: estimate="
+                      << formatEstimate(final_estimate)
+                      << " q-error="
+                      << formatQError(
+                             final_estimate,
+                             static_cast<double>(query_rows.size())
+                         )
+                      << " actual=" << query_rows.size()
+                      << std::endl;
+        }
     }
 
     void execute(const std::string& command,
@@ -11051,28 +10004,6 @@ std::string jobJoinQuery() {
         "AND {miidx.movie_id} = {mc.movie_id}";
 }
 
-std::string jobJoinBodyQuery() {
-    return
-        "PROJECT {cn.name}, {miidx.info}, {t.title} "
-        "FROM title AS t "
-        "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-        "JOIN movie_companies AS mc ON {t.id} = {mc.movie_id} "
-        "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
-        "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
-        "JOIN movie_info AS mi ON {t.id} = {mi.movie_id} "
-        "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
-        "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
-        "JOIN info_type AS it ON {miidx.info_type_id} = {it.id} "
-        "WHERE {cn.country_code} = [us] "
-        "AND {ct.kind} = production_companies "
-        "AND {it.info} = rating "
-        "AND {it2.info} = release_dates "
-        "AND {kt.kind} = movie "
-        "AND {mi.movie_id} = {miidx.movie_id} "
-        "AND {mi.movie_id} = {mc.movie_id} "
-	        "AND {miidx.movie_id} = {mc.movie_id}";
-}
-
 void printSampleRows(const QueryTable& rows, size_t limit) {
     for (size_t row_index = 0; row_index < rows.size() && row_index < limit; row_index++) {
         std::cout << "  ";
@@ -11105,18 +10036,15 @@ int main(int argc, char* argv[]) {
     db.execute("ANALYZE");
 
     auto query_txn = db.begin("Q1");
-    std::cout << "\nQuery optimization with join ordering" << std::endl;
-    std::cout << "  Workload: JOB 13d-shaped 9-table company/rating/release-date join" << std::endl;
+    std::cout << "\nQuery optimization with memo rules" << std::endl;
+    std::cout << "  Workload: JOB 9-table join query" << std::endl;
     db.explainQuery(jobJoinQuery());
-    db.printStatsAndEstimates(jobJoinQuery(), jobJoinBodyQuery(), query_txn);
+    db.printStatsAndEstimates(jobJoinQuery(), query_txn);
 
     auto query_components = parseQuery(jobJoinQuery());
     resolveQueryColumns(query_components, db.catalog);
     auto mcv_stats = loadQueryTableStats(query_components, db.catalog);
-    auto optimizer_result = Optimizer(
-        mcv_stats,
-        JoinOrderAlgorithm::ConnectedSubgraphDP
-    ).optimize(query_components);
+    auto optimizer_result = Optimizer(mcv_stats).optimize(query_components);
     auto plan = optimizer_result.plannedQuery;
     db.clearBufferPool();
     auto query_start = std::chrono::steady_clock::now();
@@ -11127,7 +10055,7 @@ int main(int argc, char* argv[]) {
     );
     auto query_end = std::chrono::steady_clock::now();
 
-    std::cout << "\nDCopt execution with MCV stats:" << std::endl;
+    std::cout << "\nMemo winner execution with MCV stats:" << std::endl;
     std::cout << "  Buffer pool is cleared before timed execution."
               << std::endl;
     std::cout << "  elapsed: " << elapsedMs(query_start, query_end)

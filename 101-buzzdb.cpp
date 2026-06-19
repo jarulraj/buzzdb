@@ -6328,17 +6328,17 @@ struct LogicalPlanNode {
 std::string logicalNodeName(LogicalPlanNode::Kind kind) {
     switch (kind) {
         case LogicalPlanNode::Kind::SCAN:
-            return "LogicalScan";
+            return "GET";
         case LogicalPlanNode::Kind::JOIN:
-            return "LogicalJoin";
+            return "EQJOIN";
         case LogicalPlanNode::Kind::FILTER:
-            return "LogicalFilter";
+            return "SELECT";
         case LogicalPlanNode::Kind::PROJECT:
-            return "LogicalProject";
+            return "PROJECT";
         case LogicalPlanNode::Kind::AGGREGATE:
-            return "LogicalAggregate";
+            return "AGGREGATE";
     }
-    return "LogicalUnknown";
+    return "UNKNOWN";
 }
 
 std::string logicalColumnLabel(const LogicalColumnExpr& expression) {
@@ -6790,10 +6790,17 @@ struct MemoExpression {
     std::vector<std::string> details;
 };
 
+struct MemoWinner {
+    std::string requiredTrait;
+    std::string expression;
+    double cost = 0.0;
+};
+
 struct MemoGroup {
     int id = 0;
     std::string logicalProperty;
     std::vector<MemoExpression> expressions;
+    std::map<std::string, MemoWinner> winners;
 };
 
 class Memo {
@@ -6808,7 +6815,7 @@ public:
         }
 
         int group_id = static_cast<int>(groups.size() + 1);
-        groups.push_back({group_id, logical_property, {}});
+        groups.push_back({group_id, logical_property, {}, {}});
         groupByProperty[logical_property] = group_id;
         return group_id;
     }
@@ -6825,6 +6832,14 @@ public:
 
         groups[group_id - 1].expressions.push_back(std::move(expression));
         return true;
+    }
+
+    void setWinner(int group_id, MemoWinner winner) {
+        groups[group_id - 1].winners[winner.requiredTrait] = std::move(winner);
+    }
+
+    int finalGroupId() const {
+        return groups.empty() ? 0 : groups.back().id;
     }
 
     const std::vector<MemoGroup>& allGroups() const {
@@ -6989,6 +7004,11 @@ void printMemo(const Memo& memo) {
                 std::cout << " [" << joinStrings(expression.details, ", ") << "]";
             }
             std::cout << std::endl;
+        }
+        for (const auto& winner : group.winners) {
+            std::cout << "    winner[" << winner.first << "] = "
+                      << winner.second.expression
+                      << " cost=" << winner.second.cost << std::endl;
         }
     }
 }
@@ -8204,6 +8224,34 @@ std::string joinPlanTreeString(const std::shared_ptr<JoinPlanNode>& node) {
     }
     return physicalJoinKindName(node->joinKind) + "(" +
         left_tree + ", " + right_tree + ")";
+}
+
+std::string memoPhysicalJoinName(PhysicalJoinKind kind) {
+    switch (kind) {
+        case PhysicalJoinKind::NestedLoopJoin:
+            return "LOOPS_JOIN";
+        case PhysicalJoinKind::HashJoin:
+            return "HASH_JOIN";
+        case PhysicalJoinKind::SortMergeJoin:
+            return "MERGE_JOIN";
+    }
+    return "HASH_JOIN";
+}
+
+std::string memoPhysicalPlanExpression(const std::shared_ptr<JoinPlanNode>& node) {
+    if (!node) {
+        return "";
+    }
+    if (node->isLeaf) {
+        return "FILE_SCAN(" + node->tableName + ")";
+    }
+    auto left = memoPhysicalPlanExpression(node->left);
+    auto right = memoPhysicalPlanExpression(node->right);
+    if (node->joinKind == PhysicalJoinKind::SortMergeJoin) {
+        left = "SORT(" + left + ")";
+        right = "SORT(" + right + ")";
+    }
+    return memoPhysicalJoinName(node->joinKind) + "(" + left + ", " + right + ")";
 }
 
 std::string joinPlanTableGroup(const std::shared_ptr<JoinPlanNode>& node) {
@@ -9480,9 +9528,46 @@ struct PlanTraitSet {
     bool orderedOutputRequired = false;
 
     std::string describe() const {
-        return orderedOutputRequired ? "ordered output" : "none";
+        return orderedOutputRequired ? "ordered output" : "unordered";
     }
 };
+
+struct MemoWinnerSearch {
+    int finalGroupId = 0;
+    std::string requiredTrait = "unordered";
+    std::string expression;
+    double cost = 0.0;
+    PlannedQuery plannedQuery;
+};
+
+MemoWinnerSearch chooseMemoWinner(Memo& memo,
+                                  const QueryComponents& components,
+                                  const StatisticsCatalog& stats,
+                                  JoinOrderAlgorithm algorithm,
+                                  const PlanTraitSet& required_traits) {
+    auto planned_query = chooseJoinOrderPlan(
+        components,
+        stats,
+        algorithm,
+        required_traits.orderedOutputRequired
+    );
+    MemoWinnerSearch winner;
+    winner.finalGroupId = memo.finalGroupId();
+    winner.requiredTrait = required_traits.describe();
+    winner.expression = planned_query.planRoot
+        ? memoPhysicalPlanExpression(planned_query.planRoot)
+        : "FILE_SCAN(" + planned_query.components.tableName + ")";
+    winner.cost = planned_query.physicalPlan.totalCost;
+    winner.plannedQuery = planned_query;
+    if (winner.finalGroupId != 0) {
+        memo.setWinner(winner.finalGroupId, {
+            winner.requiredTrait,
+            winner.expression,
+            winner.cost
+        });
+    }
+    return winner;
+}
 
 struct OptimizerResult {
     QueryComponents logicalQuery;
@@ -9492,6 +9577,7 @@ struct OptimizerResult {
     PlannedQuery plannedQuery;
     JoinOrderAlgorithm algorithm = JoinOrderAlgorithm::ConnectedSubgraphDP;
     PlanTraitSet requiredTraits;
+    MemoWinnerSearch memoWinner;
 };
 
 class Optimizer {
@@ -9510,11 +9596,12 @@ public:
 
     OptimizerResult optimize(const QueryComponents& components) const {
         auto memo_rewrite = buildMemoWithRuleAlternatives(components);
-        PlannedQuery planned_query = chooseJoinOrderPlan(
+        auto memo_winner = chooseMemoWinner(
+            memo_rewrite.memo,
             components,
             stats,
             algorithm,
-            requiredTraits.orderedOutputRequired
+            requiredTraits
         );
 
         return {
@@ -9522,9 +9609,10 @@ public:
             std::move(memo_rewrite.memo),
             memo_rewrite.stats,
             std::move(memo_rewrite.firedRules),
-            planned_query,
+            memo_winner.plannedQuery,
             algorithm,
-            requiredTraits
+            requiredTraits,
+            memo_winner
         };
     }
 };
@@ -9536,6 +9624,16 @@ void printOptimizerSummary(const OptimizerResult& result) {
               << joinOrderAlgorithmName(result.algorithm) << std::endl;
     std::cout << "  required traits: "
               << result.requiredTraits.describe() << std::endl;
+    std::cout << "\nMemo winner search:" << std::endl;
+    std::cout << "  required trait: "
+              << result.memoWinner.requiredTrait << std::endl;
+    std::cout << "  final group: G"
+              << result.memoWinner.finalGroupId << std::endl;
+    std::cout << "  final group winner: "
+              << result.memoWinner.expression << std::endl;
+    std::cout << "  winner cost: "
+              << formatEstimate(result.memoWinner.cost) << std::endl;
+    std::cout << "  executable plan: from memo winner" << std::endl;
     std::cout << "  logical rule fires: "
               << result.firedRules.size() << std::endl;
     std::cout << "  physical implementation rules: "
@@ -11024,7 +11122,6 @@ public:
     }
 
     void printStatsAndEstimates(const std::string& query,
-                                const std::string& join_body_query,
                                 const TxnPtr& txn = nullptr,
                                 bool ordered_output_required = false) {
         auto components = parseQuery(query);
@@ -11085,26 +11182,25 @@ public:
                       << std::endl;
         }
 
-        auto join_body_components = parseQuery(join_body_query);
-        resolveQueryColumns(join_body_components, catalog);
-        planned_query_cache[
-            join_body_query + "#" +
-            joinOrderAlgorithmName(default_algorithm)
-        ] = Optimizer(
-                stats,
-                default_algorithm,
-                {ordered_output_required}
-            ).optimize(join_body_components).plannedQuery;
-        auto join_body_rows = executeQuery(join_body_query, txn, false);
-        std::cout << "  final join body: estimate="
-                  << formatEstimate(final_estimate)
-                  << " q-error="
-                  << formatQError(
-                         final_estimate,
-                         static_cast<double>(join_body_rows.size())
-                     )
-                  << " actual=" << join_body_rows.size()
-                  << std::endl;
+        auto query_rows = executeQuery(query, txn, false);
+        if (hasAggregateProjection(components) ||
+            components.sumOperation ||
+            components.groupBy) {
+            std::cout << "  estimated join rows before aggregation: "
+                      << formatEstimate(final_estimate) << std::endl;
+            std::cout << "  query output rows: "
+                      << query_rows.size() << std::endl;
+        } else {
+            std::cout << "  final join body: estimate="
+                      << formatEstimate(final_estimate)
+                      << " q-error="
+                      << formatQError(
+                             final_estimate,
+                             static_cast<double>(query_rows.size())
+                         )
+                      << " actual=" << query_rows.size()
+                      << std::endl;
+        }
     }
 
     void execute(const std::string& command,
@@ -11238,28 +11334,6 @@ std::string jobJoinQuery() {
         "AND {miidx.movie_id} = {mc.movie_id}";
 }
 
-std::string jobJoinBodyQuery() {
-    return
-        "PROJECT {cn.name}, {miidx.info}, {t.title} "
-        "FROM title AS t "
-        "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-        "JOIN movie_companies AS mc ON {t.id} = {mc.movie_id} "
-        "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
-        "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
-        "JOIN movie_info AS mi ON {t.id} = {mi.movie_id} "
-        "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
-        "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
-        "JOIN info_type AS it ON {miidx.info_type_id} = {it.id} "
-        "WHERE {cn.country_code} = [us] "
-        "AND {ct.kind} = production_companies "
-        "AND {it.info} = rating "
-        "AND {it2.info} = release_dates "
-        "AND {kt.kind} = movie "
-        "AND {mi.movie_id} = {miidx.movie_id} "
-        "AND {mi.movie_id} = {mc.movie_id} "
-	        "AND {miidx.movie_id} = {mc.movie_id}";
-}
-
 void printSampleRows(const QueryTable& rows, size_t limit) {
     for (size_t row_index = 0; row_index < rows.size() && row_index < limit; row_index++) {
         std::cout << "  ";
@@ -11293,9 +11367,9 @@ int main(int argc, char* argv[]) {
 
     auto query_txn = db.begin("Q1");
     std::cout << "\nQuery optimization with join ordering" << std::endl;
-    std::cout << "  Workload: JOB 13d-shaped 9-table company/rating/release-date join" << std::endl;
+    std::cout << "  Workload: JOB 9-table join query" << std::endl;
     db.explainQuery(jobJoinQuery());
-    db.printStatsAndEstimates(jobJoinQuery(), jobJoinBodyQuery(), query_txn);
+    db.printStatsAndEstimates(jobJoinQuery(), query_txn);
 
     auto query_components = parseQuery(jobJoinQuery());
     resolveQueryColumns(query_components, db.catalog);

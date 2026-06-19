@@ -10464,7 +10464,6 @@ public:
     }
 
     void printStatsAndEstimates(const std::string& query,
-                                const std::string& join_body_query,
                                 const TxnPtr& txn = nullptr,
                                 bool ordered_output_required = false) {
         auto components = parseQuery(query);
@@ -10525,26 +10524,25 @@ public:
                       << std::endl;
         }
 
-        auto join_body_components = parseQuery(join_body_query);
-        resolveQueryColumns(join_body_components, catalog);
-        planned_query_cache[
-            join_body_query + "#" +
-            joinOrderAlgorithmName(default_algorithm)
-        ] = Optimizer(
-                stats,
-                default_algorithm,
-                {ordered_output_required}
-            ).optimize(join_body_components).plannedQuery;
-        auto join_body_rows = executeQuery(join_body_query, txn, false);
-        std::cout << "  final join body: estimate="
-                  << formatEstimate(final_estimate)
-                  << " q-error="
-                  << formatQError(
-                         final_estimate,
-                         static_cast<double>(join_body_rows.size())
-                     )
-                  << " actual=" << join_body_rows.size()
-                  << std::endl;
+        auto query_rows = executeQuery(query, txn, false);
+        if (hasAggregateProjection(components) ||
+            components.sumOperation ||
+            components.groupBy) {
+            std::cout << "  estimated join rows before aggregation: "
+                      << formatEstimate(final_estimate) << std::endl;
+            std::cout << "  query output rows: "
+                      << query_rows.size() << std::endl;
+        } else {
+            std::cout << "  final join body: estimate="
+                      << formatEstimate(final_estimate)
+                      << " q-error="
+                      << formatQError(
+                             final_estimate,
+                             static_cast<double>(query_rows.size())
+                         )
+                      << " actual=" << query_rows.size()
+                      << std::endl;
+        }
     }
 
     void execute(const std::string& command,
@@ -10678,28 +10676,6 @@ std::string jobJoinQuery() {
         "AND {miidx.movie_id} = {mc.movie_id}";
 }
 
-std::string jobJoinBodyQuery() {
-    return
-        "PROJECT {cn.name}, {miidx.info}, {t.title} "
-        "FROM title AS t "
-        "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-        "JOIN movie_companies AS mc ON {t.id} = {mc.movie_id} "
-        "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
-        "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
-        "JOIN movie_info AS mi ON {t.id} = {mi.movie_id} "
-        "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
-        "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
-        "JOIN info_type AS it ON {miidx.info_type_id} = {it.id} "
-        "WHERE {cn.country_code} = [us] "
-        "AND {ct.kind} = production_companies "
-        "AND {it.info} = rating "
-        "AND {it2.info} = release_dates "
-        "AND {kt.kind} = movie "
-        "AND {mi.movie_id} = {miidx.movie_id} "
-        "AND {mi.movie_id} = {mc.movie_id} "
-	        "AND {miidx.movie_id} = {mc.movie_id}";
-}
-
 void printSampleRows(const QueryTable& rows, size_t limit) {
     for (size_t row_index = 0; row_index < rows.size() && row_index < limit; row_index++) {
         std::cout << "  ";
@@ -10733,9 +10709,9 @@ int main(int argc, char* argv[]) {
 
     auto query_txn = db.begin("Q1");
     std::cout << "\nQuery optimization with join ordering" << std::endl;
-    std::cout << "  Workload: JOB 13d-shaped 9-table company/rating/release-date join" << std::endl;
+    std::cout << "  Workload: JOB 9-table join query" << std::endl;
     db.explainQuery(jobJoinQuery());
-    db.printStatsAndEstimates(jobJoinQuery(), jobJoinBodyQuery(), query_txn);
+    db.printStatsAndEstimates(jobJoinQuery(), query_txn);
 
     auto query_components = parseQuery(jobJoinQuery());
     resolveQueryColumns(query_components, db.catalog);

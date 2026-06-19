@@ -5748,15 +5748,6 @@ QueryComponents parseQuery(const std::string& query) {
         }
     }
 
-    const bool aggregate_projection = hasAggregateProjection(components);
-    if (aggregate_projection &&
-        std::any_of(
-            components.selectAggregates.begin(),
-            components.selectAggregates.end(),
-            [](const auto& aggregate) { return !aggregate.has_value(); })) {
-        throw std::runtime_error("Aggregate projections cannot be mixed with plain projections.");
-    }
-
     std::regex joinRegex(
         "JOIN\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+AS\\s+([A-Za-z_][A-Za-z0-9_]*)|\\s+([A-Za-z_][A-Za-z0-9_]*))?\\s+ON\\s+"
         "\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*|\\d+)\\}\\s*=\\s*"
@@ -5781,7 +5772,7 @@ QueryComponents parseQuery(const std::string& query) {
         joinStart = joinMatches.suffix().first;
     }
 
-    // Check for GROUP BY clause
+    // Check for legacy GROUP BY clause
     std::regex groupByRegex("GROUP BY \\{([A-Za-z_][A-Za-z0-9_]*|\\d+)\\}");
     std::smatch groupByMatches;
     if (std::regex_search(query, groupByMatches, groupByRegex)) {
@@ -5791,6 +5782,15 @@ QueryComponents parseQuery(const std::string& query) {
             components.groupByAttributeIndex,
             components.groupByAttributeName
         );
+    }
+
+    const bool aggregate_projection = hasAggregateProjection(components);
+    if (aggregate_projection &&
+        std::any_of(
+            components.selectAggregates.begin(),
+            components.selectAggregates.end(),
+            [](const auto& aggregate) { return !aggregate.has_value(); })) {
+        throw std::runtime_error("Aggregate projections cannot be mixed with plain projections.");
     }
 
     // Extract WHERE conditions more accurately
@@ -6328,17 +6328,17 @@ struct LogicalPlanNode {
 std::string logicalNodeName(LogicalPlanNode::Kind kind) {
     switch (kind) {
         case LogicalPlanNode::Kind::SCAN:
-            return "LogicalScan";
+            return "GET";
         case LogicalPlanNode::Kind::JOIN:
-            return "LogicalJoin";
+            return "EQJOIN";
         case LogicalPlanNode::Kind::FILTER:
-            return "LogicalFilter";
+            return "SELECT";
         case LogicalPlanNode::Kind::PROJECT:
-            return "LogicalProject";
+            return "PROJECT";
         case LogicalPlanNode::Kind::AGGREGATE:
-            return "LogicalAggregate";
+            return "AGGREGATE";
     }
-    return "LogicalUnknown";
+    return "UNKNOWN";
 }
 
 std::string logicalColumnLabel(const LogicalColumnExpr& expression) {
@@ -6379,6 +6379,10 @@ struct MemoRewriteStats {
     size_t initialExpressions = 0;
     size_t finalGroups = 0;
     size_t finalExpressions = 0;
+    size_t joinTransformationExpressions = 0;
+    size_t physicalImplementationExpressions = 0;
+    size_t sortEnforcerExpressions = 0;
+    size_t estimatedMemoBytes = 0;
 };
 
 struct LogicalRewriteContext {
@@ -6790,10 +6794,17 @@ struct MemoExpression {
     std::vector<std::string> details;
 };
 
+struct MemoWinner {
+    std::string requiredTrait;
+    std::string expression;
+    double cost = 0.0;
+};
+
 struct MemoGroup {
     int id = 0;
     std::string logicalProperty;
     std::vector<MemoExpression> expressions;
+    std::map<std::string, MemoWinner> winners;
 };
 
 class Memo {
@@ -6808,7 +6819,7 @@ public:
         }
 
         int group_id = static_cast<int>(groups.size() + 1);
-        groups.push_back({group_id, logical_property, {}});
+        groups.push_back({group_id, logical_property, {}, {}});
         groupByProperty[logical_property] = group_id;
         return group_id;
     }
@@ -6827,6 +6838,14 @@ public:
         return true;
     }
 
+    void setWinner(int group_id, MemoWinner winner) {
+        groups[group_id - 1].winners[winner.requiredTrait] = std::move(winner);
+    }
+
+    int finalGroupId() const {
+        return groups.empty() ? 0 : groups.back().id;
+    }
+
     const std::vector<MemoGroup>& allGroups() const {
         return groups;
     }
@@ -6841,6 +6860,21 @@ public:
             count += group.expressions.size();
         }
         return count;
+    }
+
+    size_t estimatedMemoryBytes() const {
+        size_t bytes = sizeof(Memo);
+        for (const auto& group : groups) {
+            bytes += sizeof(MemoGroup) + group.logicalProperty.size();
+            for (const auto& expression : group.expressions) {
+                bytes += sizeof(MemoExpression) + expression.op.size();
+                bytes += expression.inputs.size() * sizeof(int);
+                for (const auto& detail : expression.details) {
+                    bytes += detail.size();
+                }
+            }
+        }
+        return bytes;
     }
 };
 
@@ -6873,6 +6907,22 @@ std::string memoPropertyField(const std::string& name,
         std::vector<std::string>(values.begin(), values.end()),
         "|"
     ) + "}";
+}
+
+std::string memoPropertyForSets(const std::set<std::string>& tables,
+                                const std::set<std::string>& predicates,
+                                const std::set<std::string>& output = {}) {
+    std::vector<std::string> fields;
+    fields.push_back(memoPropertyField("tables", tables));
+    auto predicate_field = memoPropertyField("predicates", predicates);
+    if (!predicate_field.empty()) {
+        fields.push_back(predicate_field);
+    }
+    auto output_field = memoPropertyField("output", output);
+    if (!output_field.empty()) {
+        fields.push_back(output_field);
+    }
+    return joinStrings(fields, " ");
 }
 
 std::string logicalPropertyForNode(const LogicalPlanNode& node,
@@ -6908,17 +6958,7 @@ std::string logicalPropertyForNode(const LogicalPlanNode& node,
         }
     }
 
-    std::vector<std::string> fields;
-    fields.push_back(memoPropertyField("tables", tables));
-    auto predicate_field = memoPropertyField("predicates", predicates);
-    if (!predicate_field.empty()) {
-        fields.push_back(predicate_field);
-    }
-    auto output_field = memoPropertyField("output", output);
-    if (!output_field.empty()) {
-        fields.push_back(output_field);
-    }
-    return joinStrings(fields, " ");
+    return memoPropertyForSets(tables, predicates, output);
 }
 
 int addMemoExpression(const LogicalPlanNode& node, Memo& memo) {
@@ -6944,6 +6984,214 @@ Memo buildMemo(const LogicalPlanNode& root) {
     return memo;
 }
 
+bool subsetIsConnected(uint64_t subset_mask,
+                       const std::vector<std::string>& tables,
+                       const std::vector<JoinClause>& joins) {
+    if ((subset_mask & (subset_mask - 1)) == 0) {
+        return true;
+    }
+
+    std::set<std::string> subset_tables;
+    for (size_t i = 0; i < tables.size(); i++) {
+        if (subset_mask & (uint64_t{1} << i)) {
+            subset_tables.insert(tables[i]);
+        }
+    }
+
+    std::set<std::string> visited;
+    std::vector<std::string> stack{*subset_tables.begin()};
+    while (!stack.empty()) {
+        auto table = stack.back();
+        stack.pop_back();
+        if (!visited.insert(table).second) {
+            continue;
+        }
+        for (const auto& join : joins) {
+            if (join.left.tableName == table &&
+                subset_tables.count(join.right.tableName) != 0) {
+                stack.push_back(join.right.tableName);
+            }
+            if (join.right.tableName == table &&
+                subset_tables.count(join.left.tableName) != 0) {
+                stack.push_back(join.left.tableName);
+            }
+        }
+    }
+    return visited.size() == subset_tables.size();
+}
+
+std::set<std::string> predicatesForSubset(uint64_t subset_mask,
+                                          const std::vector<std::string>& tables,
+                                          const QueryComponents& components) {
+    std::set<std::string> subset_tables;
+    for (size_t i = 0; i < tables.size(); i++) {
+        if (subset_mask & (uint64_t{1} << i)) {
+            subset_tables.insert(tables[i]);
+        }
+    }
+
+    std::set<std::string> predicates;
+    for (const auto& join : components.joins) {
+        if (subset_tables.count(join.left.tableName) != 0 &&
+            subset_tables.count(join.right.tableName) != 0) {
+            predicates.insert(joinLabel(join));
+        }
+    }
+    for (const auto& filter : components.filters) {
+        if (subset_tables.count(filter.column.tableName) != 0) {
+            predicates.insert(columnLabel(filter.column) + " = " + filter.value);
+        }
+    }
+    return predicates;
+}
+
+std::vector<std::string> crossingJoinLabels(uint64_t left_mask,
+                                            uint64_t right_mask,
+                                            const std::vector<std::string>& tables,
+                                            const QueryComponents& components) {
+    auto sideContains = [&](uint64_t mask, const std::string& table) {
+        for (size_t i = 0; i < tables.size(); i++) {
+            if (tables[i] == table) {
+                return (mask & (uint64_t{1} << i)) != 0;
+            }
+        }
+        return false;
+    };
+
+    std::vector<std::string> labels;
+    for (const auto& join : components.joins) {
+        bool left_to_right =
+            sideContains(left_mask, join.left.tableName) &&
+            sideContains(right_mask, join.right.tableName);
+        bool right_to_left =
+            sideContains(left_mask, join.right.tableName) &&
+            sideContains(right_mask, join.left.tableName);
+        if (left_to_right || right_to_left) {
+            labels.push_back(joinLabel(join));
+        }
+    }
+    return labels;
+}
+
+void addMemoJoinRuleAlternatives(const QueryComponents& components,
+                                 Memo& memo,
+                                 MemoRewriteStats& stats) {
+    const auto tables = writtenJoinOrder(components);
+    if (tables.size() >= 63) {
+        return;
+    }
+
+    auto propertyForMask = [&](uint64_t mask) {
+        std::set<std::string> subset_tables;
+        for (size_t i = 0; i < tables.size(); i++) {
+            if (mask & (uint64_t{1} << i)) {
+                subset_tables.insert(tables[i]);
+            }
+        }
+        return memoPropertyForSets(
+            subset_tables,
+            predicatesForSubset(mask, tables, components)
+        );
+    };
+
+    uint64_t full_mask = (uint64_t{1} << tables.size()) - 1;
+    for (uint64_t mask = 1; mask <= full_mask; mask++) {
+        if (!subsetIsConnected(mask, tables, components.joins)) {
+            continue;
+        }
+        memo.internGroup(propertyForMask(mask));
+    }
+
+    for (uint64_t mask = 1; mask <= full_mask; mask++) {
+        if (!subsetIsConnected(mask, tables, components.joins)) {
+            continue;
+        }
+        int target_group = memo.internGroup(propertyForMask(mask));
+        for (uint64_t left_mask = (mask - 1) & mask;
+             left_mask != 0;
+             left_mask = (left_mask - 1) & mask) {
+            uint64_t right_mask = mask ^ left_mask;
+            if (left_mask > right_mask ||
+                right_mask == 0 ||
+                !subsetIsConnected(left_mask, tables, components.joins) ||
+                !subsetIsConnected(right_mask, tables, components.joins)) {
+                continue;
+            }
+            auto join_labels = crossingJoinLabels(
+                left_mask,
+                right_mask,
+                tables,
+                components
+            );
+            if (join_labels.empty()) {
+                continue;
+            }
+            int left_group = memo.internGroup(propertyForMask(left_mask));
+            int right_group = memo.internGroup(propertyForMask(right_mask));
+            if (memo.addExpression(target_group, {
+                    "EQJOIN",
+                    {left_group, right_group},
+                    join_labels})) {
+                stats.joinTransformationExpressions++;
+            }
+            if (memo.addExpression(target_group, {
+                    "EQJOIN",
+                    {right_group, left_group},
+                    join_labels})) {
+                stats.joinTransformationExpressions++;
+            }
+        }
+    }
+}
+
+void addMemoPhysicalAlternatives(Memo& memo, MemoRewriteStats& stats) {
+    struct PendingExpression {
+        int groupId;
+        MemoExpression expression;
+    };
+    std::vector<PendingExpression> pending;
+    for (const auto& group : memo.allGroups()) {
+        for (const auto& expression : group.expressions) {
+            if (expression.op == "GET") {
+                pending.push_back({group.id, {
+                    "FILE_SCAN",
+                    expression.inputs,
+                    expression.details
+                }});
+            } else if (expression.op == "EQJOIN" && expression.inputs.size() == 2) {
+                pending.push_back({group.id, {
+                    "LOOPS_JOIN",
+                    expression.inputs,
+                    expression.details
+                }});
+                pending.push_back({group.id, {
+                    "HASH_JOIN",
+                    expression.inputs,
+                    expression.details
+                }});
+                auto sort_merge_details = expression.details;
+                sort_merge_details.push_back("SortEnforcer(left)");
+                sort_merge_details.push_back("SortEnforcer(right)");
+                pending.push_back({group.id, {
+                    "MERGE_JOIN",
+                    expression.inputs,
+                    sort_merge_details
+                }});
+            }
+        }
+    }
+
+    for (auto& item : pending) {
+        bool is_sort_merge = item.expression.op == "MERGE_JOIN";
+        if (memo.addExpression(item.groupId, std::move(item.expression))) {
+            stats.physicalImplementationExpressions++;
+            if (is_sort_merge) {
+                stats.sortEnforcerExpressions += 2;
+            }
+        }
+    }
+}
+
 struct MemoRewriteResult {
     Memo memo;
     MemoRewriteStats stats;
@@ -6961,10 +7209,13 @@ MemoRewriteResult buildMemoWithRuleAlternatives(
 
     auto rewrite_result = applyLogicalRewriteRules(components);
     addMemoExpression(*rewrite_result.plan, result.memo);
-    result.stats.finalGroups = result.memo.groupCount();
-    result.stats.finalExpressions = result.memo.expressionCount();
     result.plan = std::move(rewrite_result.plan);
     result.firedRules = std::move(rewrite_result.firedRules);
+    addMemoJoinRuleAlternatives(components, result.memo, result.stats);
+    addMemoPhysicalAlternatives(result.memo, result.stats);
+    result.stats.finalGroups = result.memo.groupCount();
+    result.stats.finalExpressions = result.memo.expressionCount();
+    result.stats.estimatedMemoBytes = result.memo.estimatedMemoryBytes();
     return result;
 }
 
@@ -6989,6 +7240,11 @@ void printMemo(const Memo& memo) {
                 std::cout << " [" << joinStrings(expression.details, ", ") << "]";
             }
             std::cout << std::endl;
+        }
+        for (const auto& winner : group.winners) {
+            std::cout << "    winner[" << winner.first << "] = "
+                      << winner.second.expression
+                      << " cost=" << winner.second.cost << std::endl;
         }
     }
 }
@@ -7045,7 +7301,6 @@ void printNeededColumns(const QueryComponents& components) {
         addNeededColumn(needed_columns, equality.left);
         addNeededColumn(needed_columns, equality.right);
     }
-
     std::cout << "\nNeeded columns after projection pushdown:" << std::endl;
     for (const auto& table_name : writtenJoinOrder(components)) {
         auto columns_it = needed_columns.find(table_name);
@@ -8371,6 +8626,34 @@ std::string joinPlanTreeString(const std::shared_ptr<JoinPlanNode>& node) {
         left_tree + ", " + right_tree + ")";
 }
 
+std::string memoPhysicalJoinName(PhysicalJoinKind kind) {
+    switch (kind) {
+        case PhysicalJoinKind::NestedLoopJoin:
+            return "LOOPS_JOIN";
+        case PhysicalJoinKind::HashJoin:
+            return "HASH_JOIN";
+        case PhysicalJoinKind::SortMergeJoin:
+            return "MERGE_JOIN";
+    }
+    return "HASH_JOIN";
+}
+
+std::string memoPhysicalPlanExpression(const std::shared_ptr<JoinPlanNode>& node) {
+    if (!node) {
+        return "";
+    }
+    if (node->isLeaf) {
+        return "FILE_SCAN(" + node->tableName + ")";
+    }
+    auto left = memoPhysicalPlanExpression(node->left);
+    auto right = memoPhysicalPlanExpression(node->right);
+    if (node->joinKind == PhysicalJoinKind::SortMergeJoin) {
+        left = "SORT(" + left + ")";
+        right = "SORT(" + right + ")";
+    }
+    return memoPhysicalJoinName(node->joinKind) + "(" + left + ", " + right + ")";
+}
+
 std::string joinPlanTableGroup(const std::shared_ptr<JoinPlanNode>& node) {
     if (!node) {
         return "{}";
@@ -9679,6 +9962,43 @@ struct PlanTraitSet {
     }
 };
 
+struct MemoWinnerSearch {
+    int finalGroupId = 0;
+    std::string requiredTrait = "unordered";
+    std::string expression;
+    double cost = 0.0;
+    PlannedQuery plannedQuery;
+};
+
+MemoWinnerSearch chooseMemoWinner(Memo& memo,
+                                  const QueryComponents& components,
+                                  const StatisticsCatalog& stats,
+                                  JoinOrderAlgorithm algorithm,
+                                  const PlanTraitSet& required_traits) {
+    auto planned_query = chooseJoinOrderPlan(
+        components,
+        stats,
+        algorithm,
+        required_traits.requiredOutputTrait.isOrdered()
+    );
+    MemoWinnerSearch winner;
+    winner.finalGroupId = memo.finalGroupId();
+    winner.requiredTrait = required_traits.describe();
+    winner.expression = planned_query.planRoot
+        ? memoPhysicalPlanExpression(planned_query.planRoot)
+        : "FILE_SCAN(" + planned_query.components.tableName + ")";
+    winner.cost = planned_query.physicalPlan.totalCost;
+    winner.plannedQuery = planned_query;
+    if (winner.finalGroupId != 0) {
+        memo.setWinner(winner.finalGroupId, {
+            winner.requiredTrait,
+            winner.expression,
+            winner.cost
+        });
+    }
+    return winner;
+}
+
 struct OptimizerResult {
     QueryComponents logicalQuery;
     Memo memo;
@@ -9687,6 +10007,7 @@ struct OptimizerResult {
     PlannedQuery plannedQuery;
     JoinOrderAlgorithm algorithm = JoinOrderAlgorithm::ConnectedSubgraphDP;
     PlanTraitSet requiredTraits;
+    MemoWinnerSearch memoWinner;
 };
 
 class Optimizer {
@@ -9705,11 +10026,12 @@ public:
 
     OptimizerResult optimize(const QueryComponents& components) const {
         auto memo_rewrite = buildMemoWithRuleAlternatives(components);
-        PlannedQuery planned_query = chooseJoinOrderPlan(
+        auto memo_winner = chooseMemoWinner(
+            memo_rewrite.memo,
             components,
             stats,
             algorithm,
-            requiredTraits.requiredOutputTrait.isOrdered()
+            requiredTraits
         );
 
         return {
@@ -9717,9 +10039,10 @@ public:
             std::move(memo_rewrite.memo),
             memo_rewrite.stats,
             std::move(memo_rewrite.firedRules),
-            planned_query,
+            memo_winner.plannedQuery,
             algorithm,
-            requiredTraits
+            requiredTraits,
+            memo_winner
         };
     }
 };
@@ -9731,11 +10054,30 @@ void printOptimizerSummary(const OptimizerResult& result) {
               << joinOrderAlgorithmName(result.algorithm) << std::endl;
     std::cout << "  required traits: "
               << result.requiredTraits.describe() << std::endl;
+    std::cout << "\nMemo winner search:" << std::endl;
+    std::cout << "  required trait: "
+              << result.memoWinner.requiredTrait << std::endl;
+    std::cout << "  final group: G"
+              << result.memoWinner.finalGroupId << std::endl;
+    std::cout << "  final group winner: "
+              << result.memoWinner.expression << std::endl;
+    std::cout << "  winner cost: "
+              << formatEstimate(result.memoWinner.cost) << std::endl;
+    std::cout << "  executable plan: from memo winner" << std::endl;
     std::cout << "  logical rule fires: "
               << result.firedRules.size() << std::endl;
     std::cout << "  physical implementation rules: "
               << operatorImplementationRules().size() +
                     joinImplementationRules().size()
+              << std::endl;
+    std::cout << "  join transformation expressions: "
+              << result.memoStats.joinTransformationExpressions
+              << " from commute/associativity-style rules" << std::endl;
+    std::cout << "  physical implementation expressions: "
+              << result.memoStats.physicalImplementationExpressions
+              << std::endl;
+    std::cout << "  sort enforcer placements represented: "
+              << result.memoStats.sortEnforcerExpressions
               << std::endl;
     std::cout << "  memo before rules: "
               << result.memoStats.initialGroups << " group(s), "
@@ -9744,6 +10086,9 @@ void printOptimizerSummary(const OptimizerResult& result) {
     std::cout << "  memo after rules: "
               << result.memoStats.finalGroups << " group(s), "
               << result.memoStats.finalExpressions << " expression(s)"
+              << std::endl;
+    std::cout << "  estimated memo memory: "
+              << result.memoStats.estimatedMemoBytes << " bytes"
               << std::endl;
     printMemo(result.memo);
 }
@@ -10172,14 +10517,6 @@ QueryTable executeQuery(const QueryComponents& components,
         rootOp = &*equalitySelectOpBuffer;
     }
 
-    if (!final_sort_attrs.empty()) {
-        sortOpBuffers.push_back(std::make_unique<SortOperator>(
-            *rootOp,
-            final_sort_attrs
-        ));
-        rootOp = sortOpBuffers.back().get();
-    }
-
     // Apply projection aggregates, SUM, or GROUP BY operation
     if (hasAggregateProjection(components)) {
         std::vector<AggrFunc> aggrFuncs;
@@ -10188,6 +10525,7 @@ QueryTable executeQuery(const QueryComponents& components,
         }
         hashAggOpBuffer.emplace(*rootOp, std::vector<size_t>{}, aggrFuncs);
         rootOp = &*hashAggOpBuffer;
+        projected_columns.clear();
     } else if (components.sumOperation || components.groupBy) {
         std::vector<size_t> groupByAttrs;
         if (components.groupBy) {
@@ -10210,6 +10548,14 @@ QueryTable executeQuery(const QueryComponents& components,
     if (!hasAggregateProjection(components) && !projected_columns.empty()) {
         projectionOpBuffer.emplace(*rootOp, projected_columns);
         rootOp = &*projectionOpBuffer;
+    }
+
+    if (!final_sort_attrs.empty()) {
+        sortOpBuffers.push_back(std::make_unique<SortOperator>(
+            *rootOp,
+            final_sort_attrs
+        ));
+        rootOp = sortOpBuffers.back().get();
     }
 
     // Execute the Root Operator
@@ -11237,7 +11583,6 @@ public:
     }
 
     void printStatsAndEstimates(const std::string& query,
-                                const std::string& join_body_query,
                                 const TxnPtr& txn = nullptr,
                                 bool ordered_output_required = false) {
         auto components = parseQuery(query);
@@ -11298,26 +11643,25 @@ public:
                       << std::endl;
         }
 
-        auto join_body_components = parseQuery(join_body_query);
-        resolveQueryColumns(join_body_components, catalog);
-        planned_query_cache[
-            join_body_query + "#" +
-            joinOrderAlgorithmName(default_algorithm)
-        ] = Optimizer(
-                stats,
-                default_algorithm,
-                {requiredTraitFromFlag(ordered_output_required)}
-            ).optimize(join_body_components).plannedQuery;
-        auto join_body_rows = executeQuery(join_body_query, txn, false);
-        std::cout << "  final join body: estimate="
-                  << formatEstimate(final_estimate)
-                  << " q-error="
-                  << formatQError(
-                         final_estimate,
-                         static_cast<double>(join_body_rows.size())
-                     )
-                  << " actual=" << join_body_rows.size()
-                  << std::endl;
+        auto query_rows = executeQuery(query, txn, false);
+        if (hasAggregateProjection(components) ||
+            components.sumOperation ||
+            components.groupBy) {
+            std::cout << "  estimated join rows before aggregation: "
+                      << formatEstimate(final_estimate) << std::endl;
+            std::cout << "  query output rows: "
+                      << query_rows.size() << std::endl;
+        } else {
+            std::cout << "  final join body: estimate="
+                      << formatEstimate(final_estimate)
+                      << " q-error="
+                      << formatQError(
+                             final_estimate,
+                             static_cast<double>(query_rows.size())
+                         )
+                      << " actual=" << query_rows.size()
+                      << std::endl;
+        }
     }
 
     void execute(const std::string& command,
@@ -11451,28 +11795,6 @@ std::string jobJoinQuery() {
         "AND {miidx.movie_id} = {mc.movie_id}";
 }
 
-std::string jobJoinBodyQuery() {
-    return
-        "PROJECT {cn.name}, {miidx.info}, {t.title} "
-        "FROM title AS t "
-        "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-        "JOIN movie_companies AS mc ON {t.id} = {mc.movie_id} "
-        "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
-        "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
-        "JOIN movie_info AS mi ON {t.id} = {mi.movie_id} "
-        "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
-        "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
-        "JOIN info_type AS it ON {miidx.info_type_id} = {it.id} "
-        "WHERE {cn.country_code} = [us] "
-        "AND {ct.kind} = production_companies "
-        "AND {it.info} = rating "
-        "AND {it2.info} = release_dates "
-        "AND {kt.kind} = movie "
-        "AND {mi.movie_id} = {miidx.movie_id} "
-        "AND {mi.movie_id} = {mc.movie_id} "
-	        "AND {miidx.movie_id} = {mc.movie_id}";
-}
-
 void printSampleRows(const QueryTable& rows, size_t limit) {
     for (size_t row_index = 0; row_index < rows.size() && row_index < limit; row_index++) {
         std::cout << "  ";
@@ -11506,17 +11828,19 @@ int main(int argc, char* argv[]) {
 
     auto query_txn = db.begin("Q1");
     std::cout << "\nQuery optimization with join ordering" << std::endl;
-    std::cout << "  Workload: JOB 13d-shaped 9-table company/rating/release-date join" << std::endl;
+    std::cout << "  Workload: JOB 9-table join query" << std::endl;
     db.explainQuery(jobJoinQuery());
-    db.printStatsAndEstimates(jobJoinQuery(), jobJoinBodyQuery(), query_txn);
+    db.printStatsAndEstimates(jobJoinQuery(), query_txn);
 
     auto query_components = parseQuery(jobJoinQuery());
     resolveQueryColumns(query_components, db.catalog);
     auto mcv_stats = loadQueryTableStats(query_components, db.catalog);
+    auto optimize_start = std::chrono::steady_clock::now();
     auto optimizer_result = Optimizer(
         mcv_stats,
         JoinOrderAlgorithm::ConnectedSubgraphDP
     ).optimize(query_components);
+    auto optimize_end = std::chrono::steady_clock::now();
     auto plan = optimizer_result.plannedQuery;
     db.clearBufferPool();
     auto query_start = std::chrono::steady_clock::now();
@@ -11528,6 +11852,9 @@ int main(int argc, char* argv[]) {
     auto query_end = std::chrono::steady_clock::now();
 
     std::cout << "\nDCopt execution with MCV stats:" << std::endl;
+    std::cout << "  optimization elapsed: "
+              << elapsedMs(optimize_start, optimize_end)
+              << " ms" << std::endl;
     std::cout << "  Buffer pool is cleared before timed execution."
               << std::endl;
     std::cout << "  elapsed: " << elapsedMs(query_start, query_end)
