@@ -6769,9 +6769,36 @@ void recordMemoRule(MemoTransformationStats& stats,
     stats.firedRules.push_back({rule_name, detail});
 }
 
-void applyMemoTransformationRules(Memo& memo, MemoTransformationStats& stats) {
+void addMemoLogicalRewriteAlternatives(Memo& memo,
+                                       const QueryComponents& components,
+                                       MemoTransformationStats& stats) {
+    auto before_groups = memo.groupCount();
+    auto before_expressions = memo.expressionCount();
+    auto rewritten_plan = buildRewrittenLogicalPlan(components);
+    addMemoExpression(*rewritten_plan, memo);
+    if (memo.groupCount() == before_groups &&
+        memo.expressionCount() == before_expressions) {
+        return;
+    }
+
+    recordMemoRule(
+        stats,
+        "FILTER_PUSH_DOWN",
+        "memo adds scan-level filter alternatives"
+    );
+    recordMemoRule(
+        stats,
+        "JOIN_PREDICATE_ATTACH",
+        "memo attaches available equality predicates to joins"
+    );
+}
+
+void applyMemoTransformationRules(Memo& memo,
+                                  const QueryComponents& components,
+                                  MemoTransformationStats& stats) {
     stats.initialGroups = memo.groupCount();
     stats.initialExpressions = memo.expressionCount();
+    addMemoLogicalRewriteAlternatives(memo, components, stats);
 
     for (size_t pass = 0; pass < 2; pass++) {
         bool changed = false;
@@ -6855,6 +6882,66 @@ void applyMemoTransformationRules(Memo& memo, MemoTransformationStats& stats) {
                         );
                     }
                 }
+
+                const auto& right_group =
+                    groups_snapshot[right_group_id - 1];
+                for (const auto& right_expression : right_group.expressions) {
+                    if (right_expression.op != "LogicalJoin" ||
+                        right_expression.inputs.size() != 2) {
+                        continue;
+                    }
+
+                    int b_group_id = right_expression.inputs[0];
+                    int c_group_id = right_expression.inputs[1];
+                    auto c_tables = memoPropertySet(
+                        groups_snapshot[c_group_id - 1].logicalProperty,
+                        "tables"
+                    );
+                    bool top_predicate_uses_c = false;
+                    for (const auto& predicate : expression.details) {
+                        top_predicate_uses_c =
+                            top_predicate_uses_c ||
+                            predicateMentionsAnyTable(predicate, c_tables);
+                    }
+                    if (top_predicate_uses_c) {
+                        continue;
+                    }
+
+                    int ab_group_id = memo.internGroup(
+                        memoPropertyForInputs(
+                            {left_group_id, b_group_id},
+                            expression.details,
+                            memo
+                        )
+                    );
+                    if (memo.addExpression(ab_group_id, {
+                            "LogicalJoin",
+                            {left_group_id, b_group_id},
+                            expression.details
+                        })) {
+                        changed = true;
+                        recordMemoRule(
+                            stats,
+                            "EQJOIN_RTOL",
+                            "G" + std::to_string(group.id) +
+                            " creates G" + std::to_string(ab_group_id)
+                        );
+                    }
+
+                    if (memo.addExpression(group.id, {
+                            "LogicalJoin",
+                            {ab_group_id, c_group_id},
+                            right_expression.details
+                        })) {
+                        changed = true;
+                        recordMemoRule(
+                            stats,
+                            "EQJOIN_RTOL",
+                            "G" + std::to_string(group.id) +
+                            " adds right-to-left association"
+                        );
+                    }
+                }
             }
         }
         if (!changed) {
@@ -6883,6 +6970,45 @@ void applyMemoImplementationRules(Memo& memo, MemoTransformationStats& stats) {
                         " implements logical scan"
                     );
                 }
+            } else if (expression.op == "LogicalFilter") {
+                if (memo.addExpression(group.id, {
+                        "Filter",
+                        expression.inputs,
+                        expression.details
+                    })) {
+                    recordMemoRule(
+                        stats,
+                        "SELECT_TO_FILTER",
+                        "G" + std::to_string(group.id) +
+                        " implements logical filter"
+                    );
+                }
+            } else if (expression.op == "LogicalProject") {
+                if (memo.addExpression(group.id, {
+                        "Project",
+                        expression.inputs,
+                        expression.details
+                    })) {
+                    recordMemoRule(
+                        stats,
+                        "PROJECT_TO_PROJECT",
+                        "G" + std::to_string(group.id) +
+                        " implements logical project"
+                    );
+                }
+            } else if (expression.op == "LogicalAggregate") {
+                if (memo.addExpression(group.id, {
+                        "HashAggregate",
+                        expression.inputs,
+                        expression.details
+                    })) {
+                    recordMemoRule(
+                        stats,
+                        "AGG_TO_HASH_AGG",
+                        "G" + std::to_string(group.id) +
+                        " implements logical aggregate"
+                    );
+                }
             } else if (expression.op == "LogicalJoin") {
                 for (const auto& implementation :
                      {"NestedLoopJoin", "HashJoin", "SortMergeJoin"}) {
@@ -6891,9 +7017,17 @@ void applyMemoImplementationRules(Memo& memo, MemoTransformationStats& stats) {
                             expression.inputs,
                             expression.details
                         })) {
+                        std::string rule_name;
+                        if (std::string(implementation) == "NestedLoopJoin") {
+                            rule_name = "EQJOIN_TO_LOOPS_JOIN";
+                        } else if (std::string(implementation) == "HashJoin") {
+                            rule_name = "EQJOIN_TO_HASH_JOIN";
+                        } else {
+                            rule_name = "EQJOIN_TO_MERGE_JOIN";
+                        }
                         recordMemoRule(
                             stats,
-                            "EQJOIN_TO_" + std::string(implementation),
+                            rule_name,
                             "G" + std::to_string(group.id) +
                             " implements logical join"
                         );
@@ -7010,12 +7144,12 @@ void printLogicalExplanation(const QueryComponents& components) {
     auto rewritten_plan = buildRewrittenLogicalPlan(components);
     std::cout << "\nOriginal logical plan:" << std::endl;
     printLogicalPlanNode(*logical_plan);
-    std::cout << "\nRewrite rules applied:" << std::endl;
+    std::cout << "\nLogical rewrite rules represented in memo:" << std::endl;
     std::cout << "  Split conjunctive predicates" << std::endl;
     std::cout << "  Push single-table selections to scans" << std::endl;
     std::cout << "  Attach column equality predicates to joins when both sides are available" << std::endl;
     std::cout << "  Derive table-local needed columns" << std::endl;
-    std::cout << "\nRewritten logical plan:" << std::endl;
+    std::cout << "\nRepresentative rewritten alternative:" << std::endl;
     printLogicalPlanNode(*rewritten_plan);
     printQueryGraph(components);
     std::cout << "  Written join order: "
@@ -8092,6 +8226,10 @@ std::optional<PhysicalJoinKind> memoImplementationJoinKind(
     return std::nullopt;
 }
 
+bool memoPassthroughPhysicalOperator(const std::string& op) {
+    return op == "Filter" || op == "Project" || op == "HashAggregate";
+}
+
 std::optional<MemoPlanChoice> chooseMemoGroupPlan(
     const Memo& memo,
     const QueryComponents& components,
@@ -8129,9 +8267,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                     base.physicalPlan
                 };
             }
-        } else if ((expression.op == "LogicalFilter" ||
-                    expression.op == "LogicalProject" ||
-                    expression.op == "LogicalAggregate") &&
+        } else if (memoPassthroughPhysicalOperator(expression.op) &&
                    expression.inputs.size() == 1) {
             candidate = chooseMemoGroupPlan(
                 memo,
@@ -8293,10 +8429,10 @@ public:
           requiredTraits(requiredTraits) {}
 
     OptimizerResult optimize(const QueryComponents& components) const {
-        auto rewritten_plan = buildRewrittenLogicalPlan(components);
-        auto memo = buildMemo(*rewritten_plan);
+        auto logical_plan = buildLogicalPlan(components);
+        auto memo = buildMemo(*logical_plan);
         MemoTransformationStats memo_stats;
-        applyMemoTransformationRules(memo, memo_stats);
+        applyMemoTransformationRules(memo, components, memo_stats);
         applyMemoImplementationRules(memo, memo_stats);
         auto memo_winner = chooseMemoWinner(
             memo,
