@@ -8820,38 +8820,70 @@ public:
     }
 };
 
+struct SearchStrategyStats {
+    size_t optimizeGroupTasks = 0;
+    size_t applyRuleTasks = 0;
+    size_t optimizeInputTasks = 0;
+    size_t enforceSortTasks = 0;
+    size_t expressionsVisited = 0;
+    size_t expressionsPrunedByCostBound = 0;
+    size_t rulesSkippedByProperty = 0;
+    size_t winnerCacheHits = 0;
+    size_t taskBudget = 0;
+    size_t tasksExecuted = 0;
+    double initialIncumbentCost = 0.0;
+    double finalCostBound = 0.0;
+    bool seededBaselinePlan = false;
+    bool stoppedByTaskBudget = false;
+};
+
+struct OptimizerContext {
+    Memo& memo;
+    const QueryComponents& components;
+    const StatisticsCatalog& stats;
+    const OptimizerAlgebra& algebra;
+    const PlanTraitSet& requiredTraits;
+    MemoTransformationStats* memoStats = nullptr;
+};
+
 class SearchStrategy {
 public:
     virtual ~SearchStrategy() = default;
-
     virtual std::string name() const = 0;
-    virtual MemoWinnerSearch chooseWinner(
-        Memo& memo,
-        const QueryComponents& components,
-        const StatisticsCatalog& stats,
-        const OptimizerAlgebra& algebra,
-        const PlanTraitSet& required_traits) const = 0;
+    virtual PlannedQuery optimize(OptimizerContext& context) = 0;
+    virtual SearchStrategyStats stats() const {
+        return {};
+    }
 };
 
-class MemoWinnerSearchStrategy : public SearchStrategy {
+class BottomUpMemoSearchStrategy : public SearchStrategy {
+    SearchStrategyStats lastStats;
+
 public:
     std::string name() const override {
-        return "memo winner search";
+        return "BottomUpMemo";
     }
 
-    MemoWinnerSearch chooseWinner(
-        Memo& memo,
-        const QueryComponents& components,
-        const StatisticsCatalog& stats,
-        const OptimizerAlgebra& algebra,
-        const PlanTraitSet& required_traits) const override {
+    PlannedQuery optimize(OptimizerContext& context) override {
+        lastStats = {};
+        if (context.memoStats) {
+            applyMemoTransformationRules(
+                context.memo,
+                context.components,
+                *context.memoStats
+            );
+        }
         return chooseMemoWinner(
-            memo,
-            components,
-            stats,
-            algebra,
-            required_traits
-        );
+            context.memo,
+            context.components,
+            context.stats,
+            context.algebra,
+            context.requiredTraits
+        ).plannedQuery;
+    }
+
+    SearchStrategyStats stats() const override {
+        return lastStats;
     }
 };
 
@@ -8875,7 +8907,7 @@ class Optimizer {
     PlanTraitSet requiredTraits;
     BuzzDBOptimizerAlgebra algebra;
     MemoRewriteSearchSpace searchSpace;
-    MemoWinnerSearchStrategy searchStrategy;
+    mutable BottomUpMemoSearchStrategy searchStrategy;
 
 public:
     Optimizer(const StatisticsCatalog& stats,
@@ -8886,14 +8918,31 @@ public:
     OptimizerResult optimize(const QueryComponents& components) const {
         auto memo = algebra.buildInitialMemo(components);
         MemoTransformationStats memo_stats;
-        searchSpace.expand(memo, components, memo_stats);
-        auto memo_winner = searchStrategy.chooseWinner(
+        OptimizerContext context{
             memo,
             components,
             stats,
             algebra,
-            requiredTraits
-        );
+            requiredTraits,
+            &memo_stats
+        };
+        auto planned_query = searchStrategy.optimize(context);
+
+        MemoWinnerSearch memo_winner;
+        memo_winner.finalGroupId = memo.finalGroupId();
+        memo_winner.requiredTrait = requiredTraits.describe();
+        memo_winner.expression = planned_query.planRoot
+            ? memoPhysicalPlanExpression(planned_query.planRoot)
+            : "Scan(" + planned_query.components.tableName + ")";
+        memo_winner.cost = planned_query.physicalPlan.totalCost;
+        memo_winner.plannedQuery = planned_query;
+        if (memo_winner.finalGroupId != INVALID_GROUP_ID) {
+            memo.setWinner(memo_winner.finalGroupId, {
+                memo_winner.requiredTrait,
+                memo_winner.expression,
+                memo_winner.cost
+            });
+        }
 
         return {
             components,
