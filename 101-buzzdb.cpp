@@ -6229,7 +6229,7 @@ std::string logicalNodeName(LogicalPlanNode::Kind kind) {
         case LogicalPlanNode::Kind::SCAN:
             return "LogicalScan";
         case LogicalPlanNode::Kind::JOIN:
-            return "LogicalJoin";
+            return "LogicalEquiJoin";
         case LogicalPlanNode::Kind::FILTER:
             return "LogicalFilter";
         case LogicalPlanNode::Kind::PROJECT:
@@ -6538,10 +6538,50 @@ void printLogicalPlanNode(const LogicalPlanNode& node, size_t indent = 2) {
     }
 }
 
-struct MemoExpression {
+using GroupId = int;
+using ExpressionId = int;
+
+constexpr GroupId INVALID_GROUP_ID = 0;
+constexpr ExpressionId INVALID_EXPRESSION_ID = 0;
+
+void combineMemoHash(size_t& seed, size_t value) {
+    seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+struct MemoExpressionKey {
     std::string op;
-    std::vector<int> inputs;
+    std::vector<GroupId> inputs;
     std::vector<std::string> details;
+
+    bool operator==(const MemoExpressionKey& other) const {
+        return op == other.op &&
+               inputs == other.inputs &&
+               details == other.details;
+    }
+};
+
+struct MemoExpressionKeyHash {
+    size_t operator()(const MemoExpressionKey& key) const {
+        size_t seed = std::hash<std::string>{}(key.op);
+        for (GroupId input : key.inputs) {
+            combineMemoHash(seed, std::hash<int>{}(input));
+        }
+        for (const auto& detail : key.details) {
+            combineMemoHash(seed, std::hash<std::string>{}(detail));
+        }
+        return seed;
+    }
+};
+
+struct MemoExpression {
+    ExpressionId id = INVALID_EXPRESSION_ID;
+    std::string op;
+    std::vector<GroupId> inputs;
+    std::vector<std::string> details;
+
+    MemoExpressionKey key() const {
+        return {op, inputs, details};
+    }
 };
 
 struct RuleFire {
@@ -6554,6 +6594,8 @@ struct MemoTransformationStats {
     size_t initialExpressions = 0;
     size_t finalGroups = 0;
     size_t finalExpressions = 0;
+    size_t mergedGroups = 0;
+    size_t deduplicatedExpressions = 0;
     std::vector<RuleFire> firedRules;
 };
 
@@ -6564,53 +6606,113 @@ struct MemoWinner {
 };
 
 struct MemoGroup {
-    int id = 0;
+    GroupId id = INVALID_GROUP_ID;
     std::string logicalProperty;
     std::vector<MemoExpression> expressions;
+    std::unordered_map<MemoExpressionKey, ExpressionId, MemoExpressionKeyHash> expressionIds;
     std::map<std::string, MemoWinner> winners;
 };
 
 class Memo {
     std::vector<MemoGroup> groups;
-    std::map<std::string, int> groupByProperty;
-    int rootGroupId = 0;
+    std::map<std::string, GroupId> groupByProperty;
+    GroupId rootGroupId = INVALID_GROUP_ID;
+    ExpressionId nextExpressionId = 1;
+    size_t groupMergeCount = 0;
+    size_t duplicateExpressionCount = 0;
+
+    MemoGroup& groupFor(GroupId group_id) {
+        return groups[group_id - 1];
+    }
+
+    const MemoGroup& groupFor(GroupId group_id) const {
+        return groups[group_id - 1];
+    }
+
+    void rebuildExpressionIds(MemoGroup& group) {
+        group.expressionIds.clear();
+        for (const auto& expression : group.expressions) {
+            group.expressionIds[expression.key()] = expression.id;
+        }
+    }
 
 public:
-    int internGroup(const std::string& logical_property) {
+    GroupId internGroup(const std::string& logical_property) {
         auto it = groupByProperty.find(logical_property);
         if (it != groupByProperty.end()) {
-            return it->second;
+            return mergeGroups(it->second, it->second);
         }
 
-        int group_id = static_cast<int>(groups.size() + 1);
-        groups.push_back({group_id, logical_property, {}, {}});
+        GroupId group_id = static_cast<GroupId>(groups.size() + 1);
+        MemoGroup group;
+        group.id = group_id;
+        group.logicalProperty = logical_property;
+        groups.push_back(std::move(group));
         groupByProperty[logical_property] = group_id;
         return group_id;
     }
 
-    bool addExpression(int group_id, MemoExpression expression) {
-        auto& expressions = groups[group_id - 1].expressions;
-        for (const auto& existing : expressions) {
-            if (existing.op == expression.op &&
-                existing.inputs == expression.inputs &&
-                existing.details == expression.details) {
-                return false;
-            }
+    bool addExpressionToGroup(GroupId group_id, MemoExpression expression) {
+        auto& group = groupFor(group_id);
+        auto expression_key = expression.key();
+        if (group.expressionIds.find(expression_key) != group.expressionIds.end()) {
+            duplicateExpressionCount++;
+            return false;
         }
 
-        expressions.push_back(std::move(expression));
+        expression.id = nextExpressionId++;
+        group.expressionIds[expression_key] = expression.id;
+        group.expressions.push_back(std::move(expression));
         return true;
     }
 
-    void setWinner(int group_id, MemoWinner winner) {
-        groups[group_id - 1].winners[winner.requiredTrait] = std::move(winner);
+    bool addExpression(GroupId group_id, MemoExpression expression) {
+        return addExpressionToGroup(group_id, std::move(expression));
     }
 
-    void setFinalGroupId(int group_id) {
+    GroupId mergeGroups(GroupId target_group_id, GroupId source_group_id) {
+        groupMergeCount++;
+        if (target_group_id == source_group_id) {
+            return target_group_id;
+        }
+
+        auto& source = groupFor(source_group_id);
+        auto source_expressions = source.expressions;
+        for (auto expression : source_expressions) {
+            addExpressionToGroup(target_group_id, std::move(expression));
+        }
+
+        for (auto& group : groups) {
+            for (auto& expression : group.expressions) {
+                for (auto& input : expression.inputs) {
+                    if (input == source_group_id) {
+                        input = target_group_id;
+                    }
+                }
+            }
+            rebuildExpressionIds(group);
+        }
+
+        auto& target = groupFor(target_group_id);
+        for (const auto& winner : source.winners) {
+            target.winners.emplace(winner.first, winner.second);
+        }
+        groupByProperty[source.logicalProperty] = target_group_id;
+        if (rootGroupId == source_group_id) {
+            rootGroupId = target_group_id;
+        }
+        return target_group_id;
+    }
+
+    void setWinner(GroupId group_id, MemoWinner winner) {
+        groupFor(group_id).winners[winner.requiredTrait] = std::move(winner);
+    }
+
+    void setFinalGroupId(GroupId group_id) {
         rootGroupId = group_id;
     }
 
-    int finalGroupId() const {
+    GroupId finalGroupId() const {
         return rootGroupId;
     }
 
@@ -6628,6 +6730,14 @@ public:
             count += group.expressions.size();
         }
         return count;
+    }
+
+    size_t mergedGroupCount() const {
+        return groupMergeCount;
+    }
+
+    size_t deduplicatedExpressionCount() const {
+        return duplicateExpressionCount;
     }
 };
 
@@ -6662,12 +6772,12 @@ std::string memoPropertyField(const std::string& name,
     ) + "}";
 }
 
-std::string memoPropertyForInputs(const std::vector<int>& input_groups,
+std::string memoPropertyForInputs(const std::vector<GroupId>& input_groups,
                                   const std::vector<std::string>& predicates,
                                   const Memo& memo) {
     std::set<std::string> tables;
     std::set<std::string> all_predicates(predicates.begin(), predicates.end());
-    for (int group_id : input_groups) {
+    for (GroupId group_id : input_groups) {
         const auto& property = memo.allGroups()[group_id - 1].logicalProperty;
         auto input_tables = memoPropertySet(property, "tables");
         tables.insert(input_tables.begin(), input_tables.end());
@@ -6687,19 +6797,29 @@ std::string memoPropertyForInputs(const std::vector<int>& input_groups,
 bool predicateMentionsAnyTable(const std::string& predicate,
                                const std::set<std::string>& tables) {
     for (const auto& table : tables) {
-        if (predicate.find("{" + table + ".") != std::string::npos) {
+        if (predicate.find(table + ".") != std::string::npos) {
             return true;
         }
     }
     return false;
 }
 
+MemoExpression makeMemoExpression(const std::string& op,
+                                  std::vector<GroupId> inputs,
+                                  std::vector<std::string> details) {
+    MemoExpression expression;
+    expression.op = op;
+    expression.inputs = std::move(inputs);
+    expression.details = std::move(details);
+    return expression;
+}
+
 std::string logicalPropertyForNode(const LogicalPlanNode& node,
-                                   const std::vector<int>& input_groups,
+                                   const std::vector<GroupId>& input_groups,
                                    const Memo& memo) {
     std::set<std::string> tables;
     std::set<std::string> predicates;
-    for (int group_id : input_groups) {
+    for (GroupId group_id : input_groups) {
         const auto& property = memo.allGroups()[group_id - 1].logicalProperty;
         auto input_tables = memoPropertySet(property, "tables");
         tables.insert(input_tables.begin(), input_tables.end());
@@ -6740,20 +6860,20 @@ std::string logicalPropertyForNode(const LogicalPlanNode& node,
     return joinStrings(fields, " ");
 }
 
-int addMemoExpression(const LogicalPlanNode& node, Memo& memo) {
-    std::vector<int> input_groups;
+GroupId addMemoExpression(const LogicalPlanNode& node, Memo& memo) {
+    std::vector<GroupId> input_groups;
     for (const auto& input : node.inputs) {
         input_groups.push_back(addMemoExpression(*input, memo));
     }
 
-    int group_id = memo.internGroup(
+    GroupId group_id = memo.internGroup(
         logicalPropertyForNode(node, input_groups, memo)
     );
-    memo.addExpression(group_id, {
+    memo.addExpression(group_id, makeMemoExpression(
         logicalNodeName(node.kind),
         input_groups,
         logicalExpressionLabels(node)
-    });
+    ));
     return group_id;
 }
 
@@ -6769,28 +6889,341 @@ void recordMemoRule(MemoTransformationStats& stats,
     stats.firedRules.push_back({rule_name, detail});
 }
 
-void addMemoLogicalRewriteAlternatives(Memo& memo,
-                                       const QueryComponents& components,
-                                       MemoTransformationStats& stats) {
-    auto before_groups = memo.groupCount();
-    auto before_expressions = memo.expressionCount();
-    auto rewritten_plan = buildRewrittenLogicalPlan(components);
-    addMemoExpression(*rewritten_plan, memo);
-    if (memo.groupCount() == before_groups &&
-        memo.expressionCount() == before_expressions) {
-        return;
+enum class PatternKind {
+    MatchOp,
+    PickOne,
+    PickMany,
+    IgnoreOne,
+    IgnoreMany
+};
+
+enum class RuleKind {
+    Transformation,
+    Implementation
+};
+
+struct RulePattern {
+    PatternKind kind = PatternKind::IgnoreOne;
+    std::string op;
+    std::vector<RulePattern> inputs;
+};
+
+RulePattern matchOpPattern(const std::string& op,
+                           std::vector<RulePattern> inputs = {}) {
+    RulePattern pattern;
+    pattern.kind = PatternKind::MatchOp;
+    pattern.op = op;
+    pattern.inputs = std::move(inputs);
+    return pattern;
+}
+
+RulePattern pickOnePattern() {
+    RulePattern pattern;
+    pattern.kind = PatternKind::PickOne;
+    return pattern;
+}
+
+bool matchRulePattern(const RulePattern& pattern,
+                      const MemoExpression& expression) {
+    if (pattern.kind != PatternKind::MatchOp) {
+        return true;
     }
 
-    recordMemoRule(
-        stats,
-        "FILTER_PUSH_DOWN",
-        "memo adds scan-level filter alternatives"
+    if (expression.op != pattern.op) {
+        return false;
+    }
+
+    size_t required_inputs = 0;
+    bool accepts_many = false;
+    for (const auto& input : pattern.inputs) {
+        if (input.kind == PatternKind::PickMany ||
+            input.kind == PatternKind::IgnoreMany) {
+            accepts_many = true;
+            continue;
+        }
+        required_inputs++;
+    }
+    return accepts_many
+        ? expression.inputs.size() >= required_inputs
+        : expression.inputs.size() == required_inputs;
+}
+
+struct RuleBinding {
+    Memo& memo;
+    const QueryComponents& components;
+    const std::vector<MemoGroup>& groups;
+    const MemoGroup& group;
+    const MemoExpression& expression;
+};
+
+struct OptimizerRule {
+    std::string name;
+    RuleKind kind;
+    int promise;
+    RulePattern pattern;
+    std::function<std::vector<MemoExpression>(RuleBinding&)> apply;
+};
+
+std::vector<MemoExpression> addRewrittenLogicalPlan(RuleBinding& binding) {
+    auto rewritten_plan = buildRewrittenLogicalPlan(binding.components);
+    addMemoExpression(*rewritten_plan, binding.memo);
+    return {};
+}
+
+std::vector<MemoExpression> commuteEquiJoin(RuleBinding& binding) {
+    auto commuted = binding.expression;
+    std::swap(commuted.inputs[0], commuted.inputs[1]);
+    return {commuted};
+}
+
+std::vector<MemoExpression> associateLeftToRight(RuleBinding& binding) {
+    std::vector<MemoExpression> results;
+    GroupId left_group_id = binding.expression.inputs[0];
+    GroupId right_group_id = binding.expression.inputs[1];
+    const auto& left_group = binding.groups[left_group_id - 1];
+
+    for (const auto& left_expression : left_group.expressions) {
+        if (left_expression.op != "LogicalEquiJoin" ||
+            left_expression.inputs.size() != 2) {
+            continue;
+        }
+
+        GroupId a_group_id = left_expression.inputs[0];
+        GroupId b_group_id = left_expression.inputs[1];
+        auto a_tables = memoPropertySet(
+            binding.groups[a_group_id - 1].logicalProperty,
+            "tables"
+        );
+        bool top_predicate_uses_a = false;
+        for (const auto& predicate : binding.expression.details) {
+            top_predicate_uses_a =
+                top_predicate_uses_a ||
+                predicateMentionsAnyTable(predicate, a_tables);
+        }
+        if (top_predicate_uses_a) {
+            continue;
+        }
+
+        GroupId bc_group_id = binding.memo.internGroup(
+            memoPropertyForInputs(
+                {b_group_id, right_group_id},
+                binding.expression.details,
+                binding.memo
+            )
+        );
+        binding.memo.addExpression(bc_group_id, makeMemoExpression(
+            "LogicalEquiJoin",
+            {b_group_id, right_group_id},
+            binding.expression.details
+        ));
+
+        results.push_back(makeMemoExpression(
+            "LogicalEquiJoin",
+            {a_group_id, bc_group_id},
+            left_expression.details
+        ));
+    }
+    return results;
+}
+
+std::vector<MemoExpression> associateRightToLeft(RuleBinding& binding) {
+    std::vector<MemoExpression> results;
+    GroupId left_group_id = binding.expression.inputs[0];
+    GroupId right_group_id = binding.expression.inputs[1];
+    const auto& right_group = binding.groups[right_group_id - 1];
+
+    for (const auto& right_expression : right_group.expressions) {
+        if (right_expression.op != "LogicalEquiJoin" ||
+            right_expression.inputs.size() != 2) {
+            continue;
+        }
+
+        GroupId b_group_id = right_expression.inputs[0];
+        GroupId c_group_id = right_expression.inputs[1];
+        auto c_tables = memoPropertySet(
+            binding.groups[c_group_id - 1].logicalProperty,
+            "tables"
+        );
+        bool top_predicate_uses_c = false;
+        for (const auto& predicate : binding.expression.details) {
+            top_predicate_uses_c =
+                top_predicate_uses_c ||
+                predicateMentionsAnyTable(predicate, c_tables);
+        }
+        if (top_predicate_uses_c) {
+            continue;
+        }
+
+        GroupId ab_group_id = binding.memo.internGroup(
+            memoPropertyForInputs(
+                {left_group_id, b_group_id},
+                binding.expression.details,
+                binding.memo
+            )
+        );
+        binding.memo.addExpression(ab_group_id, makeMemoExpression(
+            "LogicalEquiJoin",
+            {left_group_id, b_group_id},
+            binding.expression.details
+        ));
+
+        results.push_back(makeMemoExpression(
+            "LogicalEquiJoin",
+            {ab_group_id, c_group_id},
+            right_expression.details
+        ));
+    }
+    return results;
+}
+
+std::vector<MemoExpression> implementLogicalScan(RuleBinding& binding) {
+    return {makeMemoExpression("Scan", {}, binding.expression.details)};
+}
+
+std::vector<MemoExpression> implementSelect(RuleBinding& binding) {
+    return {makeMemoExpression(
+        "Filter",
+        binding.expression.inputs,
+        binding.expression.details
+    )};
+}
+
+std::vector<MemoExpression> implementAggregate(RuleBinding& binding) {
+    return {makeMemoExpression(
+        "HashAggregate",
+        binding.expression.inputs,
+        binding.expression.details
+    )};
+}
+
+std::vector<MemoExpression> implementNestedLoopJoin(RuleBinding& binding) {
+    return {makeMemoExpression(
+        "NestedLoopJoin",
+        binding.expression.inputs,
+        binding.expression.details
+    )};
+}
+
+std::vector<MemoExpression> implementHashJoin(RuleBinding& binding) {
+    return {makeMemoExpression(
+        "HashJoin",
+        binding.expression.inputs,
+        binding.expression.details
+    )};
+}
+
+std::vector<MemoExpression> implementSortMergeJoin(RuleBinding& binding) {
+    return {makeMemoExpression(
+        "SortMergeJoin",
+        binding.expression.inputs,
+        binding.expression.details
+    )};
+}
+
+std::vector<OptimizerRule> memoTransformationRules() {
+    auto root_pattern = matchOpPattern("LogicalAggregate", {pickOnePattern()});
+    auto scan_pattern = matchOpPattern("LogicalScan");
+    auto filter_pattern = matchOpPattern("LogicalFilter", {pickOnePattern()});
+    auto aggregate_pattern = matchOpPattern("LogicalAggregate", {pickOnePattern()});
+    auto join_pattern = matchOpPattern(
+        "LogicalEquiJoin",
+        {pickOnePattern(), pickOnePattern()}
     );
-    recordMemoRule(
-        stats,
-        "JOIN_PREDICATE_ATTACH",
-        "memo attaches available equality predicates to joins"
-    );
+
+    return {
+        {
+            "FILTER_PUSH_DOWN",
+            RuleKind::Transformation,
+            100,
+            root_pattern,
+            addRewrittenLogicalPlan
+        },
+        {
+            "JOIN_PREDICATE_ATTACH",
+            RuleKind::Transformation,
+            90,
+            root_pattern,
+            addRewrittenLogicalPlan
+        },
+        {
+            "EQJOIN_COMMUTE",
+            RuleKind::Transformation,
+            80,
+            join_pattern,
+            commuteEquiJoin
+        },
+        {
+            "EQJOIN_LTOR",
+            RuleKind::Transformation,
+            70,
+            join_pattern,
+            associateLeftToRight
+        },
+        {
+            "EQJOIN_RTOL",
+            RuleKind::Transformation,
+            70,
+            join_pattern,
+            associateRightToLeft
+        },
+        {
+            "LOGICAL_SCAN_TO_SCAN",
+            RuleKind::Implementation,
+            60,
+            scan_pattern,
+            implementLogicalScan
+        },
+        {
+            "SELECT_TO_FILTER",
+            RuleKind::Implementation,
+            55,
+            filter_pattern,
+            implementSelect
+        },
+        {
+            "AGG_TO_HASH_AGG",
+            RuleKind::Implementation,
+            50,
+            aggregate_pattern,
+            implementAggregate
+        },
+        {
+            "EQJOIN_TO_LOOPS_JOIN",
+            RuleKind::Implementation,
+            45,
+            join_pattern,
+            implementNestedLoopJoin
+        },
+        {
+            "EQJOIN_TO_HASH_JOIN",
+            RuleKind::Implementation,
+            45,
+            join_pattern,
+            implementHashJoin
+        },
+        {
+            "EQJOIN_TO_MERGE_JOIN",
+            RuleKind::Implementation,
+            45,
+            join_pattern,
+            implementSortMergeJoin
+        }
+    };
+}
+
+std::string ruleFireDetail(const OptimizerRule& rule,
+                           const MemoGroup& group) {
+    return "G" + std::to_string(group.id) +
+           " matched " + rule.name +
+           " with promise " + std::to_string(rule.promise);
+}
+
+bool shouldRunPlanRewriteRuleAgain(const OptimizerRule& rule, size_t pass) {
+    if (rule.name == "FILTER_PUSH_DOWN" ||
+        rule.name == "JOIN_PREDICATE_ATTACH") {
+        return pass == 0;
+    }
+    return true;
 }
 
 void applyMemoTransformationRules(Memo& memo,
@@ -6798,149 +7231,45 @@ void applyMemoTransformationRules(Memo& memo,
                                   MemoTransformationStats& stats) {
     stats.initialGroups = memo.groupCount();
     stats.initialExpressions = memo.expressionCount();
-    addMemoLogicalRewriteAlternatives(memo, components, stats);
+    auto rules = memoTransformationRules();
 
-    for (size_t pass = 0; pass < 2; pass++) {
+    for (size_t pass = 0; pass < 6; pass++) {
         bool changed = false;
         auto groups_snapshot = memo.allGroups();
         for (const auto& group : groups_snapshot) {
             for (const auto& expression : group.expressions) {
-                if (expression.op != "LogicalJoin" ||
-                    expression.inputs.size() != 2) {
-                    continue;
-                }
-
-                MemoExpression commuted = expression;
-                std::swap(commuted.inputs[0], commuted.inputs[1]);
-                if (memo.addExpression(group.id, std::move(commuted))) {
-                    changed = true;
-                    recordMemoRule(
-                        stats,
-                        "EQJOIN_COMMUTE",
-                        "G" + std::to_string(group.id) + " swaps join inputs"
-                    );
-                }
-
-                int left_group_id = expression.inputs[0];
-                int right_group_id = expression.inputs[1];
-                const auto& left_group =
-                    groups_snapshot[left_group_id - 1];
-                for (const auto& left_expression : left_group.expressions) {
-                    if (left_expression.op != "LogicalJoin" ||
-                        left_expression.inputs.size() != 2) {
+                for (const auto& rule : rules) {
+                    if (!shouldRunPlanRewriteRuleAgain(rule, pass) ||
+                        !matchRulePattern(rule.pattern, expression)) {
                         continue;
                     }
 
-                    int a_group_id = left_expression.inputs[0];
-                    int b_group_id = left_expression.inputs[1];
-                    auto a_tables = memoPropertySet(
-                        groups_snapshot[a_group_id - 1].logicalProperty,
-                        "tables"
-                    );
-                    bool top_predicate_uses_a = false;
-                    for (const auto& predicate : expression.details) {
-                        top_predicate_uses_a =
-                            top_predicate_uses_a ||
-                            predicateMentionsAnyTable(predicate, a_tables);
-                    }
-                    if (top_predicate_uses_a) {
-                        continue;
-                    }
-
-                    int bc_group_id = memo.internGroup(
-                        memoPropertyForInputs(
-                            {b_group_id, right_group_id},
-                            expression.details,
-                            memo
-                        )
-                    );
-                    if (memo.addExpression(bc_group_id, {
-                            "LogicalJoin",
-                            {b_group_id, right_group_id},
-                            expression.details
-                        })) {
-                        changed = true;
-                        recordMemoRule(
-                            stats,
-                            "EQJOIN_LTOR",
-                            "G" + std::to_string(group.id) +
-                            " creates G" + std::to_string(bc_group_id)
+                    auto before_groups = memo.groupCount();
+                    auto before_expressions = memo.expressionCount();
+                    RuleBinding binding{
+                        memo,
+                        components,
+                        groups_snapshot,
+                        group,
+                        expression
+                    };
+                    auto generated = rule.apply(binding);
+                    for (auto& generated_expression : generated) {
+                        memo.addExpressionToGroup(
+                            group.id,
+                            std::move(generated_expression)
                         );
                     }
 
-                    if (memo.addExpression(group.id, {
-                            "LogicalJoin",
-                            {a_group_id, bc_group_id},
-                            left_expression.details
-                        })) {
-                        changed = true;
-                        recordMemoRule(
-                            stats,
-                            "EQJOIN_LTOR",
-                            "G" + std::to_string(group.id) +
-                            " adds left-to-right association"
-                        );
+                    bool rule_changed =
+                        memo.groupCount() != before_groups ||
+                        memo.expressionCount() != before_expressions;
+                    if (rule_changed ||
+                        rule.name == "FILTER_PUSH_DOWN" ||
+                        rule.name == "JOIN_PREDICATE_ATTACH") {
+                        recordMemoRule(stats, rule.name, ruleFireDetail(rule, group));
                     }
-                }
-
-                const auto& right_group =
-                    groups_snapshot[right_group_id - 1];
-                for (const auto& right_expression : right_group.expressions) {
-                    if (right_expression.op != "LogicalJoin" ||
-                        right_expression.inputs.size() != 2) {
-                        continue;
-                    }
-
-                    int b_group_id = right_expression.inputs[0];
-                    int c_group_id = right_expression.inputs[1];
-                    auto c_tables = memoPropertySet(
-                        groups_snapshot[c_group_id - 1].logicalProperty,
-                        "tables"
-                    );
-                    bool top_predicate_uses_c = false;
-                    for (const auto& predicate : expression.details) {
-                        top_predicate_uses_c =
-                            top_predicate_uses_c ||
-                            predicateMentionsAnyTable(predicate, c_tables);
-                    }
-                    if (top_predicate_uses_c) {
-                        continue;
-                    }
-
-                    int ab_group_id = memo.internGroup(
-                        memoPropertyForInputs(
-                            {left_group_id, b_group_id},
-                            expression.details,
-                            memo
-                        )
-                    );
-                    if (memo.addExpression(ab_group_id, {
-                            "LogicalJoin",
-                            {left_group_id, b_group_id},
-                            expression.details
-                        })) {
-                        changed = true;
-                        recordMemoRule(
-                            stats,
-                            "EQJOIN_RTOL",
-                            "G" + std::to_string(group.id) +
-                            " creates G" + std::to_string(ab_group_id)
-                        );
-                    }
-
-                    if (memo.addExpression(group.id, {
-                            "LogicalJoin",
-                            {ab_group_id, c_group_id},
-                            right_expression.details
-                        })) {
-                        changed = true;
-                        recordMemoRule(
-                            stats,
-                            "EQJOIN_RTOL",
-                            "G" + std::to_string(group.id) +
-                            " adds right-to-left association"
-                        );
-                    }
+                    changed = changed || rule_changed;
                 }
             }
         }
@@ -6951,94 +7280,8 @@ void applyMemoTransformationRules(Memo& memo,
 
     stats.finalGroups = memo.groupCount();
     stats.finalExpressions = memo.expressionCount();
-}
-
-void applyMemoImplementationRules(Memo& memo, MemoTransformationStats& stats) {
-    auto groups_snapshot = memo.allGroups();
-    for (const auto& group : groups_snapshot) {
-        for (const auto& expression : group.expressions) {
-            if (expression.op == "LogicalScan") {
-                if (memo.addExpression(group.id, {
-                        "Scan",
-                        expression.inputs,
-                        expression.details
-                    })) {
-                    recordMemoRule(
-                        stats,
-                        "GET_TO_SCAN",
-                        "G" + std::to_string(group.id) +
-                        " implements logical scan"
-                    );
-                }
-            } else if (expression.op == "LogicalFilter") {
-                if (memo.addExpression(group.id, {
-                        "Filter",
-                        expression.inputs,
-                        expression.details
-                    })) {
-                    recordMemoRule(
-                        stats,
-                        "SELECT_TO_FILTER",
-                        "G" + std::to_string(group.id) +
-                        " implements logical filter"
-                    );
-                }
-            } else if (expression.op == "LogicalProject") {
-                if (memo.addExpression(group.id, {
-                        "Project",
-                        expression.inputs,
-                        expression.details
-                    })) {
-                    recordMemoRule(
-                        stats,
-                        "PROJECT_TO_PROJECT",
-                        "G" + std::to_string(group.id) +
-                        " implements logical project"
-                    );
-                }
-            } else if (expression.op == "LogicalAggregate") {
-                if (memo.addExpression(group.id, {
-                        "HashAggregate",
-                        expression.inputs,
-                        expression.details
-                    })) {
-                    recordMemoRule(
-                        stats,
-                        "AGG_TO_HASH_AGG",
-                        "G" + std::to_string(group.id) +
-                        " implements logical aggregate"
-                    );
-                }
-            } else if (expression.op == "LogicalJoin") {
-                for (const auto& implementation :
-                     {"NestedLoopJoin", "HashJoin", "SortMergeJoin"}) {
-                    if (memo.addExpression(group.id, {
-                            implementation,
-                            expression.inputs,
-                            expression.details
-                        })) {
-                        std::string rule_name;
-                        if (std::string(implementation) == "NestedLoopJoin") {
-                            rule_name = "EQJOIN_TO_LOOPS_JOIN";
-                        } else if (std::string(implementation) == "HashJoin") {
-                            rule_name = "EQJOIN_TO_HASH_JOIN";
-                        } else {
-                            rule_name = "EQJOIN_TO_MERGE_JOIN";
-                        }
-                        recordMemoRule(
-                            stats,
-                            rule_name,
-                            "G" + std::to_string(group.id) +
-                            " implements logical join"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    stats.finalGroups = memo.groupCount();
-    stats.finalExpressions = memo.expressionCount();
+    stats.mergedGroups = memo.mergedGroupCount();
+    stats.deduplicatedExpressions = memo.deduplicatedExpressionCount();
 }
 
 void printMemo(const Memo& memo) {
@@ -7047,7 +7290,7 @@ void printMemo(const Memo& memo) {
         std::cout << "  G" << group.id << " " << group.logicalProperty
                   << std::endl;
         for (const auto& expression : group.expressions) {
-            std::cout << "    " << expression.op;
+            std::cout << "    E" << expression.id << " " << expression.op;
             if (!expression.inputs.empty()) {
                 std::cout << "(";
                 for (size_t i = 0; i < expression.inputs.size(); i++) {
@@ -7846,10 +8089,9 @@ struct PhysicalJoinPlan {
     double finalRows = 0.0;
     double finalPages = 0.0;
     double totalCost = 0.0;
-    std::string deliveredTrait = "unordered";
+    std::string deliveredProperty = "unordered";
     size_t sortEnforcers = 0;
     double enforcerCost = 0.0;
-    std::vector<size_t> finalSortAttrs;
     std::vector<ColumnRef> finalSortColumns;
 };
 
@@ -7871,8 +8113,6 @@ struct PlanSnapshot {
     double estimatedCost = 0.0;
     QueryComponents components;
     std::vector<PhysicalJoinKind> joinKinds;
-    std::vector<size_t> finalSortAttrs;
-    std::vector<ColumnRef> finalSortColumns;
     std::shared_ptr<JoinPlanNode> planRoot;
     std::string order;
 };
@@ -7906,8 +8146,6 @@ PlanSnapshot makePlanSnapshot(size_t transformations,
     snapshot.estimatedCost = plan.physicalPlan.totalCost;
     snapshot.components = plan.components;
     snapshot.joinKinds = plan.physicalPlan.joinKinds;
-    snapshot.finalSortAttrs = plan.physicalPlan.finalSortAttrs;
-    snapshot.finalSortColumns = plan.physicalPlan.finalSortColumns;
     snapshot.planRoot = plan.planRoot;
     snapshot.order = plan.planDescription.empty()
         ? joinStrings(writtenJoinOrder(plan.components), " -> ")
@@ -7957,6 +8195,20 @@ double tupleMaterializationCost(double rows) {
     return 0.10 * std::max(1.0, rows);
 }
 
+PhysicalJoinKind chooseCheapestJoin(const PhysicalJoinCostStep& step) {
+    PhysicalJoinKind chosen = PhysicalJoinKind::HashJoin;
+    double best_cost = step.hashJoinCost;
+
+    if (step.nestedLoopCost < best_cost) {
+        best_cost = step.nestedLoopCost;
+        chosen = PhysicalJoinKind::NestedLoopJoin;
+    }
+    if (step.sortMergeCost < best_cost) {
+        chosen = PhysicalJoinKind::SortMergeJoin;
+    }
+    return chosen;
+}
+
 double costForKind(const PhysicalJoinCostStep& step, PhysicalJoinKind kind) {
     switch (kind) {
         case PhysicalJoinKind::NestedLoopJoin:
@@ -8003,16 +8255,19 @@ PhysicalJoinCostStep estimatePhysicalJoinTrees(const QueryComponents& components
     step.rightAccessCost = right_total_cost;
     step.outputRows = output_rows;
     step.outputPages = output_pages;
+    double final_sort_cost = ordered_output_required ? sortCost(output_pages) : 0.0;
     step.orderedOutputRequired = ordered_output_required;
     step.nestedLoopCost = left_total_cost + right_total_cost +
         tupleCompareCost(left_rows * right_rows) +
-        tupleMaterializationCost(output_rows);
+        tupleMaterializationCost(output_rows) + final_sort_cost;
     step.hashJoinCost = left_total_cost + right_total_cost +
         tupleHashCost(left_rows + right_rows) +
-        tupleMaterializationCost(output_rows);
+        tupleMaterializationCost(output_rows) + final_sort_cost;
     step.sortMergeCost = left_total_cost + right_total_cost +
+        sortCost(left_pages) + sortCost(right_pages) +
         tupleCompareCost(left_rows + right_rows) +
         tupleMaterializationCost(output_rows);
+    step.chosen = chooseCheapestJoin(step);
     return step;
 }
 
@@ -8145,6 +8400,26 @@ std::string prettyJoinPlanTree(const std::shared_ptr<JoinPlanNode>& node,
     return out.str();
 }
 
+size_t bitCount(uint64_t mask) {
+    size_t count = 0;
+    while (mask != 0) {
+        count += mask & 1ULL;
+        mask >>= 1ULL;
+    }
+    return count;
+}
+
+std::set<std::string> tablesForMask(const std::vector<std::string>& table_names,
+                                    uint64_t mask) {
+    std::set<std::string> tables;
+    for (size_t i = 0; i < table_names.size(); i++) {
+        if ((mask & (1ULL << i)) != 0) {
+            tables.insert(table_names[i]);
+        }
+    }
+    return tables;
+}
+
 PlannedQuery makeBasePlanForTable(const QueryComponents& components,
                                   const StatisticsCatalog& stats,
                                   const std::string& table_name) {
@@ -8176,35 +8451,36 @@ PlannedQuery makeBasePlanForTable(const QueryComponents& components,
     return {planned, physical_plan, node};
 }
 
-std::string orderTraitForColumn(const ColumnRef& column) {
+std::string orderPropertyForColumn(const ColumnRef& column) {
     return "ordered by {" + columnLabel(column) + "}";
 }
 
-struct PlanTraitSet {
+struct PhysicalPropertySet {
     std::optional<ColumnRef> orderedBy;
 
-    bool hasOrder() const {
+    bool requiresOrder() const {
         return orderedBy.has_value();
     }
 
     std::string describe() const {
-        return orderedBy ? orderTraitForColumn(*orderedBy) : "unordered";
+        return orderedBy ? orderPropertyForColumn(*orderedBy) : "unordered";
     }
 };
 
-PlanTraitSet orderedByTrait(const ColumnRef& column) {
-    PlanTraitSet trait;
-    trait.orderedBy = column;
-    return trait;
+PhysicalPropertySet unorderedProperty() {
+    return {};
 }
 
-std::string memoCacheKey(const std::string& query,
-                         const PlanTraitSet& traits) {
-    return query + "#" + traits.describe();
+PhysicalPropertySet orderedByProperty(const ColumnRef& column) {
+    PhysicalPropertySet property;
+    property.orderedBy = column;
+    return property;
 }
+
+using PlanTraitSet = PhysicalPropertySet;
 
 struct MemoWinnerSearch {
-    int finalGroupId = 0;
+    GroupId finalGroupId = INVALID_GROUP_ID;
     std::string requiredTrait = "unordered";
     std::string deliveredTrait = "unordered";
     std::string expression;
@@ -8218,9 +8494,9 @@ struct MemoPlanChoice {
 };
 
 MemoPlanChoice addSortEnforcer(MemoPlanChoice choice,
-                               const PlanTraitSet& required_traits) {
-    if (!required_traits.hasOrder() ||
-        choice.physicalPlan.deliveredTrait == required_traits.describe()) {
+                               const PhysicalPropertySet& required_property) {
+    if (!required_property.requiresOrder() ||
+        choice.physicalPlan.deliveredProperty == required_property.describe()) {
         return choice;
     }
 
@@ -8228,10 +8504,101 @@ MemoPlanChoice addSortEnforcer(MemoPlanChoice choice,
     choice.physicalPlan.totalCost += enforcer_cost;
     choice.physicalPlan.enforcerCost += enforcer_cost;
     choice.physicalPlan.sortEnforcers++;
-    choice.physicalPlan.finalSortColumns = {*required_traits.orderedBy};
-    choice.physicalPlan.deliveredTrait = required_traits.describe();
+    choice.physicalPlan.finalSortColumns = {*required_property.orderedBy};
+    choice.physicalPlan.deliveredProperty = required_property.describe();
     return choice;
 }
+
+class OptimizerAlgebra {
+public:
+    virtual ~OptimizerAlgebra() = default;
+
+    virtual std::string name() const = 0;
+    virtual std::vector<std::string> logicalOperators() const = 0;
+    virtual std::vector<std::string> physicalAlgorithms() const = 0;
+
+    virtual Memo buildInitialMemo(const QueryComponents& components) const = 0;
+
+    virtual PlannedQuery makeBasePlan(const QueryComponents& components,
+                                      const StatisticsCatalog& stats,
+                                      const std::string& table_name) const = 0;
+
+    virtual PhysicalJoinCostStep estimateJoin(
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const JoinClause& join,
+        double left_rows,
+        double left_pages,
+        double left_total_cost,
+        double right_rows,
+        double right_pages,
+        double right_access_cost,
+        bool ordered_output_required) const = 0;
+};
+
+class BuzzDBOptimizerAlgebra : public OptimizerAlgebra {
+public:
+    std::string name() const override {
+        return "BuzzDB relational algebra";
+    }
+
+    std::vector<std::string> logicalOperators() const override {
+        return {
+            "LogicalScan",
+            "LogicalFilter",
+            "LogicalEquiJoin",
+            "LogicalProject",
+            "LogicalAggregate"
+        };
+    }
+
+    std::vector<std::string> physicalAlgorithms() const override {
+        return {
+            "Scan",
+            "Filter",
+            "NestedLoopJoin",
+            "HashJoin",
+            "SortMergeJoin",
+            "HashAggregate"
+        };
+    }
+
+    Memo buildInitialMemo(const QueryComponents& components) const override {
+        auto logical_plan = buildLogicalPlan(components);
+        return buildMemo(*logical_plan);
+    }
+
+    PlannedQuery makeBasePlan(const QueryComponents& components,
+                              const StatisticsCatalog& stats,
+                              const std::string& table_name) const override {
+        return makeBasePlanForTable(components, stats, table_name);
+    }
+
+    PhysicalJoinCostStep estimateJoin(
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const JoinClause& join,
+        double left_rows,
+        double left_pages,
+        double left_total_cost,
+        double right_rows,
+        double right_pages,
+        double right_access_cost,
+        bool ordered_output_required) const override {
+        return estimatePhysicalJoinTrees(
+            components,
+            stats,
+            join,
+            left_rows,
+            left_pages,
+            left_total_cost,
+            right_rows,
+            right_pages,
+            right_access_cost,
+            ordered_output_required
+        );
+    }
+};
 
 PhysicalJoinPlan combineMemoJoinPlans(const PhysicalJoinPlan& left_plan,
                                       const PhysicalJoinPlan& right_plan,
@@ -8257,12 +8624,11 @@ PhysicalJoinPlan combineMemoJoinPlans(const PhysicalJoinPlan& left_plan,
     plan.finalPages = step.outputPages;
     plan.sortEnforcers = left_plan.sortEnforcers + right_plan.sortEnforcers;
     plan.enforcerCost = left_plan.enforcerCost + right_plan.enforcerCost;
-    plan.deliveredTrait = "unordered";
+    plan.deliveredProperty = step.deliveredOrder;
     return plan;
 }
 
-std::optional<PhysicalJoinKind> memoImplementationJoinKind(
-    const std::string& op) {
+std::optional<PhysicalJoinKind> memoImplementationJoinKind(const std::string& op) {
     if (op == "NestedLoopJoin") {
         return PhysicalJoinKind::NestedLoopJoin;
     }
@@ -8275,32 +8641,30 @@ std::optional<PhysicalJoinKind> memoImplementationJoinKind(
     return std::nullopt;
 }
 
-bool memoPassthroughPhysicalOperator(const std::string& op) {
-    return op == "Filter" || op == "Project" || op == "HashAggregate";
-}
-
 std::optional<MemoPlanChoice> chooseMemoGroupPlan(
     const Memo& memo,
     const QueryComponents& components,
     const StatisticsCatalog& stats,
-    int group_id,
-    const PlanTraitSet& required_traits,
+    const OptimizerAlgebra& algebra,
+    GroupId group_id,
+    const PhysicalPropertySet& required_property,
     const std::vector<JoinClause>& edges,
-    std::map<std::pair<int, std::string>, MemoPlanChoice>& winners,
-    std::set<std::pair<int, std::string>>& active_groups) {
-    auto required_trait = required_traits.describe();
-    auto cached = winners.find({group_id, required_trait});
+    std::map<std::pair<GroupId, std::string>, MemoPlanChoice>& winners,
+    std::set<std::pair<GroupId, std::string>>& active_groups) {
+    auto required_property_name = required_property.describe();
+    auto cache_key = std::make_pair(group_id, required_property_name);
+    auto cached = winners.find(cache_key);
     if (cached != winners.end()) {
         return cached->second;
     }
-    if (active_groups.find({group_id, required_trait}) != active_groups.end()) {
+    if (active_groups.find(cache_key) != active_groups.end()) {
         return std::nullopt;
     }
-    active_groups.insert({group_id, required_trait});
+    active_groups.insert(cache_key);
 
     const auto& group = memo.allGroups()[group_id - 1];
     std::optional<MemoPlanChoice> best;
-    PlanTraitSet unordered_traits;
+    auto unordered_property_value = unorderedProperty();
 
     for (const auto& expression : group.expressions) {
         std::optional<MemoPlanChoice> candidate;
@@ -8308,7 +8672,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
         if (expression.op == "Scan") {
             auto tables = memoPropertySet(group.logicalProperty, "tables");
             if (tables.size() == 1) {
-                auto base = makeBasePlanForTable(
+                auto base = algebra.makeBasePlan(
                     components,
                     stats,
                     *tables.begin()
@@ -8318,14 +8682,16 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                     base.physicalPlan
                 };
             }
-        } else if (memoPassthroughPhysicalOperator(expression.op) &&
+        } else if ((expression.op == "Filter" ||
+                    expression.op == "HashAggregate") &&
                    expression.inputs.size() == 1) {
             candidate = chooseMemoGroupPlan(
                 memo,
                 components,
                 stats,
+                algebra,
                 expression.inputs[0],
-                required_traits,
+                required_property,
                 edges,
                 winners,
                 active_groups
@@ -8336,8 +8702,9 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                 memo,
                 components,
                 stats,
+                algebra,
                 expression.inputs[0],
-                unordered_traits,
+                unordered_property_value,
                 edges,
                 winners,
                 active_groups
@@ -8346,8 +8713,9 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                 memo,
                 components,
                 stats,
+                algebra,
                 expression.inputs[1],
-                unordered_traits,
+                unordered_property_value,
                 edges,
                 winners,
                 active_groups
@@ -8359,17 +8727,17 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                     edges
                 );
                 if (edge) {
-                    PlanTraitSet left_required;
-                    PlanTraitSet right_required;
+                    PhysicalPropertySet left_required;
+                    PhysicalPropertySet right_required;
                     ColumnRef delivered_order_column;
                     if (*join_kind == PhysicalJoinKind::SortMergeJoin) {
                         if (planContainsTable(*left->planRoot, edge->left.tableName)) {
-                            left_required = orderedByTrait(edge->left);
-                            right_required = orderedByTrait(edge->right);
+                            left_required = orderedByProperty(edge->left);
+                            right_required = orderedByProperty(edge->right);
                             delivered_order_column = edge->left;
                         } else {
-                            left_required = orderedByTrait(edge->right);
-                            right_required = orderedByTrait(edge->left);
+                            left_required = orderedByProperty(edge->right);
+                            right_required = orderedByProperty(edge->left);
                             delivered_order_column = edge->right;
                         }
 
@@ -8377,6 +8745,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                             memo,
                             components,
                             stats,
+                            algebra,
                             expression.inputs[0],
                             left_required,
                             edges,
@@ -8387,6 +8756,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                             memo,
                             components,
                             stats,
+                            algebra,
                             expression.inputs[1],
                             right_required,
                             edges,
@@ -8398,23 +8768,23 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                         }
                     }
 
-                    auto step = estimatePhysicalJoinTrees(
+                    auto step = algebra.estimateJoin(
                         components,
                         stats,
                         *edge,
                         left->planRoot->rows,
                         left->planRoot->pages,
-                        left->physicalPlan.totalCost,
+                        left->planRoot->totalCost,
                         right->planRoot->rows,
                         right->planRoot->pages,
-                        right->physicalPlan.totalCost,
+                        right->planRoot->totalCost,
                         false
                     );
                     step.chosen = *join_kind;
                     step.leftRequiredOrder = left_required.describe();
                     step.rightRequiredOrder = right_required.describe();
                     step.deliveredOrder = *join_kind == PhysicalJoinKind::SortMergeJoin
-                        ? orderTraitForColumn(delivered_order_column)
+                        ? orderPropertyForColumn(delivered_order_column)
                         : std::string("unordered");
 
                     auto joined = std::make_shared<JoinPlanNode>();
@@ -8436,7 +8806,6 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                         right->physicalPlan,
                         step
                     );
-                    physical_plan.deliveredTrait = step.deliveredOrder;
                     joined->totalCost = physical_plan.totalCost;
 
                     candidate = MemoPlanChoice{
@@ -8448,7 +8817,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
         }
 
         if (candidate) {
-            candidate = addSortEnforcer(*candidate, required_traits);
+            candidate = addSortEnforcer(*candidate, required_property);
         }
         if (candidate &&
             (!best ||
@@ -8458,10 +8827,9 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
         }
     }
 
-    active_groups.erase({group_id, required_trait});
-
+    active_groups.erase(cache_key);
     if (best) {
-        winners[{group_id, required_trait}] = *best;
+        winners[cache_key] = *best;
     }
     return best;
 }
@@ -8469,14 +8837,16 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
 MemoWinnerSearch chooseMemoWinner(Memo& memo,
                                   const QueryComponents& components,
                                   const StatisticsCatalog& stats,
-                                  const PlanTraitSet& required_traits) {
+                                  const OptimizerAlgebra& algebra,
+    const PlanTraitSet& required_traits) {
     auto edges = joinGraphEdges(components);
-    std::map<std::pair<int, std::string>, MemoPlanChoice> group_winners;
-    std::set<std::pair<int, std::string>> active_groups;
+    std::map<std::pair<GroupId, std::string>, MemoPlanChoice> group_winners;
+    std::set<std::pair<GroupId, std::string>> active_groups;
     auto final_choice = chooseMemoGroupPlan(
         memo,
         components,
         stats,
+        algebra,
         memo.finalGroupId(),
         required_traits,
         edges,
@@ -8484,7 +8854,7 @@ MemoWinnerSearch chooseMemoWinner(Memo& memo,
         active_groups
     );
     if (!final_choice) {
-        throw std::runtime_error("Memo winner search found no physical implementation.");
+        throw std::runtime_error("Memo winner search found no executable expression.");
     }
     PlannedQuery planned_query{
         components,
@@ -8495,7 +8865,7 @@ MemoWinnerSearch chooseMemoWinner(Memo& memo,
     MemoWinnerSearch winner;
     winner.finalGroupId = memo.finalGroupId();
     winner.requiredTrait = required_traits.describe();
-    winner.deliveredTrait = planned_query.physicalPlan.deliveredTrait;
+    winner.deliveredTrait = planned_query.physicalPlan.deliveredProperty;
     winner.expression = planned_query.planRoot
         ? memoPhysicalPlanExpression(planned_query.planRoot)
         : "Scan(" + planned_query.components.tableName + ")";
@@ -8514,6 +8884,81 @@ MemoWinnerSearch chooseMemoWinner(Memo& memo,
     return winner;
 }
 
+class SearchSpace {
+public:
+    virtual ~SearchSpace() = default;
+
+    virtual std::string name() const = 0;
+    virtual std::vector<std::string> rules() const = 0;
+    virtual void expand(Memo& memo,
+                        const QueryComponents& components,
+                        MemoTransformationStats& stats) const = 0;
+};
+
+class MemoRewriteSearchSpace : public SearchSpace {
+public:
+    std::string name() const override {
+        return "matcher-driven memo rewrite and implementation search space";
+    }
+
+    std::vector<std::string> rules() const override {
+        return {
+            "FILTER_PUSH_DOWN",
+            "JOIN_PREDICATE_ATTACH",
+            "EQJOIN_COMMUTE",
+            "EQJOIN_LTOR",
+            "EQJOIN_RTOL",
+            "LOGICAL_SCAN_TO_SCAN",
+            "SELECT_TO_FILTER",
+            "AGG_TO_HASH_AGG",
+            "EQJOIN_TO_LOOPS_JOIN",
+            "EQJOIN_TO_HASH_JOIN",
+            "EQJOIN_TO_MERGE_JOIN"
+        };
+    }
+
+    void expand(Memo& memo,
+                const QueryComponents& components,
+                MemoTransformationStats& stats) const override {
+        applyMemoTransformationRules(memo, components, stats);
+    }
+};
+
+class SearchStrategy {
+public:
+    virtual ~SearchStrategy() = default;
+
+    virtual std::string name() const = 0;
+    virtual MemoWinnerSearch chooseWinner(
+        Memo& memo,
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const OptimizerAlgebra& algebra,
+        const PlanTraitSet& required_traits) const = 0;
+};
+
+class MemoWinnerSearchStrategy : public SearchStrategy {
+public:
+    std::string name() const override {
+        return "memo winner search";
+    }
+
+    MemoWinnerSearch chooseWinner(
+        Memo& memo,
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const OptimizerAlgebra& algebra,
+        const PlanTraitSet& required_traits) const override {
+        return chooseMemoWinner(
+            memo,
+            components,
+            stats,
+            algebra,
+            required_traits
+        );
+    }
+};
+
 struct OptimizerResult {
     QueryComponents logicalQuery;
     Memo memo;
@@ -8521,11 +8966,20 @@ struct OptimizerResult {
     PlannedQuery plannedQuery;
     PlanTraitSet requiredTraits;
     MemoWinnerSearch memoWinner;
+    std::string algebraName;
+    std::string searchSpaceName;
+    std::string searchStrategyName;
+    std::vector<std::string> logicalOperators;
+    std::vector<std::string> physicalAlgorithms;
+    std::vector<std::string> searchSpaceRules;
 };
 
 class Optimizer {
     const StatisticsCatalog& stats;
     PlanTraitSet requiredTraits;
+    BuzzDBOptimizerAlgebra algebra;
+    MemoRewriteSearchSpace searchSpace;
+    MemoWinnerSearchStrategy searchStrategy;
 
 public:
     Optimizer(const StatisticsCatalog& stats,
@@ -8534,15 +8988,14 @@ public:
           requiredTraits(requiredTraits) {}
 
     OptimizerResult optimize(const QueryComponents& components) const {
-        auto logical_plan = buildLogicalPlan(components);
-        auto memo = buildMemo(*logical_plan);
+        auto memo = algebra.buildInitialMemo(components);
         MemoTransformationStats memo_stats;
-        applyMemoTransformationRules(memo, components, memo_stats);
-        applyMemoImplementationRules(memo, memo_stats);
-        auto memo_winner = chooseMemoWinner(
+        searchSpace.expand(memo, components, memo_stats);
+        auto memo_winner = searchStrategy.chooseWinner(
             memo,
             components,
             stats,
+            algebra,
             requiredTraits
         );
 
@@ -8552,15 +9005,30 @@ public:
             memo_stats,
             memo_winner.plannedQuery,
             requiredTraits,
-            memo_winner
+            memo_winner,
+            algebra.name(),
+            searchSpace.name(),
+            searchStrategy.name(),
+            algebra.logicalOperators(),
+            algebra.physicalAlgorithms(),
+            searchSpace.rules()
         };
     }
 };
 
 void printOptimizerSummary(const OptimizerResult& result) {
     std::cout << "\nOptimizer boundary:" << std::endl;
-    std::cout << "  framework: Cascades-style memo optimizer boundary" << std::endl;
-    std::cout << "  search: memo winner search" << std::endl;
+    std::cout << "  framework: optd-style memo with physical properties and enforcers" << std::endl;
+    std::cout << "  algebra: " << result.algebraName << std::endl;
+    std::cout << "    logical operators: "
+              << joinStrings(result.logicalOperators, ", ") << std::endl;
+    std::cout << "    physical algorithms: "
+              << joinStrings(result.physicalAlgorithms, ", ") << std::endl;
+    std::cout << "  search space: " << result.searchSpaceName << std::endl;
+    std::cout << "    rules: "
+              << joinStrings(result.searchSpaceRules, ", ") << std::endl;
+    std::cout << "  search strategy: "
+              << result.searchStrategyName << std::endl;
     std::cout << "  required traits: "
               << result.requiredTraits.describe() << std::endl;
     std::cout << "  property model: MergeJoin requests ordered join-key inputs; Sort enforces missing order"
@@ -8577,12 +9045,12 @@ void printOptimizerSummary(const OptimizerResult& result) {
     std::cout << "  delivered trait: "
               << result.memoWinner.deliveredTrait << std::endl;
     if (result.plannedQuery.physicalPlan.sortEnforcers > 0) {
-        std::cout << "  enforcer: Sort adds "
+        std::cout << "  enforcer: SORT_ENFORCER adds "
                   << formatEstimate(result.plannedQuery.physicalPlan.enforcerCost)
                   << " cost";
         if (!result.plannedQuery.physicalPlan.finalSortColumns.empty()) {
             std::cout << " for "
-                      << orderTraitForColumn(
+                      << orderPropertyForColumn(
                              result.plannedQuery.physicalPlan.finalSortColumns.front()
                          );
         }
@@ -8599,6 +9067,10 @@ void printOptimizerSummary(const OptimizerResult& result) {
               << result.memoStats.finalGroups << " group(s), "
               << result.memoStats.finalExpressions << " expression(s)"
               << std::endl;
+    std::cout << "  equivalent group merges: "
+              << result.memoStats.mergedGroups << std::endl;
+    std::cout << "  expression hash deduplications: "
+              << result.memoStats.deduplicatedExpressions << std::endl;
     std::map<std::string, size_t> rule_counts;
     for (const auto& fire : result.memoStats.firedRules) {
         rule_counts[fire.ruleName]++;
@@ -8654,7 +9126,7 @@ void printPhysicalJoinCosts(const QueryComponents& components,
               << std::endl;
     std::cout << "  # HashJoin scans/builds the right side once, then probes with the left stream"
               << std::endl;
-    std::cout << "  # SortMergeJoin requests ordered join-key inputs; Sort enforcers provide missing order"
+    std::cout << "  # SortMergeJoin uses in-memory Sort operators before merge"
               << std::endl;
     if (plan_description.empty()) {
         std::cout << "  chosen join order: "
@@ -8663,11 +9135,6 @@ void printPhysicalJoinCosts(const QueryComponents& components,
     } else if (plan_root) {
         std::cout << "  chosen join tree:" << std::endl;
         std::cout << prettyJoinPlanTree(plan_root, "    ");
-        if (!plan.finalSortColumns.empty()) {
-            std::cout << "    Sort enforcer for "
-                      << orderTraitForColumn(plan.finalSortColumns.front())
-                      << std::endl;
-        }
     } else {
         std::cout << "  chosen join tree: "
                   << plan_description
@@ -8696,18 +9163,13 @@ void printPhysicalJoinCosts(const QueryComponents& components,
                   << formatEstimate(step.hashJoinCost)
                   << " SortMergeJoin cost="
                   << formatEstimate(step.sortMergeCost);
+        if (step.orderedOutputRequired) {
+            std::cout << " (Sort inputs; no final Sort)";
+        }
         std::cout << std::endl;
         std::cout << "    chosen: "
                   << physicalJoinKindName(step.chosen)
                   << std::endl;
-        if (step.chosen == PhysicalJoinKind::SortMergeJoin) {
-            std::cout << "    required child traits: left "
-                      << step.leftRequiredOrder
-                      << ", right " << step.rightRequiredOrder
-                      << std::endl;
-            std::cout << "    delivered trait: "
-                      << step.deliveredOrder << std::endl;
-        }
     }
     std::cout << "  estimated plan cost: "
               << formatEstimate(plan.totalCost)
@@ -8715,12 +9177,6 @@ void printPhysicalJoinCosts(const QueryComponents& components,
               << formatEstimate(plan.finalRows) << "/"
               << formatEstimate(plan.finalPages)
               << std::endl;
-    if (plan.sortEnforcers > 0) {
-        std::cout << "  enforcer cost: "
-                  << formatEstimate(plan.enforcerCost)
-                  << " via " << plan.sortEnforcers
-                  << " Sort operator(s)" << std::endl;
-    }
 }
 
 std::unique_ptr<IPredicate> makeScanFilterPredicate(const QueryComponents& components,
@@ -8766,7 +9222,6 @@ QueryTable executeQuery(const QueryComponents& components,
                         bool print_tuples = true,
                         const std::vector<PhysicalJoinKind>& join_kinds = {},
                         const std::vector<size_t>& final_sort_attrs = {},
-                        const std::vector<ColumnRef>& final_sort_columns = {},
                         const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
     std::map<std::string, size_t> table_offsets;
     std::map<std::string, size_t> table_widths;
@@ -9026,25 +9481,10 @@ QueryTable executeQuery(const QueryComponents& components,
         rootOp = &*equalitySelectOpBuffer;
     }
 
-    std::vector<size_t> resolved_final_sort_attrs = final_sort_attrs;
-    for (const auto& sort_column : final_sort_columns) {
-        auto offset_it = table_offsets.find(sort_column.tableName);
-        auto width_it = table_widths.find(sort_column.tableName);
-        if (offset_it == table_offsets.end() ||
-            width_it == table_widths.end() ||
-            sort_column.attributeIndex < 0 ||
-            static_cast<size_t>(sort_column.attributeIndex) >= width_it->second) {
-            throw std::runtime_error("Sort enforcer column is not in the query output.");
-        }
-        resolved_final_sort_attrs.push_back(
-            offset_it->second + static_cast<size_t>(sort_column.attributeIndex)
-        );
-    }
-
-    if (!resolved_final_sort_attrs.empty()) {
+    if (!final_sort_attrs.empty()) {
         sortOpBuffers.push_back(std::make_unique<SortOperator>(
             *rootOp,
-            resolved_final_sort_attrs
+            final_sort_attrs
         ));
         rootOp = sortOpBuffers.back().get();
     }
@@ -10010,7 +10450,7 @@ public:
                 join_kinds = forced_join_kinds;
             } else {
                 try {
-                    auto cache_key = memoCacheKey(query, {});
+                    auto cache_key = query + "#memo";
                     auto cached = planned_query_cache.find(cache_key);
                     PlannedQuery planned_query;
                     if (cached != planned_query_cache.end()) {
@@ -10044,7 +10484,6 @@ public:
             print_tuples,
             join_kinds,
             final_sort_attrs,
-            {},
             planned_root
         );
         return result;
@@ -10078,8 +10517,7 @@ public:
             txn,
             print_tuples,
             snapshot.joinKinds,
-            snapshot.finalSortAttrs,
-            snapshot.finalSortColumns,
+            {},
             snapshot.planRoot
         );
     }
@@ -10103,7 +10541,7 @@ public:
         printOptimizerSummary(optimizer_result);
         auto planned_query = optimizer_result.plannedQuery;
         planned_query_cache[
-            memoCacheKey(query, optimizer_result.requiredTraits)
+            query + "#memo"
         ] = planned_query;
         printPhysicalJoinCosts(
             planned_query.components,
@@ -10329,15 +10767,14 @@ int main(int argc, char* argv[]) {
     db.execute("ANALYZE");
 
     auto query_txn = db.begin("Q1");
+    std::cout << "\nQuery optimization with memo rules" << std::endl;
+    std::cout << "  Workload: JOB 9-table join query" << std::endl;
+    db.explainQuery(jobJoinQuery());
     auto query_components = parseQuery(jobJoinQuery());
     resolveQueryColumns(query_components, db.catalog);
     ColumnRef required_order{"t", "id", -1};
     resolveColumnRef(required_order, db.catalog, query_components);
-    auto required_traits = orderedByTrait(required_order);
-    std::cout << "\nQuery optimization with memo rules" << std::endl;
-    std::cout << "  Workload: JOB 9-table join query" << std::endl;
-    std::cout << "  Required trait: " << required_traits.describe() << std::endl;
-    db.explainQuery(jobJoinQuery());
+    auto required_traits = orderedByProperty(required_order);
     db.printStatsAndEstimates(jobJoinQuery(), query_txn, required_traits);
 
     auto mcv_stats = loadQueryTableStats(query_components, db.catalog);
@@ -10352,7 +10789,7 @@ int main(int argc, char* argv[]) {
     );
     auto query_end = std::chrono::steady_clock::now();
 
-    std::cout << "\nMemo winner execution with MCV stats and traits:" << std::endl;
+    std::cout << "\nMemo winner execution with MCV stats:" << std::endl;
     std::cout << "  Buffer pool is cleared before timed execution."
               << std::endl;
     std::cout << "  elapsed: " << elapsedMs(query_start, query_end)
@@ -10365,11 +10802,6 @@ int main(int argc, char* argv[]) {
     if (plan.planRoot) {
         std::cout << "  plan:" << std::endl;
         std::cout << prettyJoinPlanTree(plan.planRoot, "    ");
-        if (!plan.physicalPlan.finalSortColumns.empty()) {
-            std::cout << "    Sort enforcer for "
-                      << orderTraitForColumn(plan.physicalPlan.finalSortColumns.front())
-                      << std::endl;
-        }
     }
     if (plan.dpStatesKept > 0) {
         std::cout << "  DP states kept: " << plan.dpStatesKept

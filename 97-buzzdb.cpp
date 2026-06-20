@@ -6229,7 +6229,7 @@ std::string logicalNodeName(LogicalPlanNode::Kind kind) {
         case LogicalPlanNode::Kind::SCAN:
             return "LogicalScan";
         case LogicalPlanNode::Kind::JOIN:
-            return "LogicalJoin";
+            return "LogicalEquiJoin";
         case LogicalPlanNode::Kind::FILTER:
             return "LogicalFilter";
         case LogicalPlanNode::Kind::PROJECT:
@@ -7953,6 +7953,97 @@ struct MemoPlanChoice {
     PhysicalJoinPlan physicalPlan;
 };
 
+class OptimizerAlgebra {
+public:
+    virtual ~OptimizerAlgebra() = default;
+
+    virtual std::string name() const = 0;
+    virtual std::vector<std::string> logicalOperators() const = 0;
+    virtual std::vector<std::string> physicalAlgorithms() const = 0;
+
+    virtual Memo buildInitialMemo(const QueryComponents& components) const = 0;
+
+    virtual PlannedQuery makeBasePlan(const QueryComponents& components,
+                                      const StatisticsCatalog& stats,
+                                      const std::string& table_name) const = 0;
+
+    virtual PhysicalJoinCostStep estimateJoin(
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const JoinClause& join,
+        double left_rows,
+        double left_pages,
+        double left_total_cost,
+        double right_rows,
+        double right_pages,
+        double right_access_cost,
+        bool ordered_output_required) const = 0;
+};
+
+class BuzzDBOptimizerAlgebra : public OptimizerAlgebra {
+public:
+    std::string name() const override {
+        return "BuzzDB relational algebra";
+    }
+
+    std::vector<std::string> logicalOperators() const override {
+        return {
+            "LogicalScan",
+            "LogicalFilter",
+            "LogicalEquiJoin",
+            "LogicalProject",
+            "LogicalAggregate"
+        };
+    }
+
+    std::vector<std::string> physicalAlgorithms() const override {
+        return {
+            "Scan",
+            "Filter",
+            "NestedLoopJoin",
+            "HashJoin",
+            "SortMergeJoin",
+            "HashAggregate"
+        };
+    }
+
+    Memo buildInitialMemo(const QueryComponents& components) const override {
+        auto logical_plan = buildLogicalPlan(components);
+        return buildMemo(*logical_plan);
+    }
+
+    PlannedQuery makeBasePlan(const QueryComponents& components,
+                              const StatisticsCatalog& stats,
+                              const std::string& table_name) const override {
+        return makeBasePlanForTable(components, stats, table_name);
+    }
+
+    PhysicalJoinCostStep estimateJoin(
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const JoinClause& join,
+        double left_rows,
+        double left_pages,
+        double left_total_cost,
+        double right_rows,
+        double right_pages,
+        double right_access_cost,
+        bool ordered_output_required) const override {
+        return estimatePhysicalJoinTrees(
+            components,
+            stats,
+            join,
+            left_rows,
+            left_pages,
+            left_total_cost,
+            right_rows,
+            right_pages,
+            right_access_cost,
+            ordered_output_required
+        );
+    }
+};
+
 PhysicalJoinPlan combineMemoJoinPlans(const PhysicalJoinPlan& left_plan,
                                       const PhysicalJoinPlan& right_plan,
                                       const PhysicalJoinCostStep& step) {
@@ -7982,6 +8073,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
     const Memo& memo,
     const QueryComponents& components,
     const StatisticsCatalog& stats,
+    const OptimizerAlgebra& algebra,
     int group_id,
     bool ordered_output_required,
     const std::vector<JoinClause>& edges,
@@ -8005,7 +8097,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
         if (expression.op == "LogicalScan") {
             auto tables = memoPropertySet(group.logicalProperty, "tables");
             if (tables.size() == 1) {
-                auto base = makeBasePlanForTable(
+                auto base = algebra.makeBasePlan(
                     components,
                     stats,
                     *tables.begin()
@@ -8023,18 +8115,20 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                 memo,
                 components,
                 stats,
+                algebra,
                 expression.inputs[0],
                 ordered_output_required,
                 edges,
                 winners,
                 active_groups
             );
-        } else if (expression.op == "LogicalJoin" &&
+        } else if (expression.op == "LogicalEquiJoin" &&
                    expression.inputs.size() == 2) {
             auto left = chooseMemoGroupPlan(
                 memo,
                 components,
                 stats,
+                algebra,
                 expression.inputs[0],
                 ordered_output_required,
                 edges,
@@ -8045,6 +8139,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                 memo,
                 components,
                 stats,
+                algebra,
                 expression.inputs[1],
                 ordered_output_required,
                 edges,
@@ -8058,7 +8153,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
                     edges
                 );
                 if (edge) {
-                    auto step = estimatePhysicalJoinTrees(
+                    auto step = algebra.estimateJoin(
                         components,
                         stats,
                         *edge,
@@ -8117,6 +8212,7 @@ std::optional<MemoPlanChoice> chooseMemoGroupPlan(
 MemoWinnerSearch chooseMemoWinner(Memo& memo,
                                   const QueryComponents& components,
                                   const StatisticsCatalog& stats,
+                                  const OptimizerAlgebra& algebra,
                                   const PlanTraitSet& required_traits) {
     auto edges = joinGraphEdges(components);
     std::map<int, MemoPlanChoice> group_winners;
@@ -8125,6 +8221,7 @@ MemoWinnerSearch chooseMemoWinner(Memo& memo,
         memo,
         components,
         stats,
+        algebra,
         memo.finalGroupId(),
         required_traits.orderedOutputRequired,
         edges,
@@ -8158,6 +8255,72 @@ MemoWinnerSearch chooseMemoWinner(Memo& memo,
     return winner;
 }
 
+class SearchSpace {
+public:
+    virtual ~SearchSpace() = default;
+
+    virtual std::string name() const = 0;
+    virtual std::vector<std::string> rules() const = 0;
+    virtual void expand(Memo& memo,
+                        const QueryComponents& components,
+                        MemoTransformationStats& stats) const = 0;
+};
+
+class MemoRewriteSearchSpace : public SearchSpace {
+public:
+    std::string name() const override {
+        return "memo rewrite search space";
+    }
+
+    std::vector<std::string> rules() const override {
+        return {
+            "FILTER_PUSH_DOWN",
+            "JOIN_PREDICATE_ATTACH"
+        };
+    }
+
+    void expand(Memo& memo,
+                const QueryComponents& components,
+                MemoTransformationStats& stats) const override {
+        applyMemoTransformationRules(memo, components, stats);
+    }
+};
+
+class SearchStrategy {
+public:
+    virtual ~SearchStrategy() = default;
+
+    virtual std::string name() const = 0;
+    virtual MemoWinnerSearch chooseWinner(
+        Memo& memo,
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const OptimizerAlgebra& algebra,
+        const PlanTraitSet& required_traits) const = 0;
+};
+
+class MemoWinnerSearchStrategy : public SearchStrategy {
+public:
+    std::string name() const override {
+        return "memo winner search";
+    }
+
+    MemoWinnerSearch chooseWinner(
+        Memo& memo,
+        const QueryComponents& components,
+        const StatisticsCatalog& stats,
+        const OptimizerAlgebra& algebra,
+        const PlanTraitSet& required_traits) const override {
+        return chooseMemoWinner(
+            memo,
+            components,
+            stats,
+            algebra,
+            required_traits
+        );
+    }
+};
+
 struct OptimizerResult {
     QueryComponents logicalQuery;
     Memo memo;
@@ -8165,11 +8328,20 @@ struct OptimizerResult {
     PlannedQuery plannedQuery;
     PlanTraitSet requiredTraits;
     MemoWinnerSearch memoWinner;
+    std::string algebraName;
+    std::string searchSpaceName;
+    std::string searchStrategyName;
+    std::vector<std::string> logicalOperators;
+    std::vector<std::string> physicalAlgorithms;
+    std::vector<std::string> searchSpaceRules;
 };
 
 class Optimizer {
     const StatisticsCatalog& stats;
     PlanTraitSet requiredTraits;
+    BuzzDBOptimizerAlgebra algebra;
+    MemoRewriteSearchSpace searchSpace;
+    MemoWinnerSearchStrategy searchStrategy;
 
 public:
     Optimizer(const StatisticsCatalog& stats,
@@ -8178,14 +8350,14 @@ public:
           requiredTraits(requiredTraits) {}
 
     OptimizerResult optimize(const QueryComponents& components) const {
-        auto logical_plan = buildLogicalPlan(components);
-        auto memo = buildMemo(*logical_plan);
+        auto memo = algebra.buildInitialMemo(components);
         MemoTransformationStats memo_stats;
-        applyMemoTransformationRules(memo, components, memo_stats);
-        auto memo_winner = chooseMemoWinner(
+        searchSpace.expand(memo, components, memo_stats);
+        auto memo_winner = searchStrategy.chooseWinner(
             memo,
             components,
             stats,
+            algebra,
             requiredTraits
         );
 
@@ -8195,15 +8367,30 @@ public:
             memo_stats,
             memo_winner.plannedQuery,
             requiredTraits,
-            memo_winner
+            memo_winner,
+            algebra.name(),
+            searchSpace.name(),
+            searchStrategy.name(),
+            algebra.logicalOperators(),
+            algebra.physicalAlgorithms(),
+            searchSpace.rules()
         };
     }
 };
 
 void printOptimizerSummary(const OptimizerResult& result) {
     std::cout << "\nOptimizer boundary:" << std::endl;
-    std::cout << "  framework: Cascades-style memo optimizer boundary" << std::endl;
-    std::cout << "  search: memo winner search" << std::endl;
+    std::cout << "  framework: OPT++-style optimizer components" << std::endl;
+    std::cout << "  algebra: " << result.algebraName << std::endl;
+    std::cout << "    logical operators: "
+              << joinStrings(result.logicalOperators, ", ") << std::endl;
+    std::cout << "    physical algorithms: "
+              << joinStrings(result.physicalAlgorithms, ", ") << std::endl;
+    std::cout << "  search space: " << result.searchSpaceName << std::endl;
+    std::cout << "    rules: "
+              << joinStrings(result.searchSpaceRules, ", ") << std::endl;
+    std::cout << "  search strategy: "
+              << result.searchStrategyName << std::endl;
     std::cout << "  required traits: "
               << result.requiredTraits.describe() << std::endl;
     std::cout << "\nMemo winner search:" << std::endl;
