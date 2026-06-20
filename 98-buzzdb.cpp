@@ -6640,7 +6640,7 @@ public:
     GroupId internGroup(const std::string& logical_property) {
         auto it = groupByProperty.find(logical_property);
         if (it != groupByProperty.end()) {
-            return mergeGroups(it->second, it->second);
+            return it->second;
         }
 
         GroupId group_id = static_cast<GroupId>(groups.size() + 1);
@@ -6671,10 +6671,10 @@ public:
     }
 
     GroupId mergeGroups(GroupId target_group_id, GroupId source_group_id) {
-        groupMergeCount++;
         if (target_group_id == source_group_id) {
             return target_group_id;
         }
+        groupMergeCount++;
 
         auto& source = groupFor(source_group_id);
         auto source_expressions = source.expressions;

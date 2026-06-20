@@ -6640,7 +6640,7 @@ public:
     GroupId internGroup(const std::string& logical_property) {
         auto it = groupByProperty.find(logical_property);
         if (it != groupByProperty.end()) {
-            return mergeGroups(it->second, it->second);
+            return it->second;
         }
 
         GroupId group_id = static_cast<GroupId>(groups.size() + 1);
@@ -6671,10 +6671,10 @@ public:
     }
 
     GroupId mergeGroups(GroupId target_group_id, GroupId source_group_id) {
-        groupMergeCount++;
         if (target_group_id == source_group_id) {
             return target_group_id;
         }
+        groupMergeCount++;
 
         auto& source = groupFor(source_group_id);
         auto source_expressions = source.expressions;
@@ -7076,27 +7076,33 @@ std::vector<MemoExpression> associateRightToLeft(RuleBinding& binding) {
 }
 
 std::vector<OptimizerRule> memoTransformationRules() {
-    auto root_pattern = matchOpPattern("LogicalAggregate", {pickOnePattern()});
+    auto filter_pattern = matchOpPattern("LogicalFilter", {pickOnePattern()});
+    auto project_pattern = matchOpPattern("LogicalProject", {pickOnePattern()});
+    auto aggregate_pattern = matchOpPattern("LogicalAggregate", {pickOnePattern()});
     auto join_pattern = matchOpPattern(
         "LogicalEquiJoin",
         {pickOnePattern(), pickOnePattern()}
     );
 
-    return {
-        {
+    std::vector<OptimizerRule> rules;
+    for (const auto& root_pattern : {filter_pattern, project_pattern, aggregate_pattern}) {
+        rules.push_back({
             "FILTER_PUSH_DOWN",
             RuleKind::Transformation,
             100,
             root_pattern,
             addRewrittenLogicalPlan
-        },
-        {
+        });
+        rules.push_back({
             "JOIN_PREDICATE_ATTACH",
             RuleKind::Transformation,
             90,
             root_pattern,
             addRewrittenLogicalPlan
-        },
+        });
+    }
+
+    std::vector<OptimizerRule> rest = {
         {
             "EQJOIN_COMMUTE",
             RuleKind::Transformation,
@@ -7119,6 +7125,8 @@ std::vector<OptimizerRule> memoTransformationRules() {
             associateRightToLeft
         }
     };
+    rules.insert(rules.end(), rest.begin(), rest.end());
+    return rules;
 }
 
 std::string ruleFireDetail(const OptimizerRule& rule,

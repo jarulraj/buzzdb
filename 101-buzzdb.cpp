@@ -6641,7 +6641,7 @@ public:
     GroupId internGroup(const std::string& logical_property) {
         auto it = groupByProperty.find(logical_property);
         if (it != groupByProperty.end()) {
-            return mergeGroups(it->second, it->second);
+            return it->second;
         }
 
         GroupId group_id = static_cast<GroupId>(groups.size() + 1);
@@ -6672,10 +6672,10 @@ public:
     }
 
     GroupId mergeGroups(GroupId target_group_id, GroupId source_group_id) {
-        groupMergeCount++;
         if (target_group_id == source_group_id) {
             return target_group_id;
         }
+        groupMergeCount++;
 
         auto& source = groupFor(source_group_id);
         auto source_expressions = source.expressions;
@@ -7122,30 +7122,34 @@ std::vector<MemoExpression> implementSortMergeJoin(RuleBinding& binding) {
 }
 
 std::vector<OptimizerRule> memoTransformationRules() {
-    auto root_pattern = matchOpPattern("LogicalAggregate", {pickOnePattern()});
     auto scan_pattern = matchOpPattern("LogicalScan");
     auto filter_pattern = matchOpPattern("LogicalFilter", {pickOnePattern()});
+    auto project_pattern = matchOpPattern("LogicalProject", {pickOnePattern()});
     auto aggregate_pattern = matchOpPattern("LogicalAggregate", {pickOnePattern()});
     auto join_pattern = matchOpPattern(
         "LogicalEquiJoin",
         {pickOnePattern(), pickOnePattern()}
     );
 
-    return {
-        {
+    std::vector<OptimizerRule> rules;
+    for (const auto& root_pattern : {filter_pattern, project_pattern, aggregate_pattern}) {
+        rules.push_back({
             "FILTER_PUSH_DOWN",
             RuleKind::Transformation,
             100,
             root_pattern,
             addRewrittenLogicalPlan
-        },
-        {
+        });
+        rules.push_back({
             "JOIN_PREDICATE_ATTACH",
             RuleKind::Transformation,
             90,
             root_pattern,
             addRewrittenLogicalPlan
-        },
+        });
+    }
+
+    std::vector<OptimizerRule> rest = {
         {
             "EQJOIN_COMMUTE",
             RuleKind::Transformation,
@@ -7210,6 +7214,8 @@ std::vector<OptimizerRule> memoTransformationRules() {
             implementSortMergeJoin
         }
     };
+    rules.insert(rules.end(), rest.begin(), rest.end());
+    return rules;
 }
 
 std::string ruleFireDetail(const OptimizerRule& rule,
@@ -8653,9 +8659,7 @@ struct SearchStrategyStats {
     size_t winnerCacheHits = 0;
     size_t taskBudget = 0;
     size_t tasksExecuted = 0;
-    double initialIncumbentCost = 0.0;
     double finalCostBound = 0.0;
-    bool seededBaselinePlan = false;
     bool stoppedByTaskBudget = false;
 };
 
@@ -9044,8 +9048,7 @@ public:
 enum class CascadesTaskKind {
     OptimizeGroup,
     ApplyRule,
-    OptimizeInput,
-    EnforceSort
+    OptimizeInput
 };
 
 std::optional<JoinClause> joinEdgeBetweenTableSets(
@@ -9092,18 +9095,13 @@ struct CascadesTask {
                                       PhysicalPropertySet property) {
         return {CascadesTaskKind::OptimizeInput, group_id, property, 0, ""};
     }
-
-    static CascadesTask enforceSort(GroupId group_id,
-                                    PhysicalPropertySet property) {
-        return {CascadesTaskKind::EnforceSort, group_id, property, 0, ""};
-    }
 };
 
 class CascadesSearchStrategy : public SearchStrategy {
     SearchStrategyStats lastStats;
     std::map<std::pair<GroupId, std::string>, MemoPlanChoice> groupWinners;
-    std::set<std::pair<GroupId, std::string>> expandedGroups;
-    std::set<std::pair<GroupId, std::string>> ruleExpandedGroups;
+    std::map<std::pair<GroupId, std::string>, size_t> expandedExpressionCounts;
+    std::map<std::pair<GroupId, std::string>, size_t> ruleExpandedExpressionCounts;
     std::map<GroupId, std::vector<CascadesTask>> parentTasks;
     size_t taskBudget = 0;
     GroupId rootGroupId = INVALID_GROUP_ID;
@@ -9124,6 +9122,17 @@ class CascadesSearchStrategy : public SearchStrategy {
     const MemoPlanChoice& winnerFor(GroupId group_id,
                                     const PhysicalPropertySet& property) const {
         return groupWinners.at(keyFor(group_id, property));
+    }
+
+    bool needsOptimization(const Memo& memo,
+                           GroupId group_id,
+                           const PhysicalPropertySet& property) const {
+        auto key = keyFor(group_id, property);
+        auto expanded = expandedExpressionCounts.find(key);
+        size_t expression_count =
+            memo.allGroups()[group_id - 1].expressions.size();
+        return expanded == expandedExpressionCounts.end() ||
+               expanded->second < expression_count;
     }
 
     bool recordCandidate(GroupId group_id,
@@ -9174,6 +9183,7 @@ class CascadesSearchStrategy : public SearchStrategy {
                               const CascadesTask& retry_task,
                               GroupId group_id,
                               PhysicalPropertySet property) {
+        parentTasks[group_id].push_back(retry_task);
         task_queue.push_front(retry_task);
         task_queue.push_front(CascadesTask::optimizeInput(group_id, property));
     }
@@ -9181,11 +9191,13 @@ class CascadesSearchStrategy : public SearchStrategy {
     void applyRulesForGroup(OptimizerContext& context,
                             GroupId group_id,
                             const PhysicalPropertySet& required_property) {
-        if (!ruleExpandedGroups.insert(keyFor(group_id, required_property)).second) {
-            return;
-        }
-
         auto rules = memoTransformationRules();
+        auto expansion_key = keyFor(group_id, required_property);
+        size_t processed_expressions = 0;
+        auto processed = ruleExpandedExpressionCounts.find(expansion_key);
+        if (processed != ruleExpandedExpressionCounts.end()) {
+            processed_expressions = processed->second;
+        }
         auto required_property_name = required_property.describe();
         auto unordered_property_name = unorderedProperty().describe();
         if (context.memoStats) {
@@ -9198,58 +9210,71 @@ class CascadesSearchStrategy : public SearchStrategy {
                     : context.memoStats->initialExpressions;
         }
 
-        for (RuleKind phase : {RuleKind::Transformation, RuleKind::Implementation}) {
+        bool made_progress = true;
+        while (made_progress) {
+            made_progress = false;
             auto groups_snapshot = context.memo.allGroups();
             if (group_id == INVALID_GROUP_ID ||
                 static_cast<size_t>(group_id) > groups_snapshot.size()) {
                 return;
             }
             const auto group = groups_snapshot[group_id - 1];
-            for (const auto& expression : group.expressions) {
-                for (const auto& rule : rules) {
-                    if (rule.kind != phase ||
-                        !matchRulePattern(rule.pattern, expression)) {
-                        continue;
-                    }
-                    if (required_property_name == unordered_property_name &&
-                        rule.name == "EQJOIN_TO_MERGE_JOIN") {
-                        lastStats.rulesSkippedByProperty++;
-                        continue;
-                    }
+            if (processed_expressions >= group.expressions.size()) {
+                break;
+            }
 
-                    auto before_groups = context.memo.groupCount();
-                    auto before_expressions = context.memo.expressionCount();
-                    RuleBinding binding{
-                        context.memo,
-                        context.components,
-                        groups_snapshot,
-                        group,
-                        expression
-                    };
-                    auto generated = rule.apply(binding);
-                    for (auto& generated_expression : generated) {
-                        context.memo.addExpressionToGroup(
-                            group.id,
-                            std::move(generated_expression)
-                        );
-                    }
+            size_t start_index = processed_expressions;
+            processed_expressions = group.expressions.size();
+            for (RuleKind phase : {RuleKind::Transformation, RuleKind::Implementation}) {
+                for (size_t i = start_index; i < group.expressions.size(); i++) {
+                    const auto& expression = group.expressions[i];
+                    for (const auto& rule : rules) {
+                        if (rule.kind != phase ||
+                            !matchRulePattern(rule.pattern, expression)) {
+                            continue;
+                        }
+                        if (required_property_name == unordered_property_name &&
+                            rule.name == "EQJOIN_TO_MERGE_JOIN") {
+                            lastStats.rulesSkippedByProperty++;
+                            continue;
+                        }
 
-                    bool rule_changed =
-                        context.memo.groupCount() != before_groups ||
-                        context.memo.expressionCount() != before_expressions;
-                    if (context.memoStats &&
-                        (rule_changed ||
-                         rule.name == "FILTER_PUSH_DOWN" ||
-                         rule.name == "JOIN_PREDICATE_ATTACH")) {
-                        recordMemoRule(
-                            *context.memoStats,
-                            rule.name,
-                            ruleFireDetail(rule, group)
-                        );
+                        auto before_groups = context.memo.groupCount();
+                        auto before_expressions = context.memo.expressionCount();
+                        RuleBinding binding{
+                            context.memo,
+                            context.components,
+                            groups_snapshot,
+                            group,
+                            expression
+                        };
+                        auto generated = rule.apply(binding);
+                        for (auto& generated_expression : generated) {
+                            context.memo.addExpressionToGroup(
+                                group.id,
+                                std::move(generated_expression)
+                            );
+                        }
+
+                        bool rule_changed =
+                            context.memo.groupCount() != before_groups ||
+                            context.memo.expressionCount() != before_expressions;
+                        made_progress = made_progress || rule_changed;
+                        if (context.memoStats &&
+                            (rule_changed ||
+                             rule.name == "FILTER_PUSH_DOWN" ||
+                             rule.name == "JOIN_PREDICATE_ATTACH")) {
+                            recordMemoRule(
+                                *context.memoStats,
+                                rule.name,
+                                ruleFireDetail(rule, group)
+                            );
+                        }
                     }
                 }
             }
         }
+        ruleExpandedExpressionCounts[expansion_key] = processed_expressions;
 
         if (context.memoStats) {
             context.memoStats->finalGroups = context.memo.groupCount();
@@ -9295,7 +9320,8 @@ class CascadesSearchStrategy : public SearchStrategy {
         if ((expression.op == "Filter" ||
              expression.op == "HashAggregate") &&
             expression.inputs.size() == 1) {
-            if (!hasWinner(expression.inputs[0], task.requiredProperty)) {
+            if (!hasWinner(expression.inputs[0], task.requiredProperty) ||
+                needsOptimization(context.memo, expression.inputs[0], task.requiredProperty)) {
                 scheduleMissingInput(
                     task_queue,
                     task,
@@ -9343,7 +9369,8 @@ class CascadesSearchStrategy : public SearchStrategy {
             }
         }
 
-        if (!hasWinner(expression.inputs[0], left_required)) {
+        if (!hasWinner(expression.inputs[0], left_required) ||
+            needsOptimization(context.memo, expression.inputs[0], left_required)) {
             scheduleMissingInput(
                 task_queue,
                 task,
@@ -9352,7 +9379,8 @@ class CascadesSearchStrategy : public SearchStrategy {
             );
             return;
         }
-        if (!hasWinner(expression.inputs[1], right_required)) {
+        if (!hasWinner(expression.inputs[1], right_required) ||
+            needsOptimization(context.memo, expression.inputs[1], right_required)) {
             scheduleMissingInput(
                 task_queue,
                 task,
@@ -9410,107 +9438,6 @@ class CascadesSearchStrategy : public SearchStrategy {
         }
     }
 
-    void buildParentTasks(OptimizerContext& context) {
-        parentTasks.clear();
-        for (const auto& group : context.memo.allGroups()) {
-            auto parent_required = group.id == rootGroupId
-                ? context.requiredTraits
-                : unorderedProperty();
-            for (size_t i = 0; i < group.expressions.size(); i++) {
-                const auto& expression = group.expressions[i];
-                if (expression.op != "Filter" &&
-                    expression.op != "HashAggregate" &&
-                    !memoImplementationJoinKind(expression.op)) {
-                    continue;
-                }
-                for (GroupId input_group_id : expression.inputs) {
-                    parentTasks[input_group_id].push_back(
-                        CascadesTask::applyRule(
-                            group.id,
-                            parent_required,
-                            i,
-                            expression.op
-                        )
-                    );
-                }
-            }
-        }
-    }
-
-    void seedRandomOrderHashPlan(OptimizerContext& context,
-                                 const std::vector<JoinClause>& edges) {
-        auto start_order = writtenJoinOrder(context.components);
-        auto current = context.algebra.makeBasePlan(
-            context.components,
-            context.stats,
-            start_order.front()
-        );
-        MemoPlanChoice choice{current.planRoot, current.physicalPlan};
-
-        for (size_t i = 1; i < start_order.size(); i++) {
-            auto right = context.algebra.makeBasePlan(
-                context.components,
-                context.stats,
-                start_order[i]
-            );
-            auto edge = joinEdgeBetweenPlans(
-                *choice.planRoot,
-                *right.planRoot,
-                edges
-            );
-            if (!edge) {
-                return;
-            }
-
-            auto step = context.algebra.estimateJoin(
-                context.components,
-                context.stats,
-                *edge,
-                choice.planRoot->rows,
-                choice.planRoot->pages,
-                choice.planRoot->totalCost,
-                right.planRoot->rows,
-                right.planRoot->pages,
-                right.planRoot->totalCost,
-                false
-            );
-            step.chosen = PhysicalJoinKind::HashJoin;
-            step.leftRequiredOrder = unorderedProperty().describe();
-            step.rightRequiredOrder = unorderedProperty().describe();
-            step.deliveredOrder = "unordered";
-
-            auto joined = std::make_shared<JoinPlanNode>();
-            joined->isLeaf = false;
-            joined->left = choice.planRoot;
-            joined->right = right.planRoot;
-            joined->join = *edge;
-            joined->joinKind = PhysicalJoinKind::HashJoin;
-            joined->tables = joined->left->tables;
-            joined->tables.insert(
-                joined->tables.end(),
-                joined->right->tables.begin(),
-                joined->right->tables.end()
-            );
-            joined->rows = step.outputRows;
-            joined->pages = step.outputPages;
-
-            auto plan = combineMemoJoinPlans(
-                choice.physicalPlan,
-                right.physicalPlan,
-                step
-            );
-            joined->totalCost = plan.totalCost;
-            choice = MemoPlanChoice{joined, plan};
-        }
-
-        auto root_key = keyFor(context.memo.finalGroupId(), context.requiredTraits);
-        groupWinners[root_key] = choice;
-        costBound = choice.physicalPlan.totalCost;
-        lastStats.initialIncumbentCost = costBound;
-        lastStats.finalCostBound = costBound;
-        lastStats.seededBaselinePlan = true;
-    }
-
 public:
     explicit CascadesSearchStrategy(size_t task_budget = 0)
         : taskBudget(task_budget) {}
@@ -9525,15 +9452,14 @@ public:
         lastStats = {};
         lastStats.taskBudget = taskBudget;
         groupWinners.clear();
-        expandedGroups.clear();
-        ruleExpandedGroups.clear();
+        expandedExpressionCounts.clear();
+        ruleExpandedExpressionCounts.clear();
         parentTasks.clear();
         rootGroupId = context.memo.finalGroupId();
         rootProperty = context.requiredTraits.describe();
         costBound = std::numeric_limits<double>::infinity();
 
         auto edges = joinGraphEdges(context.components);
-        seedRandomOrderHashPlan(context, edges);
         std::deque<CascadesTask> task_queue;
         task_queue.push_back(
             CascadesTask::optimizeGroup(
@@ -9549,17 +9475,30 @@ public:
 
             if (task.kind == CascadesTaskKind::OptimizeGroup) {
                 auto group_key = keyFor(task.groupId, task.requiredProperty);
-                if (!expandedGroups.insert(group_key).second) {
+                size_t current_expression_count =
+                    context.memo.allGroups()[task.groupId - 1].expressions.size();
+                size_t previous_expression_count = 0;
+                auto expanded_count = expandedExpressionCounts.find(group_key);
+                if (expanded_count != expandedExpressionCounts.end()) {
+                    previous_expression_count = expanded_count->second;
+                }
+                if (previous_expression_count >= current_expression_count) {
                     continue;
                 }
                 lastStats.optimizeGroupTasks++;
                 applyRulesForGroup(context, task.groupId, task.requiredProperty);
-                buildParentTasks(context);
                 const auto& group = context.memo.allGroups()[task.groupId - 1];
                 std::vector<size_t> expression_order(group.expressions.size());
-                for (size_t i = 0; i < expression_order.size(); i++) {
+                for (size_t i = previous_expression_count;
+                     i < expression_order.size();
+                     i++) {
                     expression_order[i] = i;
                 }
+                expression_order.erase(
+                    expression_order.begin(),
+                    expression_order.begin() +
+                        static_cast<long>(previous_expression_count)
+                );
                 std::stable_sort(
                     expression_order.begin(),
                     expression_order.end(),
@@ -9586,6 +9525,7 @@ public:
                         return promise(left_op) > promise(right_op);
                     }
                 );
+                expandedExpressionCounts[group_key] = group.expressions.size();
 
                 for (auto it = expression_order.rbegin();
                      it != expression_order.rend();
@@ -9604,20 +9544,13 @@ public:
                             expression.op
                         )
                     );
-                    if (expression.op == "SortMergeJoin") {
-                        task_queue.push_front(
-                            CascadesTask::enforceSort(
-                                task.groupId,
-                                task.requiredProperty
-                            )
-                        );
-                    }
                 }
             } else if (task.kind == CascadesTaskKind::ApplyRule) {
                 applyExpression(context, edges, task, task_queue);
             } else if (task.kind == CascadesTaskKind::OptimizeInput) {
                 lastStats.optimizeInputTasks++;
-                if (!hasWinner(task.groupId, task.requiredProperty)) {
+                if (!hasWinner(task.groupId, task.requiredProperty) ||
+                    needsOptimization(context.memo, task.groupId, task.requiredProperty)) {
                     task_queue.push_front(
                         CascadesTask::optimizeGroup(
                             task.groupId,
@@ -9625,8 +9558,6 @@ public:
                         )
                     );
                 }
-            } else if (task.kind == CascadesTaskKind::EnforceSort) {
-                // Enforcer insertion happens when a candidate lacks this property.
             }
 
             if (taskBudget > 0 &&
