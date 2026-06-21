@@ -4670,6 +4670,123 @@ public:
     }
 };
 
+uint64_t hashFieldForBloom(const Field& field) {
+    switch (field.getType()) {
+        case INT:
+            return std::hash<int>{}(field.asInt()) ^ 0x9e3779b97f4a7c15ULL;
+        case FLOAT:
+            return std::hash<float>{}(field.asFloat()) ^ 0xbf58476d1ce4e5b9ULL;
+        case STRING:
+            return std::hash<std::string>{}(field.asString()) ^ 0x94d049bb133111ebULL;
+    }
+    throw std::runtime_error("Unsupported field type for Bloom filter.");
+}
+
+class BloomFilter {
+private:
+    std::vector<uint64_t> bits;
+    size_t bit_count;
+    size_t hash_count;
+    size_t inserted = 0;
+
+    static uint64_t mix(uint64_t value) {
+        value += 0x9e3779b97f4a7c15ULL;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+        return value ^ (value >> 31);
+    }
+
+public:
+    BloomFilter(size_t expected_keys = 4096,
+                double bits_per_key = 12.0,
+                size_t num_hashes = 4)
+        : bit_count(std::max<size_t>(
+              1024,
+              static_cast<size_t>(expected_keys * bits_per_key))),
+          hash_count(std::max<size_t>(1, num_hashes)) {
+        bits.assign((bit_count + 63) / 64, 0);
+    }
+
+    void add(const Field& field) {
+        const auto base_hash = hashFieldForBloom(field);
+        for (size_t hash_index = 0; hash_index < hash_count; hash_index++) {
+            const auto bit = mix(base_hash + hash_index) % bit_count;
+            bits[bit / 64] |= (1ULL << (bit % 64));
+        }
+        inserted++;
+    }
+
+    bool mayContain(const Field& field) const {
+        const auto base_hash = hashFieldForBloom(field);
+        for (size_t hash_index = 0; hash_index < hash_count; hash_index++) {
+            const auto bit = mix(base_hash + hash_index) % bit_count;
+            if ((bits[bit / 64] & (1ULL << (bit % 64))) == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t insertedKeys() const { return inserted; }
+    size_t bitCount() const { return bit_count; }
+    size_t hashCount() const { return hash_count; }
+};
+
+struct LipRuntimeFilter {
+    std::string sourceTable;
+    std::string sourceColumn;
+    std::string targetTable;
+    std::string targetColumn;
+    int targetAttributeIndex = -1;
+    BloomFilter filter;
+    size_t probes = 0;
+    size_t rejected = 0;
+    size_t passed = 0;
+};
+
+struct LipFilterSpec {
+    std::string sourceTable;
+    std::string sourceColumn;
+    int sourceAttributeIndex = -1;
+    std::string targetTable;
+    std::string targetColumn;
+    int targetAttributeIndex = -1;
+};
+
+struct LipExecutionContext {
+    std::map<std::string, std::vector<LipRuntimeFilter>> filtersByTargetTable;
+
+    bool empty() const {
+        return filtersByTargetTable.empty();
+    }
+};
+
+class BloomFilterPredicate : public IPredicate {
+private:
+    LipRuntimeFilter* runtime_filter;
+
+public:
+    explicit BloomFilterPredicate(LipRuntimeFilter* filter)
+        : runtime_filter(filter) {}
+
+    bool check(const Tuple& tuple) const override {
+        const auto attr_index = static_cast<size_t>(
+            runtime_filter->targetAttributeIndex
+        );
+        if (attr_index >= tuple.fields.size()) {
+            throw std::runtime_error("LIP Bloom filter column is out of range.");
+        }
+
+        runtime_filter->probes++;
+        if (runtime_filter->filter.mayContain(*tuple.fields[attr_index])) {
+            runtime_filter->passed++;
+            return true;
+        }
+        runtime_filter->rejected++;
+        return false;
+    }
+};
+
 class SelectOperator : public UnaryOperator {
 private:
     std::unique_ptr<IPredicate> predicate;
@@ -5577,6 +5694,12 @@ struct ColumnEqualityClause {
     ColumnRef right;
 };
 
+struct UdfPredicateClause {
+    std::string functionName;
+    ColumnRef argument;
+    std::string value;
+};
+
 struct QueryComponents {
     std::string tableName;
     std::string baseTableName;
@@ -5586,6 +5709,7 @@ struct QueryComponents {
     std::vector<JoinClause> joins;
     std::vector<FilterClause> filters;
     std::vector<ColumnEqualityClause> columnEqualities;
+    std::vector<UdfPredicateClause> udfPredicates;
     bool sumOperation = false;
     std::string sumAttributeName;
     int sumAttributeIndex = -1;
@@ -5839,6 +5963,25 @@ QueryComponents parseQuery(const std::string& query) {
     auto where_pos = query.find(" WHERE ");
     if (where_pos != std::string::npos) {
         std::string where_part = query.substr(where_pos);
+        std::regex udfPredicateRegex(
+            "([A-Za-z_][A-Za-z0-9_]*)\\s*\\(\\s*"
+            "\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*|\\d+)\\}\\s*\\)"
+            "\\s*=\\s*'?([^\\s']+)'?");
+        std::smatch udfPredicateMatches;
+        auto udfPredicateStart = where_part.cbegin();
+        while (std::regex_search(
+                   udfPredicateStart,
+                   where_part.cend(),
+                   udfPredicateMatches,
+                   udfPredicateRegex)) {
+            components.udfPredicates.push_back({
+                udfPredicateMatches[1],
+                parseColumnRef(udfPredicateMatches[2], udfPredicateMatches[3]),
+                udfPredicateMatches[4]
+            });
+            udfPredicateStart = udfPredicateMatches.suffix().first;
+        }
+
         std::regex columnEqualityRegex(
             "\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*|\\d+)\\}\\s*=\\s*"
             "\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*|\\d+)\\}");
@@ -5951,6 +6094,10 @@ void resolveQueryColumns(QueryComponents& components, Catalog& catalog) {
     for (auto& equality : components.columnEqualities) {
         resolveColumnRef(equality.left, catalog, components);
         resolveColumnRef(equality.right, catalog, components);
+    }
+
+    for (auto& udf_predicate : components.udfPredicates) {
+        resolveColumnRef(udf_predicate.argument, catalog, components);
     }
 
     resolveBaseAttribute(
@@ -10444,9 +10591,47 @@ void printPhysicalJoinCosts(const QueryComponents& components,
               << std::endl;
 }
 
+std::vector<LipFilterSpec> deriveLipFilterSpecs(const QueryComponents& components) {
+    std::set<std::string> filtered_tables;
+    for (const auto& filter : components.filters) {
+        filtered_tables.insert(filter.column.tableName);
+    }
+
+    std::set<std::string> seen_specs;
+    std::vector<LipFilterSpec> specs;
+    auto addSpec = [&](const ColumnRef& source, const ColumnRef& target) {
+        if (filtered_tables.find(source.tableName) == filtered_tables.end()) {
+            return;
+        }
+        if (source.attributeIndex < 0 || target.attributeIndex < 0) {
+            return;
+        }
+        const std::string key = source.tableName + "." + source.columnName +
+            "->" + target.tableName + "." + target.columnName;
+        if (!seen_specs.insert(key).second) {
+            return;
+        }
+        specs.push_back({
+            source.tableName,
+            source.columnName,
+            source.attributeIndex,
+            target.tableName,
+            target.columnName,
+            target.attributeIndex
+        });
+    };
+
+    for (const auto& join : components.joins) {
+        addSpec(join.left, join.right);
+        addSpec(join.right, join.left);
+    }
+    return specs;
+}
+
 std::unique_ptr<IPredicate> makeScanFilterPredicate(const QueryComponents& components,
                                                     Catalog& catalog,
-                                                    const std::string& table_name) {
+                                                    const std::string& table_name,
+                                                    LipExecutionContext* lip_context = nullptr) {
     auto predicate = std::make_unique<ComplexPredicate>(ComplexPredicate::LogicOperator::AND);
     bool has_filter = false;
     auto& metadata = catalog.getTable(actualTableName(components, table_name));
@@ -10474,10 +10659,117 @@ std::unique_ptr<IPredicate> makeScanFilterPredicate(const QueryComponents& compo
         has_filter = true;
     }
 
+    if (lip_context != nullptr) {
+        auto filter_it = lip_context->filtersByTargetTable.find(table_name);
+        if (filter_it != lip_context->filtersByTargetTable.end()) {
+            for (auto& lip_filter : filter_it->second) {
+                if (lip_filter.targetAttributeIndex < 0 ||
+                    static_cast<size_t>(lip_filter.targetAttributeIndex) >=
+                        metadata.schema.columns.size()) {
+                    throw std::runtime_error("LIP Bloom filter column is out of range.");
+                }
+                predicate->addPredicate(
+                    std::make_unique<BloomFilterPredicate>(&lip_filter)
+                );
+                has_filter = true;
+            }
+        }
+    }
+
     if (!has_filter) {
         return nullptr;
     }
     return predicate;
+}
+
+std::unique_ptr<LipExecutionContext> buildLipExecutionContext(
+    const QueryComponents& components,
+    Catalog& catalog,
+    BufferManager& buffer_manager) {
+    auto context = std::make_unique<LipExecutionContext>();
+    auto specs = deriveLipFilterSpecs(components);
+
+    for (const auto& spec : specs) {
+        auto& metadata = catalog.getTable(actualTableName(components, spec.sourceTable));
+        if (spec.sourceAttributeIndex < 0 ||
+            static_cast<size_t>(spec.sourceAttributeIndex) >= metadata.schema.columns.size()) {
+            throw std::runtime_error("LIP Bloom filter source column is out of range.");
+        }
+
+        TableHeap heap(metadata, buffer_manager);
+        ScanOperator scan(heap);
+        auto source_predicate = makeScanFilterPredicate(
+            components,
+            catalog,
+            spec.sourceTable
+        );
+        std::optional<SelectOperator> filtered_scan;
+        Operator* source_op = &scan;
+        if (source_predicate) {
+            filtered_scan.emplace(scan, std::move(source_predicate));
+            source_op = &*filtered_scan;
+        }
+
+        LipRuntimeFilter runtime_filter;
+        runtime_filter.sourceTable = spec.sourceTable;
+        runtime_filter.sourceColumn = spec.sourceColumn;
+        runtime_filter.targetTable = spec.targetTable;
+        runtime_filter.targetColumn = spec.targetColumn;
+        runtime_filter.targetAttributeIndex = spec.targetAttributeIndex;
+
+        source_op->open();
+        while (source_op->next()) {
+            const auto& tuple = source_op->getOutput();
+            runtime_filter.filter.add(
+                *tuple.fields[static_cast<size_t>(spec.sourceAttributeIndex)]
+            );
+        }
+        source_op->close();
+
+        context->filtersByTargetTable[spec.targetTable].push_back(
+            std::move(runtime_filter)
+        );
+    }
+    for (auto& target_entry : context->filtersByTargetTable) {
+        std::sort(
+            target_entry.second.begin(),
+            target_entry.second.end(),
+            [](const auto& left, const auto& right) {
+                return left.filter.insertedKeys() < right.filter.insertedKeys();
+            }
+        );
+    }
+
+    return context;
+}
+
+void printLipSummary(const LipExecutionContext& context) {
+    std::cout << "\nLIP Bloom filters:" << std::endl;
+    if (context.empty()) {
+        std::cout << "  none; no filtered join inputs found" << std::endl;
+        return;
+    }
+
+    for (const auto& target_entry : context.filtersByTargetTable) {
+        for (const auto& filter : target_entry.second) {
+            double reject_rate = filter.probes == 0
+                ? 0.0
+                : (100.0 * static_cast<double>(filter.rejected) /
+                   static_cast<double>(filter.probes));
+            std::cout << "  "
+                      << filter.sourceTable << "." << filter.sourceColumn
+                      << " -> "
+                      << filter.targetTable << "." << filter.targetColumn
+                      << ": keys=" << filter.filter.insertedKeys()
+                      << ", bits=" << filter.filter.bitCount()
+                      << ", hashes=" << filter.filter.hashCount()
+                      << ", probes=" << filter.probes
+                      << ", rejected=" << filter.rejected
+                      << " (" << formatEstimate(reject_rate) << "%)"
+                      << ", passed=" << filter.passed
+                      << std::endl;
+        }
+    }
 }
 
 QueryTable executeQuery(const QueryComponents& components,
@@ -10487,7 +10779,8 @@ QueryTable executeQuery(const QueryComponents& components,
                         bool print_tuples = true,
                         const std::vector<PhysicalJoinKind>& join_kinds = {},
                         const std::vector<size_t>& final_sort_attrs = {},
-                        const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
+                        const std::shared_ptr<JoinPlanNode>& plan_root = nullptr,
+                        LipExecutionContext* lip_context = nullptr) {
     std::map<std::string, size_t> table_offsets;
     std::map<std::string, size_t> table_widths;
     std::vector<std::unique_ptr<TableHeap>> heaps;
@@ -10503,7 +10796,12 @@ QueryTable executeQuery(const QueryComponents& components,
         table_widths[table_name] = metadata.schema.columns.size();
         heaps.push_back(std::make_unique<TableHeap>(metadata, buffer_manager));
         scans.push_back(std::make_unique<ScanOperator>(*heaps.back()));
-        auto predicate = makeScanFilterPredicate(components, catalog, table_name);
+        auto predicate = makeScanFilterPredicate(
+            components,
+            catalog,
+            table_name,
+            lip_context
+        );
         if (predicate) {
             pushedSelects.push_back(std::make_unique<SelectOperator>(
                 *scans.back(),
@@ -11756,7 +12054,10 @@ public:
 
     QueryTable executePlanSnapshot(const PlanSnapshot& snapshot,
                                    const TxnPtr& txn = nullptr,
-                                   bool print_tuples = false) {
+                                   bool print_tuples = false,
+                                   bool use_lip = false,
+                                   bool print_lip = false,
+                                   LipExecutionContext* captured_lip = nullptr) {
         if (!acquireQueryLocks(txn, snapshot.components)) {
             return {};
         }
@@ -11775,7 +12076,15 @@ public:
                             ))
                       << std::endl;
         }
-        return ::executeQuery(
+        std::unique_ptr<LipExecutionContext> lip_context;
+        if (use_lip) {
+            lip_context = buildLipExecutionContext(
+                snapshot.components,
+                catalog,
+                buffer_manager
+            );
+        }
+        auto result = ::executeQuery(
             snapshot.components,
             catalog,
             buffer_manager,
@@ -11783,8 +12092,16 @@ public:
             print_tuples,
             snapshot.joinKinds,
             {},
-            snapshot.planRoot
+            snapshot.planRoot,
+            lip_context.get()
         );
+        if (captured_lip != nullptr && lip_context) {
+            *captured_lip = *lip_context;
+        }
+        if (print_lip && lip_context) {
+            printLipSummary(*lip_context);
+        }
+        return result;
     }
 
     void explainQuery(const std::string& query) {
@@ -11795,19 +12112,26 @@ public:
 
     OptimizerResult printStatsAndEstimates(const std::string& query,
                                            const TxnPtr& txn = nullptr,
-                                           PlanTraitSet required_traits = {}) {
+                                           PlanTraitSet required_traits = {},
+                                           bool print_details = true) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
         auto stats = loadQueryTableStats(components, catalog);
-        printAnalyzeStats(components, stats);
-        auto final_estimate = printCardinalityEstimates(components, stats);
+        double final_estimate = 0.0;
+        if (print_details) {
+            printAnalyzeStats(components, stats);
+            final_estimate = printCardinalityEstimates(components, stats);
+        }
         Optimizer optimizer(stats, required_traits);
         auto optimizer_result = optimizer.optimize(components);
-        printOptimizerSummary(optimizer_result);
         auto planned_query = optimizer_result.plannedQuery;
         planned_query_cache[
             query + "#memo"
         ] = planned_query;
+        if (!print_details) {
+            return optimizer_result;
+        }
+        printOptimizerSummary(optimizer_result);
         printPhysicalJoinCosts(
             planned_query.components,
             planned_query.physicalPlan,
@@ -11979,19 +12303,18 @@ void createJobTables(BuzzDB& db) {
     });
 }
 
-std::string jobJoinQuery() {
+std::string udfJobQuery() {
     return
-        "PROJECT MIN{cn.name}, MIN{miidx.info}, MIN{t.title} "
+        "PROJECT MIN{miidx.info}, MIN{t.title} "
         "FROM title AS t "
         "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
         "JOIN movie_companies AS mc ON {t.id} = {mc.movie_id} "
-        "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
         "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
         "JOIN movie_info AS mi ON {t.id} = {mi.movie_id} "
         "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
         "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
         "JOIN info_type AS it ON {miidx.info_type_id} = {it.id} "
-        "WHERE {cn.country_code} = [us] "
+        "WHERE company_country({mc.company_id}) = [us] "
         "AND {ct.kind} = production_companies "
         "AND {it.info} = rating "
         "AND {it2.info} = release_dates "
@@ -11999,6 +12322,175 @@ std::string jobJoinQuery() {
         "AND {mi.movie_id} = {miidx.movie_id} "
         "AND {mi.movie_id} = {mc.movie_id} "
         "AND {miidx.movie_id} = {mc.movie_id}";
+}
+
+struct ScalarUdfDefinition {
+    std::string name;
+    std::string lookupTable;
+    std::string lookupKeyColumn;
+    std::string returnColumn;
+};
+
+ScalarUdfDefinition companyCountryUdf() {
+    return {
+        "company_country",
+        "company_name",
+        "id",
+        "country_code"
+    };
+}
+
+std::string freshAlias(const QueryComponents& components,
+                       const std::string& base_alias) {
+    if (components.tableAliases.find(base_alias) == components.tableAliases.end()) {
+        return base_alias;
+    }
+    for (size_t suffix = 1; ; suffix++) {
+        std::string candidate = base_alias + std::to_string(suffix);
+        if (components.tableAliases.find(candidate) == components.tableAliases.end()) {
+            return candidate;
+        }
+    }
+}
+
+QueryComponents inlineScalarUdfs(QueryComponents components, Catalog& catalog) {
+    for (const auto& udf_predicate : components.udfPredicates) {
+        auto udf = companyCountryUdf();
+        if (udf_predicate.functionName != udf.name) {
+            throw std::runtime_error("Unsupported scalar UDF: " + udf_predicate.functionName);
+        }
+
+        std::string alias = freshAlias(components, "cn_udf");
+        components.tableAliases[alias] = udf.lookupTable;
+        components.joins.push_back({
+            alias,
+            udf.lookupTable,
+            udf_predicate.argument,
+            parseColumnRef(alias, udf.lookupKeyColumn)
+        });
+        components.filters.push_back({
+            parseColumnRef(alias, udf.returnColumn),
+            udf_predicate.value
+        });
+    }
+    components.udfPredicates.clear();
+    resolveQueryColumns(components, catalog);
+    return components;
+}
+
+struct BlackBoxUdfRunStats {
+    std::string functionName;
+    size_t totalInputRows = 0;
+    size_t sampledCalls = 0;
+    size_t sampledMatches = 0;
+    size_t hiddenRowsChecked = 0;
+    long long sampleMicros = 0;
+};
+
+std::optional<std::string> evaluateCompanyCountryBlackBox(
+    int company_id,
+    Catalog& catalog,
+    BufferManager& buffer_manager,
+    BlackBoxUdfRunStats& stats) {
+    auto udf = companyCountryUdf();
+    auto& metadata = catalog.getTable(udf.lookupTable);
+    auto id_index = static_cast<size_t>(findColumnIndex(metadata, udf.lookupKeyColumn));
+    auto country_index = static_cast<size_t>(findColumnIndex(metadata, udf.returnColumn));
+
+    TableHeap table(metadata, buffer_manager);
+    ScanOperator scan(table);
+    scan.open();
+    while (scan.next()) {
+        stats.hiddenRowsChecked++;
+        const auto& tuple = scan.getOutput();
+        if (tuple.fields[id_index]->asInt() == company_id) {
+            auto country = tuple.fields[country_index]->asString();
+            scan.close();
+            return country;
+        }
+    }
+    scan.close();
+    return std::nullopt;
+}
+
+BlackBoxUdfRunStats measureBlackBoxUdfPrefix(
+    const QueryComponents& components,
+    Catalog& catalog,
+    BufferManager& buffer_manager,
+    const StatisticsCatalog& stats,
+    size_t sample_calls) {
+    if (components.udfPredicates.empty()) {
+        throw std::runtime_error("Expected a scalar UDF predicate.");
+    }
+
+    const auto& udf_predicate = components.udfPredicates.front();
+    BlackBoxUdfRunStats run_stats;
+    run_stats.functionName = udf_predicate.functionName;
+    run_stats.totalInputRows = tableStatsFor(
+        stats,
+        components,
+        udf_predicate.argument.tableName
+    ).rowCount;
+
+    auto& metadata = catalog.getTable(
+        actualTableName(components, udf_predicate.argument.tableName)
+    );
+    TableHeap source_table(metadata, buffer_manager);
+    ScanOperator scan(source_table);
+
+    auto start = std::chrono::steady_clock::now();
+    scan.open();
+    while (scan.next() && run_stats.sampledCalls < sample_calls) {
+        const auto& tuple = scan.getOutput();
+        int company_id = tuple.fields[
+            static_cast<size_t>(udf_predicate.argument.attributeIndex)
+        ]->asInt();
+        auto country = evaluateCompanyCountryBlackBox(
+            company_id,
+            catalog,
+            buffer_manager,
+            run_stats
+        );
+        if (country && *country == udf_predicate.value) {
+            run_stats.sampledMatches++;
+        }
+        run_stats.sampledCalls++;
+    }
+    scan.close();
+    auto end = std::chrono::steady_clock::now();
+    run_stats.sampleMicros = std::chrono::duration_cast<std::chrono::microseconds>(
+        end - start
+    ).count();
+    return run_stats;
+}
+
+void printBlackBoxUdfStats(const BlackBoxUdfRunStats& stats) {
+    double scale = stats.sampledCalls == 0
+        ? 0.0
+        : static_cast<double>(stats.totalInputRows) /
+          static_cast<double>(stats.sampledCalls);
+    auto projected_checks = static_cast<size_t>(
+        static_cast<double>(stats.hiddenRowsChecked) * scale
+    );
+    auto projected_ms = static_cast<long long>(
+        (static_cast<double>(stats.sampleMicros) * scale) / 1000.0
+    );
+
+    std::cout << "\nBlack-box scalar UDF path:" << std::endl;
+    std::cout << "  function: " << stats.functionName
+              << "(company_id) reads company_name internally" << std::endl;
+    std::cout << "  sampled prefix calls: " << stats.sampledCalls
+              << " of " << stats.totalInputRows
+              << " movie_companies rows" << std::endl;
+    std::cout << "  sampled matches: " << stats.sampledMatches << std::endl;
+    std::cout << "  hidden company_name rows checked: "
+              << stats.hiddenRowsChecked << std::endl;
+    std::cout << "  prefix-projected full hidden row checks: "
+              << projected_checks << std::endl;
+    std::cout << "  sampled UDF lookup time: "
+              << (stats.sampleMicros / 1000) << " ms" << std::endl;
+    std::cout << "  prefix-projected full UDF lookup time: "
+              << projected_ms << " ms" << std::endl;
 }
 
 void printSampleRows(const QueryTable& rows, size_t limit) {
@@ -12023,67 +12515,75 @@ int main(int argc, char* argv[]) {
 
     createJobTables(db);
 
-    auto load_txn = db.begin("LOAD");
     auto load_start = std::chrono::steady_clock::now();
     if (seed_database) {
+        auto load_txn = db.begin("LOAD");
         db.loadDataFile(imdb_filename, load_txn);
+        db.commit(load_txn);
     }
     auto load_end = std::chrono::steady_clock::now();
-    db.commit(load_txn);
-    db.execute("ANALYZE");
+    db.analyze("", false);
 
-    auto query_txn = db.begin("Q1");
-    std::cout << "\nQuery optimization with memo rules" << std::endl;
-    std::cout << "  Workload: JOB 9-table join query" << std::endl;
-    db.explainQuery(jobJoinQuery());
-    auto query_components = parseQuery(jobJoinQuery());
-    resolveQueryColumns(query_components, db.catalog);
-    ColumnRef required_order{"t", "id", -1};
-    resolveColumnRef(required_order, db.catalog, query_components);
-    auto required_traits = orderedByProperty(required_order);
-    auto optimizer_result = db.printStatsAndEstimates(
-        jobJoinQuery(),
-        query_txn,
-        required_traits
+    std::cout << "\nScalar UDF inlining" << std::endl;
+    std::cout << "  Workload: JOB-style query with company_country(mc.company_id)" << std::endl;
+    std::cout << "  Black-box UDF execution hides a company_name lookup per row."
+              << std::endl;
+    std::cout << "  Froid-style inlining exposes that lookup as a normal join and filter."
+              << std::endl;
+
+    auto udf_components = parseQuery(udfJobQuery());
+    resolveQueryColumns(udf_components, db.catalog);
+    auto udf_table_stats = loadQueryTableStats(udf_components, db.catalog);
+    std::cout << "  Buffer pool is cleared before the black-box UDF prefix."
+              << std::endl;
+    db.clearBufferPool();
+    auto black_box_stats = measureBlackBoxUdfPrefix(
+        udf_components,
+        db.catalog,
+        db.buffer_manager,
+        udf_table_stats,
+        1000
     );
+    printBlackBoxUdfStats(black_box_stats);
+
+    auto inlined_components = inlineScalarUdfs(udf_components, db.catalog);
+    ColumnRef required_order{"t", "id", -1};
+    resolveColumnRef(required_order, db.catalog, inlined_components);
+    auto required_traits = orderedByProperty(required_order);
+    auto optimizer_stats = loadQueryTableStats(inlined_components, db.catalog);
+    Optimizer optimizer(optimizer_stats, required_traits);
+    auto optimizer_result = optimizer.optimize(inlined_components);
     auto plan = optimizer_result.plannedQuery;
 
-    QueryTable selected_rows;
-    std::cout << "\nOptimization and execution timing:" << std::endl;
-    std::cout << "  Buffer pool is cleared before each timed execution."
+    auto snapshot = makePlanSnapshot(0, plan);
+    std::cout << "\nFroid-style inlined relational path:" << std::endl;
+    std::cout << "  UDF calls: 0" << std::endl;
+    std::cout << "  exposed rewrite: company_country({mc.company_id}) = [us]"
+              << " becomes JOIN company_name AS cn_udf"
+              << " plus cn_udf.country_code = [us]" << std::endl;
+    std::cout << "  Buffer pool is cleared again before timed execution."
               << std::endl;
-    for (const auto& comparison : optimizer_result.strategyComparisons) {
-        db.clearBufferPool();
-        auto query_start = std::chrono::steady_clock::now();
-        auto rows = db.executePlanSnapshot(
-            makePlanSnapshot(0, comparison.plannedQuery),
-            query_txn,
-            false
-        );
-        auto query_end = std::chrono::steady_clock::now();
-        auto execute_ms = elapsedMs(query_start, query_end);
-        auto optimize_ms = comparison.optimizationMicros / 1000.0;
-        std::cout << "  " << comparison.name
-                  << ": optimize " << comparison.optimizationMicros
-                  << " us, execute "
-                  << execute_ms
-                  << " ms, total "
-                  << formatEstimate(optimize_ms + static_cast<double>(execute_ms))
-                  << " ms, output rows " << rows.size()
-                  << ", estimated cost "
-                  << formatEstimate(comparison.plannedQuery.physicalPlan.totalCost)
-                  << std::endl;
-        if (comparison.name == "Cascades(cost-bound, soft-task-budget=10000)") {
-            selected_rows = std::move(rows);
-        }
-    }
 
-    std::cout << "\nSelected Cascades memo winner:" << std::endl;
+    db.clearBufferPool();
+    auto inlined_start = std::chrono::steady_clock::now();
+    auto inlined_rows = db.executePlanSnapshot(
+        snapshot,
+        nullptr,
+        false,
+        false
+    );
+    auto inlined_end = std::chrono::steady_clock::now();
+
+    std::cout << "  Inlined query time: "
+              << elapsedMs(inlined_start, inlined_end)
+              << " ms, output rows " << inlined_rows.size() << std::endl;
+
+    std::cout << "\nSelected physical plan after inlining:" << std::endl;
     std::cout << "  estimated cost: "
               << formatEstimate(plan.physicalPlan.totalCost) << std::endl;
     std::cout << "  estimated join rows: "
               << formatEstimate(plan.physicalPlan.finalRows) << std::endl;
-    std::cout << "  output rows: " << selected_rows.size() << std::endl;
+    std::cout << "  output rows: " << inlined_rows.size() << std::endl;
     if (plan.physicalRoot) {
         std::cout << "  physical plan tree:" << std::endl;
         std::cout << physicalPlanTreeString(plan.physicalRoot, "    ");
@@ -12096,8 +12596,7 @@ int main(int argc, char* argv[]) {
                   << plan.dpCrossProductsPruned << std::endl;
     }
     std::cout << "  Sample rows:" << std::endl;
-    printSampleRows(selected_rows, 5);
-    db.commit(query_txn);
+    printSampleRows(inlined_rows, 5);
     std::cout << "\nTiming:" << std::endl;
     if (seed_database) {
         std::cout << "  Load: " << elapsedMs(load_start, load_end)

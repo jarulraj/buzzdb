@@ -6391,6 +6391,27 @@ struct LogicalPlanNode {
     std::vector<std::unique_ptr<LogicalPlanNode>> inputs;
 };
 
+struct PhysicalPlanNode {
+    enum class Kind {
+        SCAN,
+        FILTER,
+        PROJECT,
+        HASH_AGGREGATE,
+        NESTED_LOOP_JOIN,
+        HASH_JOIN,
+        SORT_MERGE_JOIN,
+        SORT
+    };
+
+    Kind kind;
+    std::string tableName;
+    JoinClause join;
+    std::vector<ColumnRef> sortColumns;
+    double rows = 0.0;
+    double cost = 0.0;
+    std::vector<std::shared_ptr<PhysicalPlanNode>> inputs;
+};
+
 std::string logicalNodeName(LogicalPlanNode::Kind kind) {
     switch (kind) {
         case LogicalPlanNode::Kind::SCAN:
@@ -6405,6 +6426,28 @@ std::string logicalNodeName(LogicalPlanNode::Kind kind) {
             return "LogicalAggregate";
     }
     return "LogicalUnknown";
+}
+
+std::string physicalNodeName(PhysicalPlanNode::Kind kind) {
+    switch (kind) {
+        case PhysicalPlanNode::Kind::SCAN:
+            return "Scan";
+        case PhysicalPlanNode::Kind::FILTER:
+            return "Filter";
+        case PhysicalPlanNode::Kind::PROJECT:
+            return "Project";
+        case PhysicalPlanNode::Kind::HASH_AGGREGATE:
+            return "HashAggregate";
+        case PhysicalPlanNode::Kind::NESTED_LOOP_JOIN:
+            return "NestedLoopJoin";
+        case PhysicalPlanNode::Kind::HASH_JOIN:
+            return "HashJoin";
+        case PhysicalPlanNode::Kind::SORT_MERGE_JOIN:
+            return "SortMergeJoin";
+        case PhysicalPlanNode::Kind::SORT:
+            return "Sort";
+    }
+    return "PhysicalUnknown";
 }
 
 std::string logicalColumnLabel(const LogicalColumnExpr& expression) {
@@ -8333,6 +8376,7 @@ struct PlannedQuery {
     QueryComponents components;
     PhysicalJoinPlan physicalPlan;
     std::shared_ptr<JoinPlanNode> planRoot;
+    std::shared_ptr<PhysicalPlanNode> physicalRoot;
     std::string planDescription;
     size_t dpStatesKept = 0;
     size_t dpCandidatesConsidered = 0;
@@ -8344,10 +8388,12 @@ struct PlannedQuery {
     PlannedQuery(QueryComponents components,
                  PhysicalJoinPlan physicalPlan,
                  std::shared_ptr<JoinPlanNode> planRoot = nullptr,
-                 std::string planDescription = "")
+                 std::string planDescription = "",
+                 std::shared_ptr<PhysicalPlanNode> physicalRoot = nullptr)
         : components(std::move(components)),
           physicalPlan(std::move(physicalPlan)),
           planRoot(std::move(planRoot)),
+          physicalRoot(std::move(physicalRoot)),
           planDescription(std::move(planDescription)) {}
 };
 
@@ -8539,32 +8585,172 @@ std::string joinPlanTreeString(const std::shared_ptr<JoinPlanNode>& node) {
         left_tree + ", " + right_tree + ")";
 }
 
-std::string memoPhysicalJoinName(PhysicalJoinKind kind) {
+PhysicalPlanNode::Kind physicalJoinNodeKind(PhysicalJoinKind kind) {
     switch (kind) {
         case PhysicalJoinKind::NestedLoopJoin:
-            return "NestedLoopJoin";
+            return PhysicalPlanNode::Kind::NESTED_LOOP_JOIN;
         case PhysicalJoinKind::HashJoin:
-            return "HashJoin";
+            return PhysicalPlanNode::Kind::HASH_JOIN;
         case PhysicalJoinKind::SortMergeJoin:
-            return "SortMergeJoin";
+            return PhysicalPlanNode::Kind::SORT_MERGE_JOIN;
     }
-    return "HashJoin";
+    return PhysicalPlanNode::Kind::HASH_JOIN;
 }
 
-std::string memoPhysicalPlanExpression(const std::shared_ptr<JoinPlanNode>& node) {
+std::shared_ptr<PhysicalPlanNode> makePhysicalNode(
+    PhysicalPlanNode::Kind kind,
+    std::vector<std::shared_ptr<PhysicalPlanNode>> inputs = {}) {
+    auto node = std::make_shared<PhysicalPlanNode>();
+    node->kind = kind;
+    node->inputs = std::move(inputs);
+    return node;
+}
+
+bool hasTableFilter(const QueryComponents& components,
+                    const std::string& table_name) {
+    return std::any_of(
+        components.filters.begin(),
+        components.filters.end(),
+        [&](const FilterClause& filter) {
+            return filter.column.tableName == table_name;
+        }
+    );
+}
+
+std::shared_ptr<PhysicalPlanNode> physicalScanForTable(
+    const QueryComponents& components,
+    const std::string& table_name,
+    double rows,
+    double cost) {
+    auto scan = makePhysicalNode(PhysicalPlanNode::Kind::SCAN);
+    scan->tableName = table_name;
+    scan->rows = rows;
+    scan->cost = cost;
+    if (!hasTableFilter(components, table_name)) {
+        return scan;
+    }
+
+    auto filter = makePhysicalNode(PhysicalPlanNode::Kind::FILTER, {scan});
+    filter->rows = rows;
+    filter->cost = cost;
+    return filter;
+}
+
+std::shared_ptr<PhysicalPlanNode> physicalPlanFromJoinTree(
+    const QueryComponents& components,
+    const std::shared_ptr<JoinPlanNode>& node) {
+    if (!node) {
+        return nullptr;
+    }
+    if (node->isLeaf) {
+        return physicalScanForTable(
+            components,
+            node->tableName,
+            node->rows,
+            node->totalCost
+        );
+    }
+
+    auto left = physicalPlanFromJoinTree(components, node->left);
+    auto right = physicalPlanFromJoinTree(components, node->right);
+    if (node->joinKind == PhysicalJoinKind::SortMergeJoin) {
+        left = makePhysicalNode(PhysicalPlanNode::Kind::SORT, {left});
+        right = makePhysicalNode(PhysicalPlanNode::Kind::SORT, {right});
+    }
+
+    auto join = makePhysicalNode(physicalJoinNodeKind(node->joinKind), {left, right});
+    join->join = node->join;
+    join->rows = node->rows;
+    join->cost = node->totalCost;
+    return join;
+}
+
+std::shared_ptr<PhysicalPlanNode> buildPhysicalPlanTree(
+    const QueryComponents& components,
+    const std::shared_ptr<JoinPlanNode>& plan_root,
+    const PhysicalJoinPlan& physical_plan) {
+    auto root = physicalPlanFromJoinTree(components, plan_root);
+    if (!root) {
+        root = physicalScanForTable(
+            components,
+            components.tableName,
+            physical_plan.finalRows,
+            physical_plan.totalCost
+        );
+    }
+
+    if (components.whereCondition ||
+        components.equalityWhereCondition ||
+        !components.columnEqualities.empty()) {
+        root = makePhysicalNode(PhysicalPlanNode::Kind::FILTER, {root});
+    }
+
+    if (hasAggregateProjection(components) || components.sumOperation || components.groupBy) {
+        root = makePhysicalNode(PhysicalPlanNode::Kind::HASH_AGGREGATE, {root});
+    } else if (!components.selectColumns.empty()) {
+        root = makePhysicalNode(PhysicalPlanNode::Kind::PROJECT, {root});
+    }
+
+    if (!physical_plan.finalSortColumns.empty()) {
+        auto sort = makePhysicalNode(PhysicalPlanNode::Kind::SORT, {root});
+        sort->sortColumns = physical_plan.finalSortColumns;
+        root = sort;
+    }
+
+    root->rows = physical_plan.finalRows;
+    root->cost = physical_plan.totalCost;
+    return root;
+}
+
+std::string physicalPlanExpression(const std::shared_ptr<PhysicalPlanNode>& node) {
     if (!node) {
         return "";
     }
-    if (node->isLeaf) {
-        return "Scan(" + node->tableName + ")";
+    auto name = physicalNodeName(node->kind);
+    if (node->kind == PhysicalPlanNode::Kind::SCAN) {
+        return name + "(" + node->tableName + ")";
     }
-    auto left = memoPhysicalPlanExpression(node->left);
-    auto right = memoPhysicalPlanExpression(node->right);
-    if (node->joinKind == PhysicalJoinKind::SortMergeJoin) {
-        left = "SORT(" + left + ")";
-        right = "SORT(" + right + ")";
+    if (node->inputs.empty()) {
+        return name;
     }
-    return memoPhysicalJoinName(node->joinKind) + "(" + left + ", " + right + ")";
+
+    std::vector<std::string> input_expressions;
+    for (const auto& input : node->inputs) {
+        input_expressions.push_back(physicalPlanExpression(input));
+    }
+    return name + "(" + joinStrings(input_expressions, ", ") + ")";
+}
+
+void appendPhysicalPlanTree(const std::shared_ptr<PhysicalPlanNode>& node,
+                            const std::string& indent,
+                            std::ostringstream& out) {
+    if (!node) {
+        return;
+    }
+    out << indent << physicalNodeName(node->kind);
+    if (node->kind == PhysicalPlanNode::Kind::SCAN) {
+        out << "(" << node->tableName << ")";
+    }
+    if (node->kind == PhysicalPlanNode::Kind::SORT &&
+        !node->sortColumns.empty()) {
+        out << " by {" << columnLabel(node->sortColumns.front()) << "}";
+    }
+    if (node->rows > 0.0 || node->cost > 0.0) {
+        out << "  # rows=" << formatEstimate(node->rows)
+            << " cost=" << formatEstimate(node->cost);
+    }
+    out << "\n";
+    for (const auto& input : node->inputs) {
+        appendPhysicalPlanTree(input, indent + "  ", out);
+    }
+}
+
+std::string physicalPlanTreeString(
+    const std::shared_ptr<PhysicalPlanNode>& root,
+    const std::string& indent = "") {
+    std::ostringstream out;
+    appendPhysicalPlanTree(root, indent, out);
+    return out.str();
 }
 
 std::string joinPlanTableGroup(const std::shared_ptr<JoinPlanNode>& node) {
@@ -8698,7 +8884,17 @@ struct MemoWinnerSearch {
 
 struct MemoPlanChoice {
     std::shared_ptr<JoinPlanNode> planRoot;
+    std::shared_ptr<PhysicalPlanNode> physicalRoot;
     PhysicalJoinPlan physicalPlan;
+
+    MemoPlanChoice() = default;
+
+    MemoPlanChoice(std::shared_ptr<JoinPlanNode> planRoot,
+                   PhysicalJoinPlan physicalPlan,
+                   std::shared_ptr<PhysicalPlanNode> physicalRoot = nullptr)
+        : planRoot(std::move(planRoot)),
+          physicalRoot(std::move(physicalRoot)),
+          physicalPlan(std::move(physicalPlan)) {}
 };
 
 MemoPlanChoice addSortEnforcer(MemoPlanChoice choice,
@@ -9122,18 +9318,18 @@ MemoWinnerSearch chooseMemoWinner(Memo& memo,
         components,
         final_choice->physicalPlan,
         final_choice->planRoot,
-        joinPlanTreeString(final_choice->planRoot)
+        joinPlanTreeString(final_choice->planRoot),
+        buildPhysicalPlanTree(
+            components,
+            final_choice->planRoot,
+            final_choice->physicalPlan
+        )
     };
     MemoWinnerSearch winner;
     winner.finalGroupId = memo.finalGroupId();
     winner.requiredTrait = required_traits.describe();
     winner.deliveredTrait = planned_query.physicalPlan.deliveredProperty;
-    winner.expression = planned_query.planRoot
-        ? memoPhysicalPlanExpression(planned_query.planRoot)
-        : "Scan(" + planned_query.components.tableName + ")";
-    if (!planned_query.physicalPlan.finalSortColumns.empty()) {
-        winner.expression = "Sort(" + winner.expression + ")";
-    }
+    winner.expression = physicalPlanExpression(planned_query.physicalRoot);
     winner.cost = planned_query.physicalPlan.totalCost;
     winner.plannedQuery = planned_query;
     if (winner.finalGroupId != 0) {
@@ -9208,7 +9404,14 @@ PlannedQuery plannedQueryFromChoice(const QueryComponents& components,
         components,
         choice.physicalPlan,
         choice.planRoot,
-        joinPlanTreeString(choice.planRoot)
+        joinPlanTreeString(choice.planRoot),
+        choice.physicalRoot
+            ? choice.physicalRoot
+            : buildPhysicalPlanTree(
+                  components,
+                  choice.planRoot,
+                  choice.physicalPlan
+              )
     };
 }
 
@@ -10098,12 +10301,9 @@ public:
         memo_winner.requiredTrait = requiredTraits.describe();
         memo_winner.deliveredTrait =
             selected->plannedQuery.physicalPlan.deliveredProperty;
-        memo_winner.expression = selected->plannedQuery.planRoot
-            ? memoPhysicalPlanExpression(selected->plannedQuery.planRoot)
-            : "Scan(" + selected->plannedQuery.components.tableName + ")";
-        if (!selected->plannedQuery.physicalPlan.finalSortColumns.empty()) {
-            memo_winner.expression = "Sort(" + memo_winner.expression + ")";
-        }
+        memo_winner.expression = physicalPlanExpression(
+            selected->plannedQuery.physicalRoot
+        );
         memo_winner.cost = selected->plannedQuery.physicalPlan.totalCost;
         memo_winner.plannedQuery = selected->plannedQuery;
         if (memo_winner.finalGroupId != INVALID_GROUP_ID) {
@@ -10226,6 +10426,11 @@ void printOptimizerSummary(const OptimizerResult& result) {
         std::cout << std::endl;
     }
     std::cout << "  executable plan: from memo winner" << std::endl;
+    std::cout << "  physical plan tree:" << std::endl;
+    std::cout << physicalPlanTreeString(
+        result.plannedQuery.physicalRoot,
+        "    "
+    );
     std::cout << "  memo rule fires: "
               << result.memoStats.firedRules.size() << std::endl;
     std::cout << "  memo before rules: "
@@ -10248,7 +10453,15 @@ void printOptimizerSummary(const OptimizerResult& result) {
         std::cout << "    " << rule_count.first << ": "
                   << rule_count.second << " expression(s)" << std::endl;
     }
-    printMemo(result.memo);
+    if (result.memo.expressionCount() <= 300) {
+        printMemo(result.memo);
+    } else {
+        std::cout << "\nMemo groups: omitted "
+                  << result.memo.groupCount() << " group(s), "
+                  << result.memo.expressionCount()
+                  << " expression(s); summary above is the teaching signal."
+                  << std::endl;
+    }
 }
 
 std::string physicalPlanTreeString(const QueryComponents& components,
@@ -12172,9 +12385,9 @@ int main(int argc, char* argv[]) {
     std::cout << "  estimated join rows: "
               << formatEstimate(plan.physicalPlan.finalRows) << std::endl;
     std::cout << "  output rows: " << lip_rows.size() << std::endl;
-    if (plan.planRoot) {
-        std::cout << "  plan:" << std::endl;
-        std::cout << prettyJoinPlanTree(plan.planRoot, "    ");
+    if (plan.physicalRoot) {
+        std::cout << "  physical plan tree:" << std::endl;
+        std::cout << physicalPlanTreeString(plan.physicalRoot, "    ");
     }
     if (plan.dpStatesKept > 0) {
         std::cout << "  DP states kept: " << plan.dpStatesKept
