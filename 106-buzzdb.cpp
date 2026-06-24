@@ -15,7 +15,7 @@
 
 // BuzzDB v106: timers, workloads, and closed-loop client workers.
 //
-// DSLabs clients are closed-loop: one outstanding command at a time. This
+// Clients are closed-loop: one outstanding command at a time. This
 // version adds that testing model, plus logical timers for retries and
 // rate-limited workloads.
 

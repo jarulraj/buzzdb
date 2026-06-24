@@ -15,7 +15,7 @@
 // BuzzDB v105: framework primitives.
 //
 // This version intentionally leaves the real BuzzDB engine out. The goal is to
-// establish the same vocabulary DSLabs uses: addresses, commands, results,
+// establish a distributed-systems vocabulary: addresses, commands, results,
 // applications, nodes, messages, a node context, and an in-process SimState.
 
 struct Address {

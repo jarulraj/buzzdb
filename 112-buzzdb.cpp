@@ -25,13 +25,13 @@
 #include <variant>
 #include <vector>
 
-// BuzzDB v111: sequenced BuzzDB commands with replicated commit logs.
+// BuzzDB v112: commit index, storage replay, and restart recovery.
 //
 // This version keeps the v108 search simulator but brings back BuzzDB's
 // database vocabulary: typed fields, tuples, schemas, tables, and a small
-// page-file storage stack. It adds a sequenced commit node that assigns each
-// command a version, appends it to two log replicas, and applies it only after
-// both logs acknowledge the replicated operation.
+// page-file storage stack. It adds the storage side of the replicated log:
+// committed entries carry a commit index, storage applies only contiguous log
+// prefixes, and restart recovery rebuilds BuzzDBCore by replaying that prefix.
 
 struct Address {
     std::string id;
@@ -2067,7 +2067,7 @@ QueryComponents parseQuery(const std::string& query) {
     std::smatch matches;
     if (!std::regex_match(query, matches, selectStarRegex)) {
         throw std::runtime_error(
-            "v109 supports SELECT * FROM <table> queries.");
+            "This version supports SELECT * FROM <table> queries.");
     }
 
     QueryComponents components;
@@ -2574,11 +2574,23 @@ struct LogAppendReply {
     Address log;
 };
 
+struct StorageApplyRequest {
+    ReplicatedLogEntry entry;
+    int commit_index;
+};
+
+struct StorageApplyReply {
+    int applied_version;
+    Address storage;
+};
+
 using Message = std::variant<
     ClientRequest,
     ClientReply,
     LogAppendRequest,
-    LogAppendReply>;
+    LogAppendReply,
+    StorageApplyRequest,
+    StorageApplyReply>;
 
 struct RetryTimer {
     int request_id;
@@ -2611,6 +2623,14 @@ std::string describeMessage(const Message& message) {
             } else if constexpr (std::is_same_v<T, LogAppendReply>) {
                 out << "LogAppendReply(version=" << value.version
                     << ", log=" << value.log << ")";
+            } else if constexpr (std::is_same_v<T, StorageApplyRequest>) {
+                out << "StorageApplyRequest(version=" << value.entry.version
+                    << ", commit_index=" << value.commit_index
+                    << ", " << describeCommand(value.entry.command) << ")";
+            } else if constexpr (std::is_same_v<T, StorageApplyReply>) {
+                out << "StorageApplyReply(applied_version="
+                    << value.applied_version
+                    << ", storage=" << value.storage << ")";
             }
             return out.str();
         },
@@ -2688,6 +2708,10 @@ Address log1() {
 
 Address log2() {
     return Address("log2");
+}
+
+Address storage1() {
+    return Address("storage1");
 }
 
 }  // namespace DemoAddress
@@ -3354,15 +3378,124 @@ private:
     std::map<int, ReplicatedLogEntry> entries_;
 };
 
+class BuzzDBStorageReplica : public Node {
+public:
+    explicit BuzzDBStorageReplica(Address address)
+        : Node(std::move(address)) {}
+
+    BuzzDBStorageReplica(Address address,
+                         std::map<int, ReplicatedLogEntry> replay_log,
+                         int commit_index)
+        : Node(std::move(address)), commit_index_(commit_index) {
+        pending_entries_ = std::move(replay_log);
+        applyReadyEntries();
+    }
+
+    void onMessage(NodeContext& ctx,
+                   const Address& from,
+                   const Message& message) override {
+        const auto* request = std::get_if<StorageApplyRequest>(&message);
+        if (request == nullptr) {
+            return;
+        }
+
+        commit_index_ = std::max(commit_index_, request->commit_index);
+        if (request->entry.version > applied_version_) {
+            pending_entries_.emplace(request->entry.version, request->entry);
+        }
+        applyReadyEntries();
+        ctx.send(from, StorageApplyReply{applied_version_, address()});
+    }
+
+    std::unique_ptr<Node> clone() const override {
+        return std::make_unique<BuzzDBStorageReplica>(*this);
+    }
+
+    int commitIndex() const {
+        return commit_index_;
+    }
+
+    int appliedVersion() const {
+        return applied_version_;
+    }
+
+    size_t pendingCount() const {
+        return pending_entries_.size();
+    }
+
+    int applyCount() const {
+        return apply_count_;
+    }
+
+    std::optional<std::string> validate() const {
+        return db_.validate();
+    }
+
+    std::string appDigest() const {
+        return db_.digest();
+    }
+
+    Result executeReadOnlyForTest(const Command& command) const {
+        BuzzDBCore copy = db_;
+        return copy.execute(command);
+    }
+
+    std::string digest() const override {
+        std::ostringstream out;
+        out << "BuzzDBStorage(commit_index=" << commit_index_
+            << ", applied_version=" << applied_version_
+            << ", pending=" << pending_entries_.size()
+            << ", apply_count=" << apply_count_
+            << ", app=" << db_.digest() << ")";
+        return out.str();
+    }
+
+    std::string describe() const override {
+        return digest();
+    }
+
+private:
+    void applyReadyEntries() {
+        for (;;) {
+            int next_version = applied_version_ + 1;
+            if (next_version > commit_index_) {
+                return;
+            }
+            auto entry = pending_entries_.find(next_version);
+            if (entry == pending_entries_.end()) {
+                return;
+            }
+
+            db_.execute(entry->second.command);
+            applied_version_ = next_version;
+            ++apply_count_;
+            pending_entries_.erase(entry);
+        }
+    }
+
+    BuzzDBCore db_;
+    int commit_index_ = 0;
+    int applied_version_ = 0;
+    int apply_count_ = 0;
+    std::map<int, ReplicatedLogEntry> pending_entries_;
+};
+
 class SequencedReplicatedBuzzDBServer : public Node {
 public:
-    SequencedReplicatedBuzzDBServer(Address address, std::vector<Address> logs)
+    SequencedReplicatedBuzzDBServer(Address address,
+                                    std::vector<Address> logs,
+                                    std::vector<Address> storage_nodes)
         : Node(std::move(address)),
           logs_(std::move(logs)),
+          storage_nodes_(std::move(storage_nodes)),
           quorum_(logs_.size()) {
         if (logs_.empty()) {
             throw std::runtime_error(
                 "replicated BuzzDB server needs at least one log replica");
+        }
+        if (storage_nodes_.empty()) {
+            throw std::runtime_error(
+                "replicated BuzzDB server needs at least one storage replica");
         }
     }
 
@@ -3394,6 +3527,10 @@ public:
         return cache_.size();
     }
 
+    int commitIndex() const {
+        return commit_index_;
+    }
+
     size_t pendingCount() const {
         return pending_by_request_.size();
     }
@@ -3405,6 +3542,7 @@ public:
     std::string digest() const override {
         std::ostringstream out;
         out << "ReplicatedBuzzDB(next_version=" << next_version_
+            << ", commit_index=" << commit_index_
             << ", committed=" << cache_.size()
             << ", pending=" << pending_by_request_.size()
             << ", max_exec=" << maxExecutionCount()
@@ -3471,12 +3609,14 @@ private:
 
         ReplicatedLogEntry entry = pending->second.entry;
         Address client = pending->second.client;
+        commit_index_ = std::max(commit_index_, entry.version);
         Result result = db_.execute(entry.command);
         std::string key = requestKey(entry.client_id, entry.request_id);
         execution_count_[key]++;
         cache_[key] = result;
         pending_by_request_.erase(pending);
         version_to_request_.erase(key_it);
+        sendStorageApplyRequests(ctx, entry);
         ctx.send(client, ClientReply{entry.client_id, entry.request_id, result});
     }
 
@@ -3486,10 +3626,19 @@ private:
         }
     }
 
+    void sendStorageApplyRequests(NodeContext& ctx,
+                                  const ReplicatedLogEntry& entry) {
+        for (const auto& storage : storage_nodes_) {
+            ctx.send(storage, StorageApplyRequest{entry, commit_index_});
+        }
+    }
+
     std::vector<Address> logs_;
+    std::vector<Address> storage_nodes_;
     size_t quorum_;
     BuzzDBCore db_;
     int next_version_ = 1;
+    int commit_index_ = 0;
     std::map<std::string, PendingCommit> pending_by_request_;
     std::map<int, std::string> version_to_request_;
     std::map<std::string, Result> cache_;
@@ -3965,6 +4114,69 @@ CheckResult replicatedBuzzDBValid(const SearchState& state,
     return {true, ""};
 }
 
+CheckResult storageMatchesCommittedLogPrefix(const SearchState& state,
+                                             const Address& storage,
+                                             const Address& log,
+                                             const Address& server) {
+    const auto* storage_node = state.nodeAs<BuzzDBStorageReplica>(storage);
+    if (storage_node == nullptr) {
+        return {false, storage.str() + " is missing"};
+    }
+    const auto* log_node = state.nodeAs<BuzzDBLogReplica>(log);
+    if (log_node == nullptr) {
+        return {false, log.str() + " is missing"};
+    }
+    const auto* server_node =
+        state.nodeAs<SequencedReplicatedBuzzDBServer>(server);
+    if (server_node == nullptr) {
+        return {false, server.str() + " is missing"};
+    }
+
+    if (storage_node->appliedVersion() > server_node->commitIndex()) {
+        return {false, "storage applied past the commit index"};
+    }
+
+    BuzzDBCore oracle;
+    for (int version = 1; version <= storage_node->appliedVersion(); ++version) {
+        auto entry = log_node->entries().find(version);
+        if (entry == log_node->entries().end()) {
+            return {false, "storage applied version " +
+                                std::to_string(version) +
+                                " missing from log"};
+        }
+        oracle.execute(entry->second.command);
+    }
+
+    if (oracle.digest() != storage_node->appDigest()) {
+        return {false, "storage state does not match replayed log prefix"};
+    }
+
+    std::optional<std::string> invariant = storage_node->validate();
+    if (invariant.has_value()) {
+        return {false, *invariant};
+    }
+    return {true, ""};
+}
+
+CheckResult storageCaughtUp(const SearchState& state,
+                            const Address& storage,
+                            const Address& server) {
+    const auto* storage_node = state.nodeAs<BuzzDBStorageReplica>(storage);
+    if (storage_node == nullptr) {
+        return {false, storage.str() + " is missing"};
+    }
+    const auto* server_node =
+        state.nodeAs<SequencedReplicatedBuzzDBServer>(server);
+    if (server_node == nullptr) {
+        return {false, server.str() + " is missing"};
+    }
+    return {storage_node->appliedVersion() == server_node->commitIndex(),
+            "storage applied version " +
+                std::to_string(storage_node->appliedVersion()) +
+                " but commit index is " +
+                std::to_string(server_node->commitIndex())};
+}
+
 CheckResult noInvariantViolation(const SearchState& state,
                                  const std::vector<NamedPredicate>& invariants) {
     for (const auto& invariant : invariants) {
@@ -4196,6 +4408,33 @@ NamedPredicate replicatedBuzzDBValid(Address server) {
         "REPLICATED_BUZZDB_VALID",
         [server = std::move(server)](const SearchState& state) {
             return ::replicatedBuzzDBValid(state, server);
+        }
+    };
+}
+
+NamedPredicate storageMatchesCommittedLogPrefix(Address storage,
+                                                Address log,
+                                                Address server) {
+    return {
+        "STORAGE_MATCHES_COMMITTED_LOG_PREFIX",
+        [storage = std::move(storage),
+         log = std::move(log),
+         server = std::move(server)](const SearchState& state) {
+            return ::storageMatchesCommittedLogPrefix(
+                state,
+                storage,
+                log,
+                server);
+        }
+    };
+}
+
+NamedPredicate storageCaughtUp(Address storage, Address server) {
+    return {
+        "STORAGE_CAUGHT_UP",
+        [storage = std::move(storage),
+         server = std::move(server)](const SearchState& state) {
+            return ::storageCaughtUp(state, storage, server);
         }
     };
 }
@@ -4683,12 +4922,15 @@ Scenario oneClientReplicatedBuzzDBScenario(Workload workload) {
     Address client = DemoAddress::client1();
     Address log1 = DemoAddress::log1();
     Address log2 = DemoAddress::log2();
+    Address storage = DemoAddress::storage1();
     return ScenarioBuilder()
         .addNode(std::make_unique<BuzzDBLogReplica>(log1))
         .addNode(std::make_unique<BuzzDBLogReplica>(log2))
+        .addNode(std::make_unique<BuzzDBStorageReplica>(storage))
         .addNode(std::make_unique<SequencedReplicatedBuzzDBServer>(
             server,
-            std::vector<Address>{log1, log2}))
+            std::vector<Address>{log1, log2},
+            std::vector<Address>{storage}))
         .addClient(client, server, 1, std::move(workload))
         .build();
 }
@@ -4778,7 +5020,7 @@ void printBuzzDBDemo() {
 }
 
 void printDurableBuzzDBDemo() {
-    const std::string database_file = "/tmp/buzzdb-v111-buzzdb.dat";
+    const std::string database_file = "/tmp/buzzdb-v112-buzzdb.dat";
     std::remove(database_file.c_str());
 
     std::cout << "Demo: reopen node-local buzzdb.dat" << std::endl;
@@ -4820,7 +5062,7 @@ void printDurableBuzzDBDemo() {
 }
 
 int main() {
-    std::cout << "BuzzDB v111: sequenced commands with replicated logs"
+    std::cout << "BuzzDB v112: commit index, storage replay, restart recovery"
               << std::endl;
     printBuzzDBDemo();
     printDurableBuzzDBDemo();
@@ -5013,7 +5255,7 @@ int main() {
     });
 
     tests.test("BuzzDB loads durable table state from buzzdb.dat", [&] {
-        const std::string database_file = "/tmp/buzzdb-v111-test-buzzdb.dat";
+        const std::string database_file = "/tmp/buzzdb-v112-test-buzzdb.dat";
         std::remove(database_file.c_str());
 
         {
@@ -5069,7 +5311,7 @@ int main() {
 
     tests.test("Catalog and TableHeap store metadata and slotted records", [&] {
         const std::string database_file =
-            "/tmp/buzzdb-v111-catalog-heap-test.dat";
+            "/tmp/buzzdb-v112-catalog-heap-test.dat";
         std::remove(database_file.c_str());
         RecordID second_record;
 
@@ -5307,6 +5549,261 @@ int main() {
                     "first log should contain committed version 1");
         tests.check(second_log != nullptr && second_log->hasVersion(1),
                     "second log should contain committed version 1");
+    });
+
+    tests.test("Replicated BuzzDB commits before storage applies", [&] {
+        Address log1 = DemoAddress::log1();
+        Address log2 = DemoAddress::log2();
+        Address storage = DemoAddress::storage1();
+        Scenario scenario =
+            oneClientReplicatedBuzzDBScenario(createTableWorkload());
+        SearchSettings settings = scenario.settings;
+
+        auto after_request = scenario.state.stepMessageMatching(
+            settings,
+            [client, server](const MessageEnvelope& envelope) {
+                return envelope.from == client &&
+                       envelope.to == server &&
+                       std::holds_alternative<ClientRequest>(envelope.message);
+            });
+        auto after_log1 = after_request->stepMessageMatching(
+            settings,
+            [server, log1](const MessageEnvelope& envelope) {
+                return envelope.from == server &&
+                       envelope.to == log1 &&
+                       std::holds_alternative<LogAppendRequest>(envelope.message);
+            });
+        auto after_ack1 = after_log1->stepMessageMatching(
+            settings,
+            [server, log1](const MessageEnvelope& envelope) {
+                const auto* ack = std::get_if<LogAppendReply>(&envelope.message);
+                return envelope.from == log1 &&
+                       envelope.to == server &&
+                       ack != nullptr &&
+                       ack->version == 1;
+            });
+        tests.check(!containsMessageMatching(
+                        *after_ack1,
+                        [](const Message& message) {
+                            return std::holds_alternative<StorageApplyRequest>(
+                                message);
+                        },
+                        "one-ack storage apply").ok,
+                    "one log ack should not advance storage");
+
+        auto after_log2 = after_ack1->stepMessageMatching(
+            settings,
+            [server, log2](const MessageEnvelope& envelope) {
+                return envelope.from == server &&
+                       envelope.to == log2 &&
+                       std::holds_alternative<LogAppendRequest>(envelope.message);
+            });
+        auto after_ack2 = after_log2->stepMessageMatching(
+            settings,
+            [server, log2](const MessageEnvelope& envelope) {
+                const auto* ack = std::get_if<LogAppendReply>(&envelope.message);
+                return envelope.from == log2 &&
+                       envelope.to == server &&
+                       ack != nullptr &&
+                       ack->version == 1;
+            });
+        tests.check(after_ack2.has_value(),
+                    "second log ack should be deliverable");
+        tests.check(containsEnvelopeMatching(
+                        *after_ack2,
+                        [server, storage](const MessageEnvelope& envelope) {
+                            return envelope.from == server &&
+                                   envelope.to == storage &&
+                                   std::holds_alternative<StorageApplyRequest>(
+                                       envelope.message);
+                        },
+                        "storage apply request").ok,
+                    "second log ack should publish committed entry to storage");
+
+        const auto* before_storage =
+            after_ack2->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(before_storage != nullptr &&
+                        before_storage->appliedVersion() == 0,
+                    "storage should be allowed to lag committed logs");
+
+        auto after_storage = after_ack2->stepMessageMatching(
+            settings,
+            [server, storage](const MessageEnvelope& envelope) {
+                return envelope.from == server &&
+                       envelope.to == storage &&
+                       std::holds_alternative<StorageApplyRequest>(
+                           envelope.message);
+            });
+        tests.check(after_storage.has_value(),
+                    "storage apply request should be deliverable");
+        const auto* storage_node =
+            after_storage->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_node != nullptr &&
+                        storage_node->appliedVersion() == 1 &&
+                        storage_node->commitIndex() == 1,
+                    "storage should apply committed version 1");
+        tests.check(storage_node->executeReadOnlyForTest(
+                        CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{0}},
+                    "replayed create table should be visible in storage");
+    });
+
+    tests.test("Storage applies committed log entries in version order", [&] {
+        Address storage = DemoAddress::storage1();
+        ReplicatedLogEntry v1{
+            1,
+            1,
+            1,
+            CreateTableCommand{"people", {"id:int", "name:string"}}
+        };
+        ReplicatedLogEntry v2{
+            2,
+            1,
+            2,
+            InsertRowCommand{"people", {"1", "Ada"}}
+        };
+
+        SearchState state;
+        state.addNode(std::make_unique<BuzzDBStorageReplica>(storage));
+        state.send(server, storage, StorageApplyRequest{v2, 2});
+
+        SearchSettings settings;
+        auto after_v2 = state.stepEvent({EventRef::Kind::Message, 1}, settings);
+        tests.check(after_v2.has_value(),
+                    "out-of-order v2 apply should be deliverable");
+        const auto* storage_after_v2 =
+            after_v2->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_after_v2 != nullptr &&
+                        storage_after_v2->appliedVersion() == 0 &&
+                        storage_after_v2->pendingCount() == 1,
+                    "storage should buffer v2 until v1 arrives");
+
+        SearchState with_v1 = *after_v2;
+        with_v1.send(server, storage, StorageApplyRequest{v1, 2});
+        auto after_v1 = with_v1.stepMessageMatching(
+            settings,
+            [server, storage](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<StorageApplyRequest>(&envelope.message);
+                return envelope.from == server &&
+                       envelope.to == storage &&
+                       request != nullptr &&
+                       request->entry.version == 1;
+            });
+        tests.check(after_v1.has_value(),
+                    "v1 apply should be deliverable");
+        const auto* storage_after_v1 =
+            after_v1->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_after_v1 != nullptr &&
+                        storage_after_v1->appliedVersion() == 2 &&
+                        storage_after_v1->pendingCount() == 0 &&
+                        storage_after_v1->applyCount() == 2,
+                    "storage should apply v1 and then buffered v2");
+
+        SearchState duplicate = *after_v1;
+        duplicate.send(server, storage, StorageApplyRequest{v1, 2});
+        auto after_duplicate = duplicate.stepMessageMatching(
+            settings,
+            [server, storage](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<StorageApplyRequest>(&envelope.message);
+                return envelope.from == server &&
+                       envelope.to == storage &&
+                       request != nullptr &&
+                       request->entry.version == 1;
+            });
+        tests.check(after_duplicate.has_value(),
+                    "duplicate v1 apply should be deliverable");
+        const auto* storage_after_duplicate =
+            after_duplicate->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_after_duplicate != nullptr &&
+                        storage_after_duplicate->appliedVersion() == 2 &&
+                        storage_after_duplicate->applyCount() == 2,
+                    "duplicate apply should not execute twice");
+    });
+
+    tests.test("Storage restart rebuilds BuzzDBCore from log prefix", [&] {
+        ReplicatedLogEntry v1{
+            1,
+            1,
+            1,
+            CreateTableCommand{"people", {"id:int", "name:string"}}
+        };
+        ReplicatedLogEntry v2{
+            2,
+            1,
+            2,
+            InsertRowCommand{"people", {"1", "Ada"}}
+        };
+        std::map<int, ReplicatedLogEntry> replay_log{
+            {1, v1},
+            {2, v2}
+        };
+
+        BuzzDBStorageReplica restarted(
+            Address("storage-restart"),
+            replay_log,
+            2);
+        tests.check(restarted.appliedVersion() == 2,
+                    "restarted storage should replay through commit index");
+        tests.check(restarted.executeReadOnlyForTest(
+                        CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{1}},
+                    "restarted storage should recover inserted row");
+
+        BuzzDBCore oracle;
+        oracle.execute(v1.command);
+        oracle.execute(v2.command);
+        tests.check(restarted.appDigest() == oracle.digest(),
+                    "restarted storage should match oracle replay");
+    });
+
+    tests.test("Replicated BuzzDB search reaches storage catch-up", [&] {
+        Address log1 = DemoAddress::log1();
+        Address log2 = DemoAddress::log2();
+        Address storage = DemoAddress::storage1();
+        Scenario scenario =
+            oneClientReplicatedBuzzDBScenario(createTableWorkload());
+        SearchSettings settings = scenario.settings;
+        settings.max_depth = 12;
+        settings.max_states = 80000;
+        settings.invariants.push_back(
+            Predicates::resultsOk(std::vector<Address>{client}));
+        settings.invariants.push_back(Predicates::atMostOnce(server));
+        settings.invariants.push_back(Predicates::replicatedBuzzDBValid(server));
+        settings.invariants.push_back(
+            Predicates::storageMatchesCommittedLogPrefix(storage, log1, server));
+        settings.goals.push_back({
+            "CLIENTS_DONE_AND_STORAGE_CAUGHT_UP",
+            [client, storage, server](const SearchState& state) {
+                CheckResult done =
+                    clientsDone(state, std::vector<Address>{client});
+                if (!done.ok) {
+                    return done;
+                }
+                return storageCaughtUp(state, storage, server);
+            }
+        });
+        SearchResults result = bfs(scenario.state, settings);
+        tests.check(result.end_condition == SearchResults::EndCondition::GoalFound,
+                    "client should finish and storage should catch up");
+        tests.check(result.terminal_state.has_value(),
+                    "goal search should return a terminal state");
+
+        const auto* first_log =
+            result.terminal_state->nodeAs<BuzzDBLogReplica>(log1);
+        const auto* second_log =
+            result.terminal_state->nodeAs<BuzzDBLogReplica>(log2);
+        const auto* storage_node =
+            result.terminal_state->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(first_log != nullptr && first_log->hasVersion(1),
+                    "first log should contain committed version 1");
+        tests.check(second_log != nullptr && second_log->hasVersion(1),
+                    "second log should contain committed version 1");
+        tests.check(storage_node != nullptr &&
+                        storage_node->appliedVersion() == 1 &&
+                        storage_node->commitIndex() == 1,
+                    "storage should catch up through committed version 1");
     });
 
     return tests.finish();

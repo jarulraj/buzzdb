@@ -25,13 +25,14 @@
 #include <variant>
 #include <vector>
 
-// BuzzDB v111: sequenced BuzzDB commands with replicated commit logs.
+// BuzzDB v113: snapshots, state transfer, and replicated log truncation.
 //
 // This version keeps the v108 search simulator but brings back BuzzDB's
 // database vocabulary: typed fields, tuples, schemas, tables, and a small
-// page-file storage stack. It adds a sequenced commit node that assigns each
-// command a version, appends it to two log replicas, and applies it only after
-// both logs acknowledge the replicated operation.
+// page-file storage stack. It adds snapshots for replicated state transfer:
+// storage can capture a BuzzDBCore image at a commit index, new storage replicas
+// can install that image and replay the remaining suffix, and log replicas can
+// truncate entries covered by a durable snapshot.
 
 struct Address {
     std::string id;
@@ -98,6 +99,22 @@ struct CountRowsCommand {
     std::string table;
 };
 
+struct BeginTransactionCommand {
+    int txn_id;
+};
+
+struct CommitTransactionCommand {
+    int txn_id;
+};
+
+struct AbortTransactionCommand {
+    int txn_id;
+};
+
+struct CheckpointCommand {
+    int snapshot_index;
+};
+
 using Command = std::variant<
     CreateTableCommand,
     InsertRowCommand,
@@ -105,7 +122,11 @@ using Command = std::variant<
     UpdateRowsCommand,
     SelectAllCommand,
     SelectWhereCommand,
-    CountRowsCommand>;
+    CountRowsCommand,
+    BeginTransactionCommand,
+    CommitTransactionCommand,
+    AbortTransactionCommand,
+    CheckpointCommand>;
 
 struct CreateTableOkResult {};
 
@@ -136,6 +157,20 @@ struct SchemaMismatchResult {};
 
 struct InvalidSchemaResult {};
 
+struct TransactionOkResult {
+    int txn_id;
+    std::string action;
+};
+
+struct TransactionErrorResult {
+    std::string reason;
+};
+
+struct CheckpointOkResult {
+    int snapshot_index;
+    int lsn;
+};
+
 using Result = std::variant<
     CreateTableOkResult,
     InsertOkResult,
@@ -146,7 +181,10 @@ using Result = std::variant<
     TableNotFoundResult,
     TableAlreadyExistsResult,
     SchemaMismatchResult,
-    InvalidSchemaResult>;
+    InvalidSchemaResult,
+    TransactionOkResult,
+    TransactionErrorResult,
+    CheckpointOkResult>;
 
 bool operator==(const CreateTableOkResult&, const CreateTableOkResult&) {
     return true;
@@ -187,6 +225,21 @@ bool operator==(const SchemaMismatchResult&, const SchemaMismatchResult&) {
 
 bool operator==(const InvalidSchemaResult&, const InvalidSchemaResult&) {
     return true;
+}
+
+bool operator==(const TransactionOkResult& lhs,
+                const TransactionOkResult& rhs) {
+    return lhs.txn_id == rhs.txn_id && lhs.action == rhs.action;
+}
+
+bool operator==(const TransactionErrorResult& lhs,
+                const TransactionErrorResult& rhs) {
+    return lhs.reason == rhs.reason;
+}
+
+bool operator==(const CheckpointOkResult& lhs,
+                const CheckpointOkResult& rhs) {
+    return lhs.snapshot_index == rhs.snapshot_index && lhs.lsn == rhs.lsn;
 }
 
 bool operator==(const Result& lhs, const Result& rhs) {
@@ -242,6 +295,15 @@ std::string describeCommand(const Command& command) {
                     << " WHERE " << value.column << "=" << value.value;
             } else if constexpr (std::is_same_v<T, CountRowsCommand>) {
                 out << "CountRows(" << value.table << ")";
+            } else if constexpr (std::is_same_v<T, BeginTransactionCommand>) {
+                out << "BEGIN TXN " << value.txn_id;
+            } else if constexpr (std::is_same_v<T, CommitTransactionCommand>) {
+                out << "COMMIT TXN " << value.txn_id;
+            } else if constexpr (std::is_same_v<T, AbortTransactionCommand>) {
+                out << "ABORT TXN " << value.txn_id;
+            } else if constexpr (std::is_same_v<T, CheckpointCommand>) {
+                out << "CHECKPOINT(snapshot_index="
+                    << value.snapshot_index << ")";
             }
             return out.str();
         },
@@ -274,6 +336,14 @@ std::string describeResult(const Result& result) {
                 out << "SchemaMismatch";
             } else if constexpr (std::is_same_v<T, InvalidSchemaResult>) {
                 out << "InvalidSchema";
+            } else if constexpr (std::is_same_v<T, TransactionOkResult>) {
+                out << "TxnOk(" << value.txn_id
+                    << ", " << value.action << ")";
+            } else if constexpr (std::is_same_v<T, TransactionErrorResult>) {
+                out << "TxnError(" << value.reason << ")";
+            } else if constexpr (std::is_same_v<T, CheckpointOkResult>) {
+                out << "CheckpointOk(index=" << value.snapshot_index
+                    << ", lsn=" << value.lsn << ")";
             }
             return out.str();
         },
@@ -819,6 +889,48 @@ private:
 };
 
 using TableMap = std::map<std::string, Table>;
+
+struct BuzzDBSnapshot {
+    int snapshot_index = 0;
+    int checkpoint_lsn = 0;
+    TableMap tables;
+    std::string digest;
+};
+
+enum class WalRecordType {
+    Begin,
+    Update,
+    Commit,
+    Abort,
+    Checkpoint
+};
+
+std::string walRecordTypeName(WalRecordType type) {
+    switch (type) {
+        case WalRecordType::Begin:
+            return "BEGIN";
+        case WalRecordType::Update:
+            return "UPDATE";
+        case WalRecordType::Commit:
+            return "COMMIT";
+        case WalRecordType::Abort:
+            return "ABORT";
+        case WalRecordType::Checkpoint:
+            return "CHECKPOINT";
+    }
+    throw std::runtime_error("Unknown WAL record type.");
+}
+
+struct RecoveryLogRecord {
+    int lsn = 0;
+    int txn_id = 0;
+    WalRecordType type = WalRecordType::Begin;
+    int snapshot_index = 0;
+    std::optional<Command> command;
+    std::optional<Result> result;
+    std::string before_digest;
+    std::string after_digest;
+};
 
 using PageID = uint32_t;
 using TableId = uint32_t;
@@ -2067,7 +2179,7 @@ QueryComponents parseQuery(const std::string& query) {
     std::smatch matches;
     if (!std::regex_match(query, matches, selectStarRegex)) {
         throw std::runtime_error(
-            "v109 supports SELECT * FROM <table> queries.");
+            "This version supports SELECT * FROM <table> queries.");
     }
 
     QueryComponents components;
@@ -2088,6 +2200,37 @@ QueryComponents parseQuery(const std::string& query) {
 
 Command parseSQL(const std::string& sql) {
     std::string statement = stripOptionalSemicolon(sql);
+    std::smatch matches;
+
+    std::regex beginRegex(
+        "^\\s*BEGIN(?:\\s+(?:TXN|TRANSACTION))?\\s+([0-9]+)\\s*$",
+        std::regex_constants::icase);
+    if (std::regex_match(statement, matches, beginRegex)) {
+        return BeginTransactionCommand{std::stoi(matches[1])};
+    }
+
+    std::regex commitRegex(
+        "^\\s*COMMIT(?:\\s+(?:TXN|TRANSACTION))?\\s+([0-9]+)\\s*$",
+        std::regex_constants::icase);
+    if (std::regex_match(statement, matches, commitRegex)) {
+        return CommitTransactionCommand{std::stoi(matches[1])};
+    }
+
+    std::regex abortRegex(
+        "^\\s*(?:ABORT|ROLLBACK)(?:\\s+(?:TXN|TRANSACTION))?\\s+([0-9]+)\\s*$",
+        std::regex_constants::icase);
+    if (std::regex_match(statement, matches, abortRegex)) {
+        return AbortTransactionCommand{std::stoi(matches[1])};
+    }
+
+    std::regex checkpointRegex(
+        "^\\s*CHECKPOINT(?:\\s+([0-9]+))?\\s*$",
+        std::regex_constants::icase);
+    if (std::regex_match(statement, matches, checkpointRegex)) {
+        int snapshot_index = matches[1].matched ? std::stoi(matches[1]) : 0;
+        return CheckpointCommand{snapshot_index};
+    }
+
     if (std::regex_search(
             statement,
             std::regex("^\\s*(PROJECT|SELECT)\\s+",
@@ -2106,7 +2249,6 @@ Command parseSQL(const std::string& sql) {
         throw std::runtime_error("Unsupported query.");
     }
 
-    std::smatch matches;
     std::regex createRegex(
         "^\\s*CREATE\\s+TABLE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\((.*)\\)\\s*$",
         std::regex_constants::icase);
@@ -2192,7 +2334,13 @@ public:
     }
 
     BuzzDBCore(const BuzzDBCore& other)
-        : tables_(other.tables_), index_(other.index_) {}
+        : tables_(other.tables_),
+          index_(other.index_),
+          active_txn_(other.active_txn_),
+          wal_(other.wal_),
+          next_lsn_(other.next_lsn_),
+          next_autocommit_txn_id_(other.next_autocommit_txn_id_),
+          last_checkpoint_lsn_(other.last_checkpoint_lsn_) {}
 
     BuzzDBCore& operator=(const BuzzDBCore& other) {
         if (this == &other) {
@@ -2200,6 +2348,11 @@ public:
         }
         tables_ = other.tables_;
         index_ = other.index_;
+        active_txn_ = other.active_txn_;
+        wal_ = other.wal_;
+        next_lsn_ = other.next_lsn_;
+        next_autocommit_txn_id_ = other.next_autocommit_txn_id_;
+        last_checkpoint_lsn_ = other.last_checkpoint_lsn_;
         database_filename_.reset();
         buffer_manager_.reset();
         catalog_.reset();
@@ -2207,44 +2360,18 @@ public:
     }
 
     Result execute(const Command& command) {
-        if (durable()) {
-            return executeDurable(command);
+        if (isTransactionControl(command)) {
+            return executeTransactionControl(command);
         }
 
-        bool command_may_mutate =
-            std::holds_alternative<CreateTableCommand>(command) ||
-            std::holds_alternative<InsertRowCommand>(command) ||
-            std::holds_alternative<DeleteRowsCommand>(command) ||
-            std::holds_alternative<UpdateRowsCommand>(command);
-
-        Result result = TableNotFoundResult{};
-        if (const auto* create = std::get_if<CreateTableCommand>(&command)) {
-            result = CreateTableOperator(tables_, *create).execute();
-        } else if (const auto* insert = std::get_if<InsertRowCommand>(&command)) {
-            result = InsertOperator(tables_, *insert).execute();
-        } else if (const auto* delete_rows =
-                       std::get_if<DeleteRowsCommand>(&command)) {
-            result = DeleteOperator(tables_, *delete_rows).execute();
-        } else if (const auto* update_rows =
-                       std::get_if<UpdateRowsCommand>(&command)) {
-            result = UpdateOperator(tables_, *update_rows).execute();
-        } else if (const auto* select =
-                       std::get_if<SelectAllCommand>(&command)) {
-            result = ScanOperator(tables_, *select).execute();
-        } else if (const auto* lookup =
-                       std::get_if<SelectWhereCommand>(&command)) {
-            result = IndexLookupOperator(tables_, index_, *lookup).execute();
-        } else if (const auto* count = std::get_if<CountRowsCommand>(&command)) {
-            result = CountOperator(tables_, *count).execute();
-        } else {
-            throw std::runtime_error(
-                "BuzzDBCore received a non-database command.");
+        if (active_txn_.has_value()) {
+            return executeInActiveTransaction(command);
         }
 
-        if (command_may_mutate && mutationSucceeded(result)) {
-            index_.rebuild(tables_);
+        if (commandMutates(command)) {
+            return executeAutocommit(command);
         }
-        return result;
+        return executeBaseNoLog(command);
     }
 
     std::vector<Result> executeAll(const std::vector<Command>& commands) {
@@ -2257,33 +2384,15 @@ public:
     }
 
     std::optional<std::string> validate() const {
-        for (const auto& entry : tables_) {
-            if (entry.first.empty()) {
-                return "table name cannot be empty";
-            }
-            const Table& table = entry.second;
-            if (table.name() != entry.first) {
-                return "table map key does not match table name";
-            }
-            if (table.schema().columns().empty()) {
-                return "table " + entry.first + " has no columns";
-            }
-
-            std::set<std::string> seen_columns;
-            for (const auto& column : table.schema().columns()) {
-                if (column.name.empty()) {
-                    return "table " + entry.first + " has an empty column";
-                }
-                if (!seen_columns.insert(column.name).second) {
-                    return "table " + entry.first +
-                           " has duplicate column " + column.name;
-                }
-            }
-
-            for (const auto& row : table.rows()) {
-                if (!table.schema().matches(row)) {
-                    return "table " + entry.first + " has a malformed row";
-                }
+        std::optional<std::string> base = validateTables(tables_);
+        if (base.has_value()) {
+            return base;
+        }
+        if (active_txn_.has_value()) {
+            std::optional<std::string> workspace =
+                validateTables(active_txn_->workspace);
+            if (workspace.has_value()) {
+                return "active transaction workspace: " + *workspace;
             }
         }
         return std::nullopt;
@@ -2325,12 +2434,333 @@ public:
         return buffer_manager_ ? buffer_manager_->stats() : BufferPoolStats{};
     }
 
+    BuzzDBSnapshot createSnapshot(int snapshot_index) {
+        int checkpoint_lsn = appendWalRecord(
+            0,
+            WalRecordType::Checkpoint,
+            std::nullopt,
+            std::nullopt,
+            digest(),
+            digest(),
+            snapshot_index);
+        last_checkpoint_lsn_ = checkpoint_lsn;
+        return BuzzDBSnapshot{
+            snapshot_index,
+            checkpoint_lsn,
+            tables_,
+            digest()
+        };
+    }
+
+    void restoreSnapshot(const BuzzDBSnapshot& snapshot) {
+        tables_ = snapshot.tables;
+        index_.rebuild(tables_);
+        active_txn_.reset();
+        last_checkpoint_lsn_ = snapshot.checkpoint_lsn;
+    }
+
+    static BuzzDBCore recoverFromSnapshotAndWal(
+        const BuzzDBSnapshot& snapshot,
+        const std::vector<RecoveryLogRecord>& wal) {
+        BuzzDBCore recovered;
+        recovered.restoreSnapshot(snapshot);
+
+        std::set<int> committed_txns;
+        for (const auto& record : wal) {
+            if (record.lsn <= snapshot.checkpoint_lsn) {
+                continue;
+            }
+            if (record.type == WalRecordType::Commit) {
+                committed_txns.insert(record.txn_id);
+            }
+        }
+
+        for (const auto& record : wal) {
+            if (record.lsn <= snapshot.checkpoint_lsn ||
+                record.type != WalRecordType::Update ||
+                !record.command.has_value() ||
+                committed_txns.find(record.txn_id) == committed_txns.end()) {
+                continue;
+            }
+            recovered.executeBaseNoLog(*record.command);
+        }
+        return recovered;
+    }
+
+    const std::vector<RecoveryLogRecord>& walRecords() const {
+        return wal_;
+    }
+
+    size_t walSize() const {
+        return wal_.size();
+    }
+
+    int lastCheckpointLsn() const {
+        return last_checkpoint_lsn_;
+    }
+
+    std::optional<int> activeTransactionId() const {
+        if (!active_txn_.has_value()) {
+            return std::nullopt;
+        }
+        return active_txn_->txn_id;
+    }
+
 private:
+    struct ActiveTransaction {
+        int txn_id = 0;
+        TableMap workspace;
+        HashIndex workspace_index;
+        std::vector<int> update_lsns;
+    };
+
+    static bool commandMutates(const Command& command) {
+        return std::holds_alternative<CreateTableCommand>(command) ||
+               std::holds_alternative<InsertRowCommand>(command) ||
+               std::holds_alternative<DeleteRowsCommand>(command) ||
+               std::holds_alternative<UpdateRowsCommand>(command);
+    }
+
+    static bool isTransactionControl(const Command& command) {
+        return std::holds_alternative<BeginTransactionCommand>(command) ||
+               std::holds_alternative<CommitTransactionCommand>(command) ||
+               std::holds_alternative<AbortTransactionCommand>(command) ||
+               std::holds_alternative<CheckpointCommand>(command);
+    }
+
     static bool mutationSucceeded(const Result& result) {
         return std::holds_alternative<CreateTableOkResult>(result) ||
                std::holds_alternative<InsertOkResult>(result) ||
                std::holds_alternative<DeleteRowsResult>(result) ||
                std::holds_alternative<UpdateRowsResult>(result);
+    }
+
+    static std::string digestTables(const TableMap& tables,
+                                    const HashIndex& index) {
+        std::ostringstream out;
+        out << "BuzzDB(tables=" << tables.size();
+        for (const auto& entry : tables) {
+            out << ";table=" << entry.second.digest();
+        }
+        out << ";index=" << index.digest();
+        out << ")";
+        return out.str();
+    }
+
+    static std::optional<std::string> validateTables(const TableMap& tables) {
+        for (const auto& entry : tables) {
+            if (entry.first.empty()) {
+                return "table name cannot be empty";
+            }
+            const Table& table = entry.second;
+            if (table.name() != entry.first) {
+                return "table map key does not match table name";
+            }
+            if (table.schema().columns().empty()) {
+                return "table " + entry.first + " has no columns";
+            }
+
+            std::set<std::string> seen_columns;
+            for (const auto& column : table.schema().columns()) {
+                if (column.name.empty()) {
+                    return "table " + entry.first + " has an empty column";
+                }
+                if (!seen_columns.insert(column.name).second) {
+                    return "table " + entry.first +
+                           " has duplicate column " + column.name;
+                }
+            }
+
+            for (const auto& row : table.rows()) {
+                if (!table.schema().matches(row)) {
+                    return "table " + entry.first + " has a malformed row";
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    static Result executeMemoryNoLog(Command command,
+                                     TableMap& tables,
+                                     HashIndex& index) {
+        bool mutates = commandMutates(command);
+        Result result = TableNotFoundResult{};
+        if (const auto* create = std::get_if<CreateTableCommand>(&command)) {
+            result = CreateTableOperator(tables, *create).execute();
+        } else if (const auto* insert =
+                       std::get_if<InsertRowCommand>(&command)) {
+            result = InsertOperator(tables, *insert).execute();
+        } else if (const auto* delete_rows =
+                       std::get_if<DeleteRowsCommand>(&command)) {
+            result = DeleteOperator(tables, *delete_rows).execute();
+        } else if (const auto* update_rows =
+                       std::get_if<UpdateRowsCommand>(&command)) {
+            result = UpdateOperator(tables, *update_rows).execute();
+        } else if (const auto* select =
+                       std::get_if<SelectAllCommand>(&command)) {
+            result = ScanOperator(tables, *select).execute();
+        } else if (const auto* lookup =
+                       std::get_if<SelectWhereCommand>(&command)) {
+            result = IndexLookupOperator(tables, index, *lookup).execute();
+        } else if (const auto* count =
+                       std::get_if<CountRowsCommand>(&command)) {
+            result = CountOperator(tables, *count).execute();
+        } else {
+            throw std::runtime_error(
+                "BuzzDBCore received a non-database command.");
+        }
+
+        if (mutates && mutationSucceeded(result)) {
+            index.rebuild(tables);
+        }
+        return result;
+    }
+
+    Result executeBaseNoLog(const Command& command) {
+        if (durable()) {
+            return executeDurable(command);
+        }
+        return executeMemoryNoLog(command, tables_, index_);
+    }
+
+    int appendWalRecord(int txn_id,
+                        WalRecordType type,
+                        std::optional<Command> command = std::nullopt,
+                        std::optional<Result> result = std::nullopt,
+                        std::string before_digest = "",
+                        std::string after_digest = "",
+                        int snapshot_index = 0) {
+        int lsn = next_lsn_++;
+        wal_.push_back(RecoveryLogRecord{
+            lsn,
+            txn_id,
+            type,
+            snapshot_index,
+            std::move(command),
+            std::move(result),
+            std::move(before_digest),
+            std::move(after_digest)
+        });
+        return lsn;
+    }
+
+    Result executeAutocommit(const Command& command) {
+        int txn_id = next_autocommit_txn_id_++;
+        appendWalRecord(txn_id, WalRecordType::Begin);
+        std::string before = digest();
+        Result result = executeBaseNoLog(command);
+        std::string after = digest();
+        if (mutationSucceeded(result)) {
+            appendWalRecord(
+                txn_id,
+                WalRecordType::Update,
+                command,
+                result,
+                before,
+                after);
+            appendWalRecord(txn_id, WalRecordType::Commit);
+        } else {
+            appendWalRecord(txn_id, WalRecordType::Abort);
+        }
+        return result;
+    }
+
+    Result executeInActiveTransaction(const Command& command) {
+        if (!active_txn_.has_value()) {
+            return TransactionErrorResult{"no active transaction"};
+        }
+        if (durable()) {
+            return TransactionErrorResult{
+                "explicit transactions use memory snapshots in this version"};
+        }
+
+        if (!commandMutates(command)) {
+            return executeMemoryNoLog(
+                command,
+                active_txn_->workspace,
+                active_txn_->workspace_index);
+        }
+
+        std::string before = digestTables(
+            active_txn_->workspace,
+            active_txn_->workspace_index);
+        Result result = executeMemoryNoLog(
+            command,
+            active_txn_->workspace,
+            active_txn_->workspace_index);
+        std::string after = digestTables(
+            active_txn_->workspace,
+            active_txn_->workspace_index);
+        if (mutationSucceeded(result)) {
+            int lsn = appendWalRecord(
+                active_txn_->txn_id,
+                WalRecordType::Update,
+                command,
+                result,
+                before,
+                after);
+            active_txn_->update_lsns.push_back(lsn);
+        }
+        return result;
+    }
+
+    Result executeTransactionControl(const Command& command) {
+        if (const auto* begin =
+                std::get_if<BeginTransactionCommand>(&command)) {
+            if (durable()) {
+                return TransactionErrorResult{
+                    "explicit transactions use memory snapshots in this version"};
+            }
+            if (active_txn_.has_value()) {
+                return TransactionErrorResult{
+                    "transaction already active"};
+            }
+            ActiveTransaction txn;
+            txn.txn_id = begin->txn_id;
+            txn.workspace = tables_;
+            txn.workspace_index = index_;
+            active_txn_ = std::move(txn);
+            appendWalRecord(begin->txn_id, WalRecordType::Begin);
+            return TransactionOkResult{begin->txn_id, "begin"};
+        }
+
+        if (const auto* commit =
+                std::get_if<CommitTransactionCommand>(&command)) {
+            if (!active_txn_.has_value() ||
+                active_txn_->txn_id != commit->txn_id) {
+                return TransactionErrorResult{
+                    "no matching active transaction"};
+            }
+            tables_ = active_txn_->workspace;
+            index_ = active_txn_->workspace_index;
+            appendWalRecord(commit->txn_id, WalRecordType::Commit);
+            active_txn_.reset();
+            return TransactionOkResult{commit->txn_id, "commit"};
+        }
+
+        if (const auto* abort =
+                std::get_if<AbortTransactionCommand>(&command)) {
+            if (!active_txn_.has_value() ||
+                active_txn_->txn_id != abort->txn_id) {
+                return TransactionErrorResult{
+                    "no matching active transaction"};
+            }
+            appendWalRecord(abort->txn_id, WalRecordType::Abort);
+            active_txn_.reset();
+            return TransactionOkResult{abort->txn_id, "abort"};
+        }
+
+        if (const auto* checkpoint =
+                std::get_if<CheckpointCommand>(&command)) {
+            BuzzDBSnapshot snapshot =
+                createSnapshot(checkpoint->snapshot_index);
+            return CheckpointOkResult{
+                snapshot.snapshot_index,
+                snapshot.checkpoint_lsn
+            };
+        }
+
+        throw std::runtime_error("Unknown transaction control command.");
     }
 
     Result executeDurable(const Command& command) {
@@ -2504,6 +2934,11 @@ private:
 
     TableMap tables_;
     HashIndex index_;
+    std::optional<ActiveTransaction> active_txn_;
+    std::vector<RecoveryLogRecord> wal_;
+    int next_lsn_ = 1;
+    int next_autocommit_txn_id_ = 1000000;
+    int last_checkpoint_lsn_ = 0;
     std::optional<std::string> database_filename_;
     std::unique_ptr<BufferManager> buffer_manager_;
     std::unique_ptr<Catalog> catalog_;
@@ -2574,11 +3009,47 @@ struct LogAppendReply {
     Address log;
 };
 
+struct LogTruncateRequest {
+    int through_version;
+};
+
+struct LogTruncateReply {
+    int truncated_through;
+    Address log;
+};
+
+struct StorageApplyRequest {
+    ReplicatedLogEntry entry;
+    int commit_index;
+};
+
+struct StorageApplyReply {
+    int applied_version;
+    Address storage;
+};
+
+struct InstallSnapshotRequest {
+    BuzzDBSnapshot snapshot;
+    int commit_index;
+};
+
+struct InstallSnapshotReply {
+    int snapshot_index;
+    int applied_version;
+    Address storage;
+};
+
 using Message = std::variant<
     ClientRequest,
     ClientReply,
     LogAppendRequest,
-    LogAppendReply>;
+    LogAppendReply,
+    LogTruncateRequest,
+    LogTruncateReply,
+    StorageApplyRequest,
+    StorageApplyReply,
+    InstallSnapshotRequest,
+    InstallSnapshotReply>;
 
 struct RetryTimer {
     int request_id;
@@ -2611,6 +3082,30 @@ std::string describeMessage(const Message& message) {
             } else if constexpr (std::is_same_v<T, LogAppendReply>) {
                 out << "LogAppendReply(version=" << value.version
                     << ", log=" << value.log << ")";
+            } else if constexpr (std::is_same_v<T, LogTruncateRequest>) {
+                out << "LogTruncateRequest(through="
+                    << value.through_version << ")";
+            } else if constexpr (std::is_same_v<T, LogTruncateReply>) {
+                out << "LogTruncateReply(through="
+                    << value.truncated_through
+                    << ", log=" << value.log << ")";
+            } else if constexpr (std::is_same_v<T, StorageApplyRequest>) {
+                out << "StorageApplyRequest(version=" << value.entry.version
+                    << ", commit_index=" << value.commit_index
+                    << ", " << describeCommand(value.entry.command) << ")";
+            } else if constexpr (std::is_same_v<T, StorageApplyReply>) {
+                out << "StorageApplyReply(applied_version="
+                    << value.applied_version
+                    << ", storage=" << value.storage << ")";
+            } else if constexpr (std::is_same_v<T, InstallSnapshotRequest>) {
+                out << "InstallSnapshotRequest(index="
+                    << value.snapshot.snapshot_index
+                    << ", commit_index=" << value.commit_index << ")";
+            } else if constexpr (std::is_same_v<T, InstallSnapshotReply>) {
+                out << "InstallSnapshotReply(index="
+                    << value.snapshot_index
+                    << ", applied_version=" << value.applied_version
+                    << ", storage=" << value.storage << ")";
             }
             return out.str();
         },
@@ -2688,6 +3183,10 @@ Address log1() {
 
 Address log2() {
     return Address("log2");
+}
+
+Address storage1() {
+    return Address("storage1");
 }
 
 }  // namespace DemoAddress
@@ -3310,13 +3809,18 @@ public:
     void onMessage(NodeContext& ctx,
                    const Address& from,
                    const Message& message) override {
-        const auto* request = std::get_if<LogAppendRequest>(&message);
-        if (request == nullptr) {
+        if (const auto* request = std::get_if<LogAppendRequest>(&message)) {
+            if (request->entry.version > truncated_through_) {
+                entries_.emplace(request->entry.version, request->entry);
+            }
+            ctx.send(from, LogAppendReply{request->entry.version, address()});
             return;
         }
 
-        entries_.emplace(request->entry.version, request->entry);
-        ctx.send(from, LogAppendReply{request->entry.version, address()});
+        if (const auto* request = std::get_if<LogTruncateRequest>(&message)) {
+            truncateThrough(request->through_version);
+            ctx.send(from, LogTruncateReply{truncated_through_, address()});
+        }
     }
 
     std::unique_ptr<Node> clone() const override {
@@ -3335,9 +3839,23 @@ public:
         return entries_;
     }
 
+    int truncatedThrough() const {
+        return truncated_through_;
+    }
+
+    void truncateThrough(int version) {
+        if (version <= truncated_through_) {
+            return;
+        }
+        truncated_through_ = version;
+        auto erase_end = entries_.upper_bound(version);
+        entries_.erase(entries_.begin(), erase_end);
+    }
+
     std::string digest() const override {
         std::ostringstream out;
-        out << "BuzzDBLog(entries=" << entries_.size();
+        out << "BuzzDBLog(truncated_through=" << truncated_through_
+            << ", entries=" << entries_.size();
         for (const auto& entry : entries_) {
             out << ",v" << entry.first << "="
                 << describeCommand(entry.second.command);
@@ -3351,18 +3869,191 @@ public:
     }
 
 private:
+    int truncated_through_ = 0;
     std::map<int, ReplicatedLogEntry> entries_;
+};
+
+class BuzzDBStorageReplica : public Node {
+public:
+    explicit BuzzDBStorageReplica(Address address)
+        : Node(std::move(address)) {}
+
+    BuzzDBStorageReplica(Address address,
+                         std::map<int, ReplicatedLogEntry> replay_log,
+                         int commit_index)
+        : Node(std::move(address)), commit_index_(commit_index) {
+        pending_entries_ = std::move(replay_log);
+        applyReadyEntries();
+    }
+
+    BuzzDBStorageReplica(Address address,
+                         BuzzDBSnapshot snapshot,
+                         std::map<int, ReplicatedLogEntry> replay_log,
+                         int commit_index)
+        : Node(std::move(address)), commit_index_(commit_index) {
+        installSnapshot(std::move(snapshot), commit_index_);
+        pending_entries_ = std::move(replay_log);
+        eraseEntriesCoveredBySnapshot();
+        applyReadyEntries();
+    }
+
+    void onMessage(NodeContext& ctx,
+                   const Address& from,
+                   const Message& message) override {
+        if (const auto* request = std::get_if<InstallSnapshotRequest>(
+                &message)) {
+            installSnapshot(request->snapshot, request->commit_index);
+            ctx.send(from, InstallSnapshotReply{
+                snapshot_index_,
+                applied_version_,
+                address()
+            });
+            return;
+        }
+
+        const auto* request = std::get_if<StorageApplyRequest>(&message);
+        if (request == nullptr) {
+            return;
+        }
+        commit_index_ = std::max(commit_index_, request->commit_index);
+        if (request->entry.version > applied_version_ &&
+            request->entry.version > snapshot_index_) {
+            pending_entries_.emplace(request->entry.version, request->entry);
+        }
+        applyReadyEntries();
+        ctx.send(from, StorageApplyReply{applied_version_, address()});
+    }
+
+    std::unique_ptr<Node> clone() const override {
+        return std::make_unique<BuzzDBStorageReplica>(*this);
+    }
+
+    int commitIndex() const {
+        return commit_index_;
+    }
+
+    int appliedVersion() const {
+        return applied_version_;
+    }
+
+    int snapshotIndex() const {
+        return snapshot_index_;
+    }
+
+    size_t pendingCount() const {
+        return pending_entries_.size();
+    }
+
+    int applyCount() const {
+        return apply_count_;
+    }
+
+    std::optional<std::string> validate() const {
+        return db_.validate();
+    }
+
+    std::string appDigest() const {
+        return db_.digest();
+    }
+
+    BuzzDBSnapshot createSnapshot() {
+        latest_snapshot_ = db_.createSnapshot(applied_version_);
+        snapshot_index_ = latest_snapshot_->snapshot_index;
+        eraseEntriesCoveredBySnapshot();
+        return *latest_snapshot_;
+    }
+
+    void installSnapshot(BuzzDBSnapshot snapshot, int commit_index) {
+        if (snapshot.snapshot_index <= snapshot_index_) {
+            commit_index_ = std::max(commit_index_, commit_index);
+            return;
+        }
+        db_.restoreSnapshot(snapshot);
+        latest_snapshot_ = std::move(snapshot);
+        snapshot_index_ = latest_snapshot_->snapshot_index;
+        applied_version_ = std::max(applied_version_, snapshot_index_);
+        commit_index_ = std::max({commit_index_, commit_index, snapshot_index_});
+        eraseEntriesCoveredBySnapshot();
+        applyReadyEntries();
+    }
+
+    const std::optional<BuzzDBSnapshot>& latestSnapshot() const {
+        return latest_snapshot_;
+    }
+
+    size_t walSize() const {
+        return db_.walSize();
+    }
+
+    Result executeReadOnlyForTest(const Command& command) const {
+        BuzzDBCore copy = db_;
+        return copy.execute(command);
+    }
+
+    std::string digest() const override {
+        std::ostringstream out;
+        out << "BuzzDBStorage(commit_index=" << commit_index_
+            << ", applied_version=" << applied_version_
+            << ", snapshot_index=" << snapshot_index_
+            << ", pending=" << pending_entries_.size()
+            << ", apply_count=" << apply_count_
+            << ", app=" << db_.digest() << ")";
+        return out.str();
+    }
+
+    std::string describe() const override {
+        return digest();
+    }
+
+private:
+    void applyReadyEntries() {
+        for (;;) {
+            int next_version = applied_version_ + 1;
+            if (next_version > commit_index_) {
+                return;
+            }
+            auto entry = pending_entries_.find(next_version);
+            if (entry == pending_entries_.end()) {
+                return;
+            }
+
+            db_.execute(entry->second.command);
+            applied_version_ = next_version;
+            ++apply_count_;
+            pending_entries_.erase(entry);
+        }
+    }
+
+    void eraseEntriesCoveredBySnapshot() {
+        auto erase_end = pending_entries_.upper_bound(snapshot_index_);
+        pending_entries_.erase(pending_entries_.begin(), erase_end);
+    }
+
+    BuzzDBCore db_;
+    int commit_index_ = 0;
+    int applied_version_ = 0;
+    int snapshot_index_ = 0;
+    int apply_count_ = 0;
+    std::optional<BuzzDBSnapshot> latest_snapshot_;
+    std::map<int, ReplicatedLogEntry> pending_entries_;
 };
 
 class SequencedReplicatedBuzzDBServer : public Node {
 public:
-    SequencedReplicatedBuzzDBServer(Address address, std::vector<Address> logs)
+    SequencedReplicatedBuzzDBServer(Address address,
+                                    std::vector<Address> logs,
+                                    std::vector<Address> storage_nodes)
         : Node(std::move(address)),
           logs_(std::move(logs)),
+          storage_nodes_(std::move(storage_nodes)),
           quorum_(logs_.size()) {
         if (logs_.empty()) {
             throw std::runtime_error(
                 "replicated BuzzDB server needs at least one log replica");
+        }
+        if (storage_nodes_.empty()) {
+            throw std::runtime_error(
+                "replicated BuzzDB server needs at least one storage replica");
         }
     }
 
@@ -3394,6 +4085,10 @@ public:
         return cache_.size();
     }
 
+    int commitIndex() const {
+        return commit_index_;
+    }
+
     size_t pendingCount() const {
         return pending_by_request_.size();
     }
@@ -3405,6 +4100,7 @@ public:
     std::string digest() const override {
         std::ostringstream out;
         out << "ReplicatedBuzzDB(next_version=" << next_version_
+            << ", commit_index=" << commit_index_
             << ", committed=" << cache_.size()
             << ", pending=" << pending_by_request_.size()
             << ", max_exec=" << maxExecutionCount()
@@ -3471,12 +4167,14 @@ private:
 
         ReplicatedLogEntry entry = pending->second.entry;
         Address client = pending->second.client;
+        commit_index_ = std::max(commit_index_, entry.version);
         Result result = db_.execute(entry.command);
         std::string key = requestKey(entry.client_id, entry.request_id);
         execution_count_[key]++;
         cache_[key] = result;
         pending_by_request_.erase(pending);
         version_to_request_.erase(key_it);
+        sendStorageApplyRequests(ctx, entry);
         ctx.send(client, ClientReply{entry.client_id, entry.request_id, result});
     }
 
@@ -3486,10 +4184,19 @@ private:
         }
     }
 
+    void sendStorageApplyRequests(NodeContext& ctx,
+                                  const ReplicatedLogEntry& entry) {
+        for (const auto& storage : storage_nodes_) {
+            ctx.send(storage, StorageApplyRequest{entry, commit_index_});
+        }
+    }
+
     std::vector<Address> logs_;
+    std::vector<Address> storage_nodes_;
     size_t quorum_;
     BuzzDBCore db_;
     int next_version_ = 1;
+    int commit_index_ = 0;
     std::map<std::string, PendingCommit> pending_by_request_;
     std::map<int, std::string> version_to_request_;
     std::map<std::string, Result> cache_;
@@ -3965,6 +4672,80 @@ CheckResult replicatedBuzzDBValid(const SearchState& state,
     return {true, ""};
 }
 
+CheckResult storageMatchesCommittedLogPrefix(const SearchState& state,
+                                             const Address& storage,
+                                             const Address& log,
+                                             const Address& server) {
+    const auto* storage_node = state.nodeAs<BuzzDBStorageReplica>(storage);
+    if (storage_node == nullptr) {
+        return {false, storage.str() + " is missing"};
+    }
+    const auto* log_node = state.nodeAs<BuzzDBLogReplica>(log);
+    if (log_node == nullptr) {
+        return {false, log.str() + " is missing"};
+    }
+    const auto* server_node =
+        state.nodeAs<SequencedReplicatedBuzzDBServer>(server);
+    if (server_node == nullptr) {
+        return {false, server.str() + " is missing"};
+    }
+
+    if (storage_node->appliedVersion() > server_node->commitIndex()) {
+        return {false, "storage applied past the commit index"};
+    }
+
+    BuzzDBCore oracle;
+    int first_version = 1;
+    if (storage_node->latestSnapshot().has_value()) {
+        oracle.restoreSnapshot(*storage_node->latestSnapshot());
+        first_version = storage_node->snapshotIndex() + 1;
+    } else if (log_node->truncatedThrough() > 0 &&
+               storage_node->appliedVersion() > log_node->truncatedThrough()) {
+        return {false, "log was truncated but storage has no snapshot"};
+    }
+
+    for (int version = first_version;
+         version <= storage_node->appliedVersion();
+         ++version) {
+        auto entry = log_node->entries().find(version);
+        if (entry == log_node->entries().end()) {
+            return {false, "storage applied version " +
+                                std::to_string(version) +
+                                " missing from log"};
+        }
+        oracle.execute(entry->second.command);
+    }
+
+    if (oracle.digest() != storage_node->appDigest()) {
+        return {false, "storage state does not match replayed log prefix"};
+    }
+
+    std::optional<std::string> invariant = storage_node->validate();
+    if (invariant.has_value()) {
+        return {false, *invariant};
+    }
+    return {true, ""};
+}
+
+CheckResult storageCaughtUp(const SearchState& state,
+                            const Address& storage,
+                            const Address& server) {
+    const auto* storage_node = state.nodeAs<BuzzDBStorageReplica>(storage);
+    if (storage_node == nullptr) {
+        return {false, storage.str() + " is missing"};
+    }
+    const auto* server_node =
+        state.nodeAs<SequencedReplicatedBuzzDBServer>(server);
+    if (server_node == nullptr) {
+        return {false, server.str() + " is missing"};
+    }
+    return {storage_node->appliedVersion() == server_node->commitIndex(),
+            "storage applied version " +
+                std::to_string(storage_node->appliedVersion()) +
+                " but commit index is " +
+                std::to_string(server_node->commitIndex())};
+}
+
 CheckResult noInvariantViolation(const SearchState& state,
                                  const std::vector<NamedPredicate>& invariants) {
     for (const auto& invariant : invariants) {
@@ -4196,6 +4977,33 @@ NamedPredicate replicatedBuzzDBValid(Address server) {
         "REPLICATED_BUZZDB_VALID",
         [server = std::move(server)](const SearchState& state) {
             return ::replicatedBuzzDBValid(state, server);
+        }
+    };
+}
+
+NamedPredicate storageMatchesCommittedLogPrefix(Address storage,
+                                                Address log,
+                                                Address server) {
+    return {
+        "STORAGE_MATCHES_COMMITTED_LOG_PREFIX",
+        [storage = std::move(storage),
+         log = std::move(log),
+         server = std::move(server)](const SearchState& state) {
+            return ::storageMatchesCommittedLogPrefix(
+                state,
+                storage,
+                log,
+                server);
+        }
+    };
+}
+
+NamedPredicate storageCaughtUp(Address storage, Address server) {
+    return {
+        "STORAGE_CAUGHT_UP",
+        [storage = std::move(storage),
+         server = std::move(server)](const SearchState& state) {
+            return ::storageCaughtUp(state, storage, server);
         }
     };
 }
@@ -4683,12 +5491,15 @@ Scenario oneClientReplicatedBuzzDBScenario(Workload workload) {
     Address client = DemoAddress::client1();
     Address log1 = DemoAddress::log1();
     Address log2 = DemoAddress::log2();
+    Address storage = DemoAddress::storage1();
     return ScenarioBuilder()
         .addNode(std::make_unique<BuzzDBLogReplica>(log1))
         .addNode(std::make_unique<BuzzDBLogReplica>(log2))
+        .addNode(std::make_unique<BuzzDBStorageReplica>(storage))
         .addNode(std::make_unique<SequencedReplicatedBuzzDBServer>(
             server,
-            std::vector<Address>{log1, log2}))
+            std::vector<Address>{log1, log2},
+            std::vector<Address>{storage}))
         .addClient(client, server, 1, std::move(workload))
         .build();
 }
@@ -4778,7 +5589,7 @@ void printBuzzDBDemo() {
 }
 
 void printDurableBuzzDBDemo() {
-    const std::string database_file = "/tmp/buzzdb-v111-buzzdb.dat";
+    const std::string database_file = "/tmp/buzzdb-v113-buzzdb.dat";
     std::remove(database_file.c_str());
 
     std::cout << "Demo: reopen node-local buzzdb.dat" << std::endl;
@@ -4819,11 +5630,33 @@ void printDurableBuzzDBDemo() {
     std::remove(database_file.c_str());
 }
 
+void printRecoverySnapshotDemo() {
+    std::cout << "Demo: WAL snapshot and recovery" << std::endl;
+    BuzzDBCore db;
+    db.execute(parseSQL("CREATE TABLE people(id:int, name:string)"));
+    BuzzDBSnapshot snapshot = db.createSnapshot(1);
+    db.execute(parseSQL("BEGIN TXN 7"));
+    db.execute(parseSQL("INSERT people|1|Ada"));
+    db.execute(parseSQL("COMMIT TXN 7"));
+
+    BuzzDBCore recovered =
+        BuzzDBCore::recoverFromSnapshotAndWal(snapshot, db.walRecords());
+    Result result = recovered.execute(parseSQL("PROJECT * FROM people"));
+    std::cout << "  snapshot index: " << snapshot.snapshot_index
+              << ", checkpoint LSN: " << snapshot.checkpoint_lsn
+              << ", WAL records: " << db.walSize() << std::endl;
+    if (const auto* rows = std::get_if<SelectAllResult>(&result)) {
+        std::cout << formatSelectAllResult(*rows);
+    }
+    std::cout << std::endl;
+}
+
 int main() {
-    std::cout << "BuzzDB v111: sequenced commands with replicated logs"
+    std::cout << "BuzzDB v113: transactions, WAL snapshots, log truncation"
               << std::endl;
     printBuzzDBDemo();
     printDurableBuzzDBDemo();
+    printRecoverySnapshotDemo();
     TestRunner tests;
 
     Address server("server1");
@@ -5012,8 +5845,104 @@ int main() {
                     "SELECT * WHERE should use the lookup path");
     });
 
+    tests.test("BuzzDB transactions write WAL and snapshot committed state", [&] {
+        BuzzDBCore db;
+        tests.check(std::holds_alternative<BeginTransactionCommand>(
+                        parseSQL("BEGIN TRANSACTION 7")),
+                    "parser should recognize transaction begin");
+        tests.check(std::holds_alternative<CommitTransactionCommand>(
+                        parseSQL("COMMIT TXN 7")),
+                    "parser should recognize transaction commit");
+        tests.check(std::holds_alternative<AbortTransactionCommand>(
+                        parseSQL("ROLLBACK 7")),
+                    "parser should recognize transaction abort");
+        tests.check(std::holds_alternative<CheckpointCommand>(
+                        parseSQL("CHECKPOINT 4")),
+                    "parser should recognize checkpoint commands");
+
+        tests.check(db.execute(parseSQL(
+                        "CREATE TABLE people(id:int, name:string)")) ==
+                        Result{CreateTableOkResult{}},
+                    "autocommit create should succeed");
+        tests.check(db.execute(BeginTransactionCommand{7}) ==
+                        Result{TransactionOkResult{7, "begin"}},
+                    "begin should create a transaction workspace");
+        tests.check(db.execute(InsertRowCommand{"people", {"1", "Ada"}}) ==
+                        Result{InsertOkResult{}},
+                    "transactional insert should succeed in workspace");
+        tests.check(db.execute(CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{1}},
+                    "transaction should read its own workspace writes");
+
+        BuzzDBSnapshot snapshot = db.createSnapshot(1);
+        BuzzDBCore restored;
+        restored.restoreSnapshot(snapshot);
+        tests.check(restored.execute(CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{0}},
+                    "snapshot should exclude uncommitted workspace rows");
+        tests.check(db.execute(AbortTransactionCommand{7}) ==
+                        Result{TransactionOkResult{7, "abort"}},
+                    "abort should discard the workspace");
+        tests.check(db.execute(CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{0}},
+                    "aborted row should not reach committed state");
+
+        size_t update_records = std::count_if(
+            db.walRecords().begin(),
+            db.walRecords().end(),
+            [](const RecoveryLogRecord& record) {
+                return record.type == WalRecordType::Update;
+            });
+        tests.check(update_records >= 2,
+                    "WAL should contain update records for autocommit and txn");
+    });
+
+    tests.test("Committed WAL suffix recovers after snapshot restore", [&] {
+        BuzzDBCore db;
+        db.execute(parseSQL("CREATE TABLE people(id:int, name:string)"));
+        BuzzDBSnapshot snapshot = db.createSnapshot(1);
+
+        tests.check(db.execute(BeginTransactionCommand{11}) ==
+                        Result{TransactionOkResult{11, "begin"}},
+                    "begin should succeed before logged insert");
+        tests.check(db.execute(InsertRowCommand{"people", {"1", "Ada"}}) ==
+                        Result{InsertOkResult{}},
+                    "transactional insert should be logged");
+        tests.check(db.execute(CommitTransactionCommand{11}) ==
+                        Result{TransactionOkResult{11, "commit"}},
+                    "commit should publish transaction workspace");
+
+        BuzzDBCore recovered =
+            BuzzDBCore::recoverFromSnapshotAndWal(snapshot, db.walRecords());
+        tests.check(recovered.execute(CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{1}},
+                    "recovery should replay committed updates after snapshot");
+        tests.check(recovered.execute(parseSQL(
+                        "SELECT * FROM people WHERE id=1")) ==
+                        Result{SelectAllResult{
+                            {"id", "name"},
+                            {{"1", "Ada"}}}},
+                    "restored snapshot should rebuild the in-memory index");
+    });
+
+    tests.test("Aborted WAL suffix is ignored during recovery", [&] {
+        BuzzDBCore db;
+        db.execute(parseSQL("CREATE TABLE people(id:int, name:string)"));
+        BuzzDBSnapshot snapshot = db.createSnapshot(1);
+
+        db.execute(BeginTransactionCommand{12});
+        db.execute(InsertRowCommand{"people", {"1", "Ada"}});
+        db.execute(AbortTransactionCommand{12});
+
+        BuzzDBCore recovered =
+            BuzzDBCore::recoverFromSnapshotAndWal(snapshot, db.walRecords());
+        tests.check(recovered.execute(CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{0}},
+                    "recovery should not replay aborted transaction updates");
+    });
+
     tests.test("BuzzDB loads durable table state from buzzdb.dat", [&] {
-        const std::string database_file = "/tmp/buzzdb-v111-test-buzzdb.dat";
+        const std::string database_file = "/tmp/buzzdb-v113-test-buzzdb.dat";
         std::remove(database_file.c_str());
 
         {
@@ -5062,76 +5991,6 @@ int main() {
                         "hash index should rebuild from loaded storage");
             tests.check(reopened.bufferStats().page_loads > 0,
                         "buffer manager should read pages during reopen");
-        }
-
-        std::remove(database_file.c_str());
-    });
-
-    tests.test("Catalog and TableHeap store metadata and slotted records", [&] {
-        const std::string database_file =
-            "/tmp/buzzdb-v111-catalog-heap-test.dat";
-        std::remove(database_file.c_str());
-        RecordID second_record;
-
-        {
-            BufferManager buffer(database_file, 2);
-            Catalog catalog(buffer);
-            catalog.bootstrap();
-            tests.check(catalog.isNewDatabase(),
-                        "catalog should bootstrap an empty database");
-            TableMetadata& metadata = catalog.createTable(
-                "people",
-                Schema::fromColumnSpecs({"id:int", "name:string"}));
-            tests.check(metadata.table_id == FIRST_USER_TABLE_ID,
-                        "first user table should get the first user id");
-            tests.check(metadata.first_page != INVALID_PAGE_ID &&
-                            metadata.first_page == metadata.last_page,
-                        "new table metadata should name its first heap page");
-
-            TableHeap heap(metadata, buffer);
-            std::optional<Tuple> first = metadata.schema.makeTuple({"1", "Ada"});
-            std::optional<Tuple> second =
-                metadata.schema.makeTuple({"2", "Grace"});
-            tests.check(first.has_value() && second.has_value(),
-                        "schema should build heap tuples");
-            std::optional<RecordID> first_record =
-                heap.insert(std::move(*first));
-            std::optional<RecordID> inserted_second =
-                heap.insert(std::move(*second));
-            tests.check(first_record.has_value() &&
-                            inserted_second.has_value(),
-                        "heap should insert tuples into slotted records");
-            tests.check(first_record->page_id == metadata.first_page &&
-                            first_record->slot_id == 0,
-                        "first tuple should occupy slot 0 on the heap page");
-            second_record = *inserted_second;
-            tests.check(second_record.page_id == metadata.first_page &&
-                            second_record.slot_id == 1,
-                        "second tuple should occupy slot 1 on the heap page");
-            tests.check(metadata.row_count == 2,
-                        "table metadata should track heap row count");
-            catalog.persistTableMetadata();
-        }
-
-        {
-            BufferManager buffer(database_file, 2);
-            Catalog catalog(buffer);
-            catalog.bootstrap();
-            TableMetadata& metadata = catalog.getTable("people");
-            tests.check(metadata.row_count == 2 &&
-                            metadata.page_ids.size() == 1,
-                        "catalog should reload table metadata");
-            TableHeap heap(metadata, buffer);
-            std::vector<Tuple> rows = heap.readAllTuples();
-            tests.check(rows.size() == 2 &&
-                            rows[1].toStrings() ==
-                                std::vector<std::string>{"2", "Grace"},
-                        "table heap should reload slotted tuple records");
-            HashIndex index;
-            index.rebuild(catalog, buffer);
-            tests.check(index.lookupRecords("people", "id", "2") ==
-                            std::vector<RecordID>{second_record},
-                        "hash index should point at the physical record id");
         }
 
         std::remove(database_file.c_str());
@@ -5228,20 +6087,22 @@ int main() {
                     "replicated server should commit exactly once");
     });
 
-    tests.test("Duplicate replicated client request executes once", [&] {
+    tests.test("Replicated BuzzDB commits before storage applies", [&] {
         Address log1 = DemoAddress::log1();
         Address log2 = DemoAddress::log2();
+        Address storage = DemoAddress::storage1();
         Scenario scenario =
             oneClientReplicatedBuzzDBScenario(createTableWorkload());
         SearchSettings settings = scenario.settings;
-        EventRef request{EventRef::Kind::Message, 1};
-        auto after_first = scenario.state.stepEvent(request, settings);
-        tests.check(after_first.has_value(), "first request was not deliverable");
-        auto after_duplicate = after_first->stepEvent(request, settings);
-        tests.check(after_duplicate.has_value(),
-                    "duplicate request was not deliverable");
 
-        auto after_log1 = after_duplicate->stepMessageMatching(
+        auto after_request = scenario.state.stepMessageMatching(
+            settings,
+            [client, server](const MessageEnvelope& envelope) {
+                return envelope.from == client &&
+                       envelope.to == server &&
+                       std::holds_alternative<ClientRequest>(envelope.message);
+            });
+        auto after_log1 = after_request->stepMessageMatching(
             settings,
             [server, log1](const MessageEnvelope& envelope) {
                 return envelope.from == server &&
@@ -5257,6 +6118,15 @@ int main() {
                        ack != nullptr &&
                        ack->version == 1;
             });
+        tests.check(!containsMessageMatching(
+                        *after_ack1,
+                        [](const Message& message) {
+                            return std::holds_alternative<StorageApplyRequest>(
+                                message);
+                        },
+                        "one-ack storage apply").ok,
+                    "one log ack should not advance storage");
+
         auto after_log2 = after_ack1->stepMessageMatching(
             settings,
             [server, log2](const MessageEnvelope& envelope) {
@@ -5275,27 +6145,423 @@ int main() {
             });
         tests.check(after_ack2.has_value(),
                     "second log ack should be deliverable");
-        tests.check(serverAtMostOnce(*after_ack2, server).ok,
-                    "replicated server should execute duplicate request once");
+        tests.check(containsEnvelopeMatching(
+                        *after_ack2,
+                        [server, storage](const MessageEnvelope& envelope) {
+                            return envelope.from == server &&
+                                   envelope.to == storage &&
+                                   std::holds_alternative<StorageApplyRequest>(
+                                       envelope.message);
+                        },
+                        "storage apply request").ok,
+                    "second log ack should publish committed entry to storage");
+
+        const auto* before_storage =
+            after_ack2->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(before_storage != nullptr &&
+                        before_storage->appliedVersion() == 0,
+                    "storage should be allowed to lag committed logs");
+
+        auto after_storage = after_ack2->stepMessageMatching(
+            settings,
+            [server, storage](const MessageEnvelope& envelope) {
+                return envelope.from == server &&
+                       envelope.to == storage &&
+                       std::holds_alternative<StorageApplyRequest>(
+                           envelope.message);
+            });
+        tests.check(after_storage.has_value(),
+                    "storage apply request should be deliverable");
+        const auto* storage_node =
+            after_storage->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_node != nullptr &&
+                        storage_node->appliedVersion() == 1 &&
+                        storage_node->commitIndex() == 1,
+                    "storage should apply committed version 1");
+        tests.check(storage_node->executeReadOnlyForTest(
+                        CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{0}},
+                    "replayed create table should be visible in storage");
     });
 
-    tests.test("Replicated BuzzDB search reaches CLIENTS_DONE", [&] {
+    tests.test("Storage applies committed log entries in version order", [&] {
+        Address storage = DemoAddress::storage1();
+        ReplicatedLogEntry v1{
+            1,
+            1,
+            1,
+            CreateTableCommand{"people", {"id:int", "name:string"}}
+        };
+        ReplicatedLogEntry v2{
+            2,
+            1,
+            2,
+            InsertRowCommand{"people", {"1", "Ada"}}
+        };
+
+        SearchState state;
+        state.addNode(std::make_unique<BuzzDBStorageReplica>(storage));
+        state.send(server, storage, StorageApplyRequest{v2, 2});
+
+        SearchSettings settings;
+        auto after_v2 = state.stepEvent({EventRef::Kind::Message, 1}, settings);
+        tests.check(after_v2.has_value(),
+                    "out-of-order v2 apply should be deliverable");
+        const auto* storage_after_v2 =
+            after_v2->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_after_v2 != nullptr &&
+                        storage_after_v2->appliedVersion() == 0 &&
+                        storage_after_v2->pendingCount() == 1,
+                    "storage should buffer v2 until v1 arrives");
+
+        SearchState with_v1 = *after_v2;
+        with_v1.send(server, storage, StorageApplyRequest{v1, 2});
+        auto after_v1 = with_v1.stepMessageMatching(
+            settings,
+            [server, storage](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<StorageApplyRequest>(&envelope.message);
+                return envelope.from == server &&
+                       envelope.to == storage &&
+                       request != nullptr &&
+                       request->entry.version == 1;
+            });
+        tests.check(after_v1.has_value(),
+                    "v1 apply should be deliverable");
+        const auto* storage_after_v1 =
+            after_v1->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_after_v1 != nullptr &&
+                        storage_after_v1->appliedVersion() == 2 &&
+                        storage_after_v1->pendingCount() == 0 &&
+                        storage_after_v1->applyCount() == 2,
+                    "storage should apply v1 and then buffered v2");
+
+        SearchState duplicate = *after_v1;
+        duplicate.send(server, storage, StorageApplyRequest{v1, 2});
+        auto after_duplicate = duplicate.stepMessageMatching(
+            settings,
+            [server, storage](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<StorageApplyRequest>(&envelope.message);
+                return envelope.from == server &&
+                       envelope.to == storage &&
+                       request != nullptr &&
+                       request->entry.version == 1;
+            });
+        tests.check(after_duplicate.has_value(),
+                    "duplicate v1 apply should be deliverable");
+        const auto* storage_after_duplicate =
+            after_duplicate->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(storage_after_duplicate != nullptr &&
+                        storage_after_duplicate->appliedVersion() == 2 &&
+                        storage_after_duplicate->applyCount() == 2,
+                    "duplicate apply should not execute twice");
+    });
+
+    tests.test("Storage restart rebuilds BuzzDBCore from log prefix", [&] {
+        ReplicatedLogEntry v1{
+            1,
+            1,
+            1,
+            CreateTableCommand{"people", {"id:int", "name:string"}}
+        };
+        ReplicatedLogEntry v2{
+            2,
+            1,
+            2,
+            InsertRowCommand{"people", {"1", "Ada"}}
+        };
+        std::map<int, ReplicatedLogEntry> replay_log{
+            {1, v1},
+            {2, v2}
+        };
+
+        BuzzDBStorageReplica restarted(
+            Address("storage-restart"),
+            replay_log,
+            2);
+        tests.check(restarted.appliedVersion() == 2,
+                    "restarted storage should replay through commit index");
+        tests.check(restarted.executeReadOnlyForTest(
+                        CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{1}},
+                    "restarted storage should recover inserted row");
+
+        BuzzDBCore oracle;
+        oracle.execute(v1.command);
+        oracle.execute(v2.command);
+        tests.check(restarted.appDigest() == oracle.digest(),
+                    "restarted storage should match oracle replay");
+    });
+
+    tests.test("Storage snapshot plus suffix recovers after log truncation", [&] {
+        Address storage = DemoAddress::storage1();
+        ReplicatedLogEntry v1{
+            1,
+            1,
+            1,
+            CreateTableCommand{"people", {"id:int", "name:string"}}
+        };
+        ReplicatedLogEntry v2{
+            2,
+            1,
+            2,
+            InsertRowCommand{"people", {"1", "Ada"}}
+        };
+        ReplicatedLogEntry v3{
+            3,
+            1,
+            3,
+            UpdateRowsCommand{"people", "name", "Augusta", "id", "1"}
+        };
+
+        BuzzDBStorageReplica storage_node(
+            storage,
+            std::map<int, ReplicatedLogEntry>{{1, v1}, {2, v2}},
+            2);
+        BuzzDBSnapshot snapshot = storage_node.createSnapshot();
+        tests.check(snapshot.snapshot_index == 2,
+                    "snapshot should remember the applied commit index");
+        tests.check(snapshot.digest == storage_node.appDigest(),
+                    "snapshot digest should match storage state at capture");
+
+        BuzzDBStorageReplica restarted(
+            Address("storage-restart-from-snapshot"),
+            snapshot,
+            std::map<int, ReplicatedLogEntry>{{3, v3}},
+            3);
+        tests.check(restarted.snapshotIndex() == 2 &&
+                        restarted.appliedVersion() == 3,
+                    "storage should restore snapshot and replay suffix");
+        tests.check(restarted.executeReadOnlyForTest(parseSQL(
+                        "SELECT * FROM people WHERE id=1")) ==
+                        Result{SelectAllResult{
+                            {"id", "name"},
+                            {{"1", "Augusta"}}}},
+                    "suffix replay should rebuild the index after restore");
+    });
+
+    tests.test("Log truncation keeps suffix and ignores old duplicate appends", [&] {
+        Address log = DemoAddress::log1();
+        ReplicatedLogEntry v1{
+            1,
+            1,
+            1,
+            CreateTableCommand{"people", {"id:int", "name:string"}}
+        };
+        ReplicatedLogEntry v2{
+            2,
+            1,
+            2,
+            InsertRowCommand{"people", {"1", "Ada"}}
+        };
+        ReplicatedLogEntry v3{
+            3,
+            1,
+            3,
+            InsertRowCommand{"people", {"2", "Grace"}}
+        };
+
+        SearchState state;
+        state.addNode(std::make_unique<BuzzDBLogReplica>(log));
+        state.send(server, log, LogAppendRequest{v1});
+        state.send(server, log, LogAppendRequest{v2});
+        state.send(server, log, LogAppendRequest{v3});
+        SearchSettings settings;
+        auto after_v1 = state.stepMessageMatching(
+            settings,
+            [log](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<LogAppendRequest>(&envelope.message);
+                return envelope.to == log &&
+                       request != nullptr &&
+                       request->entry.version == 1;
+            });
+        auto after_v2 = after_v1->stepMessageMatching(
+            settings,
+            [log](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<LogAppendRequest>(&envelope.message);
+                return envelope.to == log &&
+                       request != nullptr &&
+                       request->entry.version == 2;
+            });
+        auto after_v3 = after_v2->stepMessageMatching(
+            settings,
+            [log](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<LogAppendRequest>(&envelope.message);
+                return envelope.to == log &&
+                       request != nullptr &&
+                       request->entry.version == 3;
+            });
+        tests.check(after_v3.has_value(),
+                    "all log appends should be deliverable");
+
+        SearchState truncate = *after_v3;
+        truncate.send(server, log, LogTruncateRequest{2});
+        auto after_truncate = truncate.stepMessageMatching(
+            settings,
+            [log](const MessageEnvelope& envelope) {
+                return envelope.to == log &&
+                       std::holds_alternative<LogTruncateRequest>(
+                           envelope.message);
+            });
+        const auto* truncated_log =
+            after_truncate->nodeAs<BuzzDBLogReplica>(log);
+        tests.check(truncated_log != nullptr &&
+                        truncated_log->truncatedThrough() == 2 &&
+                        !truncated_log->hasVersion(1) &&
+                        !truncated_log->hasVersion(2) &&
+                        truncated_log->hasVersion(3),
+                    "log should discard entries covered by snapshot");
+
+        SearchState duplicate = *after_truncate;
+        duplicate.send(server, log, LogAppendRequest{v1});
+        auto after_duplicate = duplicate.stepMessageMatching(
+            settings,
+            [log](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<LogAppendRequest>(&envelope.message);
+                return envelope.to == log &&
+                       request != nullptr &&
+                       request->entry.version == 1;
+            });
+        const auto* after_duplicate_log =
+            after_duplicate->nodeAs<BuzzDBLogReplica>(log);
+        tests.check(after_duplicate_log != nullptr &&
+                        !after_duplicate_log->hasVersion(1) &&
+                        after_duplicate_log->hasVersion(3),
+                    "old duplicate appends should not resurrect truncated log");
+    });
+
+    tests.test("Snapshot install buffers reordered suffix entries", [&] {
+        Address storage = DemoAddress::storage1();
+        ReplicatedLogEntry v1{
+            1,
+            1,
+            1,
+            CreateTableCommand{"people", {"id:int", "name:string"}}
+        };
+        ReplicatedLogEntry v2{
+            2,
+            1,
+            2,
+            InsertRowCommand{"people", {"1", "Ada"}}
+        };
+        ReplicatedLogEntry v3{
+            3,
+            1,
+            3,
+            UpdateRowsCommand{"people", "name", "Augusta", "id", "1"}
+        };
+        ReplicatedLogEntry v4{
+            4,
+            1,
+            4,
+            InsertRowCommand{"people", {"2", "Grace"}}
+        };
+
+        BuzzDBStorageReplica source(
+            Address("source-storage"),
+            std::map<int, ReplicatedLogEntry>{{1, v1}, {2, v2}},
+            2);
+        BuzzDBSnapshot snapshot = source.createSnapshot();
+
+        SearchState state;
+        state.addNode(std::make_unique<BuzzDBStorageReplica>(storage));
+        state.send(server, storage, InstallSnapshotRequest{snapshot, 4});
+        SearchSettings settings;
+        auto after_snapshot = state.stepMessageMatching(
+            settings,
+            [storage](const MessageEnvelope& envelope) {
+                return envelope.to == storage &&
+                       std::holds_alternative<InstallSnapshotRequest>(
+                           envelope.message);
+            });
+        const auto* installed =
+            after_snapshot->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(installed != nullptr &&
+                        installed->snapshotIndex() == 2 &&
+                        installed->appliedVersion() == 2,
+                    "new storage should install snapshot through version 2");
+
+        SearchState with_v4 = *after_snapshot;
+        with_v4.send(server, storage, StorageApplyRequest{v4, 4});
+        auto after_v4 = with_v4.stepMessageMatching(
+            settings,
+            [storage](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<StorageApplyRequest>(&envelope.message);
+                return envelope.to == storage &&
+                       request != nullptr &&
+                       request->entry.version == 4;
+            });
+        const auto* waiting =
+            after_v4->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(waiting != nullptr &&
+                        waiting->appliedVersion() == 2 &&
+                        waiting->pendingCount() == 1,
+                    "storage should buffer v4 while v3 is missing");
+
+        SearchState with_v3 = *after_v4;
+        with_v3.send(server, storage, StorageApplyRequest{v3, 4});
+        auto after_v3 = with_v3.stepMessageMatching(
+            settings,
+            [storage](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<StorageApplyRequest>(&envelope.message);
+                return envelope.to == storage &&
+                       request != nullptr &&
+                       request->entry.version == 3;
+            });
+        const auto* caught_up =
+            after_v3->nodeAs<BuzzDBStorageReplica>(storage);
+        tests.check(caught_up != nullptr &&
+                        caught_up->appliedVersion() == 4 &&
+                        caught_up->pendingCount() == 0,
+                    "storage should apply v3 and then buffered v4");
+        tests.check(caught_up->executeReadOnlyForTest(
+                        CountRowsCommand{"people"}) ==
+                        Result{CountRowsResult{2}},
+                    "snapshot plus suffix should produce both rows");
+        tests.check(caught_up->executeReadOnlyForTest(parseSQL(
+                        "SELECT * FROM people WHERE id=1")) ==
+                        Result{SelectAllResult{
+                            {"id", "name"},
+                            {{"1", "Augusta"}}}},
+                    "restored storage should rebuild indexes after suffix");
+    });
+
+    tests.test("Replicated BuzzDB search reaches storage catch-up", [&] {
         Address log1 = DemoAddress::log1();
         Address log2 = DemoAddress::log2();
+        Address storage = DemoAddress::storage1();
         Scenario scenario =
             oneClientReplicatedBuzzDBScenario(createTableWorkload());
         SearchSettings settings = scenario.settings;
-        settings.max_depth = 10;
-        settings.max_states = 50000;
+        settings.max_depth = 12;
+        settings.max_states = 80000;
         settings.invariants.push_back(
             Predicates::resultsOk(std::vector<Address>{client}));
         settings.invariants.push_back(Predicates::atMostOnce(server));
         settings.invariants.push_back(Predicates::replicatedBuzzDBValid(server));
-        settings.goals.push_back(
-            Predicates::clientsDone(std::vector<Address>{client}));
+        settings.invariants.push_back(
+            Predicates::storageMatchesCommittedLogPrefix(storage, log1, server));
+        settings.goals.push_back({
+            "CLIENTS_DONE_AND_STORAGE_CAUGHT_UP",
+            [client, storage, server](const SearchState& state) {
+                CheckResult done =
+                    clientsDone(state, std::vector<Address>{client});
+                if (!done.ok) {
+                    return done;
+                }
+                return storageCaughtUp(state, storage, server);
+            }
+        });
         SearchResults result = bfs(scenario.state, settings);
         tests.check(result.end_condition == SearchResults::EndCondition::GoalFound,
-                    "replicated BuzzDB client should finish");
+                    "client should finish and storage should catch up");
         tests.check(result.terminal_state.has_value(),
                     "goal search should return a terminal state");
 
@@ -5303,10 +6569,16 @@ int main() {
             result.terminal_state->nodeAs<BuzzDBLogReplica>(log1);
         const auto* second_log =
             result.terminal_state->nodeAs<BuzzDBLogReplica>(log2);
+        const auto* storage_node =
+            result.terminal_state->nodeAs<BuzzDBStorageReplica>(storage);
         tests.check(first_log != nullptr && first_log->hasVersion(1),
                     "first log should contain committed version 1");
         tests.check(second_log != nullptr && second_log->hasVersion(1),
                     "second log should contain committed version 1");
+        tests.check(storage_node != nullptr &&
+                        storage_node->appliedVersion() == 1 &&
+                        storage_node->commitIndex() == 1,
+                    "storage should catch up through committed version 1");
     });
 
     return tests.finish();

@@ -19,7 +19,7 @@
 // BuzzDB v108: search state, search-time controls, scenario builders,
 // reusable predicates, BFS/DFS, and replay.
 //
-// This is the first DSLabs-style model-checking snapshot. It is still a tiny
+// This is the first model-checking snapshot. It is still a tiny
 // ping application, but the framework can now search possible message/timer
 // delivery orders, search under partitions and timer restrictions, find goal
 // states, continue searching from those states, and replay event traces.
@@ -2290,7 +2290,7 @@ int main() {
     Address server("server1");
     Address client("client1");
 
-    tests.test("SearchSettings uses DSLabs-style delivery priority", [&] {
+    tests.test("SearchSettings uses explicit delivery priority", [&] {
         SearchSettings settings;
         MessageEnvelope envelope{
             1,
@@ -2658,7 +2658,7 @@ int main() {
         tests.check(first.terminal_state.has_value(),
                     "goal search should return a terminal state");
         tests.check(clientHasExactlyResults(*first.terminal_state, client, 1).ok,
-                    "DSLabs-style exact result-count predicate should match");
+                    "exact result-count predicate should match");
         tests.check(!clientHasExactlyResults(*first.terminal_state, client, 2).ok,
                     "exact result-count predicate should reject larger counts");
     });
@@ -2684,7 +2684,7 @@ int main() {
 
     SearchSettings safety_search = setup_search;
     safety_search.goals.clear();
-    // Keep this demo bounded. With DSLabs-style duplicate-message semantics,
+    // Keep this demo bounded. With duplicate-message semantics,
     // even this tiny service can grow a large tree by repeatedly redelivering
     // old client requests. Later labs will add more focused pruning predicates.
     safety_search.max_depth = first.terminal_state->depth() + 4;
