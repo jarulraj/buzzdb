@@ -1,5 +1,3 @@
-# BuzzDB
-
 <div align="center">
   <img src="https://github.com/user-attachments/assets/04ebaaac-3ce6-46dd-8e37-535ecd1808f8" alt="BuzzDB logo" width="340">
 </div>
@@ -11,14 +9,12 @@
 <p align="center">
   <a href="https://buzzdb-docs.readthedocs.io/">Documentation</a>
   ·
-  <a href="https://buzzdb-docs.readthedocs.io/part1/setup.html">Setup Guide</a>
-  ·
-  <a href="LICENSE">License</a>
+  <a href="https://buzzdb-docs.readthedocs.io/part1/setup.html">Setup Guide</a>  ·
 </p>
 
-BuzzDB is a modular database system designed for teaching and experimentation. It introduces core database internals step by step, including storage management, indexing, query execution, transactions, recovery, concurrency control, and query optimization.
+BuzzDB is a modular database system designed for teaching. It introduces core database internals step by step, including storage management, indexing, query execution, transactions, recovery, concurrency control, and query optimization.
 
-The repository is organized as a sequence of standalone C++ versions, so each file can highlight one concept without hiding the implementation behind a large framework.
+The repository is organized as a sequence of standalone C++ versions, so each file can highlight one concept.
 
 ## Getting Started
 
