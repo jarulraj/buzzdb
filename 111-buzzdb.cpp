@@ -11993,7 +11993,7 @@ void createJobTables(BuzzDB& db) {
 }
 
 // -----------------------------------------------------------------------------
-// v111 simulator-facing command API
+// simulator-facing command API
 // -----------------------------------------------------------------------------
 
 struct Address {
@@ -12445,7 +12445,7 @@ private:
 std::string makeScratchBuzzDBFile() {
     static size_t counter = 0;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v111-core-" + std::to_string(::getpid()) + "-" + std::to_string(++counter));
+        ("buzzdb-core-" + std::to_string(::getpid()) + "-" + std::to_string(++counter));
     std::filesystem::create_directories(dir);
     return (dir / "buzzdb.dat").string();
 }
@@ -12963,7 +12963,7 @@ bool sameReplicatedLogEntry(const ReplicatedLogEntry& lhs,
 std::string makeScratchReplicationLogFile() {
     static size_t counter = 0;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v111-replog-" + std::to_string(::getpid()) + "-" +
+        ("buzzdb-replog-" + std::to_string(::getpid()) + "-" +
          std::to_string(++counter));
     std::filesystem::create_directories(dir);
     return (dir / "replication.log").string();

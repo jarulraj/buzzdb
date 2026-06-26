@@ -11994,7 +11994,7 @@ void createJobTables(BuzzDB& db) {
 }
 
 // -----------------------------------------------------------------------------
-// v112 simulator-facing command API
+// simulator-facing command API
 // -----------------------------------------------------------------------------
 
 struct Address {
@@ -12598,7 +12598,7 @@ private:
 std::string makeScratchBuzzDBFile() {
     static size_t counter = 0;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v112-core-" + std::to_string(::getpid()) + "-" + std::to_string(++counter));
+        ("buzzdb-core-" + std::to_string(::getpid()) + "-" + std::to_string(++counter));
     std::filesystem::create_directories(dir);
     return (dir / "buzzdb.dat").string();
 }
@@ -13234,6 +13234,32 @@ struct ClientReply {
     Result result;
 };
 
+struct View {
+    int number = 0;
+    Address primary;
+    Address backup;
+};
+
+bool operator==(const View& lhs, const View& rhs) {
+    return lhs.number == rhs.number &&
+           lhs.primary == rhs.primary &&
+           lhs.backup == rhs.backup;
+}
+
+bool addressEmpty(const Address& address) {
+    return address.str().empty();
+}
+
+struct ViewPing {
+    int view_number;
+};
+
+struct ViewRequest {};
+
+struct ViewReply {
+    View view;
+};
+
 struct BackupApplyRequest {
     int op_number;
     int client_id;
@@ -13266,7 +13292,7 @@ bool sameReplicatedLogEntry(const ReplicatedLogEntry& lhs,
 std::string makeScratchReplicationLogFile() {
     static size_t counter = 0;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v112-replog-" + std::to_string(::getpid()) + "-" +
+        ("buzzdb-replog-" + std::to_string(::getpid()) + "-" +
          std::to_string(++counter));
     std::filesystem::create_directories(dir);
     return (dir / "replication.log").string();
@@ -13788,7 +13814,10 @@ using Message = std::variant<
     ClientRequest,
     ClientReply,
     BackupApplyRequest,
-    BackupApplyReply>;
+    BackupApplyReply,
+    ViewPing,
+    ViewRequest,
+    ViewReply>;
 
 struct RetryTimer {
     int request_id;
@@ -13823,6 +13852,14 @@ std::string describeMessage(const Message& message) {
                     << ", client=" << value.client_id
                     << ", req=" << value.request_id
                     << ", " << describeResult(value.result) << ")";
+            } else if constexpr (std::is_same_v<T, ViewPing>) {
+                out << "ViewPing(view=" << value.view_number << ")";
+            } else if constexpr (std::is_same_v<T, ViewRequest>) {
+                out << "ViewRequest";
+            } else if constexpr (std::is_same_v<T, ViewReply>) {
+                out << "ViewReply(view=" << value.view.number
+                    << ", primary=" << value.view.primary
+                    << ", backup=" << value.view.backup << ")";
             }
             return out.str();
         },
@@ -13888,6 +13925,10 @@ Address server1() {
 
 Address backup1() {
     return Address("backup1");
+}
+
+Address viewserver1() {
+    return Address("viewserver");
 }
 
 Address client1() {
@@ -14443,6 +14484,158 @@ void NodeContext::setTimer(Timer timer,
     state_.setTimer(self_, std::move(timer), min_delay_ms, max_delay_ms);
 }
 
+class ViewServer : public Node {
+public:
+    explicit ViewServer(Address address = Address("viewserver"))
+        : Node(std::move(address)) {}
+
+    void onMessage(NodeContext& ctx,
+                   const Address& from,
+                   const Message& message) override {
+        if (const auto* ping = std::get_if<ViewPing>(&message)) {
+            ctx.send(from, ViewReply{pingServer(from.rootAddress(),
+                                                ping->view_number)});
+            return;
+        }
+        if (std::holds_alternative<ViewRequest>(message)) {
+            ++view_requests_;
+            ctx.send(from, ViewReply{current_});
+        }
+    }
+
+    std::unique_ptr<Node> clone() const override {
+        return std::make_unique<ViewServer>(*this);
+    }
+
+    View pingServer(Address server, int view_number) {
+        Address root = server.rootAddress();
+        ServerState& state = servers_[root];
+        state.last_ping_tick = tick_;
+        state.last_view_number = view_number;
+        state.has_pinged = true;
+
+        if (addressEmpty(current_.primary)) {
+            installView(root, Address());
+            return current_;
+        }
+
+        if (root == current_.primary && view_number == current_.number) {
+            primary_acked_ = true;
+        }
+
+        advanceView();
+        return current_;
+    }
+
+    void tick() {
+        ++tick_;
+        advanceView();
+    }
+
+    const View& currentView() const {
+        return current_;
+    }
+
+    bool primaryAcked() const {
+        return primary_acked_;
+    }
+
+    size_t viewRequestCount() const {
+        return view_requests_;
+    }
+
+    bool serverAlive(const Address& server) const {
+        auto it = servers_.find(server.rootAddress());
+        if (it == servers_.end() || !it->second.has_pinged) {
+            return false;
+        }
+        return tick_ - it->second.last_ping_tick <= kDeadPings;
+    }
+
+    std::string digest() const override {
+        std::ostringstream out;
+        out << "ViewServer(view=" << current_.number
+            << ", primary=" << current_.primary
+            << ", backup=" << current_.backup
+            << ", acked=" << (primary_acked_ ? "true" : "false")
+            << ", requests=" << view_requests_ << ")";
+        return out.str();
+    }
+
+    std::string describe() const override {
+        return digest();
+    }
+
+private:
+    struct ServerState {
+        int last_ping_tick = 0;
+        int last_view_number = 0;
+        bool has_pinged = false;
+    };
+
+    bool backupReadyForPromotion(const Address& backup) const {
+        auto it = servers_.find(backup.rootAddress());
+        return it != servers_.end() &&
+               it->second.has_pinged &&
+               it->second.last_view_number == current_.number;
+    }
+
+    Address chooseIdle(Address exclude) const {
+        for (const auto& entry : servers_) {
+            const Address& candidate = entry.first;
+            if (candidate == exclude ||
+                candidate == current_.primary ||
+                candidate == current_.backup ||
+                !serverAlive(candidate)) {
+                continue;
+            }
+            return candidate;
+        }
+        return Address();
+    }
+
+    void advanceView() {
+        if (addressEmpty(current_.primary) || !primary_acked_) {
+            return;
+        }
+
+        const bool primary_dead = !serverAlive(current_.primary);
+        const bool have_backup = !addressEmpty(current_.backup);
+        const bool backup_dead =
+            have_backup && !serverAlive(current_.backup);
+
+        if (primary_dead && have_backup &&
+            serverAlive(current_.backup) &&
+            backupReadyForPromotion(current_.backup)) {
+            Address new_primary = current_.backup;
+            Address new_backup = chooseIdle(new_primary);
+            installView(new_primary, new_backup);
+            return;
+        }
+
+        if (!primary_dead && (backup_dead || !have_backup)) {
+            Address new_backup = chooseIdle(current_.primary);
+            if (backup_dead || !addressEmpty(new_backup)) {
+                installView(current_.primary, new_backup);
+            }
+        }
+    }
+
+    void installView(Address primary, Address backup) {
+        current_ = View{current_.number + 1,
+                        std::move(primary),
+                        std::move(backup)};
+        primary_acked_ = false;
+    }
+
+    static constexpr int kDeadPings = 2;
+    int tick_ = 0;
+    View current_;
+    bool primary_acked_ = true;
+    size_t view_requests_ = 0;
+    std::map<Address, ServerState> servers_;
+};
+
 class AtMostOnceServer : public Node {
 public:
     AtMostOnceServer(Address address, std::unique_ptr<Application> app)
@@ -14550,6 +14743,11 @@ public:
     void onMessage(NodeContext& ctx,
                    const Address& from,
                    const Message& message) override {
+        if (const auto* client_request = std::get_if<ClientRequest>(&message)) {
+            handlePromotedClientRequest(ctx, from, *client_request);
+            return;
+        }
+
         const auto* request = std::get_if<BackupApplyRequest>(&message);
         if (request == nullptr) {
             return;
@@ -14643,6 +14841,13 @@ public:
         return op_log_;
     }
 
+    Result executeReadOnlyForTest(const Command& command) const {
+        BuzzDBCore copy = db_;
+        return runWithSuppressedStdout([&] {
+            return copy.execute(command);
+        });
+    }
+
     std::string digest() const override {
         std::ostringstream out;
         out << "BackupReplica(applied_op=" << appliedOp()
@@ -14664,6 +14869,50 @@ private:
         BackupApplyRequest request;
         Address primary;
     };
+
+    void handlePromotedClientRequest(NodeContext& ctx,
+                                     const Address& from,
+                                     const ClientRequest& request) {
+        std::string key = requestKey(request.client_id, request.request_id);
+        auto cached = session_results_.find(key);
+        if (cached != session_results_.end()) {
+            ctx.send(from, ClientReply{
+                request.client_id,
+                request.request_id,
+                cached->second
+            });
+            return;
+        }
+
+        int op_number = std::max(next_expected_op_, op_log_.lastOp() + 1);
+        next_expected_op_ = op_number + 1;
+        op_log_.append(ReplicatedLogEntry{
+            op_number,
+            request.client_id,
+            request.request_id,
+            request.command
+        });
+        commit_index_ = std::max(commit_index_, op_number);
+        op_log_.advanceCommitIndex(commit_index_);
+
+        Result result = runWithSuppressedStdout([&] {
+            return db_.executeReplicated(
+                op_number,
+                request.client_id,
+                request.request_id,
+                request.command);
+        });
+        session_results_[key] = result;
+        result_by_op_[op_number] = result;
+        execution_count_[key]++;
+        applied_index_ = std::max(applied_index_, op_number);
+        op_log_.endOp(applied_index_);
+        ctx.send(from, ClientReply{
+            request.client_id,
+            request.request_id,
+            result
+        });
+    }
 
     void recoverLocalBuzzDB() {
         if (!std::filesystem::exists(db_.logFile())) {
@@ -15228,6 +15477,152 @@ private:
     int stale_replies_ = 0;
     std::set<int> completed_request_ids_;
     std::vector<Command> sent_commands_;
+    std::vector<Result> results_;
+};
+
+class PBClientWorker : public Node {
+public:
+    PBClientWorker(Address address,
+                   Address view_server,
+                   int client_id,
+                   Workload workload)
+        : Node(std::move(address)),
+          view_server_(std::move(view_server)),
+          client_id_(client_id),
+          workload_(std::move(workload)) {}
+
+    void init(NodeContext& ctx) override {
+        sendNext(ctx);
+    }
+
+    void onMessage(NodeContext& ctx,
+                   const Address& from,
+                   const Message& message) override {
+        (void) from;
+        if (const auto* view = std::get_if<ViewReply>(&message)) {
+            current_view_ = view->view;
+            waiting_for_view_ = false;
+            if (waiting_ && !addressEmpty(current_view_.primary)) {
+                sendInFlight(ctx);
+            }
+            return;
+        }
+
+        const auto* reply = std::get_if<ClientReply>(&message);
+        if (reply == nullptr) {
+            return;
+        }
+        if (!waiting_ ||
+            reply->client_id != client_id_ ||
+            reply->request_id != in_flight_request_id_) {
+            ++stale_replies_;
+            return;
+        }
+
+        results_.push_back(reply->result);
+        waiting_ = false;
+        waiting_for_view_ = false;
+        in_flight_request_id_ = 0;
+        sendNext(ctx);
+    }
+
+    void onTimer(NodeContext& ctx, const Timer& timer) override {
+        const auto* retry = std::get_if<RetryTimer>(&timer);
+        if (retry != nullptr &&
+            waiting_ &&
+            retry->request_id == in_flight_request_id_) {
+            ++retries_;
+            sendInFlight(ctx);
+        }
+    }
+
+    std::unique_ptr<Node> clone() const override {
+        return std::make_unique<PBClientWorker>(*this);
+    }
+
+    bool done() const {
+        return !waiting_ && !workload_.hasNext();
+    }
+
+    size_t resultCount() const {
+        return results_.size();
+    }
+
+    const View& currentView() const {
+        return current_view_;
+    }
+
+    const std::vector<Result>& results() const {
+        return results_;
+    }
+
+    bool resultsOk() const {
+        if (!workload_.hasExpectedResults()) {
+            return true;
+        }
+        if (results_.size() > workload_.expectedCount()) {
+            return false;
+        }
+        for (size_t i = 0; i < results_.size(); ++i) {
+            if (!(results_[i] == workload_.expectedResult(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::string digest() const override {
+        std::ostringstream out;
+        out << "PBClient(waiting=" << waiting_
+            << ", view=" << current_view_.number
+            << ", primary=" << current_view_.primary
+            << ", req=" << in_flight_request_id_
+            << ", results=" << results_.size()
+            << ", retries=" << retries_ << ")";
+        return out.str();
+    }
+
+    std::string describe() const override {
+        return digest();
+    }
+
+private:
+    void sendNext(NodeContext& ctx) {
+        if (!workload_.hasNext()) {
+            return;
+        }
+        waiting_ = true;
+        in_flight_request_id_ = next_request_id_++;
+        in_flight_command_ = workload_.nextCommand();
+        sendInFlight(ctx);
+    }
+
+    void sendInFlight(NodeContext& ctx) {
+        if (addressEmpty(current_view_.primary)) {
+            waiting_for_view_ = true;
+            ctx.send(view_server_, ViewRequest{});
+        } else {
+            waiting_for_view_ = false;
+            ctx.send(current_view_.primary, ClientRequest{
+                client_id_,
+                in_flight_request_id_,
+                in_flight_command_
+            });
+        }
+        ctx.setTimer(RetryTimer{in_flight_request_id_}, 5, 7);
+    }
+
+    Address view_server_;
+    int client_id_;
+    Workload workload_;
+    View current_view_;
+    bool waiting_ = false;
+    bool waiting_for_view_ = false;
+    int next_request_id_ = 1;
+    int in_flight_request_id_ = 0;
+    Command in_flight_command_ = CreateTableCommand{"", {""}};
+    int retries_ = 0;
+    int stale_replies_ = 0;
     std::vector<Result> results_;
 };
 
@@ -17552,6 +17947,132 @@ SearchState twoClientPrimaryBackupState(Workload first, Workload second) {
     return state;
 }
 
+Workload promotedTitleInsertWorkload(
+    const std::vector<std::string>& title_values) {
+    return Workload(
+        std::vector<Command>{InsertRowCommand{"title", title_values}},
+        std::vector<Result>{Result{InsertOkResult{}}});
+}
+
+void keepBackupAliveUntilPrimaryDies(ViewServer& view_server,
+                                     const Address& backup,
+                                     int backup_view_number) {
+    view_server.tick();
+    view_server.pingServer(backup, backup_view_number);
+    view_server.tick();
+    view_server.pingServer(backup, backup_view_number);
+    view_server.tick();
+}
+
+void checkViewServerPromotesDurableBackup(TestRunner& tests,
+                                          const std::string& data_file) {
+    Address view_server = ScenarioAddress::viewserver1();
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    Address client = ScenarioAddress::client1();
+    Address promoted_client = ScenarioAddress::client2();
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 1);
+    std::vector<std::string> title_values =
+        tupleValuesFromLine(title_rows[0], "title");
+
+    SearchSettings settings;
+    SearchState state =
+        oneClientPrimaryBackupScenario(createControlPlaneWorkload()).state;
+    state = deliverPrimaryBackupCommandRound(
+        state, settings, primary, backup, client, 1, 1, 1, false);
+
+    auto view_node = std::make_unique<ViewServer>(view_server);
+    view_node->pingServer(primary, 0);
+    view_node->pingServer(primary, 1);
+    view_node->pingServer(backup, 0);
+    view_node->pingServer(primary, 2);
+    view_node->pingServer(backup, 2);
+    keepBackupAliveUntilPrimaryDies(*view_node, backup, 2);
+    tests.check(view_node->currentView().primary == backup,
+                "view server should promote the initialized backup");
+    state.addNode(std::move(view_node));
+    state.addNode(std::make_unique<PBClientWorker>(
+        promoted_client,
+        view_server,
+        2,
+        promotedTitleInsertWorkload(title_values)));
+
+    EventRef view_request = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            return std::holds_alternative<ViewRequest>(envelope.message) &&
+                   envelope.from.rootAddress() == promoted_client &&
+                   envelope.to.rootAddress() == view_server;
+        },
+        "promoted client view request");
+    state = stepRequired(state, view_request, settings);
+
+    EventRef view_reply = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            const auto* reply = std::get_if<ViewReply>(&envelope.message);
+            return reply != nullptr &&
+                   reply->view.primary == backup &&
+                   envelope.from.rootAddress() == view_server &&
+                   envelope.to.rootAddress() == promoted_client;
+        },
+        "promoted client view reply");
+    state = stepRequired(state, view_reply, settings);
+
+    EventRef request = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            const auto* req = std::get_if<ClientRequest>(&envelope.message);
+            return req != nullptr &&
+                   req->client_id == 2 &&
+                   req->request_id == 1 &&
+                   envelope.from.rootAddress() == promoted_client &&
+                   envelope.to.rootAddress() == backup;
+        },
+        "view-aware promoted-backup client request");
+    state = stepRequired(state, request, settings);
+
+    EventRef reply = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            const auto* rep = std::get_if<ClientReply>(&envelope.message);
+            return rep != nullptr &&
+                   rep->client_id == 2 &&
+                   rep->request_id == 1 &&
+                   envelope.from.rootAddress() == backup &&
+                   envelope.to.rootAddress() == promoted_client;
+        },
+        "view-aware promoted-backup client reply");
+    state = stepRequired(state, reply, settings);
+
+    const auto* client_node = state.nodeAs<PBClientWorker>(promoted_client);
+    const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+    tests.check(client_node != nullptr && client_node->done(),
+                "view-aware client should finish on the promoted backup");
+    tests.check(client_node != nullptr && client_node->resultsOk(),
+                "promoted backup should return the expected insert result");
+    tests.check(client_node != nullptr &&
+                    client_node->currentView().primary == backup,
+                "client should learn the promoted backup from the view server");
+    tests.check(backup_node != nullptr &&
+                    backup_node->executionCount(2, 1) == 1,
+                "promoted backup should execute the new request once");
+    tests.check(backup_node != nullptr &&
+                    backup_node->commitIndex() == 2 &&
+                    backup_node->appliedIndex() == 2,
+                "promoted backup should durably commit and apply op 2");
+    tests.check(backup_node != nullptr &&
+                    backup_node->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{1}},
+                "promoted backup should make the real title tuple visible");
+}
+
 int main(int argc, char* argv[]) {
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
@@ -17568,6 +18089,10 @@ int main(int argc, char* argv[]) {
     }
 
     TestRunner tests;
+
+    tests.test("View server promotes durable backup for real BuzzDB work", [&] {
+        checkViewServerPromotesDurableBackup(tests, imdb_file);
+    });
 
     tests.test("P8 duplicate unreliable delivery remains at-most-once", [&] {
         Address primary = ScenarioAddress::server1();
@@ -17820,73 +18345,6 @@ int main(int argc, char* argv[]) {
                         SearchResults::EndCondition::ExceptionThrown,
                     "blocked insert search should remain safe: " +
                         result.message);
-    });
-
-    tests.test("BuzzDBCore routes commands through real v104 storage", [&] {
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 2);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<std::string> second_title =
-            tupleValuesFromLine(title_rows[1], "title");
-
-        BuzzDBCore db;
-        tests.check(db.execute(CountRowsCommand{"title"}) == Result{TableNotFoundResult{}},
-                    "missing table should return TableNotFound");
-        tests.check(db.execute(CreateTableCommand{"bad", {"id:int", "id:int"}}) == Result{InvalidSchemaResult{}},
-                    "duplicate columns should be rejected");
-        tests.check(db.execute(createTitleTableCommand()) == Result{CreateTableOkResult{}},
-                    "create table should succeed");
-        tests.check(db.execute(createTitleTableCommand()) == Result{TableAlreadyExistsResult{}},
-                    "duplicate create should be rejected");
-        tests.check(db.execute(InsertRowCommand{"title", first_title}) == Result{InsertOkResult{}},
-                    "insert should succeed");
-        tests.check(db.execute(InsertRowCommand{"title", second_title}) == Result{InsertOkResult{}},
-                    "second insert should succeed");
-        tests.check(db.execute(CountRowsCommand{"title"}) == Result{CountRowsResult{2}},
-                    "count should reflect v104 table metadata");
-        tests.check(db.execute(parseSQL("PROJECT * FROM title")) == Result{SelectAllResult{
-                        {"id", "title", "kind_id", "production_year"},
-                        {first_title, second_title}}},
-                    "PROJECT * should scan through v104 operators");
-    });
-
-    tests.test("BuzzDBCore uses real v104 ARIES log and master files", [&] {
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        const std::string updated_year =
-            replacementProductionYear(first_title[3]);
-
-        std::filesystem::path dir = std::filesystem::temp_directory_path() / "buzzdb-v112-real-log-test";
-        std::filesystem::create_directories(dir);
-        std::string db_file = (dir / "buzzdb.dat").string();
-        removeBuzzDBBundle(db_file);
-        {
-            BuzzDBCore db(db_file);
-            tests.check(buzzdbCompanionFilename(db_file, ".log").find("buzzdb.log") != std::string::npos,
-                        "v104 companion log should be buzzdb.log");
-            tests.check(db.execute(createTitleTableCommand()) == Result{CreateTableOkResult{}},
-                        "create table should succeed");
-            tests.check(db.execute(parseSQL("INSERT " + title_rows[0])) == Result{InsertOkResult{}},
-                        "insert should succeed");
-            tests.check(db.execute(parseSQL("UPDATE title SET production_year=" +
-                                            updated_year + " WHERE id=" +
-                                            first_title[0])) == Result{UpdateRowsResult{1}},
-                        "update should go through v104 logged update operator");
-            tests.check(db.execute(CheckpointCommand{}) == Result{CheckpointOkResult{}},
-                        "checkpoint should use v104 RecoveryManager");
-            tests.check(std::filesystem::exists(buzzdbCompanionFilename(db_file, ".log")),
-                        "real v104 recovery log should exist");
-            tests.check(std::filesystem::exists(buzzdbCompanionFilename(db_file, ".master")),
-                        "real v104 master record should exist");
-            tests.check(db.stableLogForces() > 0 && db.flushedLSN() > 0,
-                        "v104 recovery manager should force real log records");
-        }
-        removeBuzzDBBundle(db_file);
-        std::error_code ec;
-        std::filesystem::remove_all(dir, ec);
     });
 
     tests.test("Commit record appears only after backup acknowledgement", [&] {

@@ -18720,7 +18720,7 @@ void printRestartMeasurementRow(const RestartMeasurement& measurement) {
 }
 
 void printRestartRecoveryMeasurement(const std::string& data_file) {
-    std::cout << "BuzzDB v114 restart recovery measurement" << std::endl;
+    std::cout << "BuzzDB v115 restart recovery measurement" << std::endl;
     std::cout << "  input: " << data_file << std::endl;
     std::vector<Command> commands = createFullJobLoadCommands(data_file);
     const size_t full_snapshot_after = commands.size();
@@ -18853,7 +18853,7 @@ std::string defaultImdbInputFile() {
 void printV104BootstrapTrace(const std::string& data_file) {
     std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v114-bootstrap-trace-" + std::to_string(::getpid()));
+        ("buzzdb-v115-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
@@ -19004,6 +19004,177 @@ void checkViewServerPromotesDurableBackup(TestRunner& tests,
                 "promoted backup should make the real title tuple visible");
 }
 
+
+void seedViewServerForPrimaryBackup(ViewServer& view_server,
+                                    const Address& primary,
+                                    const Address& backup) {
+    view_server.pingServer(primary, 0);
+    view_server.pingServer(primary, 1);
+    view_server.pingServer(backup, 0);
+    view_server.pingServer(primary, 2);
+    view_server.pingServer(backup, 2);
+}
+
+std::vector<Command> titleInsertCommandsFromImdb(
+    const std::string& data_file,
+    size_t row_count) {
+    std::vector<Command> commands{createTitleTableCommand()};
+    for (const auto& row : requireTupleLinesFromFile(
+             data_file, "title", row_count)) {
+        commands.push_back(parseSQL("INSERT " + row));
+    }
+    return commands;
+}
+
+SearchState viewAwarePrimaryBackupState(std::vector<Command> commands) {
+    Address view_server = ScenarioAddress::viewserver1();
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    Address client = ScenarioAddress::client1();
+
+    SearchState state;
+    state.addNode(std::make_unique<PrimaryBackupServer>(primary, backup));
+    state.addNode(std::make_unique<BackupReplica>(backup));
+    auto view_node = std::make_unique<ViewServer>(view_server);
+    seedViewServerForPrimaryBackup(*view_node, primary, backup);
+    state.addNode(std::move(view_node));
+    state.addNode(std::make_unique<PBClientWorker>(
+        client,
+        view_server,
+        1,
+        Workload(commands, buzzDBOracleResults(commands))));
+    return state;
+}
+
+CheckResult pbClientDone(const SearchState& state, const Address& client) {
+    const auto* worker = state.nodeAs<PBClientWorker>(client);
+    if (worker == nullptr) {
+        return {false, client.str() + " is missing"};
+    }
+    return {worker->done(), client.str() + " is not done"};
+}
+
+bool messageDeliverable(const SearchSettings& settings,
+                        const Address& from,
+                        const Address& to) {
+    return settings.shouldDeliver(MessageEnvelope{0, from, to, ViewRequest{}});
+}
+
+std::vector<Address> quorumReplicaAddresses(size_t count) {
+    std::vector<Address> replicas;
+    for (size_t i = 1; i <= count; ++i) {
+        replicas.emplace_back("server" + std::to_string(i));
+    }
+    return replicas;
+}
+
+class QuorumGroup {
+public:
+    explicit QuorumGroup(std::vector<Address> replicas)
+        : replicas_(std::move(replicas)) {}
+
+    size_t size() const { return replicas_.size(); }
+
+    size_t majoritySize() const { return replicas_.size() / 2 + 1; }
+
+    bool hasMajority(const std::vector<Address>& responders) const {
+        std::set<Address> replica_roots;
+        for (const auto& replica : replicas_) {
+            replica_roots.insert(replica.rootAddress());
+        }
+        std::set<Address> unique_responders;
+        for (const auto& responder : responders) {
+            Address root = responder.rootAddress();
+            if (replica_roots.count(root) != 0) {
+                unique_responders.insert(root);
+            }
+        }
+        return unique_responders.size() >= majoritySize();
+    }
+
+private:
+    std::vector<Address> replicas_;
+};
+
+std::string formatAddressGroup(const std::vector<Address>& group) {
+    std::ostringstream out;
+    out << "{";
+    for (size_t i = 0; i < group.size(); ++i) {
+        if (i != 0) out << ", ";
+        out << group[i];
+    }
+    out << "}";
+    return out.str();
+}
+
+void printPrimaryBackupCeilingTrace(const std::string& data_file) {
+    std::cout << "Trace: primary-backup reaches its ceiling" << std::endl;
+
+    Address view_server = ScenarioAddress::viewserver1();
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    Address client = ScenarioAddress::client1();
+
+    SearchState view_state = viewAwarePrimaryBackupState(
+        titleInsertCommandsFromImdb(data_file, 1));
+    SearchSettings control_plane_partition;
+    control_plane_partition.partition({{client, primary, backup}, {view_server}});
+    bool view_request_deliverable = false;
+    for (const auto& event : view_state.events(control_plane_partition)) {
+        const auto* envelope = messageForEvent(view_state, event);
+        if (envelope != nullptr &&
+            std::holds_alternative<ViewRequest>(envelope->message) &&
+            envelope->from.rootAddress() == client &&
+            envelope->to.rootAddress() == view_server) {
+            view_request_deliverable = true;
+        }
+    }
+    std::cout << "  control plane partition: view request deliverable="
+              << (view_request_deliverable ? "yes" : "no") << std::endl;
+
+    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
+    SearchState write_state = oneClientPrimaryBackupScenario(
+        Workload(commands, buzzDBOracleResults(commands))).state;
+    SearchSettings normal;
+    write_state = deliverPrimaryBackupCommandRound(
+        write_state, normal, primary, backup, client, 1, 1, 1, false);
+
+    SearchSettings data_partition;
+    data_partition.partition({{client, primary}, {backup}});
+    EventRef write = requireMessageEvent(
+        write_state,
+        data_partition,
+        [&](const MessageEnvelope& envelope) {
+            const auto* request = std::get_if<ClientRequest>(&envelope.message);
+            return request != nullptr &&
+                   request->request_id == 2 &&
+                   envelope.from.rootAddress() == client &&
+                   envelope.to.rootAddress() == primary;
+        },
+        "ceiling trace partitioned write");
+    write_state = stepRequired(write_state, write, data_partition);
+    const auto* primary_node =
+        write_state.nodeAs<PrimaryBackupServer>(primary);
+    std::cout << "  data-plane partition: primary pending="
+              << (primary_node == nullptr ? 0 : primary_node->pendingCount())
+              << ", commit="
+              << (primary_node == nullptr ? 0 : primary_node->commitIndex())
+              << ", client reply="
+              << (newClientReplyFor(write_state, 1, 2) ? "yes" : "no")
+              << std::endl;
+
+    std::vector<Address> replicas = quorumReplicaAddresses(5);
+    QuorumGroup quorum(replicas);
+    std::vector<Address> majority{replicas[0], replicas[1], replicas[2]};
+    std::vector<Address> minority{replicas[3], replicas[4]};
+    std::cout << "  quorum partition model: "
+              << formatAddressGroup(majority) << " majority="
+              << (quorum.hasMajority(majority) ? "yes" : "no")
+              << ", " << formatAddressGroup(minority) << " majority="
+              << (quorum.hasMajority(minority) ? "yes" : "no")
+              << "\n" << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
         const std::string imdb_file =
@@ -19014,444 +19185,149 @@ int main(int argc, char* argv[]) {
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v114: read-index reads over primary-backup BuzzDB" << std::endl;
+    std::cout << "BuzzDB v115: primary-backup reaches its ceiling" << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
-        printDistributedServiceTrace(imdb_file);
         printPrimaryBackupTrace(imdb_file);
         printReadIndexPartitionTrace(imdb_file);
-        printFullPrimaryBackupLoadTrace(imdb_file);
-        printActualPrimaryBackupSearchStates(20, imdb_file);
+        printPrimaryBackupCeilingTrace(imdb_file);
         printV104BootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
 
-    tests.test("P18 multi-client writes become visible under reordered events", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client1 = ScenarioAddress::client1();
-        Address client2 = ScenarioAddress::client2();
-
-        Scenario scenario = twoClientPrimaryBackupScenario(
-            workloadForCommands(std::vector<Command>{createTitleTableCommand()}),
-            workloadForCommands(std::vector<Command>{
-                CreateTableCommand{
-                    "company_name",
-                    {"id:int", "name:string", "country_code:string"}}
-            }));
-        SearchSettings settings;
-        SearchState state = scenario.state;
-
-        EventRef first_request = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "first client write");
-        state = stepRequired(state, first_request, settings);
-        EventRef second_request = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 2 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "second client write");
-        state = stepRequired(state, second_request, settings);
-
-        EventRef second_apply_first = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 2 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "op 2 backup apply before op 1");
-        state = stepRequired(state, second_apply_first, settings);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(backup_node->appliedIndex() == 0 &&
-                        backup_node->pendingCount() == 1,
-                    "backup should buffer op 2 until op 1 arrives");
-
-        EventRef first_apply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 1 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "op 1 backup apply");
-        state = stepRequired(state, first_apply, settings);
-
-        EventRef second_ack_first = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 2 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "op 2 backup ack before op 1 ack");
-        state = stepRequired(state, second_ack_first, settings);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node->commitIndex() == 0,
-                    "primary should not commit op 2 before op 1");
-
-        EventRef first_ack = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "op 1 backup ack");
-        state = stepRequired(state, first_ack, settings);
-
-        EventRef first_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 1 &&
-                       envelope.to.rootAddress() == client1;
-            },
-            "first client reply");
-        state = stepRequired(state, first_reply, settings);
-        EventRef second_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 2 &&
-                       reply->request_id == 1 &&
-                       envelope.to.rootAddress() == client2;
-            },
-            "second client reply");
-        state = stepRequired(state, second_reply, settings);
-
-        tests.check(clientsDone(state, std::vector<Address>{client1, client2}).ok,
-                    "both clients should complete");
-        CheckResult equal = primaryBackupCommittedEqual(state, 2);
-        tests.check(equal.ok, equal.message);
-        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node->executeReadOnlyForTest(
-                        CountRowsCommand{"title"}) ==
-                        Result{CountRowsResult{0}},
-                    "title table should be visible");
-        tests.check(primary_node->executeReadOnlyForTest(
-                        CountRowsCommand{"company_name"}) ==
-                        Result{CountRowsResult{0}},
-                    "company_name table should be visible");
-    });
-
-    tests.test("P19 repeated backup-link failures block safely and recover", [&] {
+    tests.test("View-server unavailable blocks new clients", [&] {
+        Address view_server = ScenarioAddress::viewserver1();
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            parseSQL("INSERT " + title_rows[0])
-        };
-        SearchState state =
-            oneClientPrimaryBackupScenario(workloadForCommands(commands)).state;
+        SearchState state = viewAwarePrimaryBackupState(
+            titleInsertCommandsFromImdb(imdb_file, 1));
 
-        SearchSettings normal;
-        SearchSettings blocked;
-        blocked.linkActive(primary, backup, false);
+        SearchSettings partitioned;
+        partitioned.partition({{client, primary, backup}, {view_server}});
+        tests.check(containsEnvelopeMatching(
+                        state,
+                        [&](const MessageEnvelope& envelope) {
+                            return std::holds_alternative<ViewRequest>(
+                                       envelope.message) &&
+                                   envelope.from.rootAddress() == client &&
+                                   envelope.to.rootAddress() == view_server;
+                        },
+                        "initial view request").ok,
+                    "view-aware client should ask the view server first");
 
-        EventRef first_request = requireMessageEvent(
-            state,
-            blocked,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "first client request while backup link is down");
-        state = stepRequired(state, first_request, blocked);
+        bool view_request_deliverable = false;
+        for (const auto& event : state.events(partitioned)) {
+            const auto* envelope = messageForEvent(state, event);
+            if (envelope != nullptr &&
+                std::holds_alternative<ViewRequest>(envelope->message) &&
+                envelope->from.rootAddress() == client &&
+                envelope->to.rootAddress() == view_server) {
+                view_request_deliverable = true;
+            }
+        }
+        tests.check(!view_request_deliverable,
+                    "partition should make the view request undeliverable");
 
-        SearchSettings blocked_search = blocked;
-        blocked_search.max_depth = 6;
-        blocked_search.max_states = 5000;
-        blocked_search.invariants.push_back(
-            Predicates::resultsOk(std::vector<Address>{client}));
-        blocked_search.invariants.push_back(
+        SearchSettings search = partitioned;
+        search.max_depth = 7;
+        search.max_states = 2000;
+        search.invariants.push_back(
             Predicates::primaryBackupAtMostOnce(primary, backup));
-        blocked_search.goals.push_back(
-            Predicates::clientsDone(std::vector<Address>{client}));
-        SearchResults first_blocked = bfs(state, blocked_search);
-        tests.check(
-            first_blocked.end_condition !=
-                SearchResults::EndCondition::GoalFound,
-            "client should not finish while the first backup apply is blocked");
-        tests.check(
-            first_blocked.end_condition !=
-                    SearchResults::EndCondition::InvariantViolated &&
-                first_blocked.end_condition !=
-                    SearchResults::EndCondition::ExceptionThrown,
-            "blocked first command should remain safe: " +
-                first_blocked.message);
+        search.goals.push_back(NamedPredicate{
+            "PB_CLIENT_DONE_WITHOUT_VIEW_SERVER",
+            [client](const SearchState& candidate) {
+                return pbClientDone(candidate, client);
+            }});
+        SearchResults result = bfs(state, search);
+        tests.check(result.end_condition !=
+                        SearchResults::EndCondition::GoalFound,
+                    "client should not finish while the view server is unreachable");
+        tests.check(result.end_condition !=
+                        SearchResults::EndCondition::InvariantViolated &&
+                        result.end_condition !=
+                        SearchResults::EndCondition::ExceptionThrown,
+                    "blocked view-server search should remain safe: " +
+                        result.message);
+        const auto* worker = state.nodeAs<PBClientWorker>(client);
+        tests.check(worker != nullptr && worker->resultCount() == 0 &&
+                        addressEmpty(worker->currentView().primary),
+                    "client should have no primary view and no result");
+    });
 
-        EventRef first_apply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 1 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "first backup apply after link heals");
-        state = stepRequired(state, first_apply, normal);
-        EventRef first_ack = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "first backup ack after link heals");
-        state = stepRequired(state, first_ack, normal);
-        EventRef first_reply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 1 &&
-                       envelope.to.rootAddress() == client;
-            },
-            "first client reply after backup ack");
-        state = stepRequired(state, first_reply, normal);
+    tests.test("Primary isolated from backup cannot commit writes", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        SearchState state = oneClientPrimaryBackupScenario(
+            Workload(commands, buzzDBOracleResults(commands))).state;
+        SearchSettings normal;
+        state = deliverPrimaryBackupCommandRound(
+            state, normal, primary, backup, client, 1, 1, 1, false);
 
-        EventRef second_request = requireMessageEvent(
+        SearchSettings partitioned;
+        partitioned.partition({{client, primary}, {backup}});
+        EventRef client_write = requireMessageEvent(
             state,
-            blocked,
+            partitioned,
             [&](const MessageEnvelope& envelope) {
                 const auto* request =
                     std::get_if<ClientRequest>(&envelope.message);
                 return request != nullptr &&
                        request->client_id == 1 &&
                        request->request_id == 2 &&
+                       envelope.from.rootAddress() == client &&
                        envelope.to.rootAddress() == primary;
             },
-            "second client request while backup link is down");
-        state = stepRequired(state, second_request, blocked);
+            "partitioned write request");
+        state = stepRequired(state, client_write, partitioned);
 
-        SearchResults second_blocked = bfs(state, blocked_search);
-        tests.check(
-            second_blocked.end_condition !=
-                SearchResults::EndCondition::GoalFound,
-            "client should not finish while the second backup apply is blocked");
-        tests.check(
-            second_blocked.end_condition !=
-                    SearchResults::EndCondition::InvariantViolated &&
-                second_blocked.end_condition !=
-                    SearchResults::EndCondition::ExceptionThrown,
-            "blocked second command should remain safe: " +
-                second_blocked.message);
-
-        EventRef second_apply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 2 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "second backup apply after link heals");
-        state = stepRequired(state, second_apply, normal);
-        EventRef second_ack = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 2 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "second backup ack after link heals");
-        state = stepRequired(state, second_ack, normal);
-        EventRef second_reply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 2 &&
-                       envelope.to.rootAddress() == client;
-            },
-            "second client reply after backup ack");
-        state = stepRequired(state, second_reply, normal);
-
-        tests.check(clientDone(state, client).ok,
-                    "client should finish after both links heal");
-        CheckResult equal = primaryBackupCommittedEqual(state, 2);
-        tests.check(equal.ok, equal.message);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node->executeReadOnlyForTest(
-                        CountRowsCommand{"title"}) ==
-                        Result{CountRowsResult{1}},
-                    "the real title tuple should be visible after recovery");
-    });
-
-    tests.test("P20 multi-client random DFS reaches a safe completion", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client1 = ScenarioAddress::client1();
-        Address client2 = ScenarioAddress::client2();
-
-        Scenario scenario = twoClientPrimaryBackupScenario(
-            workloadForCommands(std::vector<Command>{createTitleTableCommand()}),
-            workloadForCommands(std::vector<Command>{
-                CreateTableCommand{
-                    "company_name",
-                    {"id:int", "name:string", "country_code:string"}}
-            }));
-
-        SearchSettings settings;
-        settings.max_depth = 14;
-        settings.max_states = 50000;
-        settings.seed = 114;
-        settings.random_dfs_probes = 500;
-        settings.invariants.push_back(
-            Predicates::resultsOk(std::vector<Address>{client1, client2}));
-        settings.invariants.push_back(
-            Predicates::primaryBackupAtMostOnce(primary, backup));
-        settings.goals.push_back({
-            "MULTI_CLIENT_RANDOM_DFS_DONE",
-            [client1, client2](const SearchState& state) {
-                CheckResult done =
-                    clientsDone(state, std::vector<Address>{client1, client2});
-                if (!done.ok) {
-                    return done;
-                }
-                return primaryBackupCommittedEqual(state, 2);
-            }
-        });
-
-        SearchResults result = randomDfs(scenario.state, settings);
-        tests.check(
-            result.end_condition == SearchResults::EndCondition::GoalFound,
-            "random DFS should find a safe multi-client completion, saw " +
-                endConditionName(result.end_condition) + ": " +
-                result.message);
-        std::cout << "  P20 explored states: " << result.explored
-                  << std::endl;
-    });
-
-    tests.test("Read-index read does not append a replicated operation", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            InsertRowCommand{"title", first_title},
-            CountRowsCommand{"title"}
-        };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
-        SearchSettings settings = scenario.settings;
-        SearchState state = scenario.state;
-
-        for (size_t i = 0; i < commands.size(); ++i) {
-            state = deliverPrimaryBackupCommandRound(
-                state,
-                settings,
-                primary,
-                backup,
-                client,
-                1,
-                static_cast<int>(i + 1),
-                static_cast<int>(i + 1),
-                false);
-        }
-
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        const auto* primary_node =
+            state.nodeAs<PrimaryBackupServer>(primary);
         const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(client_node != nullptr && primary_node != nullptr &&
-                        backup_node != nullptr,
-                    "read-index scenario should keep all nodes alive");
-        tests.check(client_node->results().size() == 3 &&
-                        client_node->results().back() ==
-                            Result{CountRowsResult{1}},
-                    "read-index read should return the committed row");
+        tests.check(primary_node != nullptr && backup_node != nullptr,
+                    "primary and backup should exist");
+        tests.check(primary_node->pendingCount() == 1,
+                    "isolated primary should keep the write pending");
         tests.check(primary_node->replicationLogSize() == 2 &&
-                        backup_node->replicationLogSize() == 2,
-                    "read-only request should not append a replicated entry");
-        tests.check(primary_node->commitIndex() == 2 &&
-                        backup_node->commitIndex() == 2,
-                    "read-only request should not advance commit indexes");
-        tests.check(primary_node->pendingReadCount() == 0,
-                    "read-index read should clear its pending read state");
-        tests.check(primary_node->executionCount(1, 3) == 1 &&
-                        backup_node->executionCount(1, 3) == 0,
-                    "primary should execute the read once after backup confirmation");
+                        primary_node->commitIndex() == 1,
+                    "isolated write can be logged locally but not committed");
+        tests.check(backup_node->commitIndex() == 1 &&
+                        backup_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{0}},
+                    "backup should not apply the isolated write");
+        tests.check(!newClientReplyFor(state, 1, 2),
+                    "primary should not reply before backup acknowledgement");
+
+        bool backup_apply_deliverable = false;
+        for (const auto& event : state.events(partitioned)) {
+            const auto* envelope = messageForEvent(state, event);
+            if (envelope == nullptr) continue;
+            const auto* apply =
+                std::get_if<BackupApplyRequest>(&envelope->message);
+            if (apply != nullptr && apply->op_number == 2 &&
+                envelope->from.rootAddress() == primary &&
+                envelope->to.rootAddress() == backup) {
+                backup_apply_deliverable = true;
+            }
+        }
+        tests.check(!backup_apply_deliverable,
+                    "partition should block the backup apply message");
     });
 
-    tests.test("Partitioned read-index read waits for backup confirmation", [&] {
+    tests.test("Read-index read waits under backup partition", [&] {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            InsertRowCommand{"title", first_title},
-            CountRowsCommand{"title"}
-        };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
+        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        commands.push_back(CountRowsCommand{"title"});
+        Scenario scenario = oneClientPrimaryBackupScenario(
+            Workload(commands, buzzDBOracleResults(commands)));
         SearchSettings settings = scenario.settings;
         SearchState state = scenario.state;
 
@@ -19485,15 +19361,16 @@ int main(int argc, char* argv[]) {
             "partitioned read request");
         state = stepRequired(state, client_read, partitioned);
 
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        const auto* primary_node =
+            state.nodeAs<PrimaryBackupServer>(primary);
         tests.check(primary_node != nullptr, "primary should exist");
         tests.check(primary_node->pendingReadCount() == 1,
-                    "partitioned primary should keep the read pending");
+                    "primary should keep the read pending");
         tests.check(primary_node->replicationLogSize() == 2 &&
                         primary_node->commitIndex() == 2,
-                    "partitioned read should not append or commit an operation");
+                    "read-index read should not append a log entry");
         tests.check(!newClientReplyFor(state, 1, 3),
-                    "primary should not reply before the read-index reply");
+                    "primary should not reply before backup confirmation");
         tests.check(containsEnvelopeMatching(
                         state,
                         [&](const MessageEnvelope& envelope) {
@@ -19503,7 +19380,7 @@ int main(int argc, char* argv[]) {
                                    envelope.to.rootAddress() == backup;
                         },
                         "read-index request").ok,
-                    "partitioned read should leave a read-index request in flight");
+                    "primary should send a read-index request to backup");
 
         bool read_index_deliverable = false;
         for (const auto& event : state.events(partitioned)) {
@@ -19516,198 +19393,161 @@ int main(int argc, char* argv[]) {
             }
         }
         tests.check(!read_index_deliverable,
-                    "network partition should block primary-to-backup read index");
-
-        EventRef read_index = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ReadIndexRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 3 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "healed read-index request");
-        const auto* read_index_envelope = messageForEvent(state, read_index);
-        const auto* read_index_request =
-            std::get_if<ReadIndexRequest>(&read_index_envelope->message);
-        int read_id = read_index_request->read_id;
-        state = stepRequired(state, read_index, settings);
-
-        EventRef read_index_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<ReadIndexReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->read_id == read_id &&
-                       reply->matched_index == 2 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "healed read-index reply");
-        state = stepRequired(state, read_index_reply, settings);
-
-        EventRef client_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 3 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == client;
-            },
-            "client reply after healed read-index reply");
-        state = stepRequired(state, client_reply, settings);
-
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(client_node != nullptr && primary_node != nullptr,
-                    "client and primary should exist after healing");
-        tests.check(client_node->results().size() == 3 &&
-                        client_node->results().back() ==
-                            Result{CountRowsResult{1}},
-                    "healed read-index read should complete from committed state");
-        tests.check(primary_node->pendingReadCount() == 0 &&
-                        primary_node->replicationLogSize() == 2,
-                    "healed read should clear pending state without logging a read");
+                    "partition should block the read-index request");
     });
 
-    tests.test("Partitioned write waits for backup acknowledgement", [&] {
+    tests.test("Fresh backup cannot catch up from suffix alone", [&] {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
+        std::vector<Command> prefix = titleInsertCommandsFromImdb(imdb_file, 1);
         std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            InsertRowCommand{"title", first_title}
-        };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
-        SearchSettings settings = scenario.settings;
-        SearchState state = deliverPrimaryBackupCommandRound(
-            scenario.state,
-            settings,
-            primary,
-            backup,
-            client,
-            1,
-            1,
-            1,
-            false);
-
-        SearchSettings partitioned = settings;
-        partitioned.partition({{client, primary}, {backup}});
-        EventRef client_write = requireMessageEvent(
-            state,
-            partitioned,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 2 &&
-                       envelope.from.rootAddress() == client &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "partitioned write request");
-        state = stepRequired(state, client_write, partitioned);
-
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node != nullptr, "primary should exist");
-        tests.check(primary_node->pendingCount() == 1,
-                    "partitioned primary should keep the write pending");
-        tests.check(primary_node->replicationLogSize() == 2 &&
-                        primary_node->commitIndex() == 1,
-                    "partitioned write should be logged but not committed");
-        tests.check(!newClientReplyFor(state, 1, 2),
-                    "primary should not reply before backup ack");
-
-        bool backup_apply_deliverable = false;
-        for (const auto& event : state.events(partitioned)) {
-            const auto* envelope = messageForEvent(state, event);
-            if (envelope != nullptr) {
-                const auto* apply =
-                    std::get_if<BackupApplyRequest>(&envelope->message);
-                if (apply != nullptr &&
-                    apply->op_number == 2 &&
-                    envelope->from.rootAddress() == primary &&
-                    envelope->to.rootAddress() == backup) {
-                    backup_apply_deliverable = true;
-                }
-            }
+            requireTupleLinesFromFile(imdb_file, "title", 2);
+        Command suffix = parseSQL("INSERT " + title_rows[1]);
+        SearchState source_state = oneClientPrimaryBackupScenario(
+            Workload(prefix, buzzDBOracleResults(prefix))).state;
+        SearchSettings settings;
+        for (size_t i = 0; i < prefix.size(); ++i) {
+            source_state = deliverPrimaryBackupCommandRound(
+                source_state,
+                settings,
+                primary,
+                backup,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                static_cast<int>(i + 1),
+                false);
         }
-        tests.check(!backup_apply_deliverable,
-                    "network partition should block primary-to-backup write apply");
 
-        EventRef backup_apply = requireMessageEvent(
-            state,
+        auto* source_primary = const_cast<PrimaryBackupServer*>(
+            source_state.nodeAs<PrimaryBackupServer>(primary));
+        tests.check(source_primary != nullptr,
+                    "source primary should exist before catch-up");
+        ReplicatedStateSnapshot snapshot =
+            source_primary->createSnapshotForTest();
+        tests.check(snapshot.last_included_op == 2,
+                    "snapshot should cover the stable prefix");
+
+        SearchState suffix_only_state;
+        suffix_only_state.addNode(std::make_unique<BackupReplica>(backup));
+        suffix_only_state.send(primary, backup, BackupApplyRequest{
+            3,
+            1,
+            3,
+            suffix
+        });
+        EventRef suffix_only_apply = requireMessageEvent(
+            suffix_only_state,
             settings,
             [&](const MessageEnvelope& envelope) {
                 const auto* apply =
                     std::get_if<BackupApplyRequest>(&envelope.message);
-                return apply != nullptr &&
-                       apply->op_number == 2 &&
+                return apply != nullptr && apply->op_number == 3 &&
                        envelope.from.rootAddress() == primary &&
                        envelope.to.rootAddress() == backup;
             },
-            "healed write apply");
-        state = stepRequired(state, backup_apply, settings);
+            "suffix-only apply");
+        suffix_only_state =
+            stepRequired(suffix_only_state, suffix_only_apply, settings);
 
-        EventRef backup_ack = requireMessageEvent(
-            state,
+        const auto* suffix_only_backup =
+            suffix_only_state.nodeAs<BackupReplica>(backup);
+        tests.check(suffix_only_backup != nullptr,
+                    "suffix-only backup should exist");
+        tests.check(suffix_only_backup->pendingCount() == 1 &&
+                        suffix_only_backup->commitIndex() == 0 &&
+                        suffix_only_backup->appliedIndex() == 0,
+                    "fresh backup should buffer op 3 while missing prefix ops");
+        tests.check(suffix_only_backup->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{TableNotFoundResult{}},
+                    "suffix alone should not create the missing table state");
+        tests.check(!containsEnvelopeMatching(
+                        suffix_only_state,
+                        [&](const MessageEnvelope& envelope) {
+                            return std::get_if<BackupApplyReply>(
+                                       &envelope.message) != nullptr &&
+                                   envelope.from.rootAddress() == backup &&
+                                   envelope.to.rootAddress() == primary;
+                        },
+                        "suffix-only backup ack").ok,
+                    "fresh backup should not acknowledge suffix without prefix");
+
+        SearchState catchup_state;
+        catchup_state.addNode(std::make_unique<BackupReplica>(backup));
+        catchup_state.send(primary, backup, SnapshotInstallRequest{snapshot});
+        EventRef install = requireMessageEvent(
+            catchup_state,
             settings,
             [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 2 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "healed write ack");
-        state = stepRequired(state, backup_ack, settings);
-
-        EventRef client_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 2 &&
+                return std::holds_alternative<SnapshotInstallRequest>(
+                           envelope.message) &&
                        envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == client;
+                       envelope.to.rootAddress() == backup;
             },
-            "client reply after healed write");
-        state = stepRequired(state, client_reply, settings);
+            "snapshot catch-up install");
+        catchup_state = stepRequired(catchup_state, install, settings);
+        catchup_state.send(primary, backup, BackupApplyRequest{
+            3,
+            1,
+            3,
+            suffix
+        });
+        EventRef suffix_apply = requireMessageEvent(
+            catchup_state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* apply =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return apply != nullptr && apply->op_number == 3 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "suffix catch-up apply");
+        catchup_state = stepRequired(catchup_state, suffix_apply, settings);
 
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(client_node != nullptr && primary_node != nullptr &&
-                        backup_node != nullptr,
-                    "nodes should exist after healed write");
-        tests.check(client_node->done() &&
-                        client_node->results().back() == Result{InsertOkResult{}},
-                    "healed write should eventually complete");
-        tests.check(primary_node->commitIndex() == 2 &&
-                        backup_node->commitIndex() == 2 &&
-                        primary_node->appDigest() == backup_node->appDigest(),
-                    "healed write should commit on both replicas");
+        const auto* caught_up =
+            catchup_state.nodeAs<BackupReplica>(backup);
+        tests.check(caught_up != nullptr,
+                    "catch-up backup should exist");
+        tests.check(caught_up->snapshotIndex() == 2,
+                    "backup should remember the installed snapshot index");
+        tests.check(caught_up->replicationLogSize() == 1,
+                    "backup should retain only the suffix entry after snapshot");
+        tests.check(caught_up->commitIndex() == 3 &&
+                        caught_up->appliedIndex() == 3,
+                    "suffix should advance backup commit/apply indexes");
+        tests.check(caught_up->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{2}},
+                    "snapshot plus suffix should recover both real title rows");
     });
 
-    tests.test("Two-client updates stay ordered under reordered backup messages", [&] {
+    tests.test("Quorum partition model separates majority from minority", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        QuorumGroup quorum(replicas);
+        SearchSettings partitioned;
+        partitioned.partition({
+            {replicas[0], replicas[1], replicas[2]},
+            {replicas[3], replicas[4]}
+        });
+
+        std::vector<Address> majority{replicas[0], replicas[1], replicas[2]};
+        std::vector<Address> minority{replicas[3], replicas[4]};
+        tests.check(quorum.size() == 5 && quorum.majoritySize() == 3,
+                    "five replicas should require a quorum of three");
+        tests.check(quorum.hasMajority(majority),
+                    "three connected replicas should be a majority");
+        tests.check(!quorum.hasMajority(minority),
+                    "two connected replicas should be a minority");
+        tests.check(messageDeliverable(partitioned, replicas[0], replicas[1]),
+                    "messages within the majority side should be deliverable");
+        tests.check(!messageDeliverable(partitioned, replicas[0], replicas[4]),
+                    "messages across the partition should be blocked");
+    });
+
+    tests.test("Committed log order beats message order", [&] {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
@@ -19718,13 +19558,11 @@ int main(int argc, char* argv[]) {
             tupleValuesFromLine(title_rows[0], "title");
         std::vector<Command> prefix{
             createTitleTableCommand(),
-            InsertRowCommand{"title", first_title}
+            parseSQL("INSERT " + title_rows[0])
         };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(prefix, buzzDBOracleResults(prefix)));
-        SearchSettings settings = scenario.settings;
-        SearchState state = scenario.state;
+        SearchState state = oneClientPrimaryBackupScenario(
+            Workload(prefix, buzzDBOracleResults(prefix))).state;
+        SearchSettings settings;
         for (size_t i = 0; i < prefix.size(); ++i) {
             state = deliverPrimaryBackupCommandRound(
                 state,
@@ -19739,19 +19577,9 @@ int main(int argc, char* argv[]) {
         }
 
         Command update_1999 = UpdateRowsCommand{
-            "title",
-            "production_year",
-            "1999",
-            "id",
-            first_title[0]
-        };
+            "title", "production_year", "1999", "id", first_title[0]};
         Command update_2000 = UpdateRowsCommand{
-            "title",
-            "production_year",
-            "2000",
-            "id",
-            first_title[0]
-        };
+            "title", "production_year", "2000", "id", first_title[0]};
         state.send(client, primary, ClientRequest{11, 1, update_1999});
         state.send(client2, primary, ClientRequest{12, 1, update_2000});
 
@@ -19761,23 +19589,20 @@ int main(int argc, char* argv[]) {
             [&](const MessageEnvelope& envelope) {
                 const auto* request =
                     std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 11 &&
+                return request != nullptr && request->client_id == 11 &&
                        request->request_id == 1 &&
                        envelope.from.rootAddress() == client &&
                        envelope.to.rootAddress() == primary;
             },
             "first manual update request");
         state = stepRequired(state, first_update, settings);
-
         EventRef second_update = requireMessageEvent(
             state,
             settings,
             [&](const MessageEnvelope& envelope) {
                 const auto* request =
                     std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 12 &&
+                return request != nullptr && request->client_id == 12 &&
                        request->request_id == 1 &&
                        envelope.from.rootAddress() == client2 &&
                        envelope.to.rootAddress() == primary;
@@ -19791,28 +19616,19 @@ int main(int argc, char* argv[]) {
             [&](const MessageEnvelope& envelope) {
                 const auto* apply =
                     std::get_if<BackupApplyRequest>(&envelope.message);
-                return apply != nullptr &&
-                       apply->op_number == 4 &&
+                return apply != nullptr && apply->op_number == 4 &&
                        envelope.from.rootAddress() == primary &&
                        envelope.to.rootAddress() == backup;
             },
             "op 4 apply before op 3");
         state = stepRequired(state, op4_apply, settings);
-
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(backup_node != nullptr &&
-                        backup_node->pendingCount() == 1 &&
-                        backup_node->appliedIndex() == 2,
-                    "backup should buffer op 4 until op 3 arrives");
-
         EventRef op3_apply = requireMessageEvent(
             state,
             settings,
             [&](const MessageEnvelope& envelope) {
                 const auto* apply =
                     std::get_if<BackupApplyRequest>(&envelope.message);
-                return apply != nullptr &&
-                       apply->op_number == 3 &&
+                return apply != nullptr && apply->op_number == 3 &&
                        envelope.from.rootAddress() == primary &&
                        envelope.to.rootAddress() == backup;
             },
@@ -19825,21 +19641,20 @@ int main(int argc, char* argv[]) {
             [&](const MessageEnvelope& envelope) {
                 const auto* reply =
                     std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 4 &&
+                return reply != nullptr && reply->op_number == 4 &&
                        envelope.from.rootAddress() == backup &&
                        envelope.to.rootAddress() == primary;
             },
             "op 4 ack before op 3 ack");
         state = stepRequired(state, op4_ack, settings);
-
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        const auto* primary_node =
+            state.nodeAs<PrimaryBackupServer>(primary);
         tests.check(primary_node != nullptr &&
                         primary_node->commitIndex() == 2 &&
                         primary_node->executionCount(12, 1) == 0,
-                    "primary should buffer out-of-order backup ack");
+                    "primary should not let op 4 complete before op 3");
         tests.check(!newClientReplyFor(state, 12, 1),
-                    "out-of-order ack should not produce a client reply");
+                    "out-of-order op should not produce a client reply");
 
         EventRef op3_ack = requireMessageEvent(
             state,
@@ -19847,8 +19662,7 @@ int main(int argc, char* argv[]) {
             [&](const MessageEnvelope& envelope) {
                 const auto* reply =
                     std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 3 &&
+                return reply != nullptr && reply->op_number == 3 &&
                        envelope.from.rootAddress() == backup &&
                        envelope.to.rootAddress() == primary;
             },
@@ -19856,181 +19670,26 @@ int main(int argc, char* argv[]) {
         state = stepRequired(state, op3_ack, settings);
 
         primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        backup_node = state.nodeAs<BackupReplica>(backup);
+        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
         tests.check(primary_node != nullptr && backup_node != nullptr,
-                    "primary and backup should exist after reordered acks");
+                    "primary and backup should exist after ordered commit");
         tests.check(primary_node->commitIndex() == 4 &&
                         backup_node->commitIndex() == 4,
-                    "primary should commit buffered acks in log order");
+                    "both replicas should expose one committed operation order");
         tests.check(primary_node->executionCount(11, 1) == 1 &&
                         primary_node->executionCount(12, 1) == 1 &&
                         backup_node->executionCount(11, 1) == 1 &&
                         backup_node->executionCount(12, 1) == 1,
-                    "both updates should execute once on each replica");
+                    "each completed update should apply exactly once");
         Result final_rows =
             primary_node->executeReadOnlyForTest(SelectAllCommand{"title"});
         const auto* rows = std::get_if<SelectAllResult>(&final_rows);
-        tests.check(rows != nullptr &&
-                        rows->rows.size() == 1 &&
+        tests.check(rows != nullptr && rows->rows.size() == 1 &&
                         rows->rows[0].size() == 4 &&
                         rows->rows[0][3] == "2000",
-                    "final SQL-visible value should follow primary log order");
+                    "SQL-visible result should follow the committed log order");
         tests.check(primary_node->appDigest() == backup_node->appDigest(),
-                    "reordered messages should leave replicas equal");
-    });
-
-    tests.test("Stale duplicate backup acknowledgement is ignored", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        SearchSettings settings;
-        std::vector<Command> commands{createTitleTableCommand()};
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
-        SearchState state = deliverPrimaryBackupCommandRound(
-            scenario.state,
-            settings,
-            primary,
-            backup,
-            client,
-            1,
-            1,
-            1,
-            false);
-
-        EventRef stale_ack = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 1 &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 1 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "stale duplicate backup ack");
-        state = stepRequired(state, stale_ack, settings);
-
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node != nullptr, "primary should exist");
-        tests.check(primary_node->commitIndex() == 1 &&
-                        primary_node->replicationLogSize() == 1 &&
-                        primary_node->pendingCount() == 0,
-                    "stale ack should not move primary protocol state");
-        tests.check(primary_node->executionCount(1, 1) == 1,
-                    "stale ack should not re-execute the command");
-        tests.check(!newClientReplyFor(state, 1, 1),
-                    "stale ack should not produce another client reply");
-    });
-
-    tests.test("Full IMDB committed log replay and snapshot recover the JOB query", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        std::vector<Command> commands = createFullJobLoadCommands(imdb_file);
-        size_t mutating_commands = countMutatingCommands(commands);
-        Scenario scenario = oneClientPrimaryBackupScenario(
-            Workload(commands, std::vector<Result>{}));
-        SearchSettings settings;
-        SearchState state = scenario.state;
-
-        for (size_t i = 0; i < commands.size(); ++i) {
-            state = deliverPrimaryBackupCommandRound(
-                state,
-                settings,
-                primary,
-                backup,
-                client,
-                1,
-                static_cast<int>(i + 1),
-                static_cast<int>(i + 1),
-                false);
-        }
-
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(client_node != nullptr && primary_node != nullptr &&
-                        backup_node != nullptr,
-                    "full replicated load should keep all nodes alive");
-        tests.check(client_node->done(),
-                    "client should finish the full replicated load");
-        tests.check(client_node->results().size() == commands.size(),
-                    "client should receive one result per full-load command");
-        const auto* query_rows =
-            std::get_if<QueryRowsResult>(&client_node->results().back());
-        tests.check(query_rows != nullptr && query_rows->count == 39,
-                    "full replicated load should return all distributor rows");
-        tests.check(primary_node->appDigest() == backup_node->appDigest(),
-                    "full replicated load should leave matching replicas");
-        tests.check(primary_node->replicationLogSize() == mutating_commands,
-                    "primary should log every mutating full-load operation");
-        tests.check(primary_node->commitIndex() ==
-                        static_cast<int>(mutating_commands),
-                    "primary should commit every mutating full-load operation");
-        std::vector<std::string> full_log_lines =
-            readNonEmptyLines(primary_node->replicationLogFile());
-        tests.check(countLinesStartingWith(full_log_lines, "record=ENTRY") ==
-                        mutating_commands,
-                    "primary full-load log should contain one ENTRY per write");
-        tests.check(hasLineStartingWith(
-                        full_log_lines,
-                        "record=COMMIT\tindex=" +
-                            std::to_string(mutating_commands)),
-                    "primary full-load log should contain final COMMIT");
-        PrimaryBackupServer restarted(primary,
-                                      backup,
-                                      primary_node->databaseFile(),
-                                      primary_node->replicationLogFile());
-        tests.check(restarted.commitIndex() ==
-                        static_cast<int>(mutating_commands),
-                    "full-load restart should load the committed prefix");
-        tests.check(restarted.cachedRequestCount() == mutating_commands,
-                    "full-load restart should rebuild durable write results");
-        tests.check(restarted.appDigest() == primary_node->appDigest(),
-                    "full-load restart should rebuild the same BuzzDB state");
-        tests.check(restarted.executeReadOnlyForTest(
-                        QuerySQLCommand{jobDistributorJoinRowsQuery()}) ==
-                        Result{QueryRowsResult{39}},
-                    "full-load restart should recover the JOB query result");
-
-        auto* mutable_primary = const_cast<PrimaryBackupServer*>(primary_node);
-        ReplicatedStateSnapshot snapshot =
-            mutable_primary->createSnapshotForTest();
-        tests.check(snapshot.last_included_op ==
-                        static_cast<int>(mutating_commands),
-                    "full-load snapshot should cover the full committed write prefix");
-        tests.check(mutable_primary->replicationLogSize() == 0,
-                    "full-load snapshot should truncate all operation entries");
-        std::vector<std::string> snapshot_log_lines =
-            readNonEmptyLines(mutable_primary->replicationLogFile());
-        tests.check(hasLineStartingWith(
-                        snapshot_log_lines,
-                        "record=SNAPSHOT\top=" +
-                            std::to_string(mutating_commands)),
-                    "full-load log should retain snapshot metadata");
-        tests.check(countLinesStartingWith(snapshot_log_lines, "record=ENTRY") == 0,
-                    "full-load log should not keep entries covered by snapshot");
-
-        PrimaryBackupServer restarted_from_snapshot(
-            primary,
-            backup,
-            mutable_primary->databaseFile(),
-            mutable_primary->replicationLogFile());
-        tests.check(restarted_from_snapshot.snapshotIndex() ==
-                        static_cast<int>(mutating_commands),
-                    "snapshot restart should load full-load snapshot index");
-        tests.check(restarted_from_snapshot.cachedRequestCount() ==
-                        mutating_commands,
-                    "snapshot restart should rebuild durable write results");
-        tests.check(restarted_from_snapshot.executeReadOnlyForTest(
-                        QuerySQLCommand{jobDistributorJoinRowsQuery()}) ==
-                        Result{QueryRowsResult{39}},
-                    "snapshot restart should recover the JOB query result");
+                    "replicas should agree on the final BuzzDB state");
     });
 
     return tests.finish();

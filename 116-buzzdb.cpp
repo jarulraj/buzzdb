@@ -13357,6 +13357,42 @@ struct ReadIndexReply {
     int matched_index = 0;
 };
 
+struct ClientForward {
+    Address client;
+    ClientRequest request;
+};
+
+struct RequestVote {
+    int term = 0;
+    Address candidate;
+};
+
+struct VoteReply {
+    int term = 0;
+    Address voter;
+    bool granted = false;
+};
+
+struct Heartbeat {
+    int term = 0;
+    Address leader;
+};
+
+struct QuorumAccept {
+    int term = 0;
+    int proposal_id = 0;
+    int client_id = 0;
+    int request_id = 0;
+    Command command = CreateTableCommand{"", {""}};
+};
+
+struct QuorumAcceptReply {
+    int term = 0;
+    int proposal_id = 0;
+    Address replica;
+    bool accepted = false;
+};
+
 struct ReplicatedLogEntry {
     int op_number = 0;
     int client_id = 0;
@@ -14054,12 +14090,18 @@ private:
 using Message = std::variant<
     ClientRequest,
     ClientReply,
+    ClientForward,
     BackupApplyRequest,
     BackupApplyReply,
     SnapshotInstallRequest,
     SnapshotInstallReply,
     ReadIndexRequest,
     ReadIndexReply,
+    RequestVote,
+    VoteReply,
+    Heartbeat,
+    QuorumAccept,
+    QuorumAcceptReply,
     ViewPing,
     ViewRequest,
     ViewReply>;
@@ -14068,7 +14110,11 @@ struct RetryTimer {
     int request_id;
 };
 
-using Timer = std::variant<RetryTimer>;
+struct ElectionTimer {
+    int generation = 0;
+};
+
+using Timer = std::variant<RetryTimer, ElectionTimer>;
 
 std::string requestKey(int client_id, int request_id) {
     return std::to_string(client_id) + ":" + std::to_string(request_id);
@@ -14103,6 +14149,11 @@ std::string describeMessage(const Message& message) {
                 out << "ClientReply(client=" << value.client_id
                     << ", req=" << value.request_id
                     << ", " << describeResult(value.result) << ")";
+            } else if constexpr (std::is_same_v<T, ClientForward>) {
+                out << "ClientForward(client_addr=" << value.client
+                    << ", client=" << value.request.client_id
+                    << ", req=" << value.request.request_id
+                    << ", " << describeCommand(value.request.command) << ")";
             } else if constexpr (std::is_same_v<T, BackupApplyRequest>) {
                 out << "BackupApplyRequest(op=" << value.op_number
                     << ", client=" << value.client_id
@@ -14127,6 +14178,29 @@ std::string describeMessage(const Message& message) {
             } else if constexpr (std::is_same_v<T, ReadIndexReply>) {
                 out << "ReadIndexReply(read=" << value.read_id
                     << ", matched=" << value.matched_index << ")";
+            } else if constexpr (std::is_same_v<T, RequestVote>) {
+                out << "RequestVote(term=" << value.term
+                    << ", candidate=" << value.candidate << ")";
+            } else if constexpr (std::is_same_v<T, VoteReply>) {
+                out << "VoteReply(term=" << value.term
+                    << ", voter=" << value.voter
+                    << ", granted=" << (value.granted ? "true" : "false")
+                    << ")";
+            } else if constexpr (std::is_same_v<T, Heartbeat>) {
+                out << "Heartbeat(term=" << value.term
+                    << ", leader=" << value.leader << ")";
+            } else if constexpr (std::is_same_v<T, QuorumAccept>) {
+                out << "QuorumAccept(term=" << value.term
+                    << ", proposal=" << value.proposal_id
+                    << ", client=" << value.client_id
+                    << ", req=" << value.request_id
+                    << ", " << describeCommand(value.command) << ")";
+            } else if constexpr (std::is_same_v<T, QuorumAcceptReply>) {
+                out << "QuorumAcceptReply(term=" << value.term
+                    << ", proposal=" << value.proposal_id
+                    << ", replica=" << value.replica
+                    << ", accepted=" << (value.accepted ? "true" : "false")
+                    << ")";
             } else if constexpr (std::is_same_v<T, ViewPing>) {
                 out << "ViewPing(view=" << value.view_number << ")";
             } else if constexpr (std::is_same_v<T, ViewRequest>) {
@@ -14148,6 +14222,8 @@ std::string describeTimer(const Timer& timer) {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, RetryTimer>) {
                 out << "RetryTimer(req=" << value.request_id << ")";
+            } else if constexpr (std::is_same_v<T, ElectionTimer>) {
+                out << "ElectionTimer(gen=" << value.generation << ")";
             }
             return out.str();
         },
@@ -18720,7 +18796,7 @@ void printRestartMeasurementRow(const RestartMeasurement& measurement) {
 }
 
 void printRestartRecoveryMeasurement(const std::string& data_file) {
-    std::cout << "BuzzDB v114 restart recovery measurement" << std::endl;
+    std::cout << "BuzzDB v116 restart recovery measurement" << std::endl;
     std::cout << "  input: " << data_file << std::endl;
     std::vector<Command> commands = createFullJobLoadCommands(data_file);
     const size_t full_snapshot_after = commands.size();
@@ -18853,7 +18929,7 @@ std::string defaultImdbInputFile() {
 void printV104BootstrapTrace(const std::string& data_file) {
     std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v114-bootstrap-trace-" + std::to_string(::getpid()));
+        ("buzzdb-v116-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
@@ -19004,6 +19080,908 @@ void checkViewServerPromotesDurableBackup(TestRunner& tests,
                 "promoted backup should make the real title tuple visible");
 }
 
+
+void seedViewServerForPrimaryBackup(ViewServer& view_server,
+                                    const Address& primary,
+                                    const Address& backup) {
+    view_server.pingServer(primary, 0);
+    view_server.pingServer(primary, 1);
+    view_server.pingServer(backup, 0);
+    view_server.pingServer(primary, 2);
+    view_server.pingServer(backup, 2);
+}
+
+std::vector<Command> titleInsertCommandsFromImdb(
+    const std::string& data_file,
+    size_t row_count) {
+    std::vector<Command> commands{createTitleTableCommand()};
+    for (const auto& row : requireTupleLinesFromFile(
+             data_file, "title", row_count)) {
+        commands.push_back(parseSQL("INSERT " + row));
+    }
+    return commands;
+}
+
+SearchState viewAwarePrimaryBackupState(std::vector<Command> commands) {
+    Address view_server = ScenarioAddress::viewserver1();
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    Address client = ScenarioAddress::client1();
+
+    SearchState state;
+    state.addNode(std::make_unique<PrimaryBackupServer>(primary, backup));
+    state.addNode(std::make_unique<BackupReplica>(backup));
+    auto view_node = std::make_unique<ViewServer>(view_server);
+    seedViewServerForPrimaryBackup(*view_node, primary, backup);
+    state.addNode(std::move(view_node));
+    state.addNode(std::make_unique<PBClientWorker>(
+        client,
+        view_server,
+        1,
+        Workload(commands, buzzDBOracleResults(commands))));
+    return state;
+}
+
+CheckResult pbClientDone(const SearchState& state, const Address& client) {
+    const auto* worker = state.nodeAs<PBClientWorker>(client);
+    if (worker == nullptr) {
+        return {false, client.str() + " is missing"};
+    }
+    return {worker->done(), client.str() + " is not done"};
+}
+
+bool messageDeliverable(const SearchSettings& settings,
+                        const Address& from,
+                        const Address& to) {
+    return settings.shouldDeliver(MessageEnvelope{0, from, to, ViewRequest{}});
+}
+
+std::vector<Address> quorumReplicaAddresses(size_t count) {
+    std::vector<Address> replicas;
+    for (size_t i = 1; i <= count; ++i) {
+        replicas.emplace_back("server" + std::to_string(i));
+    }
+    return replicas;
+}
+
+class QuorumGroup {
+public:
+    explicit QuorumGroup(std::vector<Address> replicas)
+        : replicas_(std::move(replicas)) {}
+
+    size_t size() const { return replicas_.size(); }
+
+    size_t majoritySize() const { return replicas_.size() / 2 + 1; }
+
+    bool hasMajority(const std::vector<Address>& responders) const {
+        std::set<Address> replica_roots;
+        for (const auto& replica : replicas_) {
+            replica_roots.insert(replica.rootAddress());
+        }
+        std::set<Address> unique_responders;
+        for (const auto& responder : responders) {
+            Address root = responder.rootAddress();
+            if (replica_roots.count(root) != 0) {
+                unique_responders.insert(root);
+            }
+        }
+        return unique_responders.size() >= majoritySize();
+    }
+
+private:
+    std::vector<Address> replicas_;
+};
+
+enum class ConsensusRole { Follower, Candidate, Leader };
+
+std::string consensusRoleName(ConsensusRole role) {
+    switch (role) {
+        case ConsensusRole::Follower:
+            return "follower";
+        case ConsensusRole::Candidate:
+            return "candidate";
+        case ConsensusRole::Leader:
+            return "leader";
+    }
+    return "unknown";
+}
+
+struct ConsensusEntry {
+    int index = 0;
+    int term = 0;
+    int client_id = 0;
+    int request_id = 0;
+    Command command = CreateTableCommand{"", {""}};
+};
+
+bool sameConsensusEntry(const ConsensusEntry& lhs,
+                        const ConsensusEntry& rhs) {
+    return lhs.index == rhs.index &&
+           lhs.term == rhs.term &&
+           lhs.client_id == rhs.client_id &&
+           lhs.request_id == rhs.request_id &&
+           lhs.command == rhs.command;
+}
+
+struct PendingConsensusClient {
+    Address client;
+    ConsensusEntry entry;
+};
+
+class ConsensusReplica final : public Node {
+public:
+    ConsensusReplica(Address address, std::vector<Address> replicas)
+        : Node(std::move(address)),
+          replicas_(normalizeReplicas(std::move(replicas), this->address())),
+          db_() {}
+
+    void init(NodeContext& ctx) override {
+        resetElectionTimer(ctx);
+    }
+
+    void onMessage(NodeContext& ctx,
+                   const Address& from,
+                   const Message& message) override {
+        if (const auto* request = std::get_if<RequestVote>(&message)) {
+            handleRequestVote(ctx, from, *request);
+            return;
+        }
+        if (const auto* reply = std::get_if<VoteReply>(&message)) {
+            handleVoteReply(ctx, *reply);
+            return;
+        }
+        if (const auto* heartbeat = std::get_if<Heartbeat>(&message)) {
+            handleHeartbeat(*heartbeat);
+            return;
+        }
+        if (const auto* request = std::get_if<ClientRequest>(&message)) {
+            handleClientRequest(ctx, from.rootAddress(), *request);
+            return;
+        }
+        if (const auto* forward = std::get_if<ClientForward>(&message)) {
+            handleClientRequest(ctx, forward->client.rootAddress(),
+                                forward->request);
+            return;
+        }
+        if (const auto* accept = std::get_if<QuorumAccept>(&message)) {
+            handleQuorumAccept(ctx, from, *accept);
+            return;
+        }
+        if (const auto* reply = std::get_if<QuorumAcceptReply>(&message)) {
+            handleQuorumAcceptReply(ctx, *reply);
+            return;
+        }
+    }
+
+    void onTimer(NodeContext& ctx, const Timer& timer) override {
+        const auto* election = std::get_if<ElectionTimer>(&timer);
+        if (election == nullptr ||
+            election->generation != election_generation_ ||
+            role_ == ConsensusRole::Leader) {
+            return;
+        }
+        startElection(ctx);
+    }
+
+    std::unique_ptr<Node> clone() const override {
+        return std::make_unique<ConsensusReplica>(*this);
+    }
+
+    ConsensusRole role() const { return role_; }
+    std::string roleName() const { return consensusRoleName(role_); }
+    int currentTerm() const { return current_term_; }
+    const Address& leader() const { return leader_; }
+    const Address& votedFor() const { return voted_for_; }
+    size_t voteCount() const { return votes_.size(); }
+    size_t majoritySize() const { return replicas_.size() / 2 + 1; }
+    int commitIndex() const { return commit_index_; }
+    int appliedIndex() const { return applied_index_; }
+    size_t pendingCount() const { return pending_by_index_.size(); }
+
+    bool isLeader() const {
+        return role_ == ConsensusRole::Leader;
+    }
+
+    bool hasAccepted(int index) const {
+        return accepted_entries_.count(index) != 0;
+    }
+
+    bool acceptedEntryMatches(int index,
+                              int term,
+                              int client_id,
+                              int request_id,
+                              const Command& command) const {
+        auto it = accepted_entries_.find(index);
+        if (it == accepted_entries_.end()) {
+            return false;
+        }
+        const ConsensusEntry& entry = it->second;
+        return entry.term == term &&
+               entry.client_id == client_id &&
+               entry.request_id == request_id &&
+               entry.command == command;
+    }
+
+    size_t acceptVoteCount(int index) const {
+        auto it = accept_votes_.find(index);
+        return it == accept_votes_.end() ? 0 : it->second.size();
+    }
+
+    int executionCount(int client_id, int request_id) const {
+        auto it = execution_count_.find(requestKey(client_id, request_id));
+        return it == execution_count_.end() ? 0 : it->second;
+    }
+
+    Result executeReadOnlyForTest(const Command& command) const {
+        BuzzDBCore copy = db_;
+        return runWithSuppressedStdout([&] {
+            return copy.execute(command);
+        });
+    }
+
+    std::string appDigest() const {
+        return db_.digest();
+    }
+
+    std::string digest() const override {
+        std::ostringstream out;
+        out << "ConsensusReplica(role=" << roleName()
+            << ", term=" << current_term_
+            << ", leader=" << leader_
+            << ", voted_for=" << voted_for_
+            << ", votes=" << votes_.size()
+            << ", commit=" << commit_index_
+            << ", applied=" << applied_index_
+            << ", pending=" << pending_by_index_.size()
+            << ")";
+        return out.str();
+    }
+
+    std::string describe() const override {
+        return digest();
+    }
+
+private:
+    static std::vector<Address> normalizeReplicas(std::vector<Address> replicas,
+                                                  const Address& self) {
+        for (auto& replica : replicas) {
+            replica = replica.rootAddress();
+        }
+        if (std::find(replicas.begin(), replicas.end(), self.rootAddress()) ==
+            replicas.end()) {
+            replicas.push_back(self.rootAddress());
+        }
+        std::sort(replicas.begin(), replicas.end());
+        replicas.erase(std::unique(replicas.begin(), replicas.end()),
+                       replicas.end());
+        return replicas;
+    }
+
+    std::vector<Address> peers() const {
+        std::vector<Address> out;
+        for (const auto& replica : replicas_) {
+            if (!(replica == address().rootAddress())) {
+                out.push_back(replica);
+            }
+        }
+        return out;
+    }
+
+    bool hasMajority(const std::set<Address>& responders) const {
+        return responders.size() >= majoritySize();
+    }
+
+    void resetElectionTimer(NodeContext& ctx) {
+        ctx.setTimer(ElectionTimer{++election_generation_}, 10, 20);
+    }
+
+    void stepDownTo(int term, Address leader = Address()) {
+        if (term > current_term_) {
+            current_term_ = term;
+            voted_for_ = Address();
+        }
+        role_ = ConsensusRole::Follower;
+        votes_.clear();
+        if (!addressEmpty(leader)) {
+            leader_ = leader.rootAddress();
+        }
+    }
+
+    void startElection(NodeContext& ctx) {
+        role_ = ConsensusRole::Candidate;
+        current_term_++;
+        voted_for_ = address().rootAddress();
+        leader_ = Address();
+        votes_.clear();
+        votes_.insert(address().rootAddress());
+
+        for (const auto& peer : peers()) {
+            ctx.send(peer, RequestVote{current_term_, address().rootAddress()});
+        }
+        if (hasMajority(votes_)) {
+            becomeLeader(ctx);
+        }
+    }
+
+    void becomeLeader(NodeContext& ctx) {
+        role_ = ConsensusRole::Leader;
+        leader_ = address().rootAddress();
+        for (const auto& peer : peers()) {
+            ctx.send(peer, Heartbeat{current_term_, address().rootAddress()});
+        }
+    }
+
+    void handleRequestVote(NodeContext& ctx,
+                           const Address& from,
+                           const RequestVote& request) {
+        if (request.term < current_term_) {
+            ctx.send(from, VoteReply{
+                current_term_,
+                address().rootAddress(),
+                false
+            });
+            return;
+        }
+        if (request.term > current_term_) {
+            stepDownTo(request.term);
+        }
+
+        bool can_vote = addressEmpty(voted_for_) ||
+                        voted_for_ == request.candidate.rootAddress();
+        if (can_vote) {
+            role_ = ConsensusRole::Follower;
+            voted_for_ = request.candidate.rootAddress();
+            leader_ = Address();
+        }
+
+        ctx.send(from, VoteReply{
+            current_term_,
+            address().rootAddress(),
+            can_vote
+        });
+    }
+
+    void handleVoteReply(NodeContext& ctx, const VoteReply& reply) {
+        if (reply.term > current_term_) {
+            stepDownTo(reply.term);
+            return;
+        }
+        if (role_ != ConsensusRole::Candidate ||
+            reply.term != current_term_ ||
+            !reply.granted) {
+            return;
+        }
+        votes_.insert(reply.voter.rootAddress());
+        if (hasMajority(votes_)) {
+            becomeLeader(ctx);
+        }
+    }
+
+    void handleHeartbeat(const Heartbeat& heartbeat) {
+        if (heartbeat.term < current_term_) {
+            return;
+        }
+        stepDownTo(heartbeat.term, heartbeat.leader);
+    }
+
+    void handleClientRequest(NodeContext& ctx,
+                             const Address& client,
+                             const ClientRequest& request) {
+        if (role_ != ConsensusRole::Leader) {
+            if (!addressEmpty(leader_) &&
+                !(leader_ == address().rootAddress())) {
+                ctx.send(leader_, ClientForward{client, request});
+            }
+            return;
+        }
+
+        std::string key = requestKey(request.client_id, request.request_id);
+        auto cached = session_results_.find(key);
+        if (cached != session_results_.end()) {
+            ctx.send(client, ClientReply{
+                request.client_id,
+                request.request_id,
+                cached->second
+            });
+            return;
+        }
+        if (pending_by_request_.count(key) != 0) {
+            return;
+        }
+
+        ConsensusEntry entry{
+            next_index_++,
+            current_term_,
+            request.client_id,
+            request.request_id,
+            request.command
+        };
+        accepted_entries_[entry.index] = entry;
+        accept_votes_[entry.index].insert(address().rootAddress());
+        pending_by_index_[entry.index] = PendingConsensusClient{client, entry};
+        pending_by_request_[key] = entry.index;
+
+        for (const auto& peer : peers()) {
+            ctx.send(peer, QuorumAccept{
+                entry.term,
+                entry.index,
+                entry.client_id,
+                entry.request_id,
+                entry.command
+            });
+        }
+        applyCommitted(ctx);
+    }
+
+    void handleQuorumAccept(NodeContext& ctx,
+                            const Address& from,
+                            const QuorumAccept& accept) {
+        if (accept.term < current_term_) {
+            ctx.send(from, QuorumAcceptReply{
+                current_term_,
+                accept.proposal_id,
+                address().rootAddress(),
+                false
+            });
+            return;
+        }
+        if (accept.term > current_term_ ||
+            role_ != ConsensusRole::Follower ||
+            !(leader_ == from.rootAddress())) {
+            stepDownTo(accept.term, from.rootAddress());
+        }
+
+        ConsensusEntry entry{
+            accept.proposal_id,
+            accept.term,
+            accept.client_id,
+            accept.request_id,
+            accept.command
+        };
+        auto existing = accepted_entries_.find(entry.index);
+        bool ok = existing == accepted_entries_.end() ||
+                  sameConsensusEntry(existing->second, entry);
+        if (ok) {
+            accepted_entries_[entry.index] = entry;
+        }
+
+        ctx.send(from, QuorumAcceptReply{
+            current_term_,
+            accept.proposal_id,
+            address().rootAddress(),
+            ok
+        });
+    }
+
+    void handleQuorumAcceptReply(NodeContext& ctx,
+                                 const QuorumAcceptReply& reply) {
+        if (reply.term > current_term_) {
+            stepDownTo(reply.term);
+            return;
+        }
+        if (role_ != ConsensusRole::Leader ||
+            reply.term != current_term_ ||
+            !reply.accepted ||
+            pending_by_index_.count(reply.proposal_id) == 0) {
+            return;
+        }
+        accept_votes_[reply.proposal_id].insert(reply.replica.rootAddress());
+        applyCommitted(ctx);
+    }
+
+    void applyCommitted(NodeContext& ctx) {
+        for (;;) {
+            int next = commit_index_ + 1;
+            auto pending = pending_by_index_.find(next);
+            if (pending == pending_by_index_.end()) {
+                return;
+            }
+            auto votes = accept_votes_.find(next);
+            if (votes == accept_votes_.end() || !hasMajority(votes->second)) {
+                return;
+            }
+
+            ConsensusEntry entry = pending->second.entry;
+            std::string key = requestKey(entry.client_id, entry.request_id);
+            Result result = StatementOkResult{};
+            auto cached = session_results_.find(key);
+            if (cached != session_results_.end()) {
+                result = cached->second;
+            } else {
+                result = runWithSuppressedStdout([&] {
+                    return db_.execute(entry.command);
+                });
+                session_results_[key] = result;
+                execution_count_[key]++;
+            }
+
+            commit_index_ = entry.index;
+            applied_index_ = entry.index;
+            ctx.send(pending->second.client, ClientReply{
+                entry.client_id,
+                entry.request_id,
+                result
+            });
+            pending_by_request_.erase(key);
+            pending_by_index_.erase(pending);
+        }
+    }
+
+    std::vector<Address> replicas_;
+    ConsensusRole role_ = ConsensusRole::Follower;
+    int current_term_ = 0;
+    Address voted_for_;
+    Address leader_;
+    int election_generation_ = 0;
+    std::set<Address> votes_;
+    int next_index_ = 1;
+    int commit_index_ = 0;
+    int applied_index_ = 0;
+    BuzzDBCore db_;
+    std::map<int, ConsensusEntry> accepted_entries_;
+    std::map<int, std::set<Address>> accept_votes_;
+    std::map<int, PendingConsensusClient> pending_by_index_;
+    std::map<std::string, int> pending_by_request_;
+    std::map<std::string, Result> session_results_;
+    std::map<std::string, int> execution_count_;
+};
+
+std::string formatAddressGroup(const std::vector<Address>& group) {
+    std::ostringstream out;
+    out << "{";
+    for (size_t i = 0; i < group.size(); ++i) {
+        if (i != 0) out << ", ";
+        out << group[i];
+    }
+    out << "}";
+    return out.str();
+}
+
+void printPrimaryBackupCeilingTrace(const std::string& data_file) {
+    std::cout << "Trace: primary-backup reaches its ceiling" << std::endl;
+
+    Address view_server = ScenarioAddress::viewserver1();
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    Address client = ScenarioAddress::client1();
+
+    SearchState view_state = viewAwarePrimaryBackupState(
+        titleInsertCommandsFromImdb(data_file, 1));
+    SearchSettings control_plane_partition;
+    control_plane_partition.partition({{client, primary, backup}, {view_server}});
+    bool view_request_deliverable = false;
+    for (const auto& event : view_state.events(control_plane_partition)) {
+        const auto* envelope = messageForEvent(view_state, event);
+        if (envelope != nullptr &&
+            std::holds_alternative<ViewRequest>(envelope->message) &&
+            envelope->from.rootAddress() == client &&
+            envelope->to.rootAddress() == view_server) {
+            view_request_deliverable = true;
+        }
+    }
+    std::cout << "  control plane partition: view request deliverable="
+              << (view_request_deliverable ? "yes" : "no") << std::endl;
+
+    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
+    SearchState write_state = oneClientPrimaryBackupScenario(
+        Workload(commands, buzzDBOracleResults(commands))).state;
+    SearchSettings normal;
+    write_state = deliverPrimaryBackupCommandRound(
+        write_state, normal, primary, backup, client, 1, 1, 1, false);
+
+    SearchSettings data_partition;
+    data_partition.partition({{client, primary}, {backup}});
+    EventRef write = requireMessageEvent(
+        write_state,
+        data_partition,
+        [&](const MessageEnvelope& envelope) {
+            const auto* request = std::get_if<ClientRequest>(&envelope.message);
+            return request != nullptr &&
+                   request->request_id == 2 &&
+                   envelope.from.rootAddress() == client &&
+                   envelope.to.rootAddress() == primary;
+        },
+        "ceiling trace partitioned write");
+    write_state = stepRequired(write_state, write, data_partition);
+    const auto* primary_node =
+        write_state.nodeAs<PrimaryBackupServer>(primary);
+    std::cout << "  data-plane partition: primary pending="
+              << (primary_node == nullptr ? 0 : primary_node->pendingCount())
+              << ", commit="
+              << (primary_node == nullptr ? 0 : primary_node->commitIndex())
+              << ", client reply="
+              << (newClientReplyFor(write_state, 1, 2) ? "yes" : "no")
+              << std::endl;
+
+    std::vector<Address> replicas = quorumReplicaAddresses(5);
+    QuorumGroup quorum(replicas);
+    std::vector<Address> majority{replicas[0], replicas[1], replicas[2]};
+    std::vector<Address> minority{replicas[3], replicas[4]};
+    std::cout << "  quorum partition model: "
+              << formatAddressGroup(majority) << " majority="
+              << (quorum.hasMajority(majority) ? "yes" : "no")
+              << ", " << formatAddressGroup(minority) << " majority="
+              << (quorum.hasMajority(minority) ? "yes" : "no")
+              << "\n" << std::endl;
+}
+
+SearchState consensusClusterState(const std::vector<Address>& replicas) {
+    SearchState state;
+    for (const auto& replica : replicas) {
+        state.addNode(std::make_unique<ConsensusReplica>(replica, replicas));
+    }
+    return state;
+}
+
+EventRef requireElectionTimerFor(const SearchState& state,
+                                 const SearchSettings& settings,
+                                 const Address& replica) {
+    return requireTimerEvent(
+        state,
+        settings,
+        [&](const TimerEnvelope& timer) {
+            return timer.to.rootAddress() == replica.rootAddress() &&
+                   std::get_if<ElectionTimer>(&timer.timer) != nullptr;
+        },
+        "election timer for " + replica.str());
+}
+
+SearchState electConsensusLeader(SearchState state,
+                                 const SearchSettings& settings,
+                                 const Address& candidate,
+                                 const std::vector<Address>& voters) {
+    state = stepRequired(
+        state,
+        requireElectionTimerFor(state, settings, candidate),
+        settings);
+
+    for (const auto& voter : voters) {
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* vote =
+                        std::get_if<RequestVote>(&envelope.message);
+                    return vote != nullptr &&
+                           vote->candidate == candidate.rootAddress() &&
+                           envelope.from.rootAddress() ==
+                               candidate.rootAddress() &&
+                           envelope.to.rootAddress() == voter.rootAddress();
+                },
+                "request vote " + candidate.str() + " -> " + voter.str()),
+            settings);
+    }
+
+    for (const auto& voter : voters) {
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* reply =
+                        std::get_if<VoteReply>(&envelope.message);
+                    return reply != nullptr &&
+                           reply->granted &&
+                           reply->voter == voter.rootAddress() &&
+                           envelope.from.rootAddress() == voter.rootAddress() &&
+                           envelope.to.rootAddress() ==
+                               candidate.rootAddress();
+                },
+                "vote reply " + voter.str() + " -> " + candidate.str()),
+            settings);
+    }
+    return state;
+}
+
+SearchState deliverHeartbeat(SearchState state,
+                             const SearchSettings& settings,
+                             const Address& leader,
+                             const Address& follower) {
+    return stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* heartbeat =
+                    std::get_if<Heartbeat>(&envelope.message);
+                return heartbeat != nullptr &&
+                       heartbeat->leader == leader.rootAddress() &&
+                       envelope.from.rootAddress() == leader.rootAddress() &&
+                       envelope.to.rootAddress() == follower.rootAddress();
+            },
+            "heartbeat " + leader.str() + " -> " + follower.str()),
+        settings);
+}
+
+SearchState deliverConsensusCommandToQuorum(
+    SearchState state,
+    const SearchSettings& settings,
+    const Address& leader,
+    const Address& client,
+    int client_id,
+    int request_id,
+    const Command& command,
+    const std::vector<Address>& acceptors) {
+    state.send(client, leader, ClientRequest{client_id, request_id, command});
+    state = stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == client_id &&
+                       request->request_id == request_id &&
+                       envelope.from.rootAddress() == client.rootAddress() &&
+                       envelope.to.rootAddress() == leader.rootAddress();
+            },
+            "consensus client request"),
+        settings);
+
+    int proposal_id = 0;
+    for (const auto& acceptor : acceptors) {
+        EventRef accept_event = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* accept =
+                    std::get_if<QuorumAccept>(&envelope.message);
+                return accept != nullptr &&
+                       accept->client_id == client_id &&
+                       accept->request_id == request_id &&
+                       envelope.from.rootAddress() == leader.rootAddress() &&
+                       envelope.to.rootAddress() == acceptor.rootAddress();
+            },
+            "quorum accept " + leader.str() + " -> " + acceptor.str());
+        const auto* envelope = messageForEvent(state, accept_event);
+        const auto* accept =
+            std::get_if<QuorumAccept>(&envelope->message);
+        proposal_id = accept->proposal_id;
+        state = stepRequired(state, accept_event, settings);
+    }
+
+    for (const auto& acceptor : acceptors) {
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* reply =
+                        std::get_if<QuorumAcceptReply>(&envelope.message);
+                    return reply != nullptr &&
+                           reply->accepted &&
+                           reply->proposal_id == proposal_id &&
+                           reply->replica == acceptor.rootAddress() &&
+                           envelope.from.rootAddress() ==
+                               acceptor.rootAddress() &&
+                           envelope.to.rootAddress() == leader.rootAddress();
+                },
+                "quorum accept reply " + acceptor.str()),
+            settings);
+    }
+    return state;
+}
+
+bool clientReplyInNetworkFor(const SearchState& state,
+                             int client_id,
+                             int request_id) {
+    for (const auto& envelope : state.network()) {
+        const auto* reply = std::get_if<ClientReply>(&envelope.message);
+        if (reply != nullptr &&
+            reply->client_id == client_id &&
+            reply->request_id == request_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+CheckResult noConsensusProgressFor(const SearchState& state,
+                                   const std::vector<Address>& replicas,
+                                   int client_id,
+                                   int request_id) {
+    if (clientReplyInNetworkFor(state, client_id, request_id)) {
+        return {false, "client received a reply"};
+    }
+    for (const auto& replica : replicas) {
+        const auto* node = state.nodeAs<ConsensusReplica>(replica);
+        if (node == nullptr) {
+            return {false, replica.str() + " is missing"};
+        }
+        if (node->commitIndex() != 0) {
+            return {false, replica.str() + " committed an entry"};
+        }
+        if (node->executionCount(client_id, request_id) != 0) {
+            return {false, replica.str() + " executed the client request"};
+        }
+    }
+    return {true, ""};
+}
+
+CheckResult atMostOneConsensusLeaderPerTerm(
+    const SearchState& state,
+    const std::vector<Address>& replicas) {
+    std::map<int, std::vector<Address>> leaders_by_term;
+    for (const auto& replica : replicas) {
+        const auto* node = state.nodeAs<ConsensusReplica>(replica);
+        if (node == nullptr) {
+            return {false, replica.str() + " is missing"};
+        }
+        if (node->role() == ConsensusRole::Leader) {
+            leaders_by_term[node->currentTerm()].push_back(replica.rootAddress());
+        }
+    }
+
+    for (const auto& entry : leaders_by_term) {
+        if (entry.second.size() > 1) {
+            std::ostringstream out;
+            out << "term " << entry.first << " has leaders";
+            for (const auto& leader : entry.second) {
+                out << " " << leader;
+            }
+            return {false, out.str()};
+        }
+    }
+    return {true, ""};
+}
+
+void printQuorumLeadershipTrace(const std::string& data_file) {
+    std::cout << "Trace: quorum leadership without a view server" << std::endl;
+    std::vector<Address> replicas = quorumReplicaAddresses(5);
+    Address leader = replicas[0];
+    Address client = ScenarioAddress::client1();
+    SearchSettings majority_partition;
+    majority_partition.partition({
+        {replicas[0], replicas[1], replicas[2], client},
+        {replicas[3], replicas[4]}
+    });
+    SearchState state = consensusClusterState(replicas);
+    state = electConsensusLeader(
+        state, majority_partition, leader, {replicas[1], replicas[2]});
+    const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+    std::cout << "  elected: " << leader
+              << " role=" << (leader_node ? leader_node->roleName() : "missing")
+              << ", term=" << (leader_node ? leader_node->currentTerm() : 0)
+              << ", votes=" << (leader_node ? leader_node->voteCount() : 0)
+              << std::endl;
+
+    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
+    state = deliverConsensusCommandToQuorum(
+        state,
+        majority_partition,
+        leader,
+        client,
+        1,
+        1,
+        commands[0],
+        {replicas[1], replicas[2]});
+    state = deliverConsensusCommandToQuorum(
+        state,
+        majority_partition,
+        leader,
+        client,
+        1,
+        2,
+        commands[1],
+        {replicas[1], replicas[2]});
+    leader_node = state.nodeAs<ConsensusReplica>(leader);
+    std::cout << "  committed through index="
+              << (leader_node ? leader_node->commitIndex() : 0)
+              << ", title rows="
+              << describeResult(leader_node
+                                    ? leader_node->executeReadOnlyForTest(
+                                          CountRowsCommand{"title"})
+                                    : Result{TableNotFoundResult{}})
+              << "\n" << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
         const std::string imdb_file =
@@ -19014,1023 +19992,632 @@ int main(int argc, char* argv[]) {
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v114: read-index reads over primary-backup BuzzDB" << std::endl;
+    std::cout << "BuzzDB v116: quorum leadership for BuzzDB" << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
-        printDistributedServiceTrace(imdb_file);
-        printPrimaryBackupTrace(imdb_file);
-        printReadIndexPartitionTrace(imdb_file);
-        printFullPrimaryBackupLoadTrace(imdb_file);
-        printActualPrimaryBackupSearchStates(20, imdb_file);
+        printPrimaryBackupCeilingTrace(imdb_file);
+        printQuorumLeadershipTrace(imdb_file);
         printV104BootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
 
-    tests.test("P18 multi-client writes become visible under reordered events", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client1 = ScenarioAddress::client1();
-        Address client2 = ScenarioAddress::client2();
+    tests.test("Majority elects leader without view server", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        SearchState state = consensusClusterState(replicas);
+        Address leader = replicas[0];
+        SearchSettings majority_partition;
+        majority_partition.partition({
+            {replicas[0], replicas[1], replicas[2]},
+            {replicas[3], replicas[4]}
+        });
 
-        Scenario scenario = twoClientPrimaryBackupScenario(
-            workloadForCommands(std::vector<Command>{createTitleTableCommand()}),
-            workloadForCommands(std::vector<Command>{
-                CreateTableCommand{
-                    "company_name",
-                    {"id:int", "name:string", "country_code:string"}}
-            }));
-        SearchSettings settings;
-        SearchState state = scenario.state;
+        state = electConsensusLeader(
+            state,
+            majority_partition,
+            leader,
+            {replicas[1], replicas[2]});
 
-        EventRef first_request = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "first client write");
-        state = stepRequired(state, first_request, settings);
-        EventRef second_request = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 2 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "second client write");
-        state = stepRequired(state, second_request, settings);
-
-        EventRef second_apply_first = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 2 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "op 2 backup apply before op 1");
-        state = stepRequired(state, second_apply_first, settings);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(backup_node->appliedIndex() == 0 &&
-                        backup_node->pendingCount() == 1,
-                    "backup should buffer op 2 until op 1 arrives");
-
-        EventRef first_apply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 1 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "op 1 backup apply");
-        state = stepRequired(state, first_apply, settings);
-
-        EventRef second_ack_first = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 2 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "op 2 backup ack before op 1 ack");
-        state = stepRequired(state, second_ack_first, settings);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node->commitIndex() == 0,
-                    "primary should not commit op 2 before op 1");
-
-        EventRef first_ack = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "op 1 backup ack");
-        state = stepRequired(state, first_ack, settings);
-
-        EventRef first_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 1 &&
-                       envelope.to.rootAddress() == client1;
-            },
-            "first client reply");
-        state = stepRequired(state, first_reply, settings);
-        EventRef second_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 2 &&
-                       reply->request_id == 1 &&
-                       envelope.to.rootAddress() == client2;
-            },
-            "second client reply");
-        state = stepRequired(state, second_reply, settings);
-
-        tests.check(clientsDone(state, std::vector<Address>{client1, client2}).ok,
-                    "both clients should complete");
-        CheckResult equal = primaryBackupCommittedEqual(state, 2);
-        tests.check(equal.ok, equal.message);
-        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node->executeReadOnlyForTest(
-                        CountRowsCommand{"title"}) ==
-                        Result{CountRowsResult{0}},
-                    "title table should be visible");
-        tests.check(primary_node->executeReadOnlyForTest(
-                        CountRowsCommand{"company_name"}) ==
-                        Result{CountRowsResult{0}},
-                    "company_name table should be visible");
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr && leader_node->isLeader(),
+                    "candidate should become leader after majority votes");
+        tests.check(leader_node != nullptr &&
+                        leader_node->currentTerm() == 1 &&
+                        leader_node->voteCount() == 3,
+                    "leader should have term 1 and three votes");
+        tests.check(!state.hasNode(ScenarioAddress::viewserver1()),
+                    "quorum leadership should not depend on a view server node");
     });
 
-    tests.test("P19 repeated backup-link failures block safely and recover", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
+    tests.test("One vote per term prevents two leaders", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        Address first_leader = replicas[0];
+        Address challenger = replicas[3];
+
+        state = electConsensusLeader(
+            state,
+            settings,
+            first_leader,
+            {replicas[1], replicas[2]});
+
+        state = stepRequired(
+            state,
+            requireElectionTimerFor(state, settings, challenger),
+            settings);
+        for (const auto& prior_voter :
+             std::vector<Address>{replicas[1], replicas[2]}) {
+            state = stepRequired(
+                state,
+                requireMessageEvent(
+                    state,
+                    settings,
+                    [&](const MessageEnvelope& envelope) {
+                        const auto* vote =
+                            std::get_if<RequestVote>(&envelope.message);
+                        return vote != nullptr &&
+                               vote->candidate == challenger.rootAddress() &&
+                               envelope.from.rootAddress() == challenger &&
+                               envelope.to.rootAddress() == prior_voter;
+                    },
+                    "same-term challenger vote request"),
+                settings);
+            state = stepRequired(
+                state,
+                requireMessageEvent(
+                    state,
+                    settings,
+                    [&](const MessageEnvelope& envelope) {
+                        const auto* reply =
+                            std::get_if<VoteReply>(&envelope.message);
+                        return reply != nullptr &&
+                               !reply->granted &&
+                               reply->voter == prior_voter.rootAddress() &&
+                               envelope.from.rootAddress() == prior_voter &&
+                               envelope.to.rootAddress() == challenger;
+                    },
+                    "same-term vote rejection"),
+                settings);
+        }
+
+        const auto* first_node = state.nodeAs<ConsensusReplica>(first_leader);
+        const auto* challenger_node = state.nodeAs<ConsensusReplica>(challenger);
+        tests.check(first_node != nullptr &&
+                        first_node->role() == ConsensusRole::Leader &&
+                        first_node->currentTerm() == 1,
+                    "the first candidate should remain leader for term 1");
+        tests.check(challenger_node != nullptr &&
+                        challenger_node->role() == ConsensusRole::Candidate &&
+                        challenger_node->currentTerm() == 1 &&
+                        challenger_node->voteCount() == 1,
+                    "same-term challenger should only have its own vote");
+        CheckResult one_leader =
+            atMostOneConsensusLeaderPerTerm(state, replicas);
+        tests.check(one_leader.ok, one_leader.message);
+    });
+
+    tests.test("Minority partition cannot elect or serve", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address candidate = replicas[3];
+        Address helper = replicas[4];
         Address client = ScenarioAddress::client1();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            parseSQL("INSERT " + title_rows[0])
-        };
-        SearchState state =
-            oneClientPrimaryBackupScenario(workloadForCommands(commands)).state;
+        SearchState state = consensusClusterState(replicas);
+        SearchSettings minority_partition;
+        minority_partition.partition({
+            {replicas[0], replicas[1], replicas[2]},
+            {candidate, helper, client}
+        });
 
-        SearchSettings normal;
-        SearchSettings blocked;
-        blocked.linkActive(primary, backup, false);
+        state = stepRequired(
+            state,
+            requireElectionTimerFor(state, minority_partition, candidate),
+            minority_partition);
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                minority_partition,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* vote =
+                        std::get_if<RequestVote>(&envelope.message);
+                    return vote != nullptr &&
+                           vote->candidate == candidate.rootAddress() &&
+                           envelope.from.rootAddress() == candidate &&
+                           envelope.to.rootAddress() == helper;
+                },
+                "minority request vote"),
+            minority_partition);
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                minority_partition,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* reply =
+                        std::get_if<VoteReply>(&envelope.message);
+                    return reply != nullptr && reply->granted &&
+                           reply->voter == helper.rootAddress() &&
+                           envelope.from.rootAddress() == helper &&
+                           envelope.to.rootAddress() == candidate;
+                },
+                "minority vote reply"),
+            minority_partition);
 
-        EventRef first_request = requireMessageEvent(
-            state,
-            blocked,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "first client request while backup link is down");
-        state = stepRequired(state, first_request, blocked);
+        const auto* candidate_node =
+            state.nodeAs<ConsensusReplica>(candidate);
+        tests.check(candidate_node != nullptr &&
+                        candidate_node->role() == ConsensusRole::Candidate &&
+                        candidate_node->voteCount() == 2,
+                    "two replicas should not form a five-node majority");
 
-        SearchSettings blocked_search = blocked;
-        blocked_search.max_depth = 6;
-        blocked_search.max_states = 5000;
-        blocked_search.invariants.push_back(
-            Predicates::resultsOk(std::vector<Address>{client}));
-        blocked_search.invariants.push_back(
-            Predicates::primaryBackupAtMostOnce(primary, backup));
-        blocked_search.goals.push_back(
-            Predicates::clientsDone(std::vector<Address>{client}));
-        SearchResults first_blocked = bfs(state, blocked_search);
-        tests.check(
-            first_blocked.end_condition !=
-                SearchResults::EndCondition::GoalFound,
-            "client should not finish while the first backup apply is blocked");
-        tests.check(
-            first_blocked.end_condition !=
-                    SearchResults::EndCondition::InvariantViolated &&
-                first_blocked.end_condition !=
-                    SearchResults::EndCondition::ExceptionThrown,
-            "blocked first command should remain safe: " +
-                first_blocked.message);
+        state.send(client, candidate, ClientRequest{
+            1,
+            1,
+            createTitleTableCommand()
+        });
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                minority_partition,
+                [&](const MessageEnvelope& envelope) {
+                    return std::get_if<ClientRequest>(
+                               &envelope.message) != nullptr &&
+                           envelope.from.rootAddress() == client &&
+                           envelope.to.rootAddress() == candidate;
+                },
+                "client request to minority candidate"),
+            minority_partition);
 
-        EventRef first_apply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 1 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "first backup apply after link heals");
-        state = stepRequired(state, first_apply, normal);
-        EventRef first_ack = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "first backup ack after link heals");
-        state = stepRequired(state, first_ack, normal);
-        EventRef first_reply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 1 &&
-                       envelope.to.rootAddress() == client;
-            },
-            "first client reply after backup ack");
-        state = stepRequired(state, first_reply, normal);
-
-        EventRef second_request = requireMessageEvent(
-            state,
-            blocked,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 2 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "second client request while backup link is down");
-        state = stepRequired(state, second_request, blocked);
-
-        SearchResults second_blocked = bfs(state, blocked_search);
-        tests.check(
-            second_blocked.end_condition !=
-                SearchResults::EndCondition::GoalFound,
-            "client should not finish while the second backup apply is blocked");
-        tests.check(
-            second_blocked.end_condition !=
-                    SearchResults::EndCondition::InvariantViolated &&
-                second_blocked.end_condition !=
-                    SearchResults::EndCondition::ExceptionThrown,
-            "blocked second command should remain safe: " +
-                second_blocked.message);
-
-        EventRef second_apply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->op_number == 2 &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "second backup apply after link heals");
-        state = stepRequired(state, second_apply, normal);
-        EventRef second_ack = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 2 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "second backup ack after link heals");
-        state = stepRequired(state, second_ack, normal);
-        EventRef second_reply = requireMessageEvent(
-            state,
-            normal,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 2 &&
-                       envelope.to.rootAddress() == client;
-            },
-            "second client reply after backup ack");
-        state = stepRequired(state, second_reply, normal);
-
-        tests.check(clientDone(state, client).ok,
-                    "client should finish after both links heal");
-        CheckResult equal = primaryBackupCommittedEqual(state, 2);
-        tests.check(equal.ok, equal.message);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node->executeReadOnlyForTest(
-                        CountRowsCommand{"title"}) ==
-                        Result{CountRowsResult{1}},
-                    "the real title tuple should be visible after recovery");
+        candidate_node = state.nodeAs<ConsensusReplica>(candidate);
+        tests.check(candidate_node != nullptr &&
+                        !candidate_node->isLeader() &&
+                        candidate_node->commitIndex() == 0 &&
+                        candidate_node->executionCount(1, 1) == 0,
+                    "minority candidate should not execute the client command");
+        tests.check(!newClientReplyFor(state, 1, 1),
+                    "minority candidate should not reply to the client");
+        tests.check(!containsEnvelopeMatching(
+                        state,
+                        [&](const MessageEnvelope& envelope) {
+                            return std::get_if<QuorumAccept>(
+                                       &envelope.message) != nullptr &&
+                                   envelope.from.rootAddress() == candidate;
+                        },
+                        "minority quorum accept").ok,
+                    "minority candidate should not send accept messages");
     });
 
-    tests.test("P20 multi-client random DFS reaches a safe completion", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client1 = ScenarioAddress::client1();
-        Address client2 = ScenarioAddress::client2();
+    tests.test("Bounded minority search finds no unsafe completion", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address candidate = replicas[3];
+        Address helper = replicas[4];
+        Address client = ScenarioAddress::client1();
+        SearchState initial = consensusClusterState(replicas);
+        initial.send(client, candidate, ClientRequest{
+            1,
+            1,
+            createTitleTableCommand()
+        });
 
-        Scenario scenario = twoClientPrimaryBackupScenario(
-            workloadForCommands(std::vector<Command>{createTitleTableCommand()}),
-            workloadForCommands(std::vector<Command>{
-                CreateTableCommand{
-                    "company_name",
-                    {"id:int", "name:string", "country_code:string"}}
-            }));
-
-        SearchSettings settings;
-        settings.max_depth = 14;
-        settings.max_states = 50000;
-        settings.seed = 114;
-        settings.random_dfs_probes = 500;
-        settings.invariants.push_back(
-            Predicates::resultsOk(std::vector<Address>{client1, client2}));
-        settings.invariants.push_back(
-            Predicates::primaryBackupAtMostOnce(primary, backup));
-        settings.goals.push_back({
-            "MULTI_CLIENT_RANDOM_DFS_DONE",
-            [client1, client2](const SearchState& state) {
-                CheckResult done =
-                    clientsDone(state, std::vector<Address>{client1, client2});
-                if (!done.ok) {
-                    return done;
-                }
-                return primaryBackupCommittedEqual(state, 2);
+        SearchSettings search;
+        search.max_depth = 5;
+        search.max_states = 500;
+        search.partition({
+            {replicas[0], replicas[1], replicas[2]},
+            {candidate, helper, client}
+        });
+        search.deliverTimers(replicas[0], false);
+        search.deliverTimers(replicas[1], false);
+        search.deliverTimers(replicas[2], false);
+        search.invariants.push_back({
+            "NO_MINORITY_PROGRESS",
+            [replicas](const SearchState& state) {
+                return noConsensusProgressFor(state, replicas, 1, 1);
+            }
+        });
+        search.invariants.push_back({
+            "AT_MOST_ONE_LEADER_PER_TERM",
+            [replicas](const SearchState& state) {
+                return atMostOneConsensusLeaderPerTerm(state, replicas);
             }
         });
 
-        SearchResults result = randomDfs(scenario.state, settings);
-        tests.check(
-            result.end_condition == SearchResults::EndCondition::GoalFound,
-            "random DFS should find a safe multi-client completion, saw " +
-                endConditionName(result.end_condition) + ": " +
-                result.message);
-        std::cout << "  P20 explored states: " << result.explored
-                  << std::endl;
+        SearchResults result = bfs(initial, search);
+        tests.check(result.end_condition ==
+                        SearchResults::EndCondition::SpaceExhausted,
+                    "minority search should exhaust safely, got " +
+                        endConditionName(result.end_condition) +
+                        ": " + result.message);
+        tests.check(result.explored > 10,
+                    "minority search should explore multiple schedules");
     });
 
-    tests.test("Read-index read does not append a replicated operation", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
+    tests.test("Majority partition serves real BuzzDB writes", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            InsertRowCommand{"title", first_title},
-            CountRowsCommand{"title"}
-        };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
-        SearchSettings settings = scenario.settings;
-        SearchState state = scenario.state;
-
-        for (size_t i = 0; i < commands.size(); ++i) {
-            state = deliverPrimaryBackupCommandRound(
-                state,
-                settings,
-                primary,
-                backup,
-                client,
-                1,
-                static_cast<int>(i + 1),
-                static_cast<int>(i + 1),
-                false);
-        }
-
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(client_node != nullptr && primary_node != nullptr &&
-                        backup_node != nullptr,
-                    "read-index scenario should keep all nodes alive");
-        tests.check(client_node->results().size() == 3 &&
-                        client_node->results().back() ==
-                            Result{CountRowsResult{1}},
-                    "read-index read should return the committed row");
-        tests.check(primary_node->replicationLogSize() == 2 &&
-                        backup_node->replicationLogSize() == 2,
-                    "read-only request should not append a replicated entry");
-        tests.check(primary_node->commitIndex() == 2 &&
-                        backup_node->commitIndex() == 2,
-                    "read-only request should not advance commit indexes");
-        tests.check(primary_node->pendingReadCount() == 0,
-                    "read-index read should clear its pending read state");
-        tests.check(primary_node->executionCount(1, 3) == 1 &&
-                        backup_node->executionCount(1, 3) == 0,
-                    "primary should execute the read once after backup confirmation");
-    });
-
-    tests.test("Partitioned read-index read waits for backup confirmation", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            InsertRowCommand{"title", first_title},
-            CountRowsCommand{"title"}
-        };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
-        SearchSettings settings = scenario.settings;
-        SearchState state = scenario.state;
-
-        for (size_t i = 0; i < 2; ++i) {
-            state = deliverPrimaryBackupCommandRound(
-                state,
-                settings,
-                primary,
-                backup,
-                client,
-                1,
-                static_cast<int>(i + 1),
-                static_cast<int>(i + 1),
-                false);
-        }
-
-        SearchSettings partitioned = settings;
-        partitioned.partition({{client, primary}, {backup}});
-        EventRef client_read = requireMessageEvent(
+        SearchSettings majority_partition;
+        majority_partition.partition({
+            {replicas[0], replicas[1], replicas[2], client},
+            {replicas[3], replicas[4]}
+        });
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(
             state,
-            partitioned,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 3 &&
-                       envelope.from.rootAddress() == client &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "partitioned read request");
-        state = stepRequired(state, client_read, partitioned);
+            majority_partition,
+            leader,
+            {replicas[1], replicas[2]});
 
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node != nullptr, "primary should exist");
-        tests.check(primary_node->pendingReadCount() == 1,
-                    "partitioned primary should keep the read pending");
-        tests.check(primary_node->replicationLogSize() == 2 &&
-                        primary_node->commitIndex() == 2,
-                    "partitioned read should not append or commit an operation");
-        tests.check(!newClientReplyFor(state, 1, 3),
-                    "primary should not reply before the read-index reply");
+        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        state = deliverConsensusCommandToQuorum(
+            state,
+            majority_partition,
+            leader,
+            client,
+            1,
+            1,
+            commands[0],
+            {replicas[1], replicas[2]});
+        tests.check(newClientReplyFor(state, 1, 1),
+                    "majority should complete the create-table command");
+        state = deliverConsensusCommandToQuorum(
+            state,
+            majority_partition,
+            leader,
+            client,
+            1,
+            2,
+            commands[1],
+            {replicas[1], replicas[2]});
+
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->commitIndex() == 2 &&
+                        leader_node->appliedIndex() == 2,
+                    "leader should commit and apply two quorum-backed entries");
+        tests.check(leader_node != nullptr &&
+                        leader_node->executionCount(1, 1) == 1 &&
+                        leader_node->executionCount(1, 2) == 1,
+                    "leader should execute each completed request once");
+        for (const auto& replica :
+             std::vector<Address>{leader, replicas[1], replicas[2]}) {
+            const auto* node = state.nodeAs<ConsensusReplica>(replica);
+            tests.check(node != nullptr &&
+                            node->acceptedEntryMatches(
+                                1, 1, 1, 1, commands[0]) &&
+                            node->acceptedEntryMatches(
+                                2, 1, 1, 2, commands[1]),
+                        replica.str() +
+                            " should store the accepted BuzzDB commands");
+        }
+        for (const auto& isolated :
+             std::vector<Address>{replicas[3], replicas[4]}) {
+            const auto* node = state.nodeAs<ConsensusReplica>(isolated);
+            tests.check(node != nullptr &&
+                            !node->hasAccepted(1) &&
+                            !node->hasAccepted(2),
+                        isolated.str() +
+                            " should not accept entries across the partition");
+        }
+        tests.check(leader_node != nullptr &&
+                        leader_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{1}},
+                    "real IMDB title tuple should be visible on the leader");
+        tests.check(newClientReplyFor(state, 1, 2),
+                    "majority should reply to the inserted row command");
+    });
+
+    tests.test("Client can contact follower and reach leader", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address leader = replicas[0];
+        Address follower = replicas[1];
+        Address client = ScenarioAddress::client1();
+        SearchSettings majority_partition;
+        majority_partition.partition({
+            {replicas[0], replicas[1], replicas[2], client},
+            {replicas[3], replicas[4]}
+        });
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(
+            state,
+            majority_partition,
+            leader,
+            {replicas[1], replicas[2]});
+        state = deliverHeartbeat(state, majority_partition, leader, follower);
+
+        Command command = createTitleTableCommand();
+        state.send(client, follower, ClientRequest{7, 1, command});
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                majority_partition,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr && request->client_id == 7 &&
+                           request->request_id == 1 &&
+                           envelope.from.rootAddress() == client &&
+                           envelope.to.rootAddress() == follower;
+                },
+                "client request to follower"),
+            majority_partition);
+
+        EventRef forward = requireMessageEvent(
+            state,
+            majority_partition,
+            [&](const MessageEnvelope& envelope) {
+                const auto* fwd = std::get_if<ClientForward>(&envelope.message);
+                return fwd != nullptr &&
+                       fwd->client == client.rootAddress() &&
+                       fwd->request.client_id == 7 &&
+                       fwd->request.request_id == 1 &&
+                       envelope.from.rootAddress() == follower &&
+                       envelope.to.rootAddress() == leader;
+            },
+            "follower forwards request to leader");
+        state = stepRequired(state, forward, majority_partition);
+
+        int proposal_id = 0;
+        for (const auto& acceptor : std::vector<Address>{replicas[1], replicas[2]}) {
+            EventRef accept_event = requireMessageEvent(
+                state,
+                majority_partition,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* accept =
+                        std::get_if<QuorumAccept>(&envelope.message);
+                    return accept != nullptr && accept->client_id == 7 &&
+                           accept->request_id == 1 &&
+                           envelope.from.rootAddress() == leader &&
+                           envelope.to.rootAddress() == acceptor;
+                },
+                "forwarded quorum accept");
+            const auto* envelope = messageForEvent(state, accept_event);
+            proposal_id = std::get_if<QuorumAccept>(
+                              &envelope->message)->proposal_id;
+            state = stepRequired(state, accept_event, majority_partition);
+        }
+        for (const auto& acceptor : std::vector<Address>{replicas[1], replicas[2]}) {
+            state = stepRequired(
+                state,
+                requireMessageEvent(
+                    state,
+                    majority_partition,
+                    [&](const MessageEnvelope& envelope) {
+                        const auto* reply =
+                            std::get_if<QuorumAcceptReply>(&envelope.message);
+                        return reply != nullptr && reply->accepted &&
+                               reply->proposal_id == proposal_id &&
+                               reply->replica == acceptor.rootAddress() &&
+                               envelope.from.rootAddress() == acceptor &&
+                               envelope.to.rootAddress() == leader;
+                    },
+                    "forwarded quorum accept reply"),
+                majority_partition);
+        }
+
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        const auto* follower_node = state.nodeAs<ConsensusReplica>(follower);
+        tests.check(newClientReplyFor(state, 7, 1),
+                    "leader should reply to the original client address");
+        tests.check(leader_node != nullptr &&
+                        leader_node->executionCount(7, 1) == 1,
+                    "leader should execute the forwarded command once");
+        tests.check(follower_node != nullptr &&
+                        follower_node->executionCount(7, 1) == 0,
+                    "follower should forward rather than execute locally");
+    });
+
+    tests.test("Leader executes only after majority accept", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(
+            state,
+            settings,
+            leader,
+            {replicas[1], replicas[2]});
+
+        state.send(client, leader, ClientRequest{
+            1,
+            1,
+            createTitleTableCommand()
+        });
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr && request->client_id == 1 &&
+                           request->request_id == 1 &&
+                           envelope.from.rootAddress() == client &&
+                           envelope.to.rootAddress() == leader;
+                },
+                "leader waits client request"),
+            settings);
+
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->pendingCount() == 1 &&
+                        leader_node->acceptVoteCount(1) == 1 &&
+                        leader_node->commitIndex() == 0,
+                    "leader should only have its own accept before peer replies");
+        tests.check(leader_node != nullptr &&
+                        leader_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{TableNotFoundResult{}},
+                    "leader should not mutate BuzzDB before a majority");
+        tests.check(!newClientReplyFor(state, 1, 1),
+                    "leader should not reply before quorum accept");
+
+        EventRef first_accept = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* accept =
+                    std::get_if<QuorumAccept>(&envelope.message);
+                return accept != nullptr && accept->proposal_id == 1 &&
+                       envelope.from.rootAddress() == leader &&
+                       envelope.to.rootAddress() == replicas[1];
+            },
+                    "first accept before majority");
+        state = stepRequired(state, first_accept, settings);
+        EventRef first_reply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<QuorumAcceptReply>(&envelope.message);
+                return reply != nullptr && reply->accepted &&
+                       reply->proposal_id == 1 &&
+                       reply->replica == replicas[1].rootAddress() &&
+                       envelope.to.rootAddress() == leader;
+            },
+            "first accept reply before majority");
+        state = stepRequired(state, first_reply, settings);
+        state = stepRequired(state, first_reply, settings);
+        leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->acceptVoteCount(1) == 2 &&
+                        leader_node->commitIndex() == 0,
+                    "duplicate reply from one follower should not form a majority");
+        tests.check(!newClientReplyFor(state, 1, 1),
+                    "two accepts in a five-node group should not reply");
+
+        EventRef second_accept = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* accept =
+                    std::get_if<QuorumAccept>(&envelope.message);
+                return accept != nullptr && accept->proposal_id == 1 &&
+                       envelope.from.rootAddress() == leader &&
+                       envelope.to.rootAddress() == replicas[2];
+            },
+            "second accept reaches majority");
+        state = stepRequired(state, second_accept, settings);
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* reply =
+                        std::get_if<QuorumAcceptReply>(&envelope.message);
+                    return reply != nullptr && reply->accepted &&
+                           reply->proposal_id == 1 &&
+                           reply->replica == replicas[2].rootAddress() &&
+                           envelope.to.rootAddress() == leader;
+                },
+                "second accept reply reaches majority"),
+            settings);
+        leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->commitIndex() == 1 &&
+                        leader_node->executionCount(1, 1) == 1,
+                    "majority accept should commit and execute once");
+        tests.check(newClientReplyFor(state, 1, 1),
+                    "leader should reply after majority accept");
+    });
+
+    tests.test("Higher term fences old leader", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address old_leader = replicas[0];
+        Address new_leader = replicas[1];
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(
+            state,
+            settings,
+            old_leader,
+            {replicas[1], replicas[2]});
+        const auto* old_leader_node =
+            state.nodeAs<ConsensusReplica>(old_leader);
+        tests.check(old_leader_node != nullptr && old_leader_node->isLeader(),
+                    "server1 should start as leader");
+
+        state = electConsensusLeader(
+            state,
+            settings,
+            new_leader,
+            {replicas[2], replicas[3]});
+        const auto* new_leader_node =
+            state.nodeAs<ConsensusReplica>(new_leader);
+        tests.check(new_leader_node != nullptr &&
+                        new_leader_node->isLeader() &&
+                        new_leader_node->currentTerm() == 2 &&
+                        new_leader_node->voteCount() == 3,
+                    "server2 should become leader through a real term-2 vote");
+
+        state = deliverHeartbeat(state, settings, new_leader, old_leader);
+
+        old_leader_node = state.nodeAs<ConsensusReplica>(old_leader);
+        tests.check(old_leader_node != nullptr &&
+                        old_leader_node->role() == ConsensusRole::Follower &&
+                        old_leader_node->currentTerm() == 2 &&
+                        old_leader_node->leader() == new_leader.rootAddress(),
+                    "higher term should demote and fence old leader");
+
+        state.send(client, old_leader, ClientRequest{
+            1,
+            1,
+            createTitleTableCommand()
+        });
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr && request->client_id == 1 &&
+                           request->request_id == 1 &&
+                           envelope.from.rootAddress() == client &&
+                           envelope.to.rootAddress() == old_leader;
+                },
+                "client request to fenced old leader"),
+            settings);
+        old_leader_node = state.nodeAs<ConsensusReplica>(old_leader);
+        tests.check(old_leader_node != nullptr &&
+                        old_leader_node->commitIndex() == 0 &&
+                        old_leader_node->executionCount(1, 1) == 0,
+                    "fenced old leader should not execute the command");
+        tests.check(!newClientReplyFor(state, 1, 1),
+                    "fenced old leader should not reply as leader");
         tests.check(containsEnvelopeMatching(
                         state,
                         [&](const MessageEnvelope& envelope) {
-                            return std::get_if<ReadIndexRequest>(
-                                       &envelope.message) != nullptr &&
-                                   envelope.from.rootAddress() == primary &&
-                                   envelope.to.rootAddress() == backup;
+                            const auto* forward =
+                                std::get_if<ClientForward>(&envelope.message);
+                            return forward != nullptr &&
+                                   forward->request.client_id == 1 &&
+                                   forward->request.request_id == 1 &&
+                                   envelope.from.rootAddress() == old_leader &&
+                                   envelope.to.rootAddress() == new_leader;
                         },
-                        "read-index request").ok,
-                    "partitioned read should leave a read-index request in flight");
-
-        bool read_index_deliverable = false;
-        for (const auto& event : state.events(partitioned)) {
-            const auto* envelope = messageForEvent(state, event);
-            if (envelope != nullptr &&
-                std::get_if<ReadIndexRequest>(&envelope->message) != nullptr &&
-                envelope->from.rootAddress() == primary &&
-                envelope->to.rootAddress() == backup) {
-                read_index_deliverable = true;
-            }
-        }
-        tests.check(!read_index_deliverable,
-                    "network partition should block primary-to-backup read index");
-
-        EventRef read_index = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ReadIndexRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 3 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "healed read-index request");
-        const auto* read_index_envelope = messageForEvent(state, read_index);
-        const auto* read_index_request =
-            std::get_if<ReadIndexRequest>(&read_index_envelope->message);
-        int read_id = read_index_request->read_id;
-        state = stepRequired(state, read_index, settings);
-
-        EventRef read_index_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<ReadIndexReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->read_id == read_id &&
-                       reply->matched_index == 2 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "healed read-index reply");
-        state = stepRequired(state, read_index_reply, settings);
-
-        EventRef client_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 3 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == client;
-            },
-            "client reply after healed read-index reply");
-        state = stepRequired(state, client_reply, settings);
-
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(client_node != nullptr && primary_node != nullptr,
-                    "client and primary should exist after healing");
-        tests.check(client_node->results().size() == 3 &&
-                        client_node->results().back() ==
-                            Result{CountRowsResult{1}},
-                    "healed read-index read should complete from committed state");
-        tests.check(primary_node->pendingReadCount() == 0 &&
-                        primary_node->replicationLogSize() == 2,
-                    "healed read should clear pending state without logging a read");
-    });
-
-    tests.test("Partitioned write waits for backup acknowledgement", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<Command> commands{
-            createTitleTableCommand(),
-            InsertRowCommand{"title", first_title}
-        };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
-        SearchSettings settings = scenario.settings;
-        SearchState state = deliverPrimaryBackupCommandRound(
-            scenario.state,
-            settings,
-            primary,
-            backup,
-            client,
-            1,
-            1,
-            1,
-            false);
-
-        SearchSettings partitioned = settings;
-        partitioned.partition({{client, primary}, {backup}});
-        EventRef client_write = requireMessageEvent(
-            state,
-            partitioned,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 2 &&
-                       envelope.from.rootAddress() == client &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "partitioned write request");
-        state = stepRequired(state, client_write, partitioned);
-
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node != nullptr, "primary should exist");
-        tests.check(primary_node->pendingCount() == 1,
-                    "partitioned primary should keep the write pending");
-        tests.check(primary_node->replicationLogSize() == 2 &&
-                        primary_node->commitIndex() == 1,
-                    "partitioned write should be logged but not committed");
-        tests.check(!newClientReplyFor(state, 1, 2),
-                    "primary should not reply before backup ack");
-
-        bool backup_apply_deliverable = false;
-        for (const auto& event : state.events(partitioned)) {
-            const auto* envelope = messageForEvent(state, event);
-            if (envelope != nullptr) {
-                const auto* apply =
-                    std::get_if<BackupApplyRequest>(&envelope->message);
-                if (apply != nullptr &&
-                    apply->op_number == 2 &&
-                    envelope->from.rootAddress() == primary &&
-                    envelope->to.rootAddress() == backup) {
-                    backup_apply_deliverable = true;
-                }
-            }
-        }
-        tests.check(!backup_apply_deliverable,
-                    "network partition should block primary-to-backup write apply");
-
-        EventRef backup_apply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* apply =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return apply != nullptr &&
-                       apply->op_number == 2 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "healed write apply");
-        state = stepRequired(state, backup_apply, settings);
-
-        EventRef backup_ack = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 2 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "healed write ack");
-        state = stepRequired(state, backup_ack, settings);
-
-        EventRef client_reply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply = std::get_if<ClientReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 2 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == client;
-            },
-            "client reply after healed write");
-        state = stepRequired(state, client_reply, settings);
-
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(client_node != nullptr && primary_node != nullptr &&
-                        backup_node != nullptr,
-                    "nodes should exist after healed write");
-        tests.check(client_node->done() &&
-                        client_node->results().back() == Result{InsertOkResult{}},
-                    "healed write should eventually complete");
-        tests.check(primary_node->commitIndex() == 2 &&
-                        backup_node->commitIndex() == 2 &&
-                        primary_node->appDigest() == backup_node->appDigest(),
-                    "healed write should commit on both replicas");
-    });
-
-    tests.test("Two-client updates stay ordered under reordered backup messages", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        Address client2 = ScenarioAddress::client2();
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 1);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<Command> prefix{
-            createTitleTableCommand(),
-            InsertRowCommand{"title", first_title}
-        };
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(prefix, buzzDBOracleResults(prefix)));
-        SearchSettings settings = scenario.settings;
-        SearchState state = scenario.state;
-        for (size_t i = 0; i < prefix.size(); ++i) {
-            state = deliverPrimaryBackupCommandRound(
-                state,
-                settings,
-                primary,
-                backup,
-                client,
-                1,
-                static_cast<int>(i + 1),
-                static_cast<int>(i + 1),
-                false);
-        }
-
-        Command update_1999 = UpdateRowsCommand{
-            "title",
-            "production_year",
-            "1999",
-            "id",
-            first_title[0]
-        };
-        Command update_2000 = UpdateRowsCommand{
-            "title",
-            "production_year",
-            "2000",
-            "id",
-            first_title[0]
-        };
-        state.send(client, primary, ClientRequest{11, 1, update_1999});
-        state.send(client2, primary, ClientRequest{12, 1, update_2000});
-
-        EventRef first_update = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 11 &&
-                       request->request_id == 1 &&
-                       envelope.from.rootAddress() == client &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "first manual update request");
-        state = stepRequired(state, first_update, settings);
-
-        EventRef second_update = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request =
-                    std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 12 &&
-                       request->request_id == 1 &&
-                       envelope.from.rootAddress() == client2 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "second manual update request");
-        state = stepRequired(state, second_update, settings);
-
-        EventRef op4_apply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* apply =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return apply != nullptr &&
-                       apply->op_number == 4 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "op 4 apply before op 3");
-        state = stepRequired(state, op4_apply, settings);
-
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(backup_node != nullptr &&
-                        backup_node->pendingCount() == 1 &&
-                        backup_node->appliedIndex() == 2,
-                    "backup should buffer op 4 until op 3 arrives");
-
-        EventRef op3_apply = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* apply =
-                    std::get_if<BackupApplyRequest>(&envelope.message);
-                return apply != nullptr &&
-                       apply->op_number == 3 &&
-                       envelope.from.rootAddress() == primary &&
-                       envelope.to.rootAddress() == backup;
-            },
-            "op 3 apply after op 4");
-        state = stepRequired(state, op3_apply, settings);
-
-        EventRef op4_ack = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 4 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "op 4 ack before op 3 ack");
-        state = stepRequired(state, op4_ack, settings);
-
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node != nullptr &&
-                        primary_node->commitIndex() == 2 &&
-                        primary_node->executionCount(12, 1) == 0,
-                    "primary should buffer out-of-order backup ack");
-        tests.check(!newClientReplyFor(state, 12, 1),
-                    "out-of-order ack should not produce a client reply");
-
-        EventRef op3_ack = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 3 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "op 3 ack after op 4 ack");
-        state = stepRequired(state, op3_ack, settings);
-
-        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(primary_node != nullptr && backup_node != nullptr,
-                    "primary and backup should exist after reordered acks");
-        tests.check(primary_node->commitIndex() == 4 &&
-                        backup_node->commitIndex() == 4,
-                    "primary should commit buffered acks in log order");
-        tests.check(primary_node->executionCount(11, 1) == 1 &&
-                        primary_node->executionCount(12, 1) == 1 &&
-                        backup_node->executionCount(11, 1) == 1 &&
-                        backup_node->executionCount(12, 1) == 1,
-                    "both updates should execute once on each replica");
-        Result final_rows =
-            primary_node->executeReadOnlyForTest(SelectAllCommand{"title"});
-        const auto* rows = std::get_if<SelectAllResult>(&final_rows);
-        tests.check(rows != nullptr &&
-                        rows->rows.size() == 1 &&
-                        rows->rows[0].size() == 4 &&
-                        rows->rows[0][3] == "2000",
-                    "final SQL-visible value should follow primary log order");
-        tests.check(primary_node->appDigest() == backup_node->appDigest(),
-                    "reordered messages should leave replicas equal");
-    });
-
-    tests.test("Stale duplicate backup acknowledgement is ignored", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        SearchSettings settings;
-        std::vector<Command> commands{createTitleTableCommand()};
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                Workload(commands, buzzDBOracleResults(commands)));
-        SearchState state = deliverPrimaryBackupCommandRound(
-            scenario.state,
-            settings,
-            primary,
-            backup,
-            client,
-            1,
-            1,
-            1,
-            false);
-
-        EventRef stale_ack = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* reply =
-                    std::get_if<BackupApplyReply>(&envelope.message);
-                return reply != nullptr &&
-                       reply->op_number == 1 &&
-                       reply->client_id == 1 &&
-                       reply->request_id == 1 &&
-                       envelope.from.rootAddress() == backup &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "stale duplicate backup ack");
-        state = stepRequired(state, stale_ack, settings);
-
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node != nullptr, "primary should exist");
-        tests.check(primary_node->commitIndex() == 1 &&
-                        primary_node->replicationLogSize() == 1 &&
-                        primary_node->pendingCount() == 0,
-                    "stale ack should not move primary protocol state");
-        tests.check(primary_node->executionCount(1, 1) == 1,
-                    "stale ack should not re-execute the command");
-        tests.check(!newClientReplyFor(state, 1, 1),
-                    "stale ack should not produce another client reply");
-    });
-
-    tests.test("Full IMDB committed log replay and snapshot recover the JOB query", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        std::vector<Command> commands = createFullJobLoadCommands(imdb_file);
-        size_t mutating_commands = countMutatingCommands(commands);
-        Scenario scenario = oneClientPrimaryBackupScenario(
-            Workload(commands, std::vector<Result>{}));
-        SearchSettings settings;
-        SearchState state = scenario.state;
-
-        for (size_t i = 0; i < commands.size(); ++i) {
-            state = deliverPrimaryBackupCommandRound(
-                state,
-                settings,
-                primary,
-                backup,
-                client,
-                1,
-                static_cast<int>(i + 1),
-                static_cast<int>(i + 1),
-                false);
-        }
-
-        const auto* client_node = state.nodeAs<ClientWorker>(client);
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(client_node != nullptr && primary_node != nullptr &&
-                        backup_node != nullptr,
-                    "full replicated load should keep all nodes alive");
-        tests.check(client_node->done(),
-                    "client should finish the full replicated load");
-        tests.check(client_node->results().size() == commands.size(),
-                    "client should receive one result per full-load command");
-        const auto* query_rows =
-            std::get_if<QueryRowsResult>(&client_node->results().back());
-        tests.check(query_rows != nullptr && query_rows->count == 39,
-                    "full replicated load should return all distributor rows");
-        tests.check(primary_node->appDigest() == backup_node->appDigest(),
-                    "full replicated load should leave matching replicas");
-        tests.check(primary_node->replicationLogSize() == mutating_commands,
-                    "primary should log every mutating full-load operation");
-        tests.check(primary_node->commitIndex() ==
-                        static_cast<int>(mutating_commands),
-                    "primary should commit every mutating full-load operation");
-        std::vector<std::string> full_log_lines =
-            readNonEmptyLines(primary_node->replicationLogFile());
-        tests.check(countLinesStartingWith(full_log_lines, "record=ENTRY") ==
-                        mutating_commands,
-                    "primary full-load log should contain one ENTRY per write");
-        tests.check(hasLineStartingWith(
-                        full_log_lines,
-                        "record=COMMIT\tindex=" +
-                            std::to_string(mutating_commands)),
-                    "primary full-load log should contain final COMMIT");
-        PrimaryBackupServer restarted(primary,
-                                      backup,
-                                      primary_node->databaseFile(),
-                                      primary_node->replicationLogFile());
-        tests.check(restarted.commitIndex() ==
-                        static_cast<int>(mutating_commands),
-                    "full-load restart should load the committed prefix");
-        tests.check(restarted.cachedRequestCount() == mutating_commands,
-                    "full-load restart should rebuild durable write results");
-        tests.check(restarted.appDigest() == primary_node->appDigest(),
-                    "full-load restart should rebuild the same BuzzDB state");
-        tests.check(restarted.executeReadOnlyForTest(
-                        QuerySQLCommand{jobDistributorJoinRowsQuery()}) ==
-                        Result{QueryRowsResult{39}},
-                    "full-load restart should recover the JOB query result");
-
-        auto* mutable_primary = const_cast<PrimaryBackupServer*>(primary_node);
-        ReplicatedStateSnapshot snapshot =
-            mutable_primary->createSnapshotForTest();
-        tests.check(snapshot.last_included_op ==
-                        static_cast<int>(mutating_commands),
-                    "full-load snapshot should cover the full committed write prefix");
-        tests.check(mutable_primary->replicationLogSize() == 0,
-                    "full-load snapshot should truncate all operation entries");
-        std::vector<std::string> snapshot_log_lines =
-            readNonEmptyLines(mutable_primary->replicationLogFile());
-        tests.check(hasLineStartingWith(
-                        snapshot_log_lines,
-                        "record=SNAPSHOT\top=" +
-                            std::to_string(mutating_commands)),
-                    "full-load log should retain snapshot metadata");
-        tests.check(countLinesStartingWith(snapshot_log_lines, "record=ENTRY") == 0,
-                    "full-load log should not keep entries covered by snapshot");
-
-        PrimaryBackupServer restarted_from_snapshot(
-            primary,
-            backup,
-            mutable_primary->databaseFile(),
-            mutable_primary->replicationLogFile());
-        tests.check(restarted_from_snapshot.snapshotIndex() ==
-                        static_cast<int>(mutating_commands),
-                    "snapshot restart should load full-load snapshot index");
-        tests.check(restarted_from_snapshot.cachedRequestCount() ==
-                        mutating_commands,
-                    "snapshot restart should rebuild durable write results");
-        tests.check(restarted_from_snapshot.executeReadOnlyForTest(
-                        QuerySQLCommand{jobDistributorJoinRowsQuery()}) ==
-                        Result{QueryRowsResult{39}},
-                    "snapshot restart should recover the JOB query result");
+                        "fenced leader forwards to new leader").ok,
+                    "fenced node should route clients to the higher-term leader");
+        tests.check(!containsEnvelopeMatching(
+                        state,
+                        [&](const MessageEnvelope& envelope) {
+                            return std::get_if<QuorumAccept>(
+                                       &envelope.message) != nullptr &&
+                                   envelope.from.rootAddress() == old_leader;
+                        },
+                        "old leader quorum accept").ok,
+                    "fenced old leader should not send accept messages");
     });
 
     return tests.finish();
