@@ -1041,7 +1041,7 @@ int main() {
         tests.check(state.pendingEvents() == 0, "event queue did not drain");
     });
 
-    tests.test("KVApplication supports Put, Append, Get, and missing keys", [&] {
+    tests.test("KVApplication mirrors the basic Lab 1 KV cases", [&] {
         KVApplication app;
         tests.check(app.execute(GetCommand{"missing"}) == Result{KeyNotFoundResult{}},
                     "missing key should return KeyNotFound");
@@ -1052,6 +1052,33 @@ int main() {
                     "append should return the full appended value");
         tests.check(app.execute(GetCommand{"foo"}) == Result{GetResult{"barbaz"}},
                     "get should see the appended value");
+        tests.check(app.execute(PutCommand{"foo", "overwrite"}) ==
+                        Result{PutOkResult{}},
+                    "put should overwrite an existing key");
+        tests.check(app.execute(GetCommand{"foo"}) ==
+                        Result{GetResult{"overwrite"}},
+                    "get should see the overwritten value");
+        tests.check(app.execute(AppendCommand{"foo", "-again"}) ==
+                        Result{AppendResult{"overwrite-again"}},
+                    "second append should extend the overwritten value");
+        tests.check(app.execute(PutCommand{"second", "value"}) ==
+                        Result{PutOkResult{}},
+                    "put on a second key should return PutOk");
+        tests.check(app.execute(GetCommand{"second"}) ==
+                        Result{GetResult{"value"}},
+                    "second key should be independent");
+
+        std::string long_value(1000, 'x');
+        long_value.replace(123, 7, "BuzzDB!");
+        tests.check(app.execute(PutCommand{"long", long_value}) ==
+                        Result{PutOkResult{}},
+                    "long arbitrary string put should return PutOk");
+        tests.check(app.execute(AppendCommand{"long", "-tail"}) ==
+                        Result{AppendResult{long_value + "-tail"}},
+                    "append should preserve long arbitrary strings");
+        tests.check(app.execute(GetCommand{"long"}) ==
+                        Result{GetResult{long_value + "-tail"}},
+                    "get should return the full long arbitrary string");
     });
 
     tests.test("KV oracle derives expected workload results", [&] {

@@ -1538,6 +1538,7 @@ public:
                 notePageFlushed(page_id, page_lsn, tag);
             }
         );
+        log_manager.readFromOffset(0);
     }
     bool isActive() const { return txn_active; }
     void resetLog() {
@@ -11993,7 +11994,7 @@ void createJobTables(BuzzDB& db) {
 }
 
 // -----------------------------------------------------------------------------
-// v110 simulator-facing command API
+// v114 simulator-facing command API
 // -----------------------------------------------------------------------------
 
 struct Address {
@@ -12047,7 +12048,6 @@ struct SelectWhereCommand {
 
 struct QuerySQLCommand { std::string sql; };
 struct CountRowsCommand { std::string table; };
-struct LoadJobDatabaseCommand { std::string data_file; };
 struct CheckpointCommand {};
 
 using Command = std::variant<
@@ -12059,8 +12059,55 @@ using Command = std::variant<
     SelectWhereCommand,
     QuerySQLCommand,
     CountRowsCommand,
-    LoadJobDatabaseCommand,
     CheckpointCommand>;
+
+bool operator==(const CreateTableCommand& lhs, const CreateTableCommand& rhs) {
+    return lhs.table == rhs.table && lhs.columns == rhs.columns;
+}
+bool operator==(const InsertRowCommand& lhs, const InsertRowCommand& rhs) {
+    return lhs.table == rhs.table && lhs.values == rhs.values;
+}
+bool operator==(const DeleteRowsCommand& lhs, const DeleteRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.column == rhs.column &&
+           lhs.value == rhs.value;
+}
+bool operator==(const UpdateRowsCommand& lhs, const UpdateRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.set_column == rhs.set_column &&
+           lhs.set_value == rhs.set_value &&
+           lhs.where_column == rhs.where_column &&
+           lhs.where_value == rhs.where_value;
+}
+bool operator==(const SelectAllCommand& lhs, const SelectAllCommand& rhs) {
+    return lhs.table == rhs.table;
+}
+bool operator==(const SelectWhereCommand& lhs, const SelectWhereCommand& rhs) {
+    return lhs.table == rhs.table && lhs.column == rhs.column &&
+           lhs.value == rhs.value;
+}
+bool operator==(const QuerySQLCommand& lhs, const QuerySQLCommand& rhs) {
+    return lhs.sql == rhs.sql;
+}
+bool operator==(const CountRowsCommand& lhs, const CountRowsCommand& rhs) {
+    return lhs.table == rhs.table;
+}
+bool operator==(const CheckpointCommand&, const CheckpointCommand&) {
+    return true;
+}
+
+bool operator==(const Command& lhs, const Command& rhs) {
+    return lhs.index() == rhs.index() &&
+           std::visit(
+               [](const auto& l, const auto& r) {
+                   using L = std::decay_t<decltype(l)>;
+                   using R = std::decay_t<decltype(r)>;
+                   if constexpr (std::is_same_v<L, R>) {
+                       return l == r;
+                   }
+                   return false;
+               },
+               lhs,
+               rhs);
+}
 
 struct CreateTableOkResult {};
 struct InsertOkResult {};
@@ -12155,8 +12202,6 @@ std::string describeCommand(const Command& command) {
                 out << "QuerySQL(" << value.sql << ")";
             } else if constexpr (std::is_same_v<T, CountRowsCommand>) {
                 out << "CountRows(" << value.table << ")";
-            } else if constexpr (std::is_same_v<T, LoadJobDatabaseCommand>) {
-                out << "LoadJobDatabase(" << value.data_file << ")";
             } else if constexpr (std::is_same_v<T, CheckpointCommand>) {
                 out << "Checkpoint";
             }
@@ -12187,6 +12232,172 @@ std::string describeResult(const Result& result) {
         },
         result);
 }
+
+std::string wireEscape(const std::string& input) {
+    std::ostringstream out;
+    out << std::hex << std::uppercase;
+    for (unsigned char ch : input) {
+        if (ch == '%' || ch == '|' || ch == '\n' || ch == '\r') {
+            out << '%' << std::setw(2) << std::setfill('0')
+                << static_cast<int>(ch) << std::setfill(' ');
+        } else {
+            out << static_cast<char>(ch);
+        }
+    }
+    return out.str();
+}
+
+int wireHexDigit(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    throw std::runtime_error("bad escape");
+}
+
+std::string wireUnescape(const std::string& input) {
+    std::string out;
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] != '%') {
+            out.push_back(input[i]);
+            continue;
+        }
+        if (i + 2 >= input.size()) {
+            throw std::runtime_error("truncated escape");
+        }
+        int hi = wireHexDigit(input[i + 1]);
+        int lo = wireHexDigit(input[i + 2]);
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+    }
+    return out;
+}
+
+std::string joinWireFields(const std::vector<std::string>& fields) {
+    std::ostringstream out;
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i != 0) out << "|";
+        out << wireEscape(fields[i]);
+    }
+    return out.str();
+}
+
+std::vector<std::string> splitWireFields(const std::string& input) {
+    std::vector<std::string> fields;
+    std::string current;
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '|') {
+            fields.push_back(wireUnescape(current));
+            current.clear();
+        } else {
+            current.push_back(input[i]);
+        }
+    }
+    fields.push_back(wireUnescape(current));
+    return fields;
+}
+
+std::vector<std::string> resultWireFields(const Result& result) {
+    return std::visit(
+        [](const auto& value) {
+            std::vector<std::string> fields;
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, CreateTableOkResult>) {
+                fields.push_back("CreateTableOk");
+            } else if constexpr (std::is_same_v<T, InsertOkResult>) {
+                fields.push_back("InsertOk");
+            } else if constexpr (std::is_same_v<T, DeleteRowsResult>) {
+                fields = {"DeleteRows", std::to_string(value.count)};
+            } else if constexpr (std::is_same_v<T, UpdateRowsResult>) {
+                fields = {"UpdateRows", std::to_string(value.count)};
+            } else if constexpr (std::is_same_v<T, SelectAllResult>) {
+                fields = {"SelectAll", std::to_string(value.columns.size())};
+                fields.insert(fields.end(), value.columns.begin(), value.columns.end());
+                fields.push_back(std::to_string(value.rows.size()));
+                for (const auto& row : value.rows) {
+                    fields.push_back(std::to_string(row.size()));
+                    fields.insert(fields.end(), row.begin(), row.end());
+                }
+            } else if constexpr (std::is_same_v<T, QueryRowsResult>) {
+                fields = {"QueryRows", std::to_string(value.count)};
+            } else if constexpr (std::is_same_v<T, CountRowsResult>) {
+                fields = {"CountRows", std::to_string(value.count)};
+            } else if constexpr (std::is_same_v<T, CheckpointOkResult>) {
+                fields.push_back("CheckpointOk");
+            } else if constexpr (std::is_same_v<T, StatementOkResult>) {
+                fields.push_back("StatementOk");
+            } else if constexpr (std::is_same_v<T, TableNotFoundResult>) {
+                fields.push_back("TableNotFound");
+            } else if constexpr (std::is_same_v<T, TableAlreadyExistsResult>) {
+                fields.push_back("TableAlreadyExists");
+            } else if constexpr (std::is_same_v<T, SchemaMismatchResult>) {
+                fields.push_back("SchemaMismatch");
+            } else if constexpr (std::is_same_v<T, InvalidSchemaResult>) {
+                fields.push_back("InvalidSchema");
+            }
+            return fields;
+        },
+        result);
+}
+
+std::string serializeResult(const Result& result) {
+    return joinWireFields(resultWireFields(result));
+}
+
+Result deserializeResult(const std::string& encoded) {
+    auto fields = splitWireFields(encoded);
+    if (fields.empty()) {
+        throw std::runtime_error("empty result encoding");
+    }
+    const std::string& kind = fields[0];
+    if (kind == "CreateTableOk" && fields.size() == 1) return CreateTableOkResult{};
+    if (kind == "InsertOk" && fields.size() == 1) return InsertOkResult{};
+    if (kind == "DeleteRows" && fields.size() == 2) return DeleteRowsResult{static_cast<size_t>(std::stoull(fields[1]))};
+    if (kind == "UpdateRows" && fields.size() == 2) return UpdateRowsResult{static_cast<size_t>(std::stoull(fields[1]))};
+    if (kind == "QueryRows" && fields.size() == 2) return QueryRowsResult{static_cast<size_t>(std::stoull(fields[1]))};
+    if (kind == "CountRows" && fields.size() == 2) return CountRowsResult{static_cast<size_t>(std::stoull(fields[1]))};
+    if (kind == "CheckpointOk" && fields.size() == 1) return CheckpointOkResult{};
+    if (kind == "StatementOk" && fields.size() == 1) return StatementOkResult{};
+    if (kind == "TableNotFound" && fields.size() == 1) return TableNotFoundResult{};
+    if (kind == "TableAlreadyExists" && fields.size() == 1) return TableAlreadyExistsResult{};
+    if (kind == "SchemaMismatch" && fields.size() == 1) return SchemaMismatchResult{};
+    if (kind == "InvalidSchema" && fields.size() == 1) return InvalidSchemaResult{};
+    if (kind == "SelectAll" && fields.size() >= 3) {
+        size_t cursor = 1;
+        size_t column_count = static_cast<size_t>(std::stoull(fields.at(cursor++)));
+        std::vector<std::string> columns;
+        for (size_t i = 0; i < column_count; ++i) {
+            columns.push_back(fields.at(cursor++));
+        }
+        size_t row_count = static_cast<size_t>(std::stoull(fields.at(cursor++)));
+        std::vector<std::vector<std::string>> rows;
+        for (size_t r = 0; r < row_count; ++r) {
+            size_t width = static_cast<size_t>(std::stoull(fields.at(cursor++)));
+            std::vector<std::string> row;
+            for (size_t c = 0; c < width; ++c) {
+                row.push_back(fields.at(cursor++));
+            }
+            rows.push_back(std::move(row));
+        }
+        if (cursor != fields.size()) {
+            throw std::runtime_error("trailing SelectAll result fields");
+        }
+        return SelectAllResult{std::move(columns), std::move(rows)};
+    }
+    throw std::runtime_error("bad result encoding: " + encoded);
+}
+
+struct ReplicationApplyRecord {
+    int op_number = 0;
+    int client_id = 0;
+    int request_id = 0;
+    Result result = StatementOkResult{};
+};
+
+struct ReplicatedStateSnapshot {
+    int last_included_op = 0;
+    std::string digest;
+    std::string database_file;
+};
 
 class Application {
 public:
@@ -12393,7 +12604,16 @@ private:
 std::string makeScratchBuzzDBFile() {
     static size_t counter = 0;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v110-core-" + std::to_string(::getpid()) + "-" + std::to_string(++counter));
+        ("buzzdb-v114-core-" + std::to_string(::getpid()) + "-" + std::to_string(++counter));
+    std::filesystem::create_directories(dir);
+    return (dir / "buzzdb.dat").string();
+}
+
+std::string makeScratchBuzzDBSnapshotFile() {
+    static size_t counter = 0;
+    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+        ("buzzdb-v114-snapshot-" + std::to_string(::getpid()) + "-" +
+         std::to_string(++counter));
     std::filesystem::create_directories(dir);
     return (dir / "buzzdb.dat").string();
 }
@@ -12426,8 +12646,7 @@ public:
 
     BuzzDBCore(const BuzzDBCore& other)
         : database_file_(makeScratchBuzzDBFile()),
-          owns_bundle_(true),
-          cached_query_results_(other.cached_query_results_) {
+          owns_bundle_(true) {
         const_cast<BuzzDBCore&>(other).flushForSnapshot();
         copyBundle(other.database_file_, database_file_);
         open();
@@ -12438,7 +12657,6 @@ public:
         cleanupOwnedBundle();
         database_file_ = makeScratchBuzzDBFile();
         owns_bundle_ = true;
-        cached_query_results_ = other.cached_query_results_;
         const_cast<BuzzDBCore&>(other).flushForSnapshot();
         copyBundle(other.database_file_, database_file_);
         open();
@@ -12483,6 +12701,9 @@ public:
         std::ostringstream out;
         out << "BuzzDB(tables=";
         auto names = const_cast<BuzzDBCore*>(this)->db_->userTableNames();
+        names.erase(
+            std::remove_if(names.begin(), names.end(), isInternalTableName),
+            names.end());
         out << names.size();
         for (const auto& name : names) {
             auto& metadata = const_cast<BuzzDBCore*>(this)->db_->catalog.getTable(name);
@@ -12550,6 +12771,88 @@ public:
     void recover() {
         ScopedBuzzDBFileBundle scope(database_file_);
         db_->recovery_manager.recover();
+    }
+
+    std::map<int, ReplicationApplyRecord> replicationApplyRecords() {
+        ScopedBuzzDBFileBundle scope(database_file_);
+        return replicationApplyRecordsNoScope();
+    }
+
+    std::optional<ReplicationApplyRecord> replicationApplyRecord(int op_number) {
+        ScopedBuzzDBFileBundle scope(database_file_);
+        return replicationApplyRecordNoScope(op_number);
+    }
+
+    ReplicatedStateSnapshot createReplicatedSnapshot(int last_included_op) {
+        if (last_included_op <= 0) {
+            throw std::runtime_error("snapshot must include at least one operation");
+        }
+        {
+            ScopedBuzzDBFileBundle scope(database_file_);
+            db_->buffer_manager.flushAllPages("replicated snapshot preflush");
+        }
+        db_.reset();
+        open();
+        {
+            ScopedBuzzDBFileBundle scope(database_file_);
+            db_->recovery_manager.recover();
+            db_->recovery_manager.checkpoint();
+            db_->recovery_manager.createFuzzyImageCopy();
+            db_->buffer_manager.flushAllPages("replicated snapshot");
+        }
+
+        std::string snapshot_file = makeScratchBuzzDBSnapshotFile();
+        copyBundle(database_file_, snapshot_file);
+        return ReplicatedStateSnapshot{
+            last_included_op,
+            digest(),
+            snapshot_file
+        };
+    }
+
+    void restoreReplicatedSnapshot(const ReplicatedStateSnapshot& snapshot) {
+        if (snapshot.last_included_op <= 0 || snapshot.database_file.empty()) {
+            throw std::runtime_error("cannot restore an empty replicated snapshot");
+        }
+        db_.reset();
+        copyBundle(snapshot.database_file, database_file_);
+        open();
+        if (digest() != snapshot.digest) {
+            throw std::runtime_error("restored snapshot digest does not match metadata");
+        }
+    }
+
+    Result executeReplicated(int op_number,
+                             int client_id,
+                             int request_id,
+                             const Command& command) {
+        ScopedBuzzDBFileBundle scope(database_file_);
+        ensureReplicationApplyTable();
+        auto existing = replicationApplyRecordNoScope(op_number);
+        if (existing) {
+            return existing->result;
+        }
+
+        auto txn = db_->beginLoggedTxn(
+            "repl-op-" + std::to_string(op_number));
+        bool checkpoint_after_commit =
+            std::holds_alternative<CheckpointCommand>(command);
+        Result result;
+        try {
+            result = checkpoint_after_commit
+                ? Result{CheckpointOkResult{}}
+                : executeForReplicatedApply(command, txn);
+            insertReplicationApplyRecord(
+                op_number, client_id, request_id, result, txn);
+            db_->commit(txn);
+        } catch (...) {
+            db_->abort(txn);
+            throw;
+        }
+        if (checkpoint_after_commit) {
+            db_->recovery_manager.checkpoint();
+        }
+        return result;
     }
 
     void bootstrapJobDatabase(const std::string& data_file,
@@ -12626,6 +12929,29 @@ private:
         return std::find(names.begin(), names.end(), table) != names.end();
     }
 
+    static bool isInternalTableName(const std::string& table) {
+        return table.rfind("__replication_", 0) == 0;
+    }
+
+    static std::string replicationApplyTableName() {
+        return "__replication_apply";
+    }
+
+    void ensureReplicationApplyTable() {
+        const std::string table = replicationApplyTableName();
+        if (tableExists(table)) {
+            return;
+        }
+        TableSchema schema;
+        schema.columns = {
+            {"op", INT},
+            {"client", INT},
+            {"request", INT},
+            {"result", STRING}
+        };
+        db_->catalog.createTable(table, std::move(schema));
+    }
+
     std::string insertStatement(const InsertRowCommand& command) const {
         std::ostringstream out;
         out << "INSERT " << command.table;
@@ -12675,8 +13001,9 @@ private:
 
     SelectAllResult selectWhere(const std::string& table,
                                 const std::string& column,
-                                const std::string& value) {
-        auto rows = db_->executeQuery(projectWhereQuery(table, column, value), nullptr, false);
+                                const std::string& value,
+                                const TxnPtr& txn = nullptr) {
+        auto rows = db_->executeQuery(projectWhereQuery(table, column, value), txn, false);
         return queryResultToSelectAll(table, rows);
     }
 
@@ -12764,10 +13091,6 @@ private:
 
     Result executeOne(const QuerySQLCommand& command) {
         try {
-            auto cached = cached_query_results_.find(command.sql);
-            if (cached != cached_query_results_.end()) {
-                return cached->second;
-            }
             return executeQueryRowCount(command.sql);
         } catch (const std::out_of_range&) {
             return TableNotFoundResult{};
@@ -12782,25 +13105,145 @@ private:
         return CountRowsResult{metadata.row_count};
     }
 
-    Result executeOne(const LoadJobDatabaseCommand& command) {
-        try {
-            bootstrapJobDatabase(command.data_file, false);
-            const std::string query = jobDistributorJoinQuery();
-            cached_query_results_[query] = executeQueryRowCount(query);
-            return StatementOkResult{};
-        } catch (const std::exception&) {
-            return SchemaMismatchResult{};
-        }
-    }
-
     Result executeOne(const CheckpointCommand&) {
         db_->recovery_manager.checkpoint();
         return CheckpointOkResult{};
     }
 
+    Result executeForReplicatedApply(const CreateTableCommand& command,
+                                     const TxnPtr&) {
+        return executeOne(command);
+    }
+
+    Result executeForReplicatedApply(const InsertRowCommand& command,
+                                     const TxnPtr& txn) {
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        try {
+            db_->executeStatement(insertStatement(command), txn, 0, false);
+            return InsertOkResult{};
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeForReplicatedApply(const DeleteRowsCommand& command,
+                                     const TxnPtr& txn) {
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        try {
+            size_t count =
+                selectWhere(command.table, command.column, command.value, txn)
+                    .rows.size();
+            db_->executeStatement(deleteStatement(command), txn, 0, false);
+            return DeleteRowsResult{count};
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeForReplicatedApply(const UpdateRowsCommand& command,
+                                     const TxnPtr& txn) {
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        try {
+            size_t count =
+                selectWhere(
+                    command.table,
+                    command.where_column,
+                    command.where_value,
+                    txn).rows.size();
+            db_->executeStatement(updateStatement(command), txn, 0, false);
+            return UpdateRowsResult{count};
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeForReplicatedApply(const SelectAllCommand& command,
+                                     const TxnPtr&) {
+        return executeOne(command);
+    }
+
+    Result executeForReplicatedApply(const SelectWhereCommand& command,
+                                     const TxnPtr&) {
+        return executeOne(command);
+    }
+
+    Result executeForReplicatedApply(const QuerySQLCommand& command,
+                                     const TxnPtr&) {
+        return executeOne(command);
+    }
+
+    Result executeForReplicatedApply(const CountRowsCommand& command,
+                                     const TxnPtr&) {
+        return executeOne(command);
+    }
+
+    Result executeForReplicatedApply(const CheckpointCommand& command,
+                                     const TxnPtr&) {
+        return executeOne(command);
+    }
+
+    Result executeForReplicatedApply(const Command& command,
+                                     const TxnPtr& txn) {
+        return std::visit(
+            [&](const auto& value) -> Result {
+                return executeForReplicatedApply(value, txn);
+            },
+            command);
+    }
+
+    void insertReplicationApplyRecord(int op_number,
+                                      int client_id,
+                                      int request_id,
+                                      const Result& result,
+                                      const TxnPtr& txn) {
+        InsertRowCommand row{
+            replicationApplyTableName(),
+            {
+                std::to_string(op_number),
+                std::to_string(client_id),
+                std::to_string(request_id),
+                wireEscape(serializeResult(result))
+            }
+        };
+        db_->executeStatement(insertStatement(row), txn, 0, false);
+    }
+
+    std::map<int, ReplicationApplyRecord> replicationApplyRecordsNoScope() {
+        std::map<int, ReplicationApplyRecord> records;
+        if (!tableExists(replicationApplyTableName())) {
+            return records;
+        }
+        auto rows = db_->executeQuery(projectAllQuery(replicationApplyTableName()),
+                                      nullptr,
+                                      false);
+        auto result = queryResultToSelectAll(replicationApplyTableName(), rows);
+        for (const auto& row : result.rows) {
+            if (row.size() != 4) {
+                throw std::runtime_error("bad replication apply row");
+            }
+            ReplicationApplyRecord record{
+                std::stoi(row[0]),
+                std::stoi(row[1]),
+                std::stoi(row[2]),
+                deserializeResult(wireUnescape(row[3]))
+            };
+            records[record.op_number] = record;
+        }
+        return records;
+    }
+
+    std::optional<ReplicationApplyRecord> replicationApplyRecordNoScope(
+        int op_number) {
+        auto records = replicationApplyRecordsNoScope();
+        auto it = records.find(op_number);
+        if (it == records.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
     std::string database_file_;
     bool owns_bundle_ = false;
-    std::map<std::string, Result> cached_query_results_;
     std::unique_ptr<BuzzDB> db_;
 };
 
@@ -12867,30 +13310,719 @@ struct BackupApplyReply {
     Result result;
 };
 
-struct View {
-    int number = 0;
-    Address primary;
-    Address backup;
+struct SnapshotInstallRequest {
+    ReplicatedStateSnapshot snapshot;
 };
 
-bool operator==(const View& lhs, const View& rhs) {
-    return lhs.number == rhs.number &&
-           lhs.primary == rhs.primary &&
-           lhs.backup == rhs.backup;
-}
-
-bool addressEmpty(const Address& address) {
-    return address.str().empty();
-}
-
-struct ViewPing {
-    int view_number;
+struct SnapshotInstallReply {
+    int last_included_op = 0;
+    std::string digest;
 };
 
-struct ViewRequest {};
+struct ReadIndexRequest {
+    int read_id = 0;
+    int client_id = 0;
+    int request_id = 0;
+    int read_index = 0;
+};
 
-struct ViewReply {
-    View view;
+struct ReadIndexReply {
+    int read_id = 0;
+    int matched_index = 0;
+};
+
+struct ReplicatedLogEntry {
+    int op_number = 0;
+    int client_id = 0;
+    int request_id = 0;
+    Command command = CreateTableCommand{"", {""}};
+};
+
+struct ReplicationLogLoadStats {
+    size_t bytes_read = 0;
+    size_t lines_read = 0;
+    size_t entry_records_seen = 0;
+    size_t entry_records_loaded = 0;
+    size_t entry_records_covered_by_snapshot = 0;
+    size_t commit_records_seen = 0;
+    size_t end_records_seen = 0;
+    size_t snapshot_records_seen = 0;
+};
+
+struct RestartRecoveryStats {
+    ReplicationLogLoadStats log_load;
+    int snapshot_index = 0;
+    int commit_index = 0;
+    int applied_index_at_start = 0;
+    int applied_index_after_recovery = 0;
+    size_t log_entries_after_snapshot = 0;
+    size_t durable_apply_records_scanned = 0;
+    size_t durable_apply_records_cached = 0;
+    size_t log_entries_examined = 0;
+    size_t log_entries_satisfied_by_apply_table = 0;
+    size_t log_entries_replayed_into_db = 0;
+    size_t end_records_written = 0;
+    long long aries_recover_micros = 0;
+    long long recover_committed_micros = 0;
+};
+
+bool sameReplicatedLogEntry(const ReplicatedLogEntry& lhs,
+                            const ReplicatedLogEntry& rhs) {
+    return lhs.op_number == rhs.op_number &&
+           lhs.client_id == rhs.client_id &&
+           lhs.request_id == rhs.request_id &&
+           lhs.command == rhs.command;
+}
+
+std::string makeScratchReplicationLogFile() {
+    static size_t counter = 0;
+    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+        ("buzzdb-v114-replog-" + std::to_string(::getpid()) + "-" +
+         std::to_string(++counter));
+    std::filesystem::create_directories(dir);
+    return (dir / "replication.log").string();
+}
+
+std::string databaseFileForReplicationLog(const std::string& replication_log_file) {
+    return (std::filesystem::path(replication_log_file).parent_path() /
+            "buzzdb.dat").string();
+}
+
+std::string replicationEscape(const std::string& input) {
+    std::ostringstream out;
+    out << std::hex << std::uppercase;
+    for (unsigned char ch : input) {
+        if (ch == '%' || ch == '\t' || ch == '\n' || ch == '\r' ||
+            ch == '=') {
+            out << '%' << std::setw(2) << std::setfill('0')
+                << static_cast<int>(ch) << std::setfill(' ');
+        } else {
+            out << static_cast<char>(ch);
+        }
+    }
+    return out.str();
+}
+
+int replicationHexDigit(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    throw std::runtime_error("bad escape in replication log");
+}
+
+std::string replicationUnescape(const std::string& input) {
+    std::string out;
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] != '%') {
+            out.push_back(input[i]);
+            continue;
+        }
+        if (i + 2 >= input.size()) {
+            throw std::runtime_error("truncated escape in replication log");
+        }
+        int hi = replicationHexDigit(input[i + 1]);
+        int lo = replicationHexDigit(input[i + 2]);
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+    }
+    return out;
+}
+
+std::vector<std::string> splitReplicationLine(const std::string& line) {
+    std::vector<std::string> tokens;
+    std::stringstream stream(line);
+    std::string token;
+    while (std::getline(stream, token, '\t')) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+std::string replicationField(const std::string& key,
+                             const std::string& value) {
+    return key + "=" + replicationEscape(value);
+}
+
+std::vector<std::string> replicationArgsForCommand(const Command& command) {
+    return std::visit(
+        [](const auto& value) {
+            std::vector<std::string> args;
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, CreateTableCommand>) {
+                args.push_back("CreateTable");
+                args.push_back(value.table);
+                args.insert(args.end(), value.columns.begin(), value.columns.end());
+            } else if constexpr (std::is_same_v<T, InsertRowCommand>) {
+                args.push_back("InsertRow");
+                args.push_back(value.table);
+                args.insert(args.end(), value.values.begin(), value.values.end());
+            } else if constexpr (std::is_same_v<T, DeleteRowsCommand>) {
+                args = {"DeleteRows", value.table, value.column, value.value};
+            } else if constexpr (std::is_same_v<T, UpdateRowsCommand>) {
+                args = {"UpdateRows", value.table, value.set_column,
+                        value.set_value, value.where_column, value.where_value};
+            } else if constexpr (std::is_same_v<T, SelectAllCommand>) {
+                args = {"SelectAll", value.table};
+            } else if constexpr (std::is_same_v<T, SelectWhereCommand>) {
+                args = {"SelectWhere", value.table, value.column, value.value};
+            } else if constexpr (std::is_same_v<T, QuerySQLCommand>) {
+                args = {"QuerySQL", value.sql};
+            } else if constexpr (std::is_same_v<T, CountRowsCommand>) {
+                args = {"CountRows", value.table};
+            } else if constexpr (std::is_same_v<T, CheckpointCommand>) {
+                args = {"Checkpoint"};
+            }
+            return args;
+        },
+        command);
+}
+
+Command commandFromReplicationArgs(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        throw std::runtime_error("replication log entry has no command");
+    }
+    const std::string& kind = args[0];
+    if (kind == "CreateTable") {
+        if (args.size() < 2) throw std::runtime_error("bad CreateTable log entry");
+        return CreateTableCommand{
+            args[1],
+            std::vector<std::string>(args.begin() + 2, args.end())};
+    }
+    if (kind == "InsertRow") {
+        if (args.size() < 2) throw std::runtime_error("bad InsertRow log entry");
+        return InsertRowCommand{
+            args[1],
+            std::vector<std::string>(args.begin() + 2, args.end())};
+    }
+    if (kind == "DeleteRows") {
+        if (args.size() != 4) throw std::runtime_error("bad DeleteRows log entry");
+        return DeleteRowsCommand{args[1], args[2], args[3]};
+    }
+    if (kind == "UpdateRows") {
+        if (args.size() != 6) throw std::runtime_error("bad UpdateRows log entry");
+        return UpdateRowsCommand{args[1], args[2], args[3], args[4], args[5]};
+    }
+    if (kind == "SelectAll") {
+        if (args.size() != 2) throw std::runtime_error("bad SelectAll log entry");
+        return SelectAllCommand{args[1]};
+    }
+    if (kind == "SelectWhere") {
+        if (args.size() != 4) throw std::runtime_error("bad SelectWhere log entry");
+        return SelectWhereCommand{args[1], args[2], args[3]};
+    }
+    if (kind == "QuerySQL") {
+        if (args.size() != 2) throw std::runtime_error("bad QuerySQL log entry");
+        return QuerySQLCommand{args[1]};
+    }
+    if (kind == "CountRows") {
+        if (args.size() != 2) throw std::runtime_error("bad CountRows log entry");
+        return CountRowsCommand{args[1]};
+    }
+    if (kind == "Checkpoint") {
+        if (args.size() != 1) throw std::runtime_error("bad Checkpoint log entry");
+        return CheckpointCommand{};
+    }
+    throw std::runtime_error("unknown command kind in replication log: " + kind);
+}
+
+class ReplicatedOperationLog {
+public:
+    ReplicatedOperationLog()
+        : log_file_(makeScratchReplicationLogFile()),
+          owns_file_(true) {
+        rewriteFile();
+    }
+
+    explicit ReplicatedOperationLog(std::string log_file,
+                                    bool owns_file = false,
+                                    bool load_existing = true)
+        : log_file_(std::filesystem::absolute(log_file).string()),
+          owns_file_(owns_file) {
+        std::filesystem::create_directories(
+            std::filesystem::path(log_file_).parent_path());
+        if (load_existing && std::filesystem::exists(log_file_)) {
+            loadFromDisk();
+        } else {
+            rewriteFile();
+        }
+    }
+
+    ReplicatedOperationLog(const ReplicatedOperationLog& other)
+        : log_file_(makeScratchReplicationLogFile()),
+          owns_file_(true),
+          entries_(other.entries_),
+          commit_index_(other.commit_index_),
+          applied_index_(other.applied_index_),
+          snapshot_index_(other.snapshot_index_),
+          snapshot_digest_(other.snapshot_digest_),
+          load_stats_(other.load_stats_) {
+        rewriteFile();
+    }
+
+    ReplicatedOperationLog& operator=(const ReplicatedOperationLog& other) {
+        if (this == &other) {
+            return *this;
+        }
+        cleanup();
+        log_file_ = makeScratchReplicationLogFile();
+        owns_file_ = true;
+        entries_ = other.entries_;
+        commit_index_ = other.commit_index_;
+        applied_index_ = other.applied_index_;
+        snapshot_index_ = other.snapshot_index_;
+        snapshot_digest_ = other.snapshot_digest_;
+        load_stats_ = other.load_stats_;
+        rewriteFile();
+        return *this;
+    }
+
+    ~ReplicatedOperationLog() {
+        cleanup();
+    }
+
+    void append(const ReplicatedLogEntry& entry) {
+        if (entry.op_number <= snapshot_index_) {
+            return;
+        }
+        auto existing = entryByOp(entry.op_number);
+        if (existing != nullptr) {
+            if (!sameReplicatedLogEntry(*existing, entry)) {
+                throw std::runtime_error(
+                    "conflicting replicated log entry for op " +
+                    std::to_string(entry.op_number));
+            }
+            return;
+        }
+        entries_.push_back(entry);
+        std::ofstream out(log_file_, std::ios::app);
+        if (!out) {
+            throw std::runtime_error("unable to append replication log");
+        }
+        out << serialize(entry) << "\n";
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("unable to flush replication log");
+        }
+    }
+
+    void advanceCommitIndex(int op_number) {
+        if (op_number < commit_index_) {
+            return;
+        }
+        if (op_number > lastOp()) {
+            throw std::runtime_error(
+                "commit index cannot advance beyond the operation log");
+        }
+        commit_index_ = op_number;
+        appendCommitRecord();
+    }
+
+    void endOp(int op_number) {
+        if (op_number < applied_index_) {
+            return;
+        }
+        if (op_number > commit_index_) {
+            throw std::runtime_error(
+                "applied index cannot advance beyond the commit index");
+        }
+        applied_index_ = op_number;
+        appendEndRecord();
+    }
+
+    void truncateThrough(int op_number, const std::string& digest) {
+        if (op_number <= snapshot_index_) {
+            return;
+        }
+        if (op_number > commit_index_) {
+            throw std::runtime_error(
+                "snapshot cannot cover operations beyond the commit index");
+        }
+        if (op_number > applied_index_) {
+            throw std::runtime_error(
+                "snapshot cannot cover operations not yet applied locally");
+        }
+        installSnapshot(op_number, digest);
+    }
+
+    void installSnapshot(int op_number, const std::string& digest) {
+        if (op_number <= snapshot_index_) {
+            return;
+        }
+        snapshot_index_ = op_number;
+        snapshot_digest_ = digest;
+        commit_index_ = std::max(commit_index_, snapshot_index_);
+        applied_index_ = std::max(applied_index_, snapshot_index_);
+        entries_.erase(
+            std::remove_if(
+                entries_.begin(),
+                entries_.end(),
+                [&](const ReplicatedLogEntry& entry) {
+                    return entry.op_number <= snapshot_index_;
+                }),
+            entries_.end());
+        rewriteFile();
+    }
+
+    bool hasOp(int op_number) const {
+        return entryByOp(op_number) != nullptr;
+    }
+
+    const ReplicatedLogEntry* entryForOp(int op_number) const {
+        return entryByOp(op_number);
+    }
+
+    size_t size() const {
+        return entries_.size();
+    }
+
+    int commitIndex() const {
+        return commit_index_;
+    }
+
+    int appliedIndex() const {
+        return applied_index_;
+    }
+
+    int snapshotIndex() const {
+        return snapshot_index_;
+    }
+
+    const std::string& snapshotDigest() const {
+        return snapshot_digest_;
+    }
+
+    int lastOp() const {
+        int last = snapshot_index_;
+        for (const auto& entry : entries_) {
+            last = std::max(last, entry.op_number);
+        }
+        return last;
+    }
+
+    const std::vector<ReplicatedLogEntry>& entries() const {
+        return entries_;
+    }
+
+    const std::string& file() const {
+        return log_file_;
+    }
+
+    const ReplicationLogLoadStats& loadStats() const {
+        return load_stats_;
+    }
+
+    bool samePrefixAs(const ReplicatedOperationLog& other) const {
+        if (snapshot_index_ != other.snapshot_index_) {
+            return false;
+        }
+        const size_t common = std::min(entries_.size(), other.entries_.size());
+        for (size_t i = 0; i < common; ++i) {
+            if (!sameReplicatedLogEntry(entries_[i], other.entries_[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::string digest() const {
+        std::ostringstream out;
+        out << "replog(size=" << entries_.size()
+            << ", last=" << lastOp()
+            << ", commit=" << commit_index_
+            << ", applied=" << applied_index_
+            << ", snapshot=" << snapshot_index_ << ")";
+        return out.str();
+    }
+
+private:
+    const ReplicatedLogEntry* entryByOp(int op_number) const {
+        for (const auto& entry : entries_) {
+            if (entry.op_number == op_number) {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    void rewriteFile() const {
+        std::ofstream out(log_file_, std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("unable to create replication log");
+        }
+        if (snapshot_index_ > 0) {
+            out << serializeSnapshot(snapshot_index_, snapshot_digest_) << "\n";
+        }
+        for (const auto& entry : entries_) {
+            out << serialize(entry) << "\n";
+        }
+        if (commit_index_ > 0) {
+            out << serializeCommit(commit_index_) << "\n";
+        }
+        if (applied_index_ > 0) {
+            out << serializeEnd(applied_index_) << "\n";
+        }
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("unable to flush replication log");
+        }
+    }
+
+    void appendCommitRecord() const {
+        std::ofstream out(log_file_, std::ios::app);
+        if (!out) {
+            throw std::runtime_error("unable to append replication commit record");
+        }
+        out << serializeCommit(commit_index_) << "\n";
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("unable to flush replication commit record");
+        }
+    }
+
+    void appendEndRecord() const {
+        std::ofstream out(log_file_, std::ios::app);
+        if (!out) {
+            throw std::runtime_error("unable to append replication END record");
+        }
+        out << serializeEnd(applied_index_) << "\n";
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("unable to flush replication END record");
+        }
+    }
+
+    void loadFromDisk() {
+        entries_.clear();
+        commit_index_ = 0;
+        applied_index_ = 0;
+        snapshot_index_ = 0;
+        snapshot_digest_.clear();
+        load_stats_ = {};
+        std::error_code file_size_error;
+        load_stats_.bytes_read =
+            std::filesystem::file_size(log_file_, file_size_error);
+        if (file_size_error) {
+            load_stats_.bytes_read = 0;
+        }
+        std::ifstream in(log_file_);
+        if (!in) {
+            throw std::runtime_error("unable to read replication log");
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            load_stats_.lines_read++;
+            if (line.rfind("record=COMMIT", 0) == 0) {
+                load_stats_.commit_records_seen++;
+                commit_index_ = std::max(commit_index_, parseCommit(line));
+            } else if (line.rfind("record=END", 0) == 0) {
+                load_stats_.end_records_seen++;
+                applied_index_ = std::max(applied_index_, parseEndOp(line));
+            } else if (line.rfind("record=SNAPSHOT", 0) == 0) {
+                load_stats_.snapshot_records_seen++;
+                auto snapshot = parseSnapshot(line);
+                if (snapshot.first >= snapshot_index_) {
+                    snapshot_index_ = snapshot.first;
+                    snapshot_digest_ = snapshot.second;
+                }
+            } else {
+                load_stats_.entry_records_seen++;
+                ReplicatedLogEntry entry = parseEntry(line);
+                if (entry.op_number > snapshot_index_) {
+                    load_stats_.entry_records_loaded++;
+                    entries_.push_back(std::move(entry));
+                } else {
+                    load_stats_.entry_records_covered_by_snapshot++;
+                }
+            }
+        }
+        commit_index_ = std::max(commit_index_, snapshot_index_);
+        applied_index_ = std::max(applied_index_, snapshot_index_);
+        if (commit_index_ > lastOp()) {
+            throw std::runtime_error(
+                "replication commit index is past the log tail");
+        }
+        if (applied_index_ > commit_index_) {
+            throw std::runtime_error(
+                "replication applied index is past the commit index");
+        }
+    }
+
+    static std::string serialize(const ReplicatedLogEntry& entry) {
+        std::ostringstream out;
+        out << replicationField("record", "ENTRY")
+            << "\t" << replicationField("op", std::to_string(entry.op_number))
+            << "\t" << replicationField("client", std::to_string(entry.client_id))
+            << "\t" << replicationField("request", std::to_string(entry.request_id));
+        for (const auto& arg : replicationArgsForCommand(entry.command)) {
+            out << "\t" << replicationField("arg", arg);
+        }
+        return out.str();
+    }
+
+    static std::string serializeCommit(int commit_index) {
+        std::ostringstream out;
+        out << replicationField("record", "COMMIT")
+            << "\t" << replicationField("index", std::to_string(commit_index));
+        return out.str();
+    }
+
+    static std::string serializeEnd(int op_number) {
+        std::ostringstream out;
+        out << replicationField("record", "END")
+            << "\t" << replicationField("op", std::to_string(op_number));
+        return out.str();
+    }
+
+    static std::string serializeSnapshot(int snapshot_index,
+                                         const std::string& digest) {
+        std::ostringstream out;
+        out << replicationField("record", "SNAPSHOT")
+            << "\t" << replicationField("op", std::to_string(snapshot_index))
+            << "\t" << replicationField("digest", digest);
+        return out.str();
+    }
+
+    static ReplicatedLogEntry parseEntry(const std::string& line) {
+        int op_number = 0;
+        int client_id = 0;
+        int request_id = 0;
+        std::vector<std::string> args;
+        bool saw_entry_record = false;
+
+        for (const auto& token : splitReplicationLine(line)) {
+            size_t eq = token.find('=');
+            if (eq == std::string::npos) {
+                throw std::runtime_error("bad token in replication log");
+            }
+            std::string key = token.substr(0, eq);
+            std::string value = replicationUnescape(token.substr(eq + 1));
+            if (key == "record") {
+                if (value != "ENTRY") {
+                    throw std::runtime_error("expected ENTRY replication record");
+                }
+                saw_entry_record = true;
+            } else if (key == "op") {
+                op_number = std::stoi(value);
+            } else if (key == "client") {
+                client_id = std::stoi(value);
+            } else if (key == "request") {
+                request_id = std::stoi(value);
+            } else if (key == "arg") {
+                args.push_back(value);
+            }
+        }
+
+        if (!saw_entry_record) {
+            throw std::runtime_error("replication log entry missing record type");
+        }
+        if (op_number <= 0 || client_id <= 0 || request_id <= 0) {
+            throw std::runtime_error("replication log entry is missing ids");
+        }
+        return ReplicatedLogEntry{
+            op_number,
+            client_id,
+            request_id,
+            commandFromReplicationArgs(args)};
+    }
+
+    static int parseCommit(const std::string& line) {
+        bool saw_commit_record = false;
+        int commit_index = -1;
+        for (const auto& token : splitReplicationLine(line)) {
+            size_t eq = token.find('=');
+            if (eq == std::string::npos) {
+                throw std::runtime_error("bad token in replication commit record");
+            }
+            std::string key = token.substr(0, eq);
+            std::string value = replicationUnescape(token.substr(eq + 1));
+            if (key == "record") {
+                if (value != "COMMIT") {
+                    throw std::runtime_error("expected COMMIT replication record");
+                }
+                saw_commit_record = true;
+            } else if (key == "index") {
+                commit_index = std::stoi(value);
+            }
+        }
+        if (!saw_commit_record || commit_index < 0) {
+            throw std::runtime_error("bad replication commit record");
+        }
+        return commit_index;
+    }
+
+    static int parseEndOp(const std::string& line) {
+        bool saw_end_record = false;
+        int op_number = -1;
+        for (const auto& token : splitReplicationLine(line)) {
+            size_t eq = token.find('=');
+            if (eq == std::string::npos) {
+                throw std::runtime_error("bad token in replication END record");
+            }
+            std::string key = token.substr(0, eq);
+            std::string value = replicationUnescape(token.substr(eq + 1));
+            if (key == "record") {
+                if (value != "END") {
+                    throw std::runtime_error("expected END replication record");
+                }
+                saw_end_record = true;
+            } else if (key == "op") {
+                op_number = std::stoi(value);
+            }
+        }
+        if (!saw_end_record || op_number < 0) {
+            throw std::runtime_error("bad replication END record");
+        }
+        return op_number;
+    }
+
+    static std::pair<int, std::string> parseSnapshot(const std::string& line) {
+        bool saw_snapshot_record = false;
+        int snapshot_index = -1;
+        std::string digest;
+        for (const auto& token : splitReplicationLine(line)) {
+            size_t eq = token.find('=');
+            if (eq == std::string::npos) {
+                throw std::runtime_error("bad token in replication SNAPSHOT record");
+            }
+            std::string key = token.substr(0, eq);
+            std::string value = replicationUnescape(token.substr(eq + 1));
+            if (key == "record") {
+                if (value != "SNAPSHOT") {
+                    throw std::runtime_error("expected SNAPSHOT replication record");
+                }
+                saw_snapshot_record = true;
+            } else if (key == "op") {
+                snapshot_index = std::stoi(value);
+            } else if (key == "digest") {
+                digest = value;
+            }
+        }
+        if (!saw_snapshot_record || snapshot_index < 0) {
+            throw std::runtime_error("bad replication SNAPSHOT record");
+        }
+        return {snapshot_index, digest};
+    }
+
+    void cleanup() {
+        if (!owns_file_ || log_file_.empty()) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(
+            std::filesystem::path(log_file_).parent_path(), ec);
+    }
+
+    std::string log_file_;
+    bool owns_file_ = false;
+    std::vector<ReplicatedLogEntry> entries_;
+    int commit_index_ = 0;
+    int applied_index_ = 0;
+    int snapshot_index_ = 0;
+    std::string snapshot_digest_;
+    ReplicationLogLoadStats load_stats_;
 };
 
 using Message = std::variant<
@@ -12898,9 +14030,10 @@ using Message = std::variant<
     ClientReply,
     BackupApplyRequest,
     BackupApplyReply,
-    ViewPing,
-    ViewRequest,
-    ViewReply>;
+    SnapshotInstallRequest,
+    SnapshotInstallReply,
+    ReadIndexRequest,
+    ReadIndexReply>;
 
 struct RetryTimer {
     int request_id;
@@ -12910,6 +14043,22 @@ using Timer = std::variant<RetryTimer>;
 
 std::string requestKey(int client_id, int request_id) {
     return std::to_string(client_id) + ":" + std::to_string(request_id);
+}
+
+bool isReadOnlyCommand(const Command& command) {
+    return std::holds_alternative<SelectAllCommand>(command) ||
+           std::holds_alternative<SelectWhereCommand>(command) ||
+           std::holds_alternative<QuerySQLCommand>(command) ||
+           std::holds_alternative<CountRowsCommand>(command);
+}
+
+size_t countMutatingCommands(const std::vector<Command>& commands) {
+    return static_cast<size_t>(std::count_if(
+        commands.begin(),
+        commands.end(),
+        [](const Command& command) {
+            return !isReadOnlyCommand(command);
+        }));
 }
 
 std::string describeMessage(const Message& message) {
@@ -12935,14 +14084,20 @@ std::string describeMessage(const Message& message) {
                     << ", client=" << value.client_id
                     << ", req=" << value.request_id
                     << ", " << describeResult(value.result) << ")";
-            } else if constexpr (std::is_same_v<T, ViewPing>) {
-                out << "ViewPing(view=" << value.view_number << ")";
-            } else if constexpr (std::is_same_v<T, ViewRequest>) {
-                out << "ViewRequest";
-            } else if constexpr (std::is_same_v<T, ViewReply>) {
-                out << "ViewReply(view=" << value.view.number
-                    << ", primary=" << value.view.primary
-                    << ", backup=" << value.view.backup << ")";
+            } else if constexpr (std::is_same_v<T, SnapshotInstallRequest>) {
+                out << "SnapshotInstallRequest(op="
+                    << value.snapshot.last_included_op << ")";
+            } else if constexpr (std::is_same_v<T, SnapshotInstallReply>) {
+                out << "SnapshotInstallReply(op="
+                    << value.last_included_op << ")";
+            } else if constexpr (std::is_same_v<T, ReadIndexRequest>) {
+                out << "ReadIndexRequest(read=" << value.read_id
+                    << ", client=" << value.client_id
+                    << ", req=" << value.request_id
+                    << ", index=" << value.read_index << ")";
+            } else if constexpr (std::is_same_v<T, ReadIndexReply>) {
+                out << "ReadIndexReply(read=" << value.read_id
+                    << ", matched=" << value.matched_index << ")";
             }
             return out.str();
         },
@@ -13008,10 +14163,6 @@ Address server1() {
 
 Address backup1() {
     return Address("backup1");
-}
-
-Address viewserver1() {
-    return Address("viewserver");
 }
 
 Address client1() {
@@ -13567,111 +14718,6 @@ void NodeContext::setTimer(Timer timer,
     state_.setTimer(self_, std::move(timer), min_delay_ms, max_delay_ms);
 }
 
-class ViewServer : public Node {
-public:
-    explicit ViewServer(Address address = Address("viewserver"))
-        : Node(std::move(address)) {}
-
-    void onMessage(NodeContext& ctx,
-                   const Address& from,
-                   const Message& message) override {
-        if (const auto* ping = std::get_if<ViewPing>(&message)) {
-            ctx.send(from, ViewReply{pingServer(from.rootAddress(), ping->view_number)});
-            return;
-        }
-        if (std::holds_alternative<ViewRequest>(message)) {
-            ++view_requests_;
-            ctx.send(from, ViewReply{current_});
-        }
-    }
-
-    std::unique_ptr<Node> clone() const override {
-        return std::make_unique<ViewServer>(*this);
-    }
-
-    View pingServer(Address server, int view_number) {
-        ServerState& state = servers_[server.rootAddress()];
-        state.last_ping_tick = tick_;
-        state.last_view_number = view_number;
-        state.has_pinged = true;
-
-        if (addressEmpty(current_.primary)) {
-            installView(server.rootAddress(), Address());
-            return current_;
-        }
-
-        if (server.rootAddress() == current_.primary &&
-            view_number == current_.number) {
-            primary_acked_ = true;
-        }
-
-        if (addressEmpty(current_.backup) &&
-            primary_acked_ &&
-            !(server.rootAddress() == current_.primary)) {
-            installView(current_.primary, server.rootAddress());
-        }
-
-        return current_;
-    }
-
-    void tick() {
-        ++tick_;
-    }
-
-    const View& currentView() const {
-        return current_;
-    }
-
-    bool primaryAcked() const {
-        return primary_acked_;
-    }
-
-    size_t viewRequestCount() const {
-        return view_requests_;
-    }
-
-    bool serverAlive(const Address& server) const {
-        auto it = servers_.find(server.rootAddress());
-        if (it == servers_.end() || !it->second.has_pinged) {
-            return false;
-        }
-        return tick_ - it->second.last_ping_tick <= kDeadPings;
-    }
-
-    std::string digest() const override {
-        std::ostringstream out;
-        out << "ViewServer(view=" << current_.number
-            << ", primary=" << current_.primary
-            << ", backup=" << current_.backup
-            << ", acked=" << (primary_acked_ ? "true" : "false")
-            << ", requests=" << view_requests_ << ")";
-        return out.str();
-    }
-
-    std::string describe() const override {
-        return digest();
-    }
-
-private:
-    struct ServerState {
-        int last_ping_tick = 0;
-        int last_view_number = 0;
-        bool has_pinged = false;
-    };
-
-    void installView(Address primary, Address backup) {
-        current_ = View{current_.number + 1, std::move(primary), std::move(backup)};
-        primary_acked_ = false;
-    }
-
-    static constexpr int kDeadPings = 2;
-    int tick_ = 0;
-    View current_;
-    bool primary_acked_ = true;
-    size_t view_requests_ = 0;
-    std::map<Address, ServerState> servers_;
-};
-
 class AtMostOnceServer : public Node {
 public:
     AtMostOnceServer(Address address, std::unique_ptr<Application> app)
@@ -13753,11 +14799,49 @@ private:
 
 class BackupReplica : public Node {
 public:
-    explicit BackupReplica(Address address) : Node(std::move(address)) {}
+    explicit BackupReplica(Address address)
+        : Node(std::move(address)),
+          op_log_(),
+          db_(databaseFileForReplicationLog(op_log_.file())) {}
+
+    BackupReplica(Address address, const std::string& replication_log_file)
+        : BackupReplica(
+              std::move(address),
+              databaseFileForReplicationLog(replication_log_file),
+              replication_log_file) {}
+
+    BackupReplica(Address address,
+                  const std::string& database_file,
+                  const std::string& replication_log_file)
+        : Node(std::move(address)),
+          op_log_(replication_log_file, false, true),
+          db_(database_file),
+          commit_index_(op_log_.commitIndex()),
+          applied_index_(op_log_.appliedIndex()) {
+        recoverLocalBuzzDB();
+        recoverCommittedEntries();
+    }
 
     void onMessage(NodeContext& ctx,
                    const Address& from,
                    const Message& message) override {
+        if (const auto* read = std::get_if<ReadIndexRequest>(&message)) {
+            ctx.send(from, ReadIndexReply{
+                read->read_id,
+                applied_index_
+            });
+            return;
+        }
+        if (const auto* install =
+                std::get_if<SnapshotInstallRequest>(&message)) {
+            installSnapshotForTest(install->snapshot);
+            ctx.send(from, SnapshotInstallReply{
+                install->snapshot.last_included_op,
+                install->snapshot.digest
+            });
+            return;
+        }
+
         const auto* request = std::get_if<BackupApplyRequest>(&message);
         if (request == nullptr) {
             return;
@@ -13819,11 +14903,85 @@ public:
         return db_.logFile();
     }
 
+    std::string databaseFile() const {
+        return db_.databaseFile();
+    }
+
+    std::string replicationLogFile() const {
+        return op_log_.file();
+    }
+
+    size_t replicationLogSize() const {
+        return op_log_.size();
+    }
+
+    int commitIndex() const {
+        return commit_index_;
+    }
+
+    int appliedIndex() const {
+        return applied_index_;
+    }
+
+    int replicationLastOp() const {
+        return op_log_.lastOp();
+    }
+
+    bool hasLoggedOp(int op_number) const {
+        return op_log_.hasOp(op_number);
+    }
+
+    const ReplicatedOperationLog& operationLog() const {
+        return op_log_;
+    }
+
+    Result executeReadOnlyForTest(const Command& command) const {
+        BuzzDBCore copy = db_;
+        return runWithSuppressedStdout([&] {
+            return copy.execute(command);
+        });
+    }
+
+    int snapshotIndex() const {
+        return op_log_.snapshotIndex();
+    }
+
+    ReplicatedStateSnapshot createSnapshotForTest() {
+        if (applied_index_ <= 0) {
+            throw std::runtime_error("backup cannot snapshot before applying an op");
+        }
+        ReplicatedStateSnapshot snapshot = runWithSuppressedStdout([&] {
+            return db_.createReplicatedSnapshot(applied_index_);
+        });
+        op_log_.truncateThrough(snapshot.last_included_op, snapshot.digest);
+        return snapshot;
+    }
+
+    void installSnapshotForTest(const ReplicatedStateSnapshot& snapshot) {
+        runWithSuppressedStdout([&] {
+            db_.restoreReplicatedSnapshot(snapshot);
+            return 0;
+        });
+        op_log_.installSnapshot(snapshot.last_included_op, snapshot.digest);
+        commit_index_ = std::max(commit_index_, snapshot.last_included_op);
+        applied_index_ = std::max(applied_index_, snapshot.last_included_op);
+        next_expected_op_ =
+            std::max(next_expected_op_, snapshot.last_included_op + 1);
+        pending_by_op_.clear();
+        result_by_op_.clear();
+        session_results_.clear();
+        execution_count_.clear();
+        recoverCommittedEntries();
+    }
+
     std::string digest() const override {
         std::ostringstream out;
         out << "BackupReplica(applied_op=" << appliedOp()
+            << ", commit_index=" << commit_index_
+            << ", applied_index=" << applied_index_
             << ", pending=" << pending_by_op_.size()
             << ", max_exec=" << maxExecutionCount()
+            << ", " << op_log_.digest()
             << ", app=" << db_.digest() << ")";
         return out.str();
     }
@@ -13838,6 +14996,73 @@ private:
         Address primary;
     };
 
+    void recoverLocalBuzzDB() {
+        if (!std::filesystem::exists(db_.logFile())) {
+            return;
+        }
+        runWithSuppressedStdout([&] {
+            db_.recover();
+            return 0;
+        });
+    }
+
+    void cacheDurableApplyRecord(const ReplicationApplyRecord& record) {
+        std::string key = requestKey(record.client_id, record.request_id);
+        session_results_[key] = record.result;
+        result_by_op_[record.op_number] = record.result;
+        execution_count_[key] = std::max(execution_count_[key], 1);
+        next_expected_op_ = std::max(next_expected_op_, record.op_number + 1);
+    }
+
+    void applyRecoveredEntry(const ReplicatedLogEntry& entry) {
+        std::string key = requestKey(entry.client_id, entry.request_id);
+        Result result = TableNotFoundResult{};
+        auto durable_record = db_.replicationApplyRecord(entry.op_number);
+        if (durable_record) {
+            result = durable_record->result;
+            cacheDurableApplyRecord(*durable_record);
+        } else {
+            result = runWithSuppressedStdout([&] {
+                return db_.executeReplicated(
+                    entry.op_number,
+                    entry.client_id,
+                    entry.request_id,
+                    entry.command);
+            });
+                execution_count_[key]++;
+        }
+        session_results_[key] = result;
+        result_by_op_[entry.op_number] = result;
+        next_expected_op_ = std::max(next_expected_op_, entry.op_number + 1);
+    }
+
+    void recoverCommittedEntries() {
+        auto durable_records = db_.replicationApplyRecords();
+        for (const auto& record : durable_records) {
+            if (record.first > commit_index_) {
+                throw std::runtime_error(
+                    "local database contains an uncommitted replicated op");
+            }
+        }
+        applied_index_ = std::max(applied_index_, op_log_.snapshotIndex());
+        next_expected_op_ =
+            std::max(next_expected_op_, op_log_.snapshotIndex() + 1);
+        for (const auto& record : durable_records) {
+            if (record.first <= commit_index_) {
+                cacheDurableApplyRecord(record.second);
+                applied_index_ = std::max(applied_index_, record.first);
+            }
+        }
+        for (const auto& entry : op_log_.entries()) {
+            if (entry.op_number > commit_index_) {
+                break;
+            }
+            applyRecoveredEntry(entry);
+            applied_index_ = std::max(applied_index_, entry.op_number);
+            op_log_.endOp(applied_index_);
+        }
+    }
+
     void applyReady(NodeContext& ctx) {
         for (;;) {
             auto pending = pending_by_op_.find(next_expected_op_);
@@ -13851,19 +15076,34 @@ private:
                 apply.request.client_id,
                 apply.request.request_id);
 
+            op_log_.append(ReplicatedLogEntry{
+                apply.request.op_number,
+                apply.request.client_id,
+                apply.request.request_id,
+                apply.request.command
+            });
+            commit_index_ = std::max(commit_index_, apply.request.op_number);
+            op_log_.advanceCommitIndex(commit_index_);
+
             Result result = TableNotFoundResult{};
             auto cached = session_results_.find(key);
             if (cached != session_results_.end()) {
                 result = cached->second;
             } else {
                 result = runWithSuppressedStdout([&] {
-                    return db_.execute(apply.request.command);
+                    return db_.executeReplicated(
+                        apply.request.op_number,
+                        apply.request.client_id,
+                        apply.request.request_id,
+                        apply.request.command);
                 });
                 session_results_[key] = result;
                 execution_count_[key]++;
             }
 
             result_by_op_[apply.request.op_number] = result;
+            applied_index_ = std::max(applied_index_, apply.request.op_number);
+            op_log_.endOp(applied_index_);
             ctx.send(apply.primary, BackupApplyReply{
                 apply.request.op_number,
                 apply.request.client_id,
@@ -13874,7 +15114,10 @@ private:
         }
     }
 
+    ReplicatedOperationLog op_log_;
     BuzzDBCore db_;
+    int commit_index_ = 0;
+    int applied_index_ = 0;
     int next_expected_op_ = 1;
     std::map<int, PendingApply> pending_by_op_;
     std::map<int, Result> result_by_op_;
@@ -13885,7 +15128,39 @@ private:
 class PrimaryBackupServer : public Node {
 public:
     PrimaryBackupServer(Address address, Address backup)
-        : Node(std::move(address)), backup_(std::move(backup)) {}
+        : Node(std::move(address)),
+          backup_(std::move(backup)),
+          op_log_(),
+          db_(databaseFileForReplicationLog(op_log_.file())) {}
+
+    PrimaryBackupServer(Address address,
+                        Address backup,
+                        const std::string& replication_log_file)
+        : PrimaryBackupServer(
+              std::move(address),
+              std::move(backup),
+              databaseFileForReplicationLog(replication_log_file),
+              replication_log_file) {}
+
+    PrimaryBackupServer(Address address,
+                        Address backup,
+                        const std::string& database_file,
+                        const std::string& replication_log_file)
+        : Node(std::move(address)),
+          backup_(std::move(backup)),
+          op_log_(replication_log_file, false, true),
+          db_(database_file),
+          commit_index_(op_log_.commitIndex()),
+          applied_index_(op_log_.appliedIndex()),
+          next_op_number_(op_log_.lastOp() + 1) {
+        restart_stats_.log_load = op_log_.loadStats();
+        restart_stats_.snapshot_index = op_log_.snapshotIndex();
+        restart_stats_.commit_index = commit_index_;
+        restart_stats_.applied_index_at_start = applied_index_;
+        restart_stats_.log_entries_after_snapshot = op_log_.entries().size();
+        recoverLocalBuzzDB();
+        recoverCommittedEntries();
+    }
 
     void onMessage(NodeContext& ctx,
                    const Address& from,
@@ -13896,6 +15171,10 @@ public:
         }
         if (const auto* reply = std::get_if<BackupApplyReply>(&message)) {
             handleBackupReply(ctx, *reply);
+            return;
+        }
+        if (const auto* read_reply = std::get_if<ReadIndexReply>(&message)) {
+            handleReadIndexReply(ctx, *read_reply);
         }
     }
 
@@ -13913,6 +15192,10 @@ public:
 
     size_t pendingCount() const {
         return pending_by_request_.size();
+    }
+
+    size_t pendingReadCount() const {
+        return pending_reads_by_request_.size();
     }
 
     int executionCount(int client_id, int request_id) const {
@@ -13936,12 +15219,95 @@ public:
         return db_.logFile();
     }
 
+    std::string databaseFile() const {
+        return db_.databaseFile();
+    }
+
+    std::string replicationLogFile() const {
+        return op_log_.file();
+    }
+
+    size_t replicationLogSize() const {
+        return op_log_.size();
+    }
+
+    int commitIndex() const {
+        return commit_index_;
+    }
+
+    int appliedIndex() const {
+        return applied_index_;
+    }
+
+    int replicationLastOp() const {
+        return op_log_.lastOp();
+    }
+
+    bool hasLoggedOp(int op_number) const {
+        return op_log_.hasOp(op_number);
+    }
+
+    const ReplicatedOperationLog& operationLog() const {
+        return op_log_;
+    }
+
+    const RestartRecoveryStats& restartStats() const {
+        return restart_stats_;
+    }
+
+    int snapshotIndex() const {
+        return op_log_.snapshotIndex();
+    }
+
+    ReplicatedStateSnapshot createSnapshotForTest() {
+        if (applied_index_ <= 0) {
+            throw std::runtime_error("primary cannot snapshot before applying an op");
+        }
+        ReplicatedStateSnapshot snapshot = runWithSuppressedStdout([&] {
+            return db_.createReplicatedSnapshot(applied_index_);
+        });
+        op_log_.truncateThrough(snapshot.last_included_op, snapshot.digest);
+        return snapshot;
+    }
+
+    void installSnapshotForTest(const ReplicatedStateSnapshot& snapshot) {
+        runWithSuppressedStdout([&] {
+            db_.restoreReplicatedSnapshot(snapshot);
+            return 0;
+        });
+        op_log_.installSnapshot(snapshot.last_included_op, snapshot.digest);
+        commit_index_ = std::max(commit_index_, snapshot.last_included_op);
+        applied_index_ = std::max(applied_index_, snapshot.last_included_op);
+        next_op_number_ = std::max(next_op_number_, snapshot.last_included_op + 1);
+        pending_by_request_.clear();
+        pending_reads_by_request_.clear();
+        backup_replies_by_op_.clear();
+        op_to_request_.clear();
+        read_request_by_id_.clear();
+        session_results_.clear();
+        execution_count_.clear();
+        recoverCommittedEntries();
+    }
+
+    Result executeReadOnlyForTest(const Command& command) const {
+        BuzzDBCore copy = db_;
+        return runWithSuppressedStdout([&] {
+            return copy.execute(command);
+        });
+    }
+
     std::string digest() const override {
         std::ostringstream out;
         out << "PrimaryBackupServer(next_op=" << next_op_number_
+            << ", next_read=" << next_read_id_
+            << ", commit_index=" << commit_index_
+            << ", applied_index=" << applied_index_
             << ", cached=" << session_results_.size()
             << ", pending=" << pending_by_request_.size()
+            << ", pending_reads=" << pending_reads_by_request_.size()
+            << ", pending_backup_replies=" << backup_replies_by_op_.size()
             << ", max_exec=" << maxExecutionCount()
+            << ", " << op_log_.digest()
             << ", app=" << db_.digest() << ")";
         return out.str();
     }
@@ -13959,6 +15325,102 @@ private:
         Address client;
     };
 
+    struct PendingRead {
+        int read_id;
+        int client_id;
+        int request_id;
+        int read_index;
+        Command command;
+        Address client;
+    };
+
+    void recoverLocalBuzzDB() {
+        if (!std::filesystem::exists(db_.logFile())) {
+            return;
+        }
+        runWithSuppressedStdout([&] {
+            db_.recover();
+            return 0;
+        });
+    }
+
+    void cacheDurableApplyRecord(const ReplicationApplyRecord& record) {
+        std::string key = requestKey(record.client_id, record.request_id);
+        session_results_[key] = record.result;
+        execution_count_[key] = std::max(execution_count_[key], 1);
+    }
+
+    bool applyRecoveredEntry(const ReplicatedLogEntry& entry) {
+        std::string key = requestKey(entry.client_id, entry.request_id);
+        Result result = TableNotFoundResult{};
+        bool replayed_into_db = false;
+        auto durable_record = db_.replicationApplyRecord(entry.op_number);
+        if (durable_record) {
+            result = durable_record->result;
+            cacheDurableApplyRecord(*durable_record);
+        } else {
+            result = runWithSuppressedStdout([&] {
+                return db_.executeReplicated(
+                    entry.op_number,
+                    entry.client_id,
+                    entry.request_id,
+                    entry.command);
+            });
+                execution_count_[key]++;
+            replayed_into_db = true;
+        }
+        session_results_[key] = result;
+        return replayed_into_db;
+    }
+
+    void recoverCommittedEntries() {
+        auto start = std::chrono::steady_clock::now();
+        restart_stats_.snapshot_index = op_log_.snapshotIndex();
+        restart_stats_.commit_index = commit_index_;
+        restart_stats_.applied_index_at_start = applied_index_;
+        restart_stats_.log_entries_after_snapshot = op_log_.entries().size();
+        auto durable_records = db_.replicationApplyRecords();
+        restart_stats_.durable_apply_records_scanned += durable_records.size();
+        for (const auto& record : durable_records) {
+            if (record.first > commit_index_) {
+                throw std::runtime_error(
+                    "local database contains an uncommitted replicated op");
+            }
+        }
+        applied_index_ = std::max(applied_index_, op_log_.snapshotIndex());
+        next_op_number_ = std::max(next_op_number_, op_log_.lastOp() + 1);
+        for (const auto& record : durable_records) {
+            if (record.first <= commit_index_) {
+                restart_stats_.durable_apply_records_cached++;
+                cacheDurableApplyRecord(record.second);
+                applied_index_ = std::max(applied_index_, record.first);
+            }
+        }
+        for (const auto& entry : op_log_.entries()) {
+            if (entry.op_number > commit_index_) {
+                break;
+            }
+            restart_stats_.log_entries_examined++;
+            bool replayed_into_db = applyRecoveredEntry(entry);
+            if (replayed_into_db) {
+                restart_stats_.log_entries_replayed_into_db++;
+            } else {
+                restart_stats_.log_entries_satisfied_by_apply_table++;
+            }
+            applied_index_ = std::max(applied_index_, entry.op_number);
+            int old_applied_index = op_log_.appliedIndex();
+            op_log_.endOp(applied_index_);
+            if (op_log_.appliedIndex() > old_applied_index) {
+                restart_stats_.end_records_written++;
+            }
+        }
+        restart_stats_.applied_index_after_recovery = applied_index_;
+        auto end = std::chrono::steady_clock::now();
+        restart_stats_.recover_committed_micros +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                end - start).count();
+    }
+
     void handleClientRequest(NodeContext& ctx,
                              const Address& from,
                              const ClientRequest& request) {
@@ -13970,6 +15432,27 @@ private:
                 request.request_id,
                 cached->second
             });
+            return;
+        }
+
+        if (isReadOnlyCommand(request.command)) {
+            auto pending_read = pending_reads_by_request_.find(key);
+            if (pending_read != pending_reads_by_request_.end()) {
+                sendReadIndex(ctx, pending_read->second);
+                return;
+            }
+
+            PendingRead read{
+                next_read_id_++,
+                request.client_id,
+                request.request_id,
+                commit_index_,
+                request.command,
+                from.rootAddress()
+            };
+            read_request_by_id_[read.read_id] = key;
+            pending_reads_by_request_.emplace(key, read);
+            sendReadIndex(ctx, read);
             return;
         }
 
@@ -13986,41 +15469,109 @@ private:
             request.command,
             from.rootAddress()
         };
+        op_log_.append(ReplicatedLogEntry{
+            entry.op_number,
+            entry.client_id,
+            entry.request_id,
+            entry.command
+        });
         op_to_request_[entry.op_number] = key;
         pending_by_request_.emplace(key, entry);
         sendBackupApply(ctx, entry);
     }
 
-    void handleBackupReply(NodeContext& ctx, const BackupApplyReply& reply) {
-        auto key_it = op_to_request_.find(reply.op_number);
-        if (key_it == op_to_request_.end()) {
+    void handleReadIndexReply(NodeContext& ctx, const ReadIndexReply& reply) {
+        auto key_it = read_request_by_id_.find(reply.read_id);
+        if (key_it == read_request_by_id_.end()) {
             return;
         }
-        auto pending = pending_by_request_.find(key_it->second);
-        if (pending == pending_by_request_.end()) {
+        auto pending = pending_reads_by_request_.find(key_it->second);
+        if (pending == pending_reads_by_request_.end()) {
+            return;
+        }
+        PendingRead read = pending->second;
+        if (reply.matched_index < read.read_index) {
             return;
         }
 
-        PendingReplication entry = pending->second;
-        Result result = runWithSuppressedStdout([&] {
-            return db_.execute(entry.command);
-        });
-        if (!(result == reply.result)) {
-            throw std::runtime_error(
-                "primary and backup produced different results for op " +
-                std::to_string(reply.op_number));
-        }
-
-        std::string key = requestKey(entry.client_id, entry.request_id);
+        Result result = executeReadOnlyForTest(read.command);
+        std::string key = requestKey(read.client_id, read.request_id);
         session_results_[key] = result;
         execution_count_[key]++;
-        pending_by_request_.erase(pending);
-        op_to_request_.erase(key_it);
-        ctx.send(entry.client, ClientReply{
-            entry.client_id,
-            entry.request_id,
+        pending_reads_by_request_.erase(pending);
+        read_request_by_id_.erase(key_it);
+        ctx.send(read.client, ClientReply{
+            read.client_id,
+            read.request_id,
             result
         });
+    }
+
+    void handleBackupReply(NodeContext& ctx, const BackupApplyReply& reply) {
+        if (reply.op_number <= applied_index_) {
+            return;
+        }
+        if (op_to_request_.find(reply.op_number) == op_to_request_.end()) {
+            return;
+        }
+        backup_replies_by_op_[reply.op_number] = reply;
+        applyReadyBackupReplies(ctx);
+    }
+
+    void applyReadyBackupReplies(NodeContext& ctx) {
+        for (;;) {
+            int next_ready_op = applied_index_ + 1;
+            auto reply_it = backup_replies_by_op_.find(next_ready_op);
+            if (reply_it == backup_replies_by_op_.end()) {
+                return;
+            }
+            BackupApplyReply reply = reply_it->second;
+            auto key_it = op_to_request_.find(reply.op_number);
+            if (key_it == op_to_request_.end()) {
+                backup_replies_by_op_.erase(reply_it);
+                continue;
+            }
+            auto pending = pending_by_request_.find(key_it->second);
+            if (pending == pending_by_request_.end()) {
+                backup_replies_by_op_.erase(reply_it);
+                op_to_request_.erase(key_it);
+                continue;
+            }
+
+            PendingReplication entry = pending->second;
+            if (!op_log_.hasOp(entry.op_number)) {
+                throw std::runtime_error(
+                    "primary tried to apply op without a replication log entry");
+            }
+            commit_index_ = std::max(commit_index_, entry.op_number);
+            op_log_.advanceCommitIndex(commit_index_);
+            Result result = runWithSuppressedStdout([&] {
+                return db_.executeReplicated(
+                    entry.op_number,
+                    entry.client_id,
+                    entry.request_id,
+                    entry.command);
+            });
+            if (!(result == reply.result)) {
+                throw std::runtime_error(
+                    "primary and backup produced different results for op " +
+                    std::to_string(reply.op_number));
+            }
+
+            std::string key = requestKey(entry.client_id, entry.request_id);
+            session_results_[key] = result;
+            execution_count_[key]++;
+            applied_index_ = std::max(applied_index_, entry.op_number);
+            op_log_.endOp(applied_index_);
+            pending_by_request_.erase(pending);
+            op_to_request_.erase(key_it);
+            backup_replies_by_op_.erase(reply_it);
+            ctx.send(entry.client, ClientReply{
+                entry.client_id,
+                entry.request_id,
+                result
+            });
+        }
     }
 
     void sendBackupApply(NodeContext& ctx, const PendingReplication& entry) {
@@ -14032,13 +15583,30 @@ private:
         });
     }
 
+    void sendReadIndex(NodeContext& ctx, const PendingRead& read) {
+        ctx.send(backup_, ReadIndexRequest{
+            read.read_id,
+            read.client_id,
+            read.request_id,
+            read.read_index
+        });
+    }
+
     Address backup_;
+    ReplicatedOperationLog op_log_;
     BuzzDBCore db_;
+    int commit_index_ = 0;
+    int applied_index_ = 0;
     int next_op_number_ = 1;
+    int next_read_id_ = 1;
     std::map<std::string, Result> session_results_;
     std::map<std::string, PendingReplication> pending_by_request_;
+    std::map<std::string, PendingRead> pending_reads_by_request_;
+    std::map<int, BackupApplyReply> backup_replies_by_op_;
     std::map<int, std::string> op_to_request_;
+    std::map<int, std::string> read_request_by_id_;
     std::map<std::string, int> execution_count_;
+    RestartRecoveryStats restart_stats_;
 };
 
 class ClientWorker : public Node {
@@ -14193,164 +15761,6 @@ private:
     int stale_replies_ = 0;
     std::set<int> completed_request_ids_;
     std::vector<Command> sent_commands_;
-    std::vector<Result> results_;
-};
-
-class PBClientWorker : public Node {
-public:
-    PBClientWorker(Address address,
-                   Address view_server,
-                   int client_id,
-                   Workload workload)
-        : Node(std::move(address)),
-          view_server_(std::move(view_server)),
-          client_id_(client_id),
-          workload_(std::move(workload)) {}
-
-    void init(NodeContext& ctx) override {
-        sendNext(ctx);
-    }
-
-    void onMessage(NodeContext& ctx,
-                   const Address& from,
-                   const Message& message) override {
-        (void) from;
-        if (const auto* view = std::get_if<ViewReply>(&message)) {
-            current_view_ = view->view;
-            waiting_for_view_ = false;
-            if (waiting_ && !addressEmpty(current_view_.primary)) {
-                sendInFlight(ctx);
-            }
-            return;
-        }
-
-        const auto* reply = std::get_if<ClientReply>(&message);
-        if (reply == nullptr) {
-            return;
-        }
-        if (!waiting_ ||
-            reply->client_id != client_id_ ||
-            reply->request_id != in_flight_request_id_) {
-            ++stale_replies_;
-            return;
-        }
-
-        results_.push_back(reply->result);
-        waiting_ = false;
-        waiting_for_view_ = false;
-        in_flight_request_id_ = 0;
-        sendNext(ctx);
-    }
-
-    void onTimer(NodeContext& ctx, const Timer& timer) override {
-        const auto* retry = std::get_if<RetryTimer>(&timer);
-        if (retry != nullptr &&
-            waiting_ &&
-            retry->request_id == in_flight_request_id_) {
-            ++retries_;
-            sendInFlight(ctx);
-        }
-    }
-
-    std::unique_ptr<Node> clone() const override {
-        return std::make_unique<PBClientWorker>(*this);
-    }
-
-    bool done() const {
-        return !waiting_ && !workload_.hasNext();
-    }
-
-    size_t resultCount() const {
-        return results_.size();
-    }
-
-    int retryCount() const {
-        return retries_;
-    }
-
-    int staleReplyCount() const {
-        return stale_replies_;
-    }
-
-    bool waitingForView() const {
-        return waiting_for_view_;
-    }
-
-    const View& currentView() const {
-        return current_view_;
-    }
-
-    const std::vector<Result>& results() const {
-        return results_;
-    }
-
-    bool resultsOk() const {
-        if (!workload_.hasExpectedResults()) {
-            return true;
-        }
-        if (results_.size() > workload_.expectedCount()) {
-            return false;
-        }
-        for (size_t i = 0; i < results_.size(); ++i) {
-            if (!(results_[i] == workload_.expectedResult(i))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    std::string digest() const override {
-        std::ostringstream out;
-        out << "PBClient(waiting=" << waiting_
-            << ", view=" << current_view_.number
-            << ", primary=" << current_view_.primary
-            << ", req=" << in_flight_request_id_
-            << ", results=" << results_.size()
-            << ", retries=" << retries_ << ")";
-        return out.str();
-    }
-
-    std::string describe() const override {
-        return digest();
-    }
-
-private:
-    void sendNext(NodeContext& ctx) {
-        if (!workload_.hasNext()) {
-            return;
-        }
-        waiting_ = true;
-        in_flight_request_id_ = next_request_id_++;
-        in_flight_command_ = workload_.nextCommand();
-        sendInFlight(ctx);
-    }
-
-    void sendInFlight(NodeContext& ctx) {
-        if (addressEmpty(current_view_.primary)) {
-            waiting_for_view_ = true;
-            ctx.send(view_server_, ViewRequest{});
-        } else {
-            waiting_for_view_ = false;
-            ctx.send(current_view_.primary, ClientRequest{
-                client_id_,
-                in_flight_request_id_,
-                in_flight_command_
-            });
-        }
-        ctx.setTimer(RetryTimer{in_flight_request_id_}, 5, 7);
-    }
-
-    Address view_server_;
-    int client_id_;
-    Workload workload_;
-    View current_view_;
-    bool waiting_ = false;
-    bool waiting_for_view_ = false;
-    int next_request_id_ = 1;
-    int in_flight_request_id_ = 0;
-    Command in_flight_command_ = CreateTableCommand{"", {""}};
-    int retries_ = 0;
-    int stale_replies_ = 0;
     std::vector<Result> results_;
 };
 
@@ -14606,31 +16016,13 @@ SearchResults replayTrace(SearchState state,
 
 CheckResult resultsOk(const SearchState& state, const Address& client) {
     const auto* worker = state.nodeAs<ClientWorker>(client);
-    if (worker != nullptr) {
-        if (!worker->resultsOk()) {
-            std::ostringstream out;
-            out << client.str() << " received unexpected results [";
-            const auto& results = worker->results();
-            for (size_t i = 0; i < results.size(); ++i) {
-                if (i != 0) {
-                    out << ", ";
-                }
-                out << describeResult(results[i]);
-            }
-            out << "]";
-            return {false, out.str()};
-        }
-        return {true, ""};
-    }
-
-    const auto* pb_worker = state.nodeAs<PBClientWorker>(client);
-    if (pb_worker == nullptr) {
+    if (worker == nullptr) {
         return {false, client.str() + " is missing"};
     }
-    if (!pb_worker->resultsOk()) {
+    if (!worker->resultsOk()) {
         std::ostringstream out;
         out << client.str() << " received unexpected results [";
-        const auto& results = pb_worker->results();
+        const auto& results = worker->results();
         for (size_t i = 0; i < results.size(); ++i) {
             if (i != 0) {
                 out << ", ";
@@ -14656,14 +16048,10 @@ CheckResult resultsOk(const SearchState& state,
 
 CheckResult clientDone(const SearchState& state, const Address& client) {
     const auto* worker = state.nodeAs<ClientWorker>(client);
-    if (worker != nullptr) {
-        return {worker->done(), client.str() + " is not done"};
-    }
-    const auto* pb_worker = state.nodeAs<PBClientWorker>(client);
-    if (pb_worker == nullptr) {
+    if (worker == nullptr) {
         return {false, client.str() + " is missing"};
     }
-    return {pb_worker->done(), client.str() + " is not done"};
+    return {worker->done(), client.str() + " is not done"};
 }
 
 CheckResult clientsDone(const SearchState& state,
@@ -15716,20 +17104,13 @@ std::vector<Command> createFullJobLoadCommands(const std::string& data_file) {
     for (const auto& row : readTupleFileRows(data_file)) {
         commands.push_back(InsertRowCommand{row.table, row.values});
     }
+    commands.push_back(CheckpointCommand{});
     commands.push_back(QuerySQLCommand{jobDistributorJoinRowsQuery()});
     return commands;
 }
 
 Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     std::vector<Command> commands = createExplicitJobJoinCommands(data_file);
-    return Workload(commands, buzzDBOracleResults(commands));
-}
-
-Workload createJobLoadWorkload(const std::string& data_file) {
-    std::vector<Command> commands{
-        LoadJobDatabaseCommand{data_file},
-        QuerySQLCommand{jobDistributorJoinQuery()}
-    };
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
@@ -15797,6 +17178,61 @@ Scenario oneClientPrimaryBackupScenario(Workload workload) {
     Scenario scenario;
     scenario.state = state;
     return scenario;
+}
+
+Workload workloadForCommands(std::vector<Command> commands) {
+    std::vector<Result> expected = buzzDBOracleResults(commands);
+    return Workload(std::move(commands), std::move(expected));
+}
+
+Scenario twoClientPrimaryBackupScenario(Workload first, Workload second) {
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+
+    SearchState state;
+    state.addNode(std::make_unique<PrimaryBackupServer>(primary, backup));
+    state.addNode(std::make_unique<BackupReplica>(backup));
+    state.addNode(std::make_unique<ClientWorker>(
+        ScenarioAddress::client1(),
+        primary,
+        1,
+        std::move(first)));
+    state.addNode(std::make_unique<ClientWorker>(
+        ScenarioAddress::client2(),
+        primary,
+        2,
+        std::move(second)));
+
+    Scenario scenario;
+    scenario.state = state;
+    return scenario;
+}
+
+CheckResult primaryBackupCommittedEqual(const SearchState& state,
+                                        int expected_commits) {
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+    const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+    if (primary_node == nullptr || backup_node == nullptr) {
+        return {false, "primary or backup is missing"};
+    }
+    if (primary_node->commitIndex() != expected_commits ||
+        backup_node->commitIndex() != expected_commits ||
+        primary_node->appliedIndex() != expected_commits ||
+        backup_node->appliedIndex() != expected_commits) {
+        std::ostringstream out;
+        out << "primary(commit=" << primary_node->commitIndex()
+            << ", applied=" << primary_node->appliedIndex()
+            << ") backup(commit=" << backup_node->commitIndex()
+            << ", applied=" << backup_node->appliedIndex()
+            << ")";
+        return {false, out.str()};
+    }
+    if (primary_node->appDigest() != backup_node->appDigest()) {
+        return {false, "primary and backup database digests differ"};
+    }
+    return {true, ""};
 }
 
 const MessageEnvelope* messageForEvent(const SearchState& state,
@@ -15889,6 +17325,10 @@ SearchState stepRequired(const SearchState& state,
     auto next = state.stepEvent(event, settings);
     if (!next) {
         throw std::runtime_error("event was not deliverable: " + event.key());
+    }
+    if (!next->exception().empty()) {
+        throw std::runtime_error(
+            "event " + event.key() + " raised: " + next->exception());
     }
     return *next;
 }
@@ -16046,12 +17486,15 @@ void printPrimaryBackupProgress(const SearchState& state,
     }
 
     std::cout << "  primary: pending=" << primary_node->pendingCount()
+              << ", pending_reads=" << primary_node->pendingReadCount()
               << ", cached_requests=" << primary_node->cachedRequestCount()
               << ", executions="
               << primary_node->executionCount(client_id, request_id)
               << ", next_op=" << primary_node->nextOpNumber()
+              << ", commit_index=" << primary_node->commitIndex()
               << std::endl;
     std::cout << "  backup: applied_op=" << backup_node->appliedOp()
+              << ", commit_index=" << backup_node->commitIndex()
               << ", pending=" << backup_node->pendingCount()
               << ", executions="
               << backup_node->executionCount(client_id, request_id)
@@ -16060,6 +17503,19 @@ void printPrimaryBackupProgress(const SearchState& state,
               << ", backup=" << backup_node->logFile()
               << ", same_file="
               << (primary_node->logFile() == backup_node->logFile() ? "yes" : "no")
+              << std::endl;
+    std::cout << "  replication logs: primary="
+              << primary_node->replicationLogFile()
+              << " entries=" << primary_node->replicationLogSize()
+              << " commit=" << primary_node->commitIndex()
+              << ", backup=" << backup_node->replicationLogFile()
+              << " entries=" << backup_node->replicationLogSize()
+              << " commit=" << backup_node->commitIndex()
+              << ", same_prefix="
+              << (primary_node->operationLog().samePrefixAs(
+                      backup_node->operationLog())
+                      ? "yes"
+                      : "no")
               << std::endl;
 }
 
@@ -16141,12 +17597,17 @@ std::string formatPrimaryBackupState(const SearchState& state,
     out << "depth=" << state.depth()
         << " history=" << formatHistory(state)
         << " primary(pending=" << primary_node->pendingCount()
+        << ", pending_reads=" << primary_node->pendingReadCount()
         << ", cached=" << primary_node->cachedRequestCount()
         << ", exec=" << primary_node->executionCount(1, 1)
         << ", next_op=" << primary_node->nextOpNumber()
+        << ", replog=" << primary_node->replicationLogSize()
+        << ", commit=" << primary_node->commitIndex()
         << ") backup(applied=" << backup_node->appliedOp()
+        << ", commit=" << backup_node->commitIndex()
         << ", pending=" << backup_node->pendingCount()
         << ", exec=" << backup_node->executionCount(1, 1)
+        << ", replog=" << backup_node->replicationLogSize()
         << ") client(results=" << client_node->resultCount()
         << ", retries=" << client_node->retryCount()
         << ", stale=" << client_node->staleReplyCount()
@@ -16209,9 +17670,9 @@ SearchState deliverPrimaryBackupCommandRound(
     }
     state = stepRequired(state, client_request, settings);
     if (print_trace) {
-        std::cout << "  primary assigned op=" << op_number
-                  << " and sent it to the backup" << std::endl;
-        std::cout << "  client reply before backup ack: "
+        std::cout << "  primary started backup coordination for request "
+                  << request_id << std::endl;
+        std::cout << "  client reply before backup coordination completes: "
                   << (newClientReplyFor(state, client_id, request_id)
                           ? "yes"
                           : "no")
@@ -16220,43 +17681,94 @@ SearchState deliverPrimaryBackupCommandRound(
             state, primary, backup, client_id, request_id);
     }
 
-    EventRef backup_apply = requireMessageEvent(
-        state,
-        settings,
-        [&](const MessageEnvelope& envelope) {
-            const auto* request =
-                std::get_if<BackupApplyRequest>(&envelope.message);
-            return request != nullptr &&
-                   request->op_number == op_number &&
-                   envelope.from.rootAddress() == primary &&
-                   envelope.to.rootAddress() == backup;
-        },
-        "backup apply request");
-    if (print_trace) {
-        std::cout << "  deliver " << describeEventRef(state, backup_apply)
-                  << std::endl;
+    bool delivered_write_path = false;
+    EventRef backup_apply;
+    for (const auto& event : state.events(settings)) {
+        const auto* envelope = messageForEvent(state, event);
+        if (envelope == nullptr) {
+            continue;
+        }
+        const auto* request =
+            std::get_if<BackupApplyRequest>(&envelope->message);
+        if (request != nullptr &&
+            request->op_number == op_number &&
+            envelope->from.rootAddress() == primary &&
+            envelope->to.rootAddress() == backup) {
+            backup_apply = event;
+            delivered_write_path = true;
+            break;
+        }
     }
-    state = stepRequired(state, backup_apply, settings);
 
-    EventRef backup_ack = requireMessageEvent(
-        state,
-        settings,
-        [&](const MessageEnvelope& envelope) {
-            const auto* reply = std::get_if<BackupApplyReply>(&envelope.message);
-            return reply != nullptr &&
-                   reply->op_number == op_number &&
-                   envelope.from.rootAddress() == backup &&
-                   envelope.to.rootAddress() == primary;
-        },
-        "backup acknowledgement");
-    if (print_trace) {
-        std::cout << "  deliver " << describeEventRef(state, backup_ack)
-                  << std::endl;
-    }
-    state = stepRequired(state, backup_ack, settings);
-    if (print_trace) {
-        printPrimaryBackupProgress(
-            state, primary, backup, client_id, request_id);
+    if (delivered_write_path) {
+        if (print_trace) {
+            std::cout << "  deliver " << describeEventRef(state, backup_apply)
+                      << std::endl;
+        }
+        state = stepRequired(state, backup_apply, settings);
+
+        EventRef backup_ack = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == op_number &&
+                       envelope.from.rootAddress() == backup &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "backup acknowledgement");
+        if (print_trace) {
+            std::cout << "  deliver " << describeEventRef(state, backup_ack)
+                      << std::endl;
+        }
+        state = stepRequired(state, backup_ack, settings);
+        if (print_trace) {
+            printPrimaryBackupProgress(
+                state, primary, backup, client_id, request_id);
+        }
+    } else {
+        EventRef read_index = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ReadIndexRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == client_id &&
+                       request->request_id == request_id &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "read-index request");
+        const auto* read_index_envelope = messageForEvent(state, read_index);
+        const auto* read_index_request =
+            std::get_if<ReadIndexRequest>(&read_index_envelope->message);
+        int read_id = read_index_request->read_id;
+        if (print_trace) {
+            std::cout << "  deliver " << describeEventRef(state, read_index)
+                      << std::endl;
+        }
+        state = stepRequired(state, read_index, settings);
+
+        EventRef read_index_reply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<ReadIndexReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->read_id == read_id &&
+                       envelope.from.rootAddress() == backup &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "read-index reply");
+        if (print_trace) {
+            std::cout << "  deliver " << describeEventRef(state, read_index_reply)
+                      << std::endl;
+        }
+        state = stepRequired(state, read_index_reply, settings);
     }
 
     EventRef client_reply = requireMessageEvent(
@@ -16327,6 +17839,15 @@ void printPrimaryBackupTrace(const std::string& data_file) {
                       ? "yes"
                       : "no")
               << std::endl;
+    std::cout << "  replicated operation logs match: "
+              << (primary_node != nullptr && backup_node != nullptr &&
+                  primary_node->operationLog().samePrefixAs(
+                      backup_node->operationLog()) &&
+                  primary_node->replicationLogSize() ==
+                      backup_node->replicationLogSize()
+                      ? "yes"
+                      : "no")
+              << std::endl;
 
     SearchSettings search_settings;
     search_settings.max_depth = 4;
@@ -16356,6 +17877,12 @@ void printPrimaryBackupTrace(const std::string& data_file) {
             if (primary_node->appDigest() != backup_node->appDigest()) {
                 return CheckResult{false, "primary and backup digests differ"};
             }
+            if (!primary_node->operationLog().samePrefixAs(
+                    backup_node->operationLog())) {
+                return CheckResult{
+                    false,
+                    "primary and backup replication logs are not compatible"};
+            }
             return CheckResult{true, ""};
         }});
     SearchResults search = bfs(scenario.state, search_settings);
@@ -16373,6 +17900,157 @@ void printPrimaryBackupTrace(const std::string& data_file) {
     }
 }
 
+void printReadIndexPartitionTrace(const std::string& data_file) {
+    std::cout << "Trace: read-index read under a network partition"
+              << std::endl;
+
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    Address client = ScenarioAddress::client1();
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 1);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<Command> commands{
+        createTitleTableCommand(),
+        InsertRowCommand{"title", first_title},
+        CountRowsCommand{"title"}
+    };
+    Scenario scenario =
+        oneClientPrimaryBackupScenario(
+            Workload(commands, buzzDBOracleResults(commands)));
+    SearchSettings settings = scenario.settings;
+    SearchState state = scenario.state;
+
+    for (size_t i = 0; i < 2; ++i) {
+        state = deliverPrimaryBackupCommandRound(
+            state,
+            settings,
+            primary,
+            backup,
+            client,
+            1,
+            static_cast<int>(i + 1),
+            static_cast<int>(i + 1),
+            false);
+    }
+
+    const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+    const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+    if (primary_node == nullptr || backup_node == nullptr) {
+        throw std::runtime_error("partition trace lost a replica");
+    }
+    std::cout << "  warmed up: primary commit=" << primary_node->commitIndex()
+              << ", backup applied=" << backup_node->appliedIndex()
+              << ", replicated entries=" << primary_node->replicationLogSize()
+              << std::endl;
+
+    SearchSettings partitioned = settings;
+    partitioned.partition({{client, primary}, {backup}});
+    std::cout << "  partition: {client1, server1} | {backup1}" << std::endl;
+
+    EventRef client_read = requireMessageEvent(
+        state,
+        partitioned,
+        [&](const MessageEnvelope& envelope) {
+            const auto* request = std::get_if<ClientRequest>(&envelope.message);
+            return request != nullptr &&
+                   request->client_id == 1 &&
+                   request->request_id == 3 &&
+                   envelope.from.rootAddress() == client &&
+                   envelope.to.rootAddress() == primary;
+        },
+        "partition trace read request");
+    std::cout << "  deliver " << describeEventRef(state, client_read)
+              << std::endl;
+    state = stepRequired(state, client_read, partitioned);
+
+    primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+    if (primary_node == nullptr) {
+        throw std::runtime_error("partition trace lost primary");
+    }
+    bool read_index_deliverable = false;
+    for (const auto& event : state.events(partitioned)) {
+        const auto* envelope = messageForEvent(state, event);
+        if (envelope != nullptr &&
+            std::get_if<ReadIndexRequest>(&envelope->message) != nullptr &&
+            envelope->from.rootAddress() == primary &&
+            envelope->to.rootAddress() == backup) {
+            read_index_deliverable = true;
+        }
+    }
+    std::cout << "  primary pending_reads=" << primary_node->pendingReadCount()
+              << ", client reply="
+              << (newClientReplyFor(state, 1, 3) ? "yes" : "no")
+              << ", read-index deliverable while partitioned="
+              << (read_index_deliverable ? "yes" : "no")
+              << std::endl;
+
+    EventRef read_index = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            const auto* request =
+                std::get_if<ReadIndexRequest>(&envelope.message);
+            return request != nullptr &&
+                   request->client_id == 1 &&
+                   request->request_id == 3 &&
+                   envelope.from.rootAddress() == primary &&
+                   envelope.to.rootAddress() == backup;
+        },
+        "partition trace healed read-index request");
+    const auto* read_index_envelope = messageForEvent(state, read_index);
+    const auto* read_index_request =
+        std::get_if<ReadIndexRequest>(&read_index_envelope->message);
+    int read_id = read_index_request->read_id;
+    std::cout << "  heal network and deliver "
+              << describeEventRef(state, read_index) << std::endl;
+    state = stepRequired(state, read_index, settings);
+
+    EventRef read_index_reply = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            const auto* reply = std::get_if<ReadIndexReply>(&envelope.message);
+            return reply != nullptr &&
+                   reply->read_id == read_id &&
+                   envelope.from.rootAddress() == backup &&
+                   envelope.to.rootAddress() == primary;
+        },
+        "partition trace read-index reply");
+    std::cout << "  deliver " << describeEventRef(state, read_index_reply)
+              << std::endl;
+    state = stepRequired(state, read_index_reply, settings);
+
+    EventRef client_reply = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            const auto* reply = std::get_if<ClientReply>(&envelope.message);
+            return reply != nullptr &&
+                   reply->client_id == 1 &&
+                   reply->request_id == 3 &&
+                   envelope.from.rootAddress() == primary &&
+                   envelope.to.rootAddress() == client;
+        },
+        "partition trace client reply");
+    std::cout << "  deliver " << describeEventRef(state, client_reply)
+              << std::endl;
+    state = stepRequired(state, client_reply, settings);
+
+    const auto* client_node = state.nodeAs<ClientWorker>(client);
+    primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+    if (client_node == nullptr || primary_node == nullptr) {
+        throw std::runtime_error("partition trace lost final nodes");
+    }
+    std::cout << "  final read result: "
+              << describeResult(client_node->results().back())
+              << ", replicated entries="
+              << primary_node->replicationLogSize()
+              << ", commit=" << primary_node->commitIndex()
+              << "\n" << std::endl;
+}
+
 void printFullPrimaryBackupLoadTrace(const std::string& data_file) {
     std::cout << "Trace: primary-backup full IMDB load replication"
               << std::endl;
@@ -16384,21 +18062,30 @@ void printFullPrimaryBackupLoadTrace(const std::string& data_file) {
 
     size_t create_count = 0;
     size_t insert_count = 0;
+    size_t checkpoint_count = 0;
     size_t query_count = 0;
     for (const auto& command : commands) {
         if (std::holds_alternative<CreateTableCommand>(command)) {
             ++create_count;
         } else if (std::holds_alternative<InsertRowCommand>(command)) {
             ++insert_count;
+        } else if (std::holds_alternative<CheckpointCommand>(command)) {
+            ++checkpoint_count;
         } else if (std::holds_alternative<QuerySQLCommand>(command)) {
             ++query_count;
         }
     }
+    size_t mutating_count = countMutatingCommands(commands);
 
     std::cout << "  input: " << data_file << std::endl;
     std::cout << "  command stream: " << commands.size()
               << " commands (" << create_count << " create, "
-              << insert_count << " insert, " << query_count << " query)"
+              << insert_count << " insert, "
+              << checkpoint_count << " checkpoint, "
+              << query_count << " query)"
+              << std::endl;
+    std::cout << "  replicated writes: " << mutating_count
+              << ", read-index reads: " << (commands.size() - mutating_count)
               << std::endl;
 
     Scenario scenario = oneClientPrimaryBackupScenario(
@@ -16411,7 +18098,7 @@ void printFullPrimaryBackupLoadTrace(const std::string& data_file) {
         const bool show =
             i < 3 || i + 3 >= commands.size() || ((i + 1) % 25 == 0);
         if (show) {
-            std::cout << "  replicate op " << (i + 1) << "/"
+            std::cout << "  run request " << (i + 1) << "/"
                       << commands.size() << ": "
                       << describeCommand(commands[i]) << std::endl;
         }
@@ -16449,6 +18136,19 @@ void printFullPrimaryBackupLoadTrace(const std::string& data_file) {
               << ", backup=" << backup_node->logFile()
               << ", same_file="
               << (primary_node->logFile() == backup_node->logFile()
+                      ? "yes"
+                      : "no")
+              << std::endl;
+    std::cout << "  replication logs: primary="
+              << primary_node->replicationLogFile()
+              << " entries=" << primary_node->replicationLogSize()
+              << " commit=" << primary_node->commitIndex()
+              << ", backup=" << backup_node->replicationLogFile()
+              << " entries=" << backup_node->replicationLogSize()
+              << " commit=" << backup_node->commitIndex()
+              << ", same_prefix="
+              << (primary_node->operationLog().samePrefixAs(
+                      backup_node->operationLog())
                       ? "yes"
                       : "no")
               << "\n" << std::endl;
@@ -16510,6 +18210,204 @@ void removeBuzzDBBundle(const std::string& database_file) {
     }
 }
 
+std::vector<std::string> readNonEmptyLines(const std::string& file) {
+    std::ifstream input(file);
+    if (!input) {
+        throw std::runtime_error("unable to read file: " + file);
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty()) {
+            lines.push_back(line);
+        }
+    }
+    return lines;
+}
+
+size_t countLinesStartingWith(const std::vector<std::string>& lines,
+                              const std::string& prefix) {
+    return static_cast<size_t>(std::count_if(
+        lines.begin(),
+        lines.end(),
+        [&](const std::string& line) {
+            return line.rfind(prefix, 0) == 0;
+        }));
+}
+
+bool hasLineStartingWith(const std::vector<std::string>& lines,
+                         const std::string& prefix) {
+    return countLinesStartingWith(lines, prefix) > 0;
+}
+
+struct RestartMeasurement {
+    std::string label;
+    long long total_restart_micros = 0;
+    RestartRecoveryStats stats;
+    size_t query_rows = 0;
+};
+
+SearchState buildMeasuredPrimaryBackupState(
+    const std::vector<Command>& commands,
+    size_t snapshot_after) {
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    Address client = ScenarioAddress::client1();
+    Scenario scenario = oneClientPrimaryBackupScenario(
+        Workload(commands, std::vector<Result>{}));
+    SearchSettings settings = scenario.settings;
+    SearchState state = scenario.state;
+
+    for (size_t i = 0; i < commands.size(); ++i) {
+        state = deliverPrimaryBackupCommandRound(
+            state,
+            settings,
+            primary,
+            backup,
+            client,
+            1,
+            static_cast<int>(i + 1),
+            static_cast<int>(i + 1),
+            false);
+        if (snapshot_after == i + 1) {
+            auto* primary_node =
+                const_cast<PrimaryBackupServer*>(
+                    state.nodeAs<PrimaryBackupServer>(primary));
+            if (primary_node == nullptr) {
+                throw std::runtime_error("missing primary for snapshot measurement");
+            }
+            primary_node->createSnapshotForTest();
+        }
+    }
+
+    return state;
+}
+
+RestartMeasurement measurePrimaryRestart(
+    const std::string& label,
+    const PrimaryBackupServer& primary_node) {
+    Address primary = ScenarioAddress::server1();
+    Address backup = ScenarioAddress::backup1();
+    RestartMeasurement measurement;
+    measurement.label = label;
+
+    auto start = std::chrono::steady_clock::now();
+    PrimaryBackupServer restarted(
+        primary,
+        backup,
+        primary_node.databaseFile(),
+        primary_node.replicationLogFile());
+    auto end = std::chrono::steady_clock::now();
+
+    measurement.total_restart_micros =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start).count();
+    measurement.stats = restarted.restartStats();
+    Result query_result = restarted.executeReadOnlyForTest(
+        QuerySQLCommand{jobDistributorJoinRowsQuery()});
+    if (const auto* rows = std::get_if<QueryRowsResult>(&query_result)) {
+        measurement.query_rows = rows->count;
+    }
+    return measurement;
+}
+
+void printRestartMeasurementRow(const RestartMeasurement& measurement) {
+    const auto& stats = measurement.stats;
+    const auto& load = stats.log_load;
+    std::cout << "  " << std::left << std::setw(22) << measurement.label
+              << std::right
+              << std::setw(9) << stats.snapshot_index
+              << std::setw(9) << stats.commit_index
+              << std::setw(11) << load.bytes_read
+              << std::setw(10) << load.entry_records_seen
+              << std::setw(10) << load.entry_records_loaded
+              << std::setw(11) << stats.log_entries_examined
+              << std::setw(11) << stats.log_entries_replayed_into_db
+              << std::setw(12) << stats.durable_apply_records_scanned
+              << std::setw(11) << stats.aries_recover_micros
+              << std::setw(11) << stats.recover_committed_micros
+              << std::setw(11) << measurement.total_restart_micros
+              << std::setw(8) << measurement.query_rows
+              << std::endl;
+}
+
+void printRestartRecoveryMeasurement(const std::string& data_file) {
+    std::cout << "BuzzDB v114 restart recovery measurement" << std::endl;
+    std::cout << "  input: " << data_file << std::endl;
+    std::vector<Command> commands = createFullJobLoadCommands(data_file);
+    const size_t full_snapshot_after = commands.size();
+    const size_t prefix_snapshot_after =
+        std::min<size_t>(100, commands.size() - 1);
+    std::cout << "  command stream: " << commands.size()
+              << " replicated operations" << std::endl;
+    std::cout << "  prefix snapshot: op " << prefix_snapshot_after
+              << " with " << (commands.size() - prefix_snapshot_after)
+              << " suffix operation(s)" << std::endl;
+
+    std::vector<RestartMeasurement> measurements;
+    {
+        SearchState state = buildMeasuredPrimaryBackupState(commands, 0);
+        const auto* primary_node =
+            state.nodeAs<PrimaryBackupServer>(ScenarioAddress::server1());
+        if (primary_node == nullptr) {
+            throw std::runtime_error("missing primary for no-snapshot measurement");
+        }
+        measurements.push_back(
+            measurePrimaryRestart("no snapshot", *primary_node));
+    }
+    {
+        SearchState state =
+            buildMeasuredPrimaryBackupState(commands, full_snapshot_after);
+        const auto* primary_node =
+            state.nodeAs<PrimaryBackupServer>(ScenarioAddress::server1());
+        if (primary_node == nullptr) {
+            throw std::runtime_error("missing primary for full-snapshot measurement");
+        }
+        measurements.push_back(
+            measurePrimaryRestart("snapshot all", *primary_node));
+    }
+    {
+        SearchState state =
+            buildMeasuredPrimaryBackupState(commands, prefix_snapshot_after);
+        const auto* primary_node =
+            state.nodeAs<PrimaryBackupServer>(ScenarioAddress::server1());
+        if (primary_node == nullptr) {
+            throw std::runtime_error("missing primary for suffix measurement");
+        }
+        measurements.push_back(
+            measurePrimaryRestart("snapshot + suffix", *primary_node));
+    }
+
+    std::cout << "\n  " << std::left << std::setw(22) << "case"
+              << std::right
+              << std::setw(9) << "snapshot"
+              << std::setw(9) << "commit"
+              << std::setw(11) << "log_bytes"
+              << std::setw(10) << "entries"
+              << std::setw(10) << "suffix"
+              << std::setw(11) << "examined"
+              << std::setw(11) << "replayed"
+              << std::setw(12) << "apply_scan"
+              << std::setw(11) << "aries_us"
+              << std::setw(11) << "repl_us"
+              << std::setw(11) << "total_us"
+              << std::setw(8) << "rows"
+              << std::endl;
+    for (const auto& measurement : measurements) {
+        printRestartMeasurementRow(measurement);
+    }
+    std::cout << "\n  entries: ENTRY records physically present in replication.log"
+              << std::endl;
+    std::cout << "  suffix: ENTRY records retained after snapshot truncation"
+              << std::endl;
+    std::cout << "  examined: suffix entries walked by replication recovery"
+              << std::endl;
+    std::cout << "  replayed: suffix entries missing from BuzzDB and reapplied"
+              << std::endl;
+    std::cout << "  apply_scan: durable __replication_apply rows scanned to rebuild"
+              << " duplicate suppression" << std::endl;
+}
+
 void printLocalBuzzDBTrace(const std::string& data_file) {
     std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
@@ -16532,7 +18430,6 @@ void printLocalBuzzDBTrace(const std::string& data_file) {
     commands.push_back(parseSQL("DELETE FROM title WHERE id=" +
                                 second_title[0]));
     commands.push_back(CountRowsCommand{"title"});
-    commands.push_back(CheckpointCommand{});
 
     std::cout << "  input: " << data_file << std::endl;
     for (const auto& command : commands) {
@@ -16568,7 +18465,7 @@ std::string defaultImdbInputFile() {
 void printV104BootstrapTrace(const std::string& data_file) {
     std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v110-bootstrap-trace-" + std::to_string(::getpid()));
+        ("buzzdb-v114-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
@@ -16591,353 +18488,381 @@ void printV104BootstrapTrace(const std::string& data_file) {
     std::filesystem::remove_all(dir);
 }
 
-Workload createControlPlaneWorkload() {
-    return Workload(
-        std::vector<Command>{createTitleTableCommand()},
-        std::vector<Result>{Result{CreateTableOkResult{}}});
-}
-
-std::unique_ptr<ViewServer> viewServerWithPrimary(Address view_server,
-                                                  Address primary) {
-    auto node = std::make_unique<ViewServer>(std::move(view_server));
-    node->pingServer(std::move(primary), 0);
-    return node;
-}
-
-std::unique_ptr<ViewServer> viewServerWithPrimaryBackup(Address view_server,
-                                                        Address primary,
-                                                        Address backup) {
-    auto node = std::make_unique<ViewServer>(std::move(view_server));
-    node->pingServer(primary, 0);
-    node->pingServer(primary, 1);
-    node->pingServer(std::move(backup), 0);
-    return node;
-}
-
-SearchState viewAwareServiceState(bool install_primary,
-                                  bool install_backup = false) {
-    Address view_server = ScenarioAddress::viewserver1();
-    Address primary = ScenarioAddress::server1();
-    Address backup = ScenarioAddress::backup1();
-    Address client = ScenarioAddress::client1();
-
-    SearchState state;
-    if (install_primary && install_backup) {
-        state.addNode(viewServerWithPrimaryBackup(view_server, primary, backup));
-    } else if (install_primary) {
-        state.addNode(viewServerWithPrimary(view_server, primary));
-    } else {
-        state.addNode(std::make_unique<ViewServer>(view_server));
+int main(int argc, char* argv[]) {
+    if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
+        const std::string imdb_file =
+            argc > 2 ? argv[2] : defaultImdbInputFile();
+        printRestartRecoveryMeasurement(imdb_file);
+        return 0;
     }
-    if (install_primary) {
-        state.addNode(std::make_unique<AtMostOnceServer>(
-            primary,
-            std::make_unique<BuzzDBApplication>()));
+
+    bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
+    int imdb_arg = tests_only ? 2 : 1;
+    std::cout << "BuzzDB v114: read-index reads over primary-backup BuzzDB" << std::endl;
+    const std::string imdb_file =
+        argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
+    if (!tests_only) {
+        printLocalBuzzDBTrace(imdb_file);
+        printDistributedServiceTrace(imdb_file);
+        printPrimaryBackupTrace(imdb_file);
+        printReadIndexPartitionTrace(imdb_file);
+        printFullPrimaryBackupLoadTrace(imdb_file);
+        printActualPrimaryBackupSearchStates(20, imdb_file);
+        printV104BootstrapTrace(imdb_file);
     }
-    if (install_backup) {
-        state.addNode(std::make_unique<AtMostOnceServer>(
-            backup,
-            std::make_unique<BuzzDBApplication>()));
-    }
-    state.addNode(std::make_unique<PBClientWorker>(
-        client,
-        view_server,
-        1,
-        createControlPlaneWorkload()));
-    return state;
-}
-
-SearchState deliverClientViewLookup(SearchState state,
-                                    const SearchSettings& settings,
-                                    const Address& client,
-                                    const Address& view_server) {
-    EventRef request = requireMessageEvent(
-        state,
-        settings,
-        [&](const MessageEnvelope& envelope) {
-            return std::holds_alternative<ViewRequest>(envelope.message) &&
-                   envelope.from.rootAddress() == client &&
-                   envelope.to.rootAddress() == view_server;
-        },
-        "client view request");
-    state = stepRequired(state, request, settings);
-
-    EventRef reply = requireMessageEvent(
-        state,
-        settings,
-        [&](const MessageEnvelope& envelope) {
-            return std::holds_alternative<ViewReply>(envelope.message) &&
-                   envelope.from.rootAddress() == view_server &&
-                   envelope.to.rootAddress() == client;
-        },
-        "view reply to client");
-    return stepRequired(state, reply, settings);
-}
-
-int runV110ControlPlaneTests() {
-    std::cout << "BuzzDB v110: view-server basics and single-primary service"
-              << std::endl;
 
     TestRunner tests;
-    Address view_server = ScenarioAddress::viewserver1();
-    Address primary = ScenarioAddress::server1();
-    Address backup = ScenarioAddress::backup1();
-    Address idle("idle1");
-    Address client = ScenarioAddress::client1();
 
-    tests.test("V1 startup view is empty", [&] {
-        ViewServer vs(view_server);
-        tests.check(vs.currentView().number == 0,
-                    "startup view should be view 0");
-        tests.check(addressEmpty(vs.currentView().primary) &&
-                        addressEmpty(vs.currentView().backup),
-                    "startup view should have no primary or backup");
-        tests.check(vs.primaryAcked(),
-                    "empty startup view should not block the first primary");
-    });
+    tests.test("P18 multi-client writes become visible under reordered events", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client1 = ScenarioAddress::client1();
+        Address client2 = ScenarioAddress::client2();
 
-    tests.test("V2 first ping initializes the primary", [&] {
-        ViewServer vs(view_server);
-        View view = vs.pingServer(primary, 0);
-        tests.check(view.number == 1, "first installed view should be view 1");
-        tests.check(view.primary == primary, "first server should become primary");
-        tests.check(addressEmpty(view.backup), "first view should not have a backup");
-        tests.check(!vs.primaryAcked(),
-                    "new view should wait for the primary acknowledgement");
-    });
-
-    tests.test("V3 backup initialized after primary acknowledges", [&] {
-        ViewServer vs(view_server);
-        vs.pingServer(primary, 0);
-        vs.pingServer(primary, 1);
-        View view = vs.pingServer(backup, 0);
-        tests.check(view.number == 2, "backup should be installed in view 2");
-        tests.check(view.primary == primary, "primary should stay stable");
-        tests.check(view.backup == backup, "second server should become backup");
-    });
-
-    tests.test("V4 backup can ping first and become primary", [&] {
-        ViewServer vs(view_server);
-        View first = vs.pingServer(backup, 0);
-        tests.check(first.primary == backup,
-                    "first live server should become primary even if named backup");
-        vs.pingServer(backup, 1);
-        View second = vs.pingServer(primary, 0);
-        tests.check(second.primary == backup,
-                    "acknowledged first server should remain primary");
-        tests.check(second.backup == primary,
-                    "later server should fill the backup slot");
-    });
-
-    tests.test("V8 view server waits for primary ACK before changing view", [&] {
-        ViewServer vs(view_server);
-        vs.pingServer(primary, 0);
-        View premature = vs.pingServer(backup, 0);
-        tests.check(premature.number == 1,
-                    "backup should not be installed before primary ACK");
-        tests.check(addressEmpty(premature.backup),
-                    "unacknowledged primary should block backup install");
-        vs.pingServer(primary, 0);
-        tests.check(vs.currentView().number == 1,
-                    "wrong primary view number should not ACK");
-        vs.pingServer(primary, 1);
-        View installed = vs.pingServer(backup, 0);
-        tests.check(installed.number == 2,
-                    "backup should install after the primary ACKs view 1");
-        tests.check(installed.backup == backup,
-                    "backup should be selected after ACK");
-    });
-
-    tests.test("V11 dead idle server is not selected as backup", [&] {
-        ViewServer vs(view_server);
-        vs.pingServer(primary, 0);
-        vs.pingServer(idle, 0);
-        vs.tick();
-        vs.tick();
-        vs.tick();
-        tests.check(!vs.serverAlive(idle),
-                    "idle server should be dead after missed ticks");
-        vs.pingServer(primary, 1);
-        tests.check(addressEmpty(vs.currentView().backup),
-                    "dead idle server should not become backup later");
-    });
-
-    tests.test("P1 client waits when no primary view exists", [&] {
+        Scenario scenario = twoClientPrimaryBackupScenario(
+            workloadForCommands(std::vector<Command>{createTitleTableCommand()}),
+            workloadForCommands(std::vector<Command>{
+                CreateTableCommand{
+                    "company_name",
+                    {"id:int", "name:string", "country_code:string"}}
+            }));
         SearchSettings settings;
-        SearchState state = viewAwareServiceState(false);
-        state = deliverClientViewLookup(state, settings, client, view_server);
+        SearchState state = scenario.state;
 
-        const auto* worker = state.nodeAs<PBClientWorker>(client);
-        tests.check(worker != nullptr, "PB client should exist");
-        tests.check(worker->resultCount() == 0,
-                    "client should not complete without a primary");
-        tests.check(!worker->done(),
-                    "client workload should remain blocked without a primary");
-        tests.check(addressEmpty(worker->currentView().primary),
-                    "client should remember the empty view");
-    });
-
-    tests.test("P2 single client completes against single primary", [&] {
-        SearchSettings settings;
-        SearchState state = viewAwareServiceState(true);
-        state = deliverClientViewLookup(state, settings, client, view_server);
-
-        EventRef request = requireMessageEvent(
+        EventRef first_request = requireMessageEvent(
             state,
             settings,
             [&](const MessageEnvelope& envelope) {
-                const auto* req = std::get_if<ClientRequest>(&envelope.message);
-                return req != nullptr &&
-                       req->client_id == 1 &&
-                       req->request_id == 1 &&
-                       envelope.from.rootAddress() == client &&
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 1 &&
+                       request->request_id == 1 &&
                        envelope.to.rootAddress() == primary;
             },
-            "client request to primary");
-        state = stepRequired(state, request, settings);
-
-        EventRef reply = requireMessageEvent(
+            "first client write");
+        state = stepRequired(state, first_request, settings);
+        EventRef second_request = requireMessageEvent(
             state,
             settings,
             [&](const MessageEnvelope& envelope) {
-                const auto* rep = std::get_if<ClientReply>(&envelope.message);
-                return rep != nullptr &&
-                       rep->client_id == 1 &&
-                       rep->request_id == 1 &&
-                       envelope.from.rootAddress() == primary &&
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 2 &&
+                       request->request_id == 1 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "second client write");
+        state = stepRequired(state, second_request, settings);
+
+        EventRef second_apply_first = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->op_number == 2 &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "op 2 backup apply before op 1");
+        state = stepRequired(state, second_apply_first, settings);
+        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+        tests.check(backup_node->appliedIndex() == 0 &&
+                        backup_node->pendingCount() == 1,
+                    "backup should buffer op 2 until op 1 arrives");
+
+        EventRef first_apply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->op_number == 1 &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "op 1 backup apply");
+        state = stepRequired(state, first_apply, settings);
+
+        EventRef second_ack_first = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 2 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "op 2 backup ack before op 1 ack");
+        state = stepRequired(state, second_ack_first, settings);
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node->commitIndex() == 0,
+                    "primary should not commit op 2 before op 1");
+
+        EventRef first_ack = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 1 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "op 1 backup ack");
+        state = stepRequired(state, first_ack, settings);
+
+        EventRef first_reply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply = std::get_if<ClientReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->client_id == 1 &&
+                       reply->request_id == 1 &&
+                       envelope.to.rootAddress() == client1;
+            },
+            "first client reply");
+        state = stepRequired(state, first_reply, settings);
+        EventRef second_reply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply = std::get_if<ClientReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->client_id == 2 &&
+                       reply->request_id == 1 &&
+                       envelope.to.rootAddress() == client2;
+            },
+            "second client reply");
+        state = stepRequired(state, second_reply, settings);
+
+        tests.check(clientsDone(state, std::vector<Address>{client1, client2}).ok,
+                    "both clients should complete");
+        CheckResult equal = primaryBackupCommittedEqual(state, 2);
+        tests.check(equal.ok, equal.message);
+        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{0}},
+                    "title table should be visible");
+        tests.check(primary_node->executeReadOnlyForTest(
+                        CountRowsCommand{"company_name"}) ==
+                        Result{CountRowsResult{0}},
+                    "company_name table should be visible");
+    });
+
+    tests.test("P19 repeated backup-link failures block safely and recover", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<Command> commands{
+            createTitleTableCommand(),
+            parseSQL("INSERT " + title_rows[0])
+        };
+        SearchState state =
+            oneClientPrimaryBackupScenario(workloadForCommands(commands)).state;
+
+        SearchSettings normal;
+        SearchSettings blocked;
+        blocked.linkActive(primary, backup, false);
+
+        EventRef first_request = requireMessageEvent(
+            state,
+            blocked,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 1 &&
+                       request->request_id == 1 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "first client request while backup link is down");
+        state = stepRequired(state, first_request, blocked);
+
+        SearchSettings blocked_search = blocked;
+        blocked_search.max_depth = 6;
+        blocked_search.max_states = 5000;
+        blocked_search.invariants.push_back(
+            Predicates::resultsOk(std::vector<Address>{client}));
+        blocked_search.invariants.push_back(
+            Predicates::primaryBackupAtMostOnce(primary, backup));
+        blocked_search.goals.push_back(
+            Predicates::clientsDone(std::vector<Address>{client}));
+        SearchResults first_blocked = bfs(state, blocked_search);
+        tests.check(
+            first_blocked.end_condition !=
+                SearchResults::EndCondition::GoalFound,
+            "client should not finish while the first backup apply is blocked");
+        tests.check(
+            first_blocked.end_condition !=
+                    SearchResults::EndCondition::InvariantViolated &&
+                first_blocked.end_condition !=
+                    SearchResults::EndCondition::ExceptionThrown,
+            "blocked first command should remain safe: " +
+                first_blocked.message);
+
+        EventRef first_apply = requireMessageEvent(
+            state,
+            normal,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->op_number == 1 &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "first backup apply after link heals");
+        state = stepRequired(state, first_apply, normal);
+        EventRef first_ack = requireMessageEvent(
+            state,
+            normal,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 1 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "first backup ack after link heals");
+        state = stepRequired(state, first_ack, normal);
+        EventRef first_reply = requireMessageEvent(
+            state,
+            normal,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply = std::get_if<ClientReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->client_id == 1 &&
+                       reply->request_id == 1 &&
                        envelope.to.rootAddress() == client;
             },
-            "primary reply to client");
-        state = stepRequired(state, reply, settings);
+            "first client reply after backup ack");
+        state = stepRequired(state, first_reply, normal);
 
-        const auto* worker = state.nodeAs<PBClientWorker>(client);
-        const auto* server = state.nodeAs<AtMostOnceServer>(primary);
-        tests.check(worker != nullptr && worker->done(),
-                    "client should finish the one-command workload");
-        tests.check(worker->resultsOk(), "client should receive CreateTableOk");
-        tests.check(server != nullptr && server->executionCount(1, 1) == 1,
-                    "primary should execute the request exactly once");
-    });
-
-    tests.test("P3 client sends work to the primary chosen by the view", [&] {
-        SearchSettings settings;
-        SearchState state = viewAwareServiceState(true, true);
-        state = deliverClientViewLookup(state, settings, client, view_server);
-
-        int to_primary = 0;
-        int to_backup = 0;
-        for (const auto& envelope : state.newMessages()) {
-            if (std::holds_alternative<ClientRequest>(envelope.message)) {
-                if (envelope.to.rootAddress() == primary) {
-                    ++to_primary;
-                }
-                if (envelope.to.rootAddress() == backup) {
-                    ++to_backup;
-                }
-            }
-        }
-        tests.check(to_primary == 1,
-                    "client should send exactly one request to the primary");
-        tests.check(to_backup == 0,
-                    "client should not send the command directly to the backup");
-    });
-
-    tests.test("P4 client observes the backup chosen by the view server", [&] {
-        SearchSettings settings;
-        SearchState state = viewAwareServiceState(true, true);
-        state = deliverClientViewLookup(state, settings, client, view_server);
-
-        const auto* worker = state.nodeAs<PBClientWorker>(client);
-        tests.check(worker != nullptr, "PB client should exist");
-        tests.check(worker->currentView().primary == primary,
-                    "client should learn the current primary");
-        tests.check(worker->currentView().backup == backup,
-                    "client should learn the current backup");
-    });
-
-    tests.test("P5 view-server request count tracks client lookups", [&] {
-        SearchSettings settings;
-        SearchState state = viewAwareServiceState(false);
-        EventRef request = requireMessageEvent(
+        EventRef second_request = requireMessageEvent(
             state,
-            settings,
+            blocked,
             [&](const MessageEnvelope& envelope) {
-                return std::holds_alternative<ViewRequest>(envelope.message) &&
-                       envelope.to.rootAddress() == view_server;
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 1 &&
+                       request->request_id == 2 &&
+                       envelope.to.rootAddress() == primary;
             },
-            "counted view request");
-        state = stepRequired(state, request, settings);
+            "second client request while backup link is down");
+        state = stepRequired(state, second_request, blocked);
 
-        const auto* vs = state.nodeAs<ViewServer>(view_server);
-        tests.check(vs != nullptr, "view server should exist");
-        tests.check(vs->viewRequestCount() == 1,
-                    "view server should count the client lookup");
+        SearchResults second_blocked = bfs(state, blocked_search);
+        tests.check(
+            second_blocked.end_condition !=
+                SearchResults::EndCondition::GoalFound,
+            "client should not finish while the second backup apply is blocked");
+        tests.check(
+            second_blocked.end_condition !=
+                    SearchResults::EndCondition::InvariantViolated &&
+                second_blocked.end_condition !=
+                    SearchResults::EndCondition::ExceptionThrown,
+            "blocked second command should remain safe: " +
+                second_blocked.message);
+
+        EventRef second_apply = requireMessageEvent(
+            state,
+            normal,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->op_number == 2 &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "second backup apply after link heals");
+        state = stepRequired(state, second_apply, normal);
+        EventRef second_ack = requireMessageEvent(
+            state,
+            normal,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 2 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "second backup ack after link heals");
+        state = stepRequired(state, second_ack, normal);
+        EventRef second_reply = requireMessageEvent(
+            state,
+            normal,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply = std::get_if<ClientReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->client_id == 1 &&
+                       reply->request_id == 2 &&
+                       envelope.to.rootAddress() == client;
+            },
+            "second client reply after backup ack");
+        state = stepRequired(state, second_reply, normal);
+
+        tests.check(clientDone(state, client).ok,
+                    "client should finish after both links heal");
+        CheckResult equal = primaryBackupCommittedEqual(state, 2);
+        tests.check(equal.ok, equal.message);
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{1}},
+                    "the real title tuple should be visible after recovery");
     });
 
-    tests.test("P16 bounded search finds single-client single-server completion", [&] {
+    tests.test("P20 multi-client random DFS reaches a safe completion", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client1 = ScenarioAddress::client1();
+        Address client2 = ScenarioAddress::client2();
+
+        Scenario scenario = twoClientPrimaryBackupScenario(
+            workloadForCommands(std::vector<Command>{createTitleTableCommand()}),
+            workloadForCommands(std::vector<Command>{
+                CreateTableCommand{
+                    "company_name",
+                    {"id:int", "name:string", "country_code:string"}}
+            }));
+
         SearchSettings settings;
-        settings.max_depth = 6;
-        settings.max_states = 2000;
-        settings.invariants.push_back(Predicates::resultsOk({client}));
-        settings.goals.push_back(Predicates::clientsDone({client}));
+        settings.max_depth = 14;
+        settings.max_states = 50000;
+        settings.seed = 114;
+        settings.random_dfs_probes = 500;
+        settings.invariants.push_back(
+            Predicates::resultsOk(std::vector<Address>{client1, client2}));
+        settings.invariants.push_back(
+            Predicates::primaryBackupAtMostOnce(primary, backup));
+        settings.goals.push_back({
+            "MULTI_CLIENT_RANDOM_DFS_DONE",
+            [client1, client2](const SearchState& state) {
+                CheckResult done =
+                    clientsDone(state, std::vector<Address>{client1, client2});
+                if (!done.ok) {
+                    return done;
+                }
+                return primaryBackupCommittedEqual(state, 2);
+            }
+        });
 
-        SearchResults result = bfs(viewAwareServiceState(true), settings);
-        std::cout << "  search: " << endConditionName(result.end_condition)
-                  << ", explored=" << result.explored
-                  << ", message=" << result.message << std::endl;
-        tests.check(result.end_condition ==
-                        SearchResults::EndCondition::GoalFound,
-                    "bounded search should find a completed client");
-        tests.check(result.explored > 0,
-                    "bounded search should explore at least one state");
-    });
-
-    return tests.finish();
-}
-
-int main(int argc, char* argv[]) {
-    (void) argc;
-    (void) argv;
-    return runV110ControlPlaneTests();
-
-    std::cout << "BuzzDB v110: primary-backup BuzzDB replication inside the search simulator" << std::endl;
-    const std::string imdb_file = argc > 1 ? argv[1] : defaultImdbInputFile();
-    printLocalBuzzDBTrace(imdb_file);
-    printDistributedServiceTrace(imdb_file);
-    printPrimaryBackupTrace(imdb_file);
-    printFullPrimaryBackupLoadTrace(imdb_file);
-    printActualPrimaryBackupSearchStates(20, imdb_file);
-    printV104BootstrapTrace(imdb_file);
-
-    TestRunner tests;
-    Address server("server1");
-    Address client("client1");
-
-    tests.test("SearchSettings uses explicit delivery priority", [&] {
-        SearchSettings settings;
-        Command first_command = createExplicitJobJoinCommands(imdb_file).front();
-        MessageEnvelope envelope{
-            1,
-            client,
-            server,
-            ClientRequest{1, 1, first_command}};
-        tests.check(settings.shouldDeliver(envelope), "default network should deliver");
-        settings.networkActive(false);
-        tests.check(!settings.shouldDeliver(envelope), "inactive network should block delivery");
-        settings.linkActive(client, server, true);
-        tests.check(settings.shouldDeliver(envelope), "explicit link should override network");
-        settings.senderActive(client, false);
-        tests.check(settings.shouldDeliver(envelope), "explicit link should override sender");
-        settings.resetNetwork();
-        settings.senderActive(client, false);
-        tests.check(!settings.shouldDeliver(envelope), "inactive sender should block delivery");
-        settings.receiverActive(server, true);
-        tests.check(!settings.shouldDeliver(envelope), "sender should take priority over receiver");
-        settings.resetNetwork();
-        settings.receiverActive(server, false);
-        tests.check(!settings.shouldDeliver(envelope), "inactive receiver should block delivery");
-        settings.resetNetwork();
-        tests.check(settings.shouldDeliver(envelope), "resetNetwork should restore delivery");
+        SearchResults result = randomDfs(scenario.state, settings);
+        tests.check(
+            result.end_condition == SearchResults::EndCondition::GoalFound,
+            "random DFS should find a safe multi-client completion, saw " +
+                endConditionName(result.end_condition) + ": " +
+                result.message);
+        std::cout << "  P20 explored states: " << result.explored
+                  << std::endl;
     });
 
     tests.test("BuzzDBCore routes commands through real v104 storage", [&] {
@@ -16977,7 +18902,7 @@ int main(int argc, char* argv[]) {
         const std::string updated_year =
             replacementProductionYear(first_title[3]);
 
-        std::filesystem::path dir = std::filesystem::temp_directory_path() / "buzzdb-v110-real-log-test";
+        std::filesystem::path dir = std::filesystem::temp_directory_path() / "buzzdb-v114-real-log-test";
         std::filesystem::create_directories(dir);
         std::string db_file = (dir / "buzzdb.dat").string();
         removeBuzzDBBundle(db_file);
@@ -17007,142 +18932,16 @@ int main(int argc, char* argv[]) {
         std::filesystem::remove_all(dir, ec);
     });
 
-    tests.test("BuzzDB parser and tuple loader feed the real core", [&] {
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 2);
-        std::vector<std::string> first_title =
-            tupleValuesFromLine(title_rows[0], "title");
-        std::vector<std::string> second_title =
-            tupleValuesFromLine(title_rows[1], "title");
-        const std::string updated_year =
-            replacementProductionYear(first_title[3]);
-        std::vector<std::string> updated_first_title = first_title;
-        updated_first_title[3] = updated_year;
-
-        BuzzDBCore db;
-        Command create = createTitleTableCommand();
-        tests.check(std::holds_alternative<CreateTableCommand>(create), "parser should produce create command");
-        tests.check(db.execute(create) == Result{CreateTableOkResult{}}, "create should succeed");
-        std::istringstream tuple_stream(joinTupleLines(title_rows));
-        for (const auto& command : loadTupleFileCommands(tuple_stream, imdb_file + ":title")) {
-            tests.check(db.execute(command) == Result{InsertOkResult{}}, "tuple-file insert should succeed");
-        }
-        tests.check(db.execute(parseSQL("UPDATE title SET production_year=" +
-                                        updated_year + " WHERE id=" +
-                                        first_title[0])) == Result{UpdateRowsResult{1}},
-                    "update should report matched row count");
-        tests.check(db.execute(parseSQL("DELETE FROM title WHERE id=" +
-                                        second_title[0])) == Result{DeleteRowsResult{1}},
-                    "delete should report matched row count");
-        tests.check(db.execute(parseSQL("SELECT * FROM title WHERE id=" +
-                                        first_title[0])) == Result{SelectAllResult{
-                        {"id", "title", "kind_id", "production_year"},
-                        {updated_first_title}}},
-                    "SELECT * WHERE should be translated to a v104 PROJECT query");
-    });
-
-    tests.test("BuzzDBCore bootstraps v104 JOB tables from an IMDB tuple file", [&] {
-        std::filesystem::path dir = std::filesystem::temp_directory_path() / "buzzdb-v110-bootstrap-test";
-        std::filesystem::remove_all(dir);
-        std::filesystem::create_directories(dir);
-        {
-            BuzzDBCore db((dir / "buzzdb.dat").string());
-            db.bootstrapJobDatabase(imdb_file);
-            tests.check(std::filesystem::exists(dir / "buzzdb.dat"),
-                        "bootstrap should generate buzzdb.dat");
-            tests.check(db.tableNames().size() == 14,
-                        "v104 bootstrap should create the JOB/IMDB table set");
-            Result title_count = db.execute(CountRowsCommand{"title"});
-            const auto* title_rows = std::get_if<CountRowsResult>(&title_count);
-            tests.check(title_rows != nullptr && title_rows->count > 0,
-                        "real IMDB tuple file should populate title");
-            Result company_count = db.execute(CountRowsCommand{"movie_companies"});
-            const auto* company_rows = std::get_if<CountRowsResult>(&company_count);
-            tests.check(company_rows != nullptr && company_rows->count > 0,
-                        "real IMDB tuple file should populate movie_companies");
-            Result join_result = db.execute(
-                QuerySQLCommand{jobDistributorJoinQuery()});
-            const auto* join_rows = std::get_if<QueryRowsResult>(&join_result);
-            tests.check(join_rows != nullptr && join_rows->count > 0,
-                        "real JOB join query should return rows");
-        }
-        std::filesystem::remove_all(dir);
-    });
-
-    tests.test("Simulator server calls BuzzDBApplication once per client request", [&] {
-        Scenario scenario =
-            oneClientBuzzDBScenario(createExplicitJobJoinWorkload(imdb_file));
-        SearchState state = scenario.state;
-        auto first = state.stepEvent(state.events().front());
-        tests.check(first.has_value(), "client request should be deliverable");
-        auto server_node = first->nodeAs<AtMostOnceServer>(ScenarioAddress::server1());
-        tests.check(server_node != nullptr && server_node->maxExecutionCount() == 1,
-                    "server should execute the BuzzDB command once");
-    });
-
-    tests.test("Retry duplicates use cached result without re-executing BuzzDB", [&] {
-        Address server = ScenarioAddress::server1();
-        Address client = ScenarioAddress::client1();
-        SearchSettings settings;
-        SearchState state = oneClientBuzzDBScenario(
-            createExplicitJobJoinWorkload(imdb_file)).state;
-
-        EventRef initial_request = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request = std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == server;
-            },
-            "initial test request");
-        state = stepRequired(state, initial_request, settings);
-
-        EventRef retry_timer = requireTimerEvent(
-            state,
-            settings,
-            [&](const TimerEnvelope& timer) {
-                const auto* retry = std::get_if<RetryTimer>(&timer.timer);
-                return retry != nullptr &&
-                       retry->request_id == 1 &&
-                       timer.to.rootAddress() == client;
-            },
-            "test retry timer");
-        state = stepRequired(state, retry_timer, settings);
-
-        uint64_t duplicate_id = 0;
-        for (const auto& envelope : state.newMessages()) {
-            const auto* request = std::get_if<ClientRequest>(&envelope.message);
-            if (request != nullptr &&
-                request->client_id == 1 &&
-                request->request_id == 1 &&
-                envelope.to.rootAddress() == server) {
-                duplicate_id = envelope.id;
-            }
-        }
-        tests.check(duplicate_id != 0, "retry should enqueue duplicate request");
-        state = stepRequired(state, {EventRef::Kind::Message, duplicate_id}, settings);
-
-        const auto* server_node = state.nodeAs<AtMostOnceServer>(server);
-        tests.check(server_node != nullptr, "server should still exist");
-        tests.check(server_node->cachedRequestCount() == 1,
-                    "server should cache one logical request");
-        tests.check(server_node->executionCount(1, 1) == 1,
-                    "duplicate request should not execute BuzzDB again");
-        tests.check(server_node->maxExecutionCount() == 1,
-                    "at-most-once invariant should hold");
-    });
-
-    tests.test("Primary-backup replies only after backup applies", [&] {
+    tests.test("Commit record appears only after backup acknowledgement", [&] {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
         SearchSettings settings;
-        SearchState state =
+        std::vector<Command> commands{createTitleTableCommand()};
+        Scenario scenario =
             oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file)).state;
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchState state = scenario.state;
 
         EventRef client_request = requireMessageEvent(
             state,
@@ -17161,10 +18960,21 @@ int main(int argc, char* argv[]) {
         tests.check(primary_node != nullptr, "primary should exist");
         tests.check(primary_node->pendingCount() == 1,
                     "primary should wait for backup acknowledgement");
-        tests.check(primary_node->executionCount(1, 1) == 0,
-                    "primary should not execute before backup ack");
-        tests.check(!newClientReplyFor(state, 1, 1),
-                    "primary should not reply before backup ack");
+        tests.check(primary_node->replicationLogSize() == 1 &&
+                        primary_node->hasLoggedOp(1),
+                    "primary should log op 1 before sending it to backup");
+        tests.check(primary_node->commitIndex() == 0,
+                    "primary should not commit before backup ack");
+        std::vector<std::string> primary_lines =
+            readNonEmptyLines(primary_node->replicationLogFile());
+        tests.check(countLinesStartingWith(primary_lines, "record=ENTRY") == 1,
+                    "primary log should contain one ENTRY record");
+        tests.check(countLinesStartingWith(primary_lines, "record=COMMIT") == 0,
+                    "primary log should not contain a COMMIT before ack");
+        tests.check(!std::filesystem::exists(
+                        std::filesystem::path(primary_node->replicationLogFile())
+                            .parent_path() / "replication.meta"),
+                    "commit index should not live in a side metadata file");
 
         EventRef backup_apply = requireMessageEvent(
             state,
@@ -17184,8 +18994,17 @@ int main(int argc, char* argv[]) {
                     "backup should apply op 1");
         tests.check(backup_node->executionCount(1, 1) == 1,
                     "backup should execute command once");
-        tests.check(!newClientReplyFor(state, 1, 1),
-                    "backup reply should go to primary, not the client");
+        tests.check(backup_node->replicationLogSize() == 1 &&
+                        backup_node->hasLoggedOp(1),
+                    "backup should log op 1 before applying it");
+        tests.check(backup_node->commitIndex() == 1,
+                    "backup should append a commit record after applying op 1");
+        std::vector<std::string> backup_lines =
+            readNonEmptyLines(backup_node->replicationLogFile());
+        tests.check(countLinesStartingWith(backup_lines, "record=ENTRY") == 1,
+                    "backup log should contain one ENTRY record");
+        tests.check(hasLineStartingWith(backup_lines, "record=COMMIT\tindex=1"),
+                    "backup log should contain COMMIT index 1");
 
         EventRef backup_ack = requireMessageEvent(
             state,
@@ -17203,110 +19022,34 @@ int main(int argc, char* argv[]) {
         backup_node = state.nodeAs<BackupReplica>(backup);
         tests.check(primary_node != nullptr && backup_node != nullptr,
                     "primary and backup should exist after ack");
-        tests.check(primary_node->pendingCount() == 0,
-                    "primary should clear pending op after ack");
-        tests.check(primary_node->cachedRequestCount() == 1,
-                    "primary should cache completed client request");
-        tests.check(primary_node->executionCount(1, 1) == 1,
-                    "primary should execute once after backup ack");
+        tests.check(primary_node->commitIndex() == 1,
+                    "primary should append COMMIT after backup ack");
+        primary_lines = readNonEmptyLines(primary_node->replicationLogFile());
+        tests.check(hasLineStartingWith(primary_lines, "record=COMMIT\tindex=1"),
+                    "primary log should contain COMMIT index 1 after ack");
         tests.check(newClientReplyFor(state, 1, 1),
                     "primary should reply after backup ack");
         tests.check(primary_node->appDigest() == backup_node->appDigest(),
                     "primary and backup BuzzDB digests should match");
     });
 
-    tests.test("Primary and backup use different local ARIES log files", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        SearchState state =
-            oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file)).state;
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
-        tests.check(primary_node != nullptr && backup_node != nullptr,
-                    "primary and backup should exist");
-        tests.check(primary_node->logFile() != backup_node->logFile(),
-                    "primary and backup must not share a local buzzdb.log file");
-    });
-
-    tests.test("Primary-backup retry resends pending op without double execution", [&] {
+    tests.test("Read-index read does not append a replicated operation", [&] {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
-        SearchSettings settings;
-        SearchState state =
-            oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file)).state;
-
-        EventRef client_request = requireMessageEvent(
-            state,
-            settings,
-            [&](const MessageEnvelope& envelope) {
-                const auto* request = std::get_if<ClientRequest>(&envelope.message);
-                return request != nullptr &&
-                       request->client_id == 1 &&
-                       request->request_id == 1 &&
-                       envelope.to.rootAddress() == primary;
-            },
-            "primary-backup initial retry request");
-        state = stepRequired(state, client_request, settings);
-
-        EventRef retry_timer = requireTimerEvent(
-            state,
-            settings,
-            [&](const TimerEnvelope& timer) {
-                const auto* retry = std::get_if<RetryTimer>(&timer.timer);
-                return retry != nullptr &&
-                       retry->request_id == 1 &&
-                       timer.to.rootAddress() == client;
-            },
-            "primary-backup retry timer");
-        state = stepRequired(state, retry_timer, settings);
-
-        uint64_t duplicate_id = 0;
-        for (const auto& envelope : state.newMessages()) {
-            const auto* request = std::get_if<ClientRequest>(&envelope.message);
-            if (request != nullptr &&
-                request->client_id == 1 &&
-                request->request_id == 1 &&
-                envelope.to.rootAddress() == primary) {
-                duplicate_id = envelope.id;
-            }
-        }
-        tests.check(duplicate_id != 0, "retry should enqueue duplicate client request");
-        state = stepRequired(state, {EventRef::Kind::Message, duplicate_id}, settings);
-
-        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
-        tests.check(primary_node != nullptr, "primary should exist");
-        tests.check(primary_node->pendingCount() == 1,
-                    "duplicate request should reuse the pending operation");
-        tests.check(primary_node->nextOpNumber() == 2,
-                    "duplicate request should not allocate op 2");
-        tests.check(primary_node->executionCount(1, 1) == 0,
-                    "primary should still wait for backup before executing");
-
-        int resent_backup_applies = 0;
-        for (const auto& envelope : state.newMessages()) {
-            const auto* request = std::get_if<BackupApplyRequest>(&envelope.message);
-            if (request != nullptr &&
-                request->op_number == 1 &&
-                envelope.to.rootAddress() == backup) {
-                resent_backup_applies++;
-            }
-        }
-        tests.check(resent_backup_applies == 1,
-                    "duplicate client request should resend op 1 to backup");
-    });
-
-    tests.test("Primary-backup deterministic trace replicates explicit commands", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        std::vector<Command> commands = createExplicitJobJoinCommands(imdb_file);
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::vector<Command> commands{
+            createTitleTableCommand(),
+            InsertRowCommand{"title", first_title},
+            CountRowsCommand{"title"}
+        };
         Scenario scenario =
             oneClientPrimaryBackupScenario(
                 Workload(commands, buzzDBOracleResults(commands)));
-        SearchSettings settings;
+        SearchSettings settings = scenario.settings;
         SearchState state = scenario.state;
 
         for (size_t i = 0; i < commands.size(); ++i) {
@@ -17327,31 +19070,1199 @@ int main(int argc, char* argv[]) {
         const auto* backup_node = state.nodeAs<BackupReplica>(backup);
         tests.check(client_node != nullptr && primary_node != nullptr &&
                         backup_node != nullptr,
-                    "replicated trace should keep all nodes alive");
-        tests.check(client_node->done(),
-                    "client should finish the explicit command workload");
-        tests.check(client_node->results().size() == commands.size(),
-                    "client should receive one result per explicit command");
-        const auto* query_rows =
-            std::get_if<QueryRowsResult>(&client_node->results().back());
-        tests.check(query_rows != nullptr && query_rows->count == 2,
-                    "final query should return the two explicit distributor rows");
-        for (size_t i = 0; i < commands.size(); ++i) {
-            int request_id = static_cast<int>(i + 1);
-            tests.check(primary_node->executionCount(1, request_id) == 1,
-                        "primary should execute each client request once");
-            tests.check(backup_node->executionCount(1, request_id) == 1,
-                        "backup should execute each replicated op once");
-        }
-        tests.check(primary_node->appDigest() == backup_node->appDigest(),
-                    "primary and backup should finish with the same BuzzDB state");
+                    "read-index scenario should keep all nodes alive");
+        tests.check(client_node->results().size() == 3 &&
+                        client_node->results().back() ==
+                            Result{CountRowsResult{1}},
+                    "read-index read should return the committed row");
+        tests.check(primary_node->replicationLogSize() == 2 &&
+                        backup_node->replicationLogSize() == 2,
+                    "read-only request should not append a replicated entry");
+        tests.check(primary_node->commitIndex() == 2 &&
+                        backup_node->commitIndex() == 2,
+                    "read-only request should not advance commit indexes");
+        tests.check(primary_node->pendingReadCount() == 0,
+                    "read-index read should clear its pending read state");
+        tests.check(primary_node->executionCount(1, 3) == 1 &&
+                        backup_node->executionCount(1, 3) == 0,
+                    "primary should execute the read once after backup confirmation");
     });
 
-    tests.test("Primary-backup full IMDB load replicates explicit commands", [&] {
+    tests.test("Partitioned read-index read waits for backup confirmation", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::vector<Command> commands{
+            createTitleTableCommand(),
+            InsertRowCommand{"title", first_title},
+            CountRowsCommand{"title"}
+        };
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchSettings settings = scenario.settings;
+        SearchState state = scenario.state;
+
+        for (size_t i = 0; i < 2; ++i) {
+            state = deliverPrimaryBackupCommandRound(
+                state,
+                settings,
+                primary,
+                backup,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                static_cast<int>(i + 1),
+                false);
+        }
+
+        SearchSettings partitioned = settings;
+        partitioned.partition({{client, primary}, {backup}});
+        EventRef client_read = requireMessageEvent(
+            state,
+            partitioned,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 1 &&
+                       request->request_id == 3 &&
+                       envelope.from.rootAddress() == client &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "partitioned read request");
+        state = stepRequired(state, client_read, partitioned);
+
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node != nullptr, "primary should exist");
+        tests.check(primary_node->pendingReadCount() == 1,
+                    "partitioned primary should keep the read pending");
+        tests.check(primary_node->replicationLogSize() == 2 &&
+                        primary_node->commitIndex() == 2,
+                    "partitioned read should not append or commit an operation");
+        tests.check(!newClientReplyFor(state, 1, 3),
+                    "primary should not reply before the read-index reply");
+        tests.check(containsEnvelopeMatching(
+                        state,
+                        [&](const MessageEnvelope& envelope) {
+                            return std::get_if<ReadIndexRequest>(
+                                       &envelope.message) != nullptr &&
+                                   envelope.from.rootAddress() == primary &&
+                                   envelope.to.rootAddress() == backup;
+                        },
+                        "read-index request").ok,
+                    "partitioned read should leave a read-index request in flight");
+
+        bool read_index_deliverable = false;
+        for (const auto& event : state.events(partitioned)) {
+            const auto* envelope = messageForEvent(state, event);
+            if (envelope != nullptr &&
+                std::get_if<ReadIndexRequest>(&envelope->message) != nullptr &&
+                envelope->from.rootAddress() == primary &&
+                envelope->to.rootAddress() == backup) {
+                read_index_deliverable = true;
+            }
+        }
+        tests.check(!read_index_deliverable,
+                    "network partition should block primary-to-backup read index");
+
+        EventRef read_index = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ReadIndexRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 1 &&
+                       request->request_id == 3 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "healed read-index request");
+        const auto* read_index_envelope = messageForEvent(state, read_index);
+        const auto* read_index_request =
+            std::get_if<ReadIndexRequest>(&read_index_envelope->message);
+        int read_id = read_index_request->read_id;
+        state = stepRequired(state, read_index, settings);
+
+        EventRef read_index_reply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<ReadIndexReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->read_id == read_id &&
+                       reply->matched_index == 2 &&
+                       envelope.from.rootAddress() == backup &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "healed read-index reply");
+        state = stepRequired(state, read_index_reply, settings);
+
+        EventRef client_reply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply = std::get_if<ClientReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->client_id == 1 &&
+                       reply->request_id == 3 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == client;
+            },
+            "client reply after healed read-index reply");
+        state = stepRequired(state, client_reply, settings);
+
+        const auto* client_node = state.nodeAs<ClientWorker>(client);
+        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(client_node != nullptr && primary_node != nullptr,
+                    "client and primary should exist after healing");
+        tests.check(client_node->results().size() == 3 &&
+                        client_node->results().back() ==
+                            Result{CountRowsResult{1}},
+                    "healed read-index read should complete from committed state");
+        tests.check(primary_node->pendingReadCount() == 0 &&
+                        primary_node->replicationLogSize() == 2,
+                    "healed read should clear pending state without logging a read");
+    });
+
+    tests.test("Partitioned write waits for backup acknowledgement", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::vector<Command> commands{
+            createTitleTableCommand(),
+            InsertRowCommand{"title", first_title}
+        };
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchSettings settings = scenario.settings;
+        SearchState state = deliverPrimaryBackupCommandRound(
+            scenario.state,
+            settings,
+            primary,
+            backup,
+            client,
+            1,
+            1,
+            1,
+            false);
+
+        SearchSettings partitioned = settings;
+        partitioned.partition({{client, primary}, {backup}});
+        EventRef client_write = requireMessageEvent(
+            state,
+            partitioned,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 1 &&
+                       request->request_id == 2 &&
+                       envelope.from.rootAddress() == client &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "partitioned write request");
+        state = stepRequired(state, client_write, partitioned);
+
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node != nullptr, "primary should exist");
+        tests.check(primary_node->pendingCount() == 1,
+                    "partitioned primary should keep the write pending");
+        tests.check(primary_node->replicationLogSize() == 2 &&
+                        primary_node->commitIndex() == 1,
+                    "partitioned write should be logged but not committed");
+        tests.check(!newClientReplyFor(state, 1, 2),
+                    "primary should not reply before backup ack");
+
+        bool backup_apply_deliverable = false;
+        for (const auto& event : state.events(partitioned)) {
+            const auto* envelope = messageForEvent(state, event);
+            if (envelope != nullptr) {
+                const auto* apply =
+                    std::get_if<BackupApplyRequest>(&envelope->message);
+                if (apply != nullptr &&
+                    apply->op_number == 2 &&
+                    envelope->from.rootAddress() == primary &&
+                    envelope->to.rootAddress() == backup) {
+                    backup_apply_deliverable = true;
+                }
+            }
+        }
+        tests.check(!backup_apply_deliverable,
+                    "network partition should block primary-to-backup write apply");
+
+        EventRef backup_apply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* apply =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return apply != nullptr &&
+                       apply->op_number == 2 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "healed write apply");
+        state = stepRequired(state, backup_apply, settings);
+
+        EventRef backup_ack = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 2 &&
+                       envelope.from.rootAddress() == backup &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "healed write ack");
+        state = stepRequired(state, backup_ack, settings);
+
+        EventRef client_reply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply = std::get_if<ClientReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->client_id == 1 &&
+                       reply->request_id == 2 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == client;
+            },
+            "client reply after healed write");
+        state = stepRequired(state, client_reply, settings);
+
+        const auto* client_node = state.nodeAs<ClientWorker>(client);
+        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+        tests.check(client_node != nullptr && primary_node != nullptr &&
+                        backup_node != nullptr,
+                    "nodes should exist after healed write");
+        tests.check(client_node->done() &&
+                        client_node->results().back() == Result{InsertOkResult{}},
+                    "healed write should eventually complete");
+        tests.check(primary_node->commitIndex() == 2 &&
+                        backup_node->commitIndex() == 2 &&
+                        primary_node->appDigest() == backup_node->appDigest(),
+                    "healed write should commit on both replicas");
+    });
+
+    tests.test("Two-client updates stay ordered under reordered backup messages", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        Address client2 = ScenarioAddress::client2();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::vector<Command> prefix{
+            createTitleTableCommand(),
+            InsertRowCommand{"title", first_title}
+        };
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(prefix, buzzDBOracleResults(prefix)));
+        SearchSettings settings = scenario.settings;
+        SearchState state = scenario.state;
+        for (size_t i = 0; i < prefix.size(); ++i) {
+            state = deliverPrimaryBackupCommandRound(
+                state,
+                settings,
+                primary,
+                backup,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                static_cast<int>(i + 1),
+                false);
+        }
+
+        Command update_1999 = UpdateRowsCommand{
+            "title",
+            "production_year",
+            "1999",
+            "id",
+            first_title[0]
+        };
+        Command update_2000 = UpdateRowsCommand{
+            "title",
+            "production_year",
+            "2000",
+            "id",
+            first_title[0]
+        };
+        state.send(client, primary, ClientRequest{11, 1, update_1999});
+        state.send(client2, primary, ClientRequest{12, 1, update_2000});
+
+        EventRef first_update = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 11 &&
+                       request->request_id == 1 &&
+                       envelope.from.rootAddress() == client &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "first manual update request");
+        state = stepRequired(state, first_update, settings);
+
+        EventRef second_update = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 12 &&
+                       request->request_id == 1 &&
+                       envelope.from.rootAddress() == client2 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "second manual update request");
+        state = stepRequired(state, second_update, settings);
+
+        EventRef op4_apply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* apply =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return apply != nullptr &&
+                       apply->op_number == 4 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "op 4 apply before op 3");
+        state = stepRequired(state, op4_apply, settings);
+
+        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+        tests.check(backup_node != nullptr &&
+                        backup_node->pendingCount() == 1 &&
+                        backup_node->appliedIndex() == 2,
+                    "backup should buffer op 4 until op 3 arrives");
+
+        EventRef op3_apply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* apply =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return apply != nullptr &&
+                       apply->op_number == 3 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "op 3 apply after op 4");
+        state = stepRequired(state, op3_apply, settings);
+
+        EventRef op4_ack = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 4 &&
+                       envelope.from.rootAddress() == backup &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "op 4 ack before op 3 ack");
+        state = stepRequired(state, op4_ack, settings);
+
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node != nullptr &&
+                        primary_node->commitIndex() == 2 &&
+                        primary_node->executionCount(12, 1) == 0,
+                    "primary should buffer out-of-order backup ack");
+        tests.check(!newClientReplyFor(state, 12, 1),
+                    "out-of-order ack should not produce a client reply");
+
+        EventRef op3_ack = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 3 &&
+                       envelope.from.rootAddress() == backup &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "op 3 ack after op 4 ack");
+        state = stepRequired(state, op3_ack, settings);
+
+        primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        backup_node = state.nodeAs<BackupReplica>(backup);
+        tests.check(primary_node != nullptr && backup_node != nullptr,
+                    "primary and backup should exist after reordered acks");
+        tests.check(primary_node->commitIndex() == 4 &&
+                        backup_node->commitIndex() == 4,
+                    "primary should commit buffered acks in log order");
+        tests.check(primary_node->executionCount(11, 1) == 1 &&
+                        primary_node->executionCount(12, 1) == 1 &&
+                        backup_node->executionCount(11, 1) == 1 &&
+                        backup_node->executionCount(12, 1) == 1,
+                    "both updates should execute once on each replica");
+        Result final_rows =
+            primary_node->executeReadOnlyForTest(SelectAllCommand{"title"});
+        const auto* rows = std::get_if<SelectAllResult>(&final_rows);
+        tests.check(rows != nullptr &&
+                        rows->rows.size() == 1 &&
+                        rows->rows[0].size() == 4 &&
+                        rows->rows[0][3] == "2000",
+                    "final SQL-visible value should follow primary log order");
+        tests.check(primary_node->appDigest() == backup_node->appDigest(),
+                    "reordered messages should leave replicas equal");
+    });
+
+    tests.test("Stale duplicate backup acknowledgement is ignored", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        std::vector<Command> commands{createTitleTableCommand()};
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchState state = deliverPrimaryBackupCommandRound(
+            scenario.state,
+            settings,
+            primary,
+            backup,
+            client,
+            1,
+            1,
+            1,
+            false);
+
+        EventRef stale_ack = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<BackupApplyReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->op_number == 1 &&
+                       reply->client_id == 1 &&
+                       reply->request_id == 1 &&
+                       envelope.from.rootAddress() == backup &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "stale duplicate backup ack");
+        state = stepRequired(state, stale_ack, settings);
+
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node != nullptr, "primary should exist");
+        tests.check(primary_node->commitIndex() == 1 &&
+                        primary_node->replicationLogSize() == 1 &&
+                        primary_node->pendingCount() == 0,
+                    "stale ack should not move primary protocol state");
+        tests.check(primary_node->executionCount(1, 1) == 1,
+                    "stale ack should not re-execute the command");
+        tests.check(!newClientReplyFor(state, 1, 1),
+                    "stale ack should not produce another client reply");
+    });
+
+    tests.test("Duplicate backup apply returns cached ack without reapply", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        SearchSettings settings;
+        std::vector<Command> commands{createTitleTableCommand()};
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchState state = scenario.state;
+
+        EventRef client_request = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->client_id == 1 &&
+                       request->request_id == 1 &&
+                       envelope.to.rootAddress() == primary;
+            },
+            "client request before duplicate backup apply");
+        state = stepRequired(state, client_request, settings);
+
+        EventRef backup_apply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->op_number == 1 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "first backup apply");
+        state = stepRequired(state, backup_apply, settings);
+
+        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+        tests.check(backup_node != nullptr, "backup should exist");
+        tests.check(backup_node->appliedOp() == 1,
+                    "backup should apply op 1 once");
+        tests.check(backup_node->executionCount(1, 1) == 1,
+                    "backup should execute first apply once");
+        tests.check(backup_node->replicationLogSize() == 1,
+                    "backup should have one replicated log entry");
+
+        state = stepRequired(state, backup_apply, settings);
+
+        backup_node = state.nodeAs<BackupReplica>(backup);
+        tests.check(backup_node != nullptr,
+                    "backup should still exist after duplicate apply");
+        tests.check(backup_node->appliedOp() == 1,
+                    "duplicate apply should not advance the applied op");
+        tests.check(backup_node->executionCount(1, 1) == 1,
+                    "duplicate apply should not execute the command again");
+        tests.check(backup_node->replicationLogSize() == 1,
+                    "duplicate apply should not append another log entry");
+        tests.check(backup_node->commitIndex() == 1,
+                    "backup commit index should remain at op 1");
+
+        size_t duplicate_acks = 0;
+        for (const auto& envelope : state.newMessages()) {
+            const auto* reply = std::get_if<BackupApplyReply>(&envelope.message);
+            if (reply != nullptr &&
+                reply->op_number == 1 &&
+                reply->client_id == 1 &&
+                reply->request_id == 1 &&
+                envelope.from.rootAddress() == backup &&
+                envelope.to.rootAddress() == primary &&
+                reply->result == Result{CreateTableOkResult{}}) {
+                duplicate_acks++;
+            }
+        }
+        tests.check(duplicate_acks == 1,
+                    "duplicate apply should produce one cached backup ack");
+
+        std::vector<std::string> backup_lines =
+            readNonEmptyLines(backup_node->replicationLogFile());
+        tests.check(countLinesStartingWith(backup_lines, "record=ENTRY") == 1,
+                    "duplicate apply should not duplicate ENTRY records");
+        tests.check(countLinesStartingWith(backup_lines, "record=COMMIT") == 1,
+                    "duplicate apply should not duplicate COMMIT records");
+        tests.check(countLinesStartingWith(backup_lines, "record=END") == 1,
+                    "duplicate apply should not duplicate END records");
+    });
+
+    tests.test("Snapshot truncates log and preserves duplicate suppression", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::vector<Command> commands{
+            createTitleTableCommand(),
+            InsertRowCommand{"title", first_title}
+        };
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchSettings settings = scenario.settings;
+        SearchState state = scenario.state;
+
+        for (size_t i = 0; i < commands.size(); ++i) {
+            state = deliverPrimaryBackupCommandRound(
+                state,
+                settings,
+                primary,
+                backup,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                static_cast<int>(i + 1),
+                false);
+        }
+
+        auto* primary_node = const_cast<PrimaryBackupServer*>(
+            state.nodeAs<PrimaryBackupServer>(primary));
+        tests.check(primary_node != nullptr, "primary should exist");
+        ReplicatedStateSnapshot snapshot =
+            primary_node->createSnapshotForTest();
+        tests.check(snapshot.last_included_op == 2,
+                    "snapshot should cover both committed operations");
+        tests.check(snapshot.digest == primary_node->appDigest(),
+                    "snapshot digest should match primary state");
+        tests.check(primary_node->snapshotIndex() == 2,
+                    "primary log should remember snapshot index 2");
+        tests.check(primary_node->replicationLogSize() == 0,
+                    "snapshot should truncate all covered operation entries");
+
+        std::vector<std::string> log_lines =
+            readNonEmptyLines(primary_node->replicationLogFile());
+        tests.check(hasLineStartingWith(log_lines, "record=SNAPSHOT\top=2"),
+                    "truncated log should contain snapshot metadata");
+        tests.check(countLinesStartingWith(log_lines, "record=ENTRY") == 0,
+                    "truncated log should not keep covered entries");
+        tests.check(hasLineStartingWith(log_lines, "record=COMMIT\tindex=2"),
+                    "truncated log should retain commit index");
+        tests.check(hasLineStartingWith(log_lines, "record=END\top=2"),
+                    "truncated log should retain local END op");
+
+        SearchState restarted_state;
+        restarted_state.addNode(std::make_unique<PrimaryBackupServer>(
+            primary,
+            backup,
+            primary_node->databaseFile(),
+            primary_node->replicationLogFile()));
+        const auto* restarted =
+            restarted_state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(restarted != nullptr, "restarted primary should exist");
+        tests.check(restarted->snapshotIndex() == 2,
+                    "restart should load snapshot metadata");
+        tests.check(restarted->cachedRequestCount() == 2,
+                    "restart should rebuild cache from snapshot apply fences");
+        tests.check(restarted->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{1}},
+                    "restart from snapshot should recover committed row");
+
+        restarted_state.send(client, primary, ClientRequest{1, 2, commands[1]});
+        auto after_duplicate =
+            restarted_state.stepEvent({EventRef::Kind::Message, 1}, settings);
+        tests.check(after_duplicate.has_value(),
+                    "duplicate post-snapshot request should be deliverable");
+        tests.check(newClientReplyFor(*after_duplicate, 1, 2),
+                    "duplicate post-snapshot request should use cached reply");
+        const auto* after_duplicate_primary =
+            after_duplicate->nodeAs<PrimaryBackupServer>(primary);
+        tests.check(after_duplicate_primary != nullptr &&
+                        after_duplicate_primary->executionCount(1, 2) == 1,
+                    "duplicate post-snapshot request should not re-execute");
+    });
+
+    tests.test("Backup installs snapshot and applies only log suffix", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 2);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::vector<std::string> second_title =
+            tupleValuesFromLine(title_rows[1], "title");
+        std::vector<Command> prefix{
+            createTitleTableCommand(),
+            InsertRowCommand{"title", first_title}
+        };
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(prefix, buzzDBOracleResults(prefix)));
+        SearchSettings settings = scenario.settings;
+        SearchState source_state = scenario.state;
+        for (size_t i = 0; i < prefix.size(); ++i) {
+            source_state = deliverPrimaryBackupCommandRound(
+                source_state,
+                settings,
+                primary,
+                backup,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                static_cast<int>(i + 1),
+                false);
+        }
+
+        auto* source_backup = const_cast<BackupReplica*>(
+            source_state.nodeAs<BackupReplica>(backup));
+        tests.check(source_backup != nullptr, "source backup should exist");
+        ReplicatedStateSnapshot snapshot =
+            source_backup->createSnapshotForTest();
+        tests.check(snapshot.last_included_op == 2,
+                    "source snapshot should cover the prefix");
+
+        SearchState state;
+        state.addNode(std::make_unique<BackupReplica>(backup));
+        state.send(primary, backup, SnapshotInstallRequest{snapshot});
+        EventRef install_snapshot = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                return std::holds_alternative<SnapshotInstallRequest>(
+                           envelope.message) &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "snapshot install request");
+        state = stepRequired(state, install_snapshot, settings);
+        tests.check(
+            containsEnvelopeMatching(
+                state,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* reply =
+                        std::get_if<SnapshotInstallReply>(&envelope.message);
+                    return reply != nullptr &&
+                           reply->last_included_op == 2 &&
+                           reply->digest == snapshot.digest &&
+                           envelope.from.rootAddress() == backup &&
+                           envelope.to.rootAddress() == primary;
+                },
+                "snapshot install reply").ok,
+            "fresh backup should acknowledge snapshot install");
+        const auto* installed = state.nodeAs<BackupReplica>(backup);
+        tests.check(installed != nullptr &&
+                        installed->snapshotIndex() == 2 &&
+                        installed->commitIndex() == 2,
+                    "fresh backup should install snapshot message through op 2");
+        tests.check(installed->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{1}},
+                    "installed snapshot should contain prefix row");
+
+        state.send(primary, backup, BackupApplyRequest{
+            3,
+            1,
+            3,
+            InsertRowCommand{"title", second_title}
+        });
+        EventRef suffix_apply = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->op_number == 3 &&
+                       envelope.from.rootAddress() == primary &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "snapshot suffix operation");
+        SearchState after_suffix =
+            stepRequired(state, suffix_apply, settings);
+        installed = after_suffix.nodeAs<BackupReplica>(backup);
+        tests.check(installed != nullptr &&
+                        installed->commitIndex() == 3 &&
+                        installed->replicationLogSize() == 1,
+                    "backup should log only the suffix after snapshot");
+        tests.check(installed->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{2}},
+                    "snapshot plus suffix should recover both rows");
+
+        std::vector<std::string> lines =
+            readNonEmptyLines(installed->replicationLogFile());
+        tests.check(hasLineStartingWith(lines, "record=SNAPSHOT\top=2"),
+                    "installed log should retain snapshot metadata");
+        tests.check(countLinesStartingWith(lines, "record=ENTRY") == 1,
+                    "installed log should contain only one suffix entry");
+
+        SearchState duplicate = after_suffix;
+        duplicate.send(primary, backup, BackupApplyRequest{
+            2,
+            1,
+            2,
+            prefix[1]
+        });
+        EventRef duplicate_apply = requireMessageEvent(
+            duplicate,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<BackupApplyRequest>(&envelope.message);
+                return request != nullptr &&
+                       request->op_number == 2 &&
+                       envelope.to.rootAddress() == backup;
+            },
+            "snapshot-covered duplicate apply");
+        auto after_duplicate =
+            duplicate.stepEvent(duplicate_apply, settings);
+        tests.check(after_duplicate.has_value(),
+                    "snapshot-covered duplicate apply should be deliverable");
+        installed = after_duplicate->nodeAs<BackupReplica>(backup);
+        tests.check(installed != nullptr &&
+                        installed->replicationLogSize() == 1 &&
+                        installed->executionCount(1, 2) == 1,
+                    "snapshot-covered duplicate should not append or re-execute");
+        size_t cached_acks = 0;
+        for (const auto& envelope : after_duplicate->newMessages()) {
+            const auto* reply = std::get_if<BackupApplyReply>(&envelope.message);
+            if (reply != nullptr &&
+                reply->op_number == 2 &&
+                reply->client_id == 1 &&
+                reply->request_id == 2 &&
+                envelope.from.rootAddress() == backup &&
+                envelope.to.rootAddress() == primary) {
+                cached_acks++;
+            }
+        }
+        tests.check(cached_acks == 1,
+                    "snapshot-covered duplicate should return cached ack");
+    });
+
+    tests.test("Primary restart replays committed prefix and duplicate cache", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<Command> commands{createTitleTableCommand()};
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchSettings settings = scenario.settings;
+        SearchState state = deliverPrimaryBackupCommandRound(
+            scenario.state,
+            settings,
+            primary,
+            backup,
+            client,
+            1,
+            1,
+            1,
+            false);
+
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(primary_node != nullptr, "primary should exist");
+        tests.check(primary_node->commitIndex() == 1,
+                    "op 1 should be committed before restart");
+
+        SearchState restarted_state;
+        restarted_state.addNode(std::make_unique<PrimaryBackupServer>(
+            primary,
+            backup,
+            primary_node->databaseFile(),
+            primary_node->replicationLogFile()));
+        const auto* restarted =
+            restarted_state.nodeAs<PrimaryBackupServer>(primary);
+        tests.check(restarted != nullptr, "restarted primary should exist");
+        tests.check(restarted->commitIndex() == 1,
+                    "restarted primary should load commit index 1");
+        tests.check(restarted->cachedRequestCount() == 1,
+                    "restarted primary should rebuild duplicate cache");
+        std::vector<std::string> log_lines =
+            readNonEmptyLines(primary_node->replicationLogFile());
+        tests.check(hasLineStartingWith(log_lines, "record=COMMIT\tindex=1"),
+                    "restart source log should contain COMMIT index 1");
+        tests.check(restarted->executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{0}},
+                    "restarted primary should replay committed create table");
+
+        restarted_state.send(client, primary, ClientRequest{1, 1, commands[0]});
+        auto after_duplicate =
+            restarted_state.stepEvent({EventRef::Kind::Message, 1}, settings);
+        tests.check(after_duplicate.has_value(),
+                    "duplicate request after restart should be deliverable");
+        tests.check(newClientReplyFor(*after_duplicate, 1, 1),
+                    "duplicate request after restart should use cached reply");
+        const auto* after_duplicate_primary =
+            after_duplicate->nodeAs<PrimaryBackupServer>(primary);
+        tests.check(after_duplicate_primary != nullptr &&
+                        after_duplicate_primary->executionCount(1, 1) == 1,
+                    "duplicate request after restart should not execute again");
+    });
+
+    tests.test("Restart replay ignores uncommitted operation log tail", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::filesystem::path dir =
+            std::filesystem::temp_directory_path() /
+            ("buzzdb-v114-uncommitted-tail-test-" +
+             std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+
+        {
+            ReplicatedOperationLog log((dir / "replication.log").string(),
+                                       false,
+                                       false);
+            log.append(ReplicatedLogEntry{
+                1,
+                1,
+                1,
+                createTitleTableCommand()});
+            log.advanceCommitIndex(1);
+            log.append(ReplicatedLogEntry{
+                2,
+                1,
+                2,
+                InsertRowCommand{"title", first_title}});
+            std::vector<std::string> lines = readNonEmptyLines(log.file());
+            tests.check(countLinesStartingWith(lines, "record=ENTRY") == 2,
+                        "test log should contain two operation entries");
+            tests.check(hasLineStartingWith(lines, "record=COMMIT\tindex=1"),
+                        "test log should commit only the first operation");
+            tests.check(!hasLineStartingWith(lines, "record=COMMIT\tindex=2"),
+                        "test log should not commit the tail operation");
+
+            PrimaryBackupServer restarted(
+                primary,
+                backup,
+                (dir / "buzzdb.dat").string(),
+                log.file());
+            tests.check(restarted.commitIndex() == 1,
+                        "restart should load committed prefix length 1");
+            tests.check(restarted.replicationLogSize() == 2,
+                        "restart should see the uncommitted tail in the log");
+            tests.check(restarted.cachedRequestCount() == 1,
+                        "restart should cache only committed requests");
+            tests.check(restarted.executionCount(1, 1) == 1,
+                        "committed op should replay once");
+            tests.check(restarted.executionCount(1, 2) == 0,
+                        "uncommitted tail should not replay");
+            tests.check(restarted.executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{0}},
+                        "uncommitted insert should not affect recovered table");
+        }
+
+        std::filesystem::remove_all(dir);
+    });
+
+    tests.test("Restart replays committed operation missing the DB apply fence", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::filesystem::path dir =
+            std::filesystem::temp_directory_path() /
+            ("buzzdb-v114-committed-missing-fence-test-" +
+             std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        std::string db_file = (dir / "buzzdb.dat").string();
+        std::string log_file = (dir / "replication.log").string();
+
+        {
+            BuzzDBCore db(db_file);
+            runWithSuppressedStdout([&] {
+                db.executeReplicated(1, 1, 1, createTitleTableCommand());
+                return 0;
+            });
+        }
+
+        {
+            ReplicatedOperationLog log(log_file, false, false);
+            log.append(ReplicatedLogEntry{1, 1, 1, createTitleTableCommand()});
+            log.advanceCommitIndex(1);
+            log.endOp(1);
+            log.append(ReplicatedLogEntry{
+                2,
+                1,
+                2,
+                InsertRowCommand{"title", first_title}});
+            log.advanceCommitIndex(2);
+
+            PrimaryBackupServer restarted(primary, backup, db_file, log.file());
+            tests.check(restarted.commitIndex() == 2,
+                        "restart should load protocol commit index 2");
+            tests.check(restarted.appliedIndex() == 2,
+                        "restart should advance apply progress after replay");
+            tests.check(restarted.executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{1}},
+                        "committed op missing from DB should be replayed once");
+            std::vector<std::string> lines = readNonEmptyLines(log.file());
+            tests.check(hasLineStartingWith(lines, "record=END\top=2"),
+                        "replay should leave a durable END op record");
+        }
+
+        std::filesystem::remove_all(dir);
+    });
+
+    tests.test("Restart trusts DB apply fence when END op record is missing", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::filesystem::path dir =
+            std::filesystem::temp_directory_path() /
+            ("buzzdb-v114-fence-without-applied-test-" +
+             std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        std::string db_file = (dir / "buzzdb.dat").string();
+        std::string log_file = (dir / "replication.log").string();
+
+        {
+            BuzzDBCore db(db_file);
+            runWithSuppressedStdout([&] {
+                db.executeReplicated(1, 1, 1, createTitleTableCommand());
+                db.executeReplicated(
+                    2,
+                    1,
+                    2,
+                    InsertRowCommand{"title", first_title});
+                return 0;
+            });
+        }
+
+        {
+            ReplicatedOperationLog log(log_file, false, false);
+            log.append(ReplicatedLogEntry{1, 1, 1, createTitleTableCommand()});
+            log.advanceCommitIndex(1);
+            log.endOp(1);
+            log.append(ReplicatedLogEntry{
+                2,
+                1,
+                2,
+                InsertRowCommand{"title", first_title}});
+            log.advanceCommitIndex(2);
+
+            PrimaryBackupServer restarted(primary, backup, db_file, log.file());
+            tests.check(restarted.appliedIndex() == 2,
+                        "restart should reconstruct apply progress from DB fence");
+            tests.check(restarted.cachedRequestCount() == 2,
+                        "restart should rebuild duplicate cache from DB fence rows");
+            tests.check(restarted.executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{1}},
+                        "operation with DB fence should not be replayed twice");
+            std::vector<std::string> lines = readNonEmptyLines(log.file());
+            tests.check(hasLineStartingWith(lines, "record=END\top=2"),
+                        "restart should repair missing END op record");
+        }
+
+        std::filesystem::remove_all(dir);
+    });
+
+    tests.test("Restart rejects local apply fence beyond protocol commit", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::filesystem::path dir =
+            std::filesystem::temp_directory_path() /
+            ("buzzdb-v114-uncommitted-fence-test-" +
+             std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        std::string db_file = (dir / "buzzdb.dat").string();
+        std::string log_file = (dir / "replication.log").string();
+
+        {
+            BuzzDBCore db(db_file);
+            runWithSuppressedStdout([&] {
+                db.executeReplicated(1, 1, 1, createTitleTableCommand());
+                db.executeReplicated(
+                    2,
+                    1,
+                    2,
+                    InsertRowCommand{"title", first_title});
+                return 0;
+            });
+        }
+
+        bool rejected = false;
+        {
+            ReplicatedOperationLog log(log_file, false, false);
+            log.append(ReplicatedLogEntry{1, 1, 1, createTitleTableCommand()});
+            log.advanceCommitIndex(1);
+            log.endOp(1);
+            log.append(ReplicatedLogEntry{
+                2,
+                1,
+                2,
+                InsertRowCommand{"title", first_title}});
+            try {
+                PrimaryBackupServer restarted(primary, backup, db_file, log.file());
+                (void) restarted;
+            } catch (const std::runtime_error& error) {
+                rejected =
+                    std::string(error.what()).find("uncommitted replicated op") !=
+                    std::string::npos;
+            }
+        }
+        tests.check(rejected,
+                    "restart should reject a DB fence beyond protocol commit");
+
+        std::filesystem::remove_all(dir);
+    });
+
+    tests.test("Primary and backup restart to the same committed state", [&] {
+        Address primary = ScenarioAddress::server1();
+        Address backup = ScenarioAddress::backup1();
+        Address client = ScenarioAddress::client1();
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        std::vector<std::string> first_title =
+            tupleValuesFromLine(title_rows[0], "title");
+        std::vector<Command> commands{
+            createTitleTableCommand(),
+            InsertRowCommand{"title", first_title}
+        };
+        Scenario scenario =
+            oneClientPrimaryBackupScenario(
+                Workload(commands, buzzDBOracleResults(commands)));
+        SearchSettings settings = scenario.settings;
+        SearchState state = scenario.state;
+
+        for (size_t i = 0; i < commands.size(); ++i) {
+            state = deliverPrimaryBackupCommandRound(
+                state,
+                settings,
+                primary,
+                backup,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                static_cast<int>(i + 1),
+                false);
+        }
+
+        const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
+        const auto* backup_node = state.nodeAs<BackupReplica>(backup);
+        tests.check(primary_node != nullptr && backup_node != nullptr,
+                    "primary and backup should exist");
+        PrimaryBackupServer restarted_primary(
+            primary,
+            backup,
+            primary_node->databaseFile(),
+            primary_node->replicationLogFile());
+        BackupReplica restarted_backup(
+            backup,
+            backup_node->databaseFile(),
+            backup_node->replicationLogFile());
+        tests.check(restarted_primary.commitIndex() == 2,
+                    "restarted primary should load commit index 2");
+        tests.check(restarted_backup.commitIndex() == 2,
+                    "restarted backup should load commit index 2");
+        tests.check(restarted_primary.appDigest() ==
+                        restarted_backup.appDigest(),
+                    "both replicas should recover the same BuzzDB state");
+        tests.check(restarted_primary.executeReadOnlyForTest(
+                        CountRowsCommand{"title"}) ==
+                        Result{CountRowsResult{1}},
+                    "committed insert should be visible after restart");
+    });
+
+    tests.test("Full IMDB committed log replay and snapshot recover the JOB query", [&] {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
         std::vector<Command> commands = createFullJobLoadCommands(imdb_file);
+        size_t mutating_commands = countMutatingCommands(commands);
         Scenario scenario = oneClientPrimaryBackupScenario(
             Workload(commands, std::vector<Result>{}));
         SearchSettings settings;
@@ -17386,42 +20297,70 @@ int main(int argc, char* argv[]) {
                     "full replicated load should return all distributor rows");
         tests.check(primary_node->appDigest() == backup_node->appDigest(),
                     "full replicated load should leave matching replicas");
-        for (size_t i = 0; i < commands.size(); ++i) {
-            int request_id = static_cast<int>(i + 1);
-            tests.check(primary_node->executionCount(1, request_id) == 1,
-                        "primary should execute each full-load request once");
-            tests.check(backup_node->executionCount(1, request_id) == 1,
-                        "backup should execute each full-load op once");
-        }
-    });
+        tests.check(primary_node->replicationLogSize() == mutating_commands,
+                    "primary should log every mutating full-load operation");
+        tests.check(primary_node->commitIndex() ==
+                        static_cast<int>(mutating_commands),
+                    "primary should commit every mutating full-load operation");
+        std::vector<std::string> full_log_lines =
+            readNonEmptyLines(primary_node->replicationLogFile());
+        tests.check(countLinesStartingWith(full_log_lines, "record=ENTRY") ==
+                        mutating_commands,
+                    "primary full-load log should contain one ENTRY per write");
+        tests.check(hasLineStartingWith(
+                        full_log_lines,
+                        "record=COMMIT\tindex=" +
+                            std::to_string(mutating_commands)),
+                    "primary full-load log should contain final COMMIT");
+        PrimaryBackupServer restarted(primary,
+                                      backup,
+                                      primary_node->databaseFile(),
+                                      primary_node->replicationLogFile());
+        tests.check(restarted.commitIndex() ==
+                        static_cast<int>(mutating_commands),
+                    "full-load restart should load the committed prefix");
+        tests.check(restarted.cachedRequestCount() == mutating_commands,
+                    "full-load restart should rebuild durable write results");
+        tests.check(restarted.appDigest() == primary_node->appDigest(),
+                    "full-load restart should rebuild the same BuzzDB state");
+        tests.check(restarted.executeReadOnlyForTest(
+                        QuerySQLCommand{jobDistributorJoinRowsQuery()}) ==
+                        Result{QueryRowsResult{39}},
+                    "full-load restart should recover the JOB query result");
 
-    tests.test("Primary-backup bounded search exhausts without invariant failure", [&] {
-        Address primary = ScenarioAddress::server1();
-        Address backup = ScenarioAddress::backup1();
-        Address client = ScenarioAddress::client1();
-        Scenario scenario =
-            oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file));
-        SearchSettings settings;
-        settings.max_depth = 4;
-        settings.max_states = 120;
-        settings.invariants.push_back(
-            Predicates::primaryBackupAtMostOnce(primary, backup));
-        settings.invariants.push_back(Predicates::resultsOk({client}));
+        auto* mutable_primary = const_cast<PrimaryBackupServer*>(primary_node);
+        ReplicatedStateSnapshot snapshot =
+            mutable_primary->createSnapshotForTest();
+        tests.check(snapshot.last_included_op ==
+                        static_cast<int>(mutating_commands),
+                    "full-load snapshot should cover the full committed write prefix");
+        tests.check(mutable_primary->replicationLogSize() == 0,
+                    "full-load snapshot should truncate all operation entries");
+        std::vector<std::string> snapshot_log_lines =
+            readNonEmptyLines(mutable_primary->replicationLogFile());
+        tests.check(hasLineStartingWith(
+                        snapshot_log_lines,
+                        "record=SNAPSHOT\top=" +
+                            std::to_string(mutating_commands)),
+                    "full-load log should retain snapshot metadata");
+        tests.check(countLinesStartingWith(snapshot_log_lines, "record=ENTRY") == 0,
+                    "full-load log should not keep entries covered by snapshot");
 
-        SearchResults result = bfs(scenario.state, settings);
-        std::cout << "  invariant-only search: "
-                  << endConditionName(result.end_condition)
-                  << ", explored=" << result.explored
-                  << ", message=" << result.message << std::endl;
-        tests.check(result.end_condition !=
-                        SearchResults::EndCondition::InvariantViolated,
-                    "bounded invariant search should not find a violation");
-        tests.check(result.end_condition !=
-                        SearchResults::EndCondition::ExceptionThrown,
-                    "bounded invariant search should not throw");
-        tests.check(result.explored > 0,
-                    "bounded invariant search should explore states");
+        PrimaryBackupServer restarted_from_snapshot(
+            primary,
+            backup,
+            mutable_primary->databaseFile(),
+            mutable_primary->replicationLogFile());
+        tests.check(restarted_from_snapshot.snapshotIndex() ==
+                        static_cast<int>(mutating_commands),
+                    "snapshot restart should load full-load snapshot index");
+        tests.check(restarted_from_snapshot.cachedRequestCount() ==
+                        mutating_commands,
+                    "snapshot restart should rebuild durable write results");
+        tests.check(restarted_from_snapshot.executeReadOnlyForTest(
+                        QuerySQLCommand{jobDistributorJoinRowsQuery()}) ==
+                        Result{QueryRowsResult{39}},
+                    "snapshot restart should recover the JOB query result");
     });
 
     return tests.finish();

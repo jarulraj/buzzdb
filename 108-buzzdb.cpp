@@ -283,6 +283,7 @@ struct ClientRequest {
     int client_id;
     int request_id;
     Command command;
+    int acknowledged_request_id = 0;
 };
 
 struct ClientReply {
@@ -299,10 +300,6 @@ struct RetryTimer {
 
 using Timer = std::variant<RetryTimer>;
 
-std::string requestKey(int client_id, int request_id) {
-    return std::to_string(client_id) + ":" + std::to_string(request_id);
-}
-
 std::string describeMessage(const Message& message) {
     return std::visit(
         [](const auto& value) {
@@ -311,6 +308,7 @@ std::string describeMessage(const Message& message) {
             if constexpr (std::is_same_v<T, ClientRequest>) {
                 out << "ClientRequest(client=" << value.client_id
                     << ", req=" << value.request_id
+                    << ", ack=" << value.acknowledged_request_id
                     << ", " << describeCommand(value.command) << ")";
             } else if constexpr (std::is_same_v<T, ClientReply>) {
                 out << "ClientReply(client=" << value.client_id
@@ -945,7 +943,17 @@ public:
             return;
         }
 
-        std::string key = requestKey(request->client_id, request->request_id);
+        int& high_watermark = acknowledged_request_id_[request->client_id];
+        high_watermark = std::max(
+            high_watermark,
+            request->acknowledged_request_id);
+        compactClientCache(request->client_id, high_watermark);
+
+        if (request->request_id <= high_watermark) {
+            return;
+        }
+
+        RequestKey key{request->client_id, request->request_id};
         auto cached = cache_.find(key);
         if (cached == cache_.end()) {
             execution_count_[key]++;
@@ -962,7 +970,28 @@ public:
 
     std::unique_ptr<Node> clone() const override {
         return std::unique_ptr<Node>(
-            new AtMostOnceServer(address(), app_->clone(), cache_, execution_count_));
+            new AtMostOnceServer(
+                address(),
+                app_->clone(),
+                cache_,
+                execution_count_,
+                acknowledged_request_id_));
+    }
+
+    size_t cacheSize() const {
+        return cache_.size();
+    }
+
+    bool hasCachedResult(int client_id, int request_id) const {
+        return cache_.find(RequestKey{client_id, request_id}) != cache_.end();
+    }
+
+    int acknowledgedRequestId(int client_id) const {
+        auto it = acknowledged_request_id_.find(client_id);
+        if (it == acknowledged_request_id_.end()) {
+            return 0;
+        }
+        return it->second;
     }
 
     int maxExecutionCount() const {
@@ -986,18 +1015,33 @@ public:
     }
 
 private:
+    using RequestKey = std::pair<int, int>;
+
     AtMostOnceServer(Address address,
                     std::unique_ptr<Application> app,
-                    std::map<std::string, Result> cache,
-                    std::map<std::string, int> execution_count)
+                    std::map<RequestKey, Result> cache,
+                    std::map<RequestKey, int> execution_count,
+                    std::map<int, int> acknowledged_request_id)
         : Node(std::move(address)),
           app_(std::move(app)),
           cache_(std::move(cache)),
-          execution_count_(std::move(execution_count)) {}
+          execution_count_(std::move(execution_count)),
+          acknowledged_request_id_(std::move(acknowledged_request_id)) {}
+
+    void compactClientCache(int client_id, int high_watermark) {
+        for (auto it = cache_.begin(); it != cache_.end();) {
+            if (it->first.first == client_id && it->first.second <= high_watermark) {
+                it = cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 
     std::unique_ptr<Application> app_;
-    std::map<std::string, Result> cache_;
-    std::map<std::string, int> execution_count_;
+    std::map<RequestKey, Result> cache_;
+    std::map<RequestKey, int> execution_count_;
+    std::map<int, int> acknowledged_request_id_;
 };
 
 class ClientWorker : public Node {
@@ -1032,6 +1076,7 @@ public:
         }
 
         results_.push_back(reply->result);
+        last_completed_request_id_ = reply->request_id;
         waiting_ = false;
         in_flight_request_id_ = 0;
         sendNext(ctx);
@@ -1089,6 +1134,7 @@ public:
             << ", results=" << results_.size()
             << ", stale=" << stale_replies_
             << ", retries=" << retries_
+            << ", ack=" << last_completed_request_id_
             << ", workload=" << workload_.digest() << ")";
         return out.str();
     }
@@ -1105,7 +1151,8 @@ public:
             out << describeResult(results_[i]);
         }
         out << "], retries=" << retries_
-            << ", stale=" << stale_replies_ << "}";
+            << ", stale=" << stale_replies_
+            << ", ack=" << last_completed_request_id_ << "}";
         return out.str();
     }
 
@@ -1125,7 +1172,8 @@ private:
         ctx.send(server_, ClientRequest{
             client_id_,
             in_flight_request_id_,
-            in_flight_command_
+            in_flight_command_,
+            last_completed_request_id_
         });
         ctx.setTimer(RetryTimer{in_flight_request_id_}, 5, 7);
     }
@@ -1139,6 +1187,7 @@ private:
     Command in_flight_command_ = PingCommand{""};
     int retries_ = 0;
     int stale_replies_ = 0;
+    int last_completed_request_id_ = 0;
     std::vector<Command> sent_commands_;
     std::vector<Result> results_;
 };
@@ -2325,16 +2374,6 @@ int main() {
                     "resetNetwork should restore delivery");
     });
 
-    tests.test("KV oracle derives expected search workload results", [&] {
-        Workload workload = appendAppendGetWorkload();
-        tests.check(workload.expectedResult(0) == Result{AppendResult{"bar"}},
-                    "oracle should expect first append");
-        tests.check(workload.expectedResult(1) == Result{AppendResult{"barbar"}},
-                    "oracle should expect second append");
-        tests.check(workload.expectedResult(2) == Result{GetResult{"barbar"}},
-                    "oracle should expect final Get");
-    });
-
     tests.test("TestSpec runs workload setup, search config, and metadata", [&] {
         TestSpec spec;
         spec.title = "SpecHappyPing";
@@ -2433,26 +2472,6 @@ int main() {
         tests.check(queued_timer.ok, "retry timer should remain pending");
     });
 
-    tests.test("Single-client search can reach CLIENTS_DONE", [&] {
-        Scenario scenario = oneClientScenario();
-        SearchSettings settings = scenario.settings;
-        settings.max_depth = 8;
-        settings.max_states = 1000;
-        settings.invariants.push_back(
-            Predicates::resultsOk(std::vector<Address>{client}));
-        settings.invariants.push_back(Predicates::atMostOnce(server));
-        settings.goals.push_back(
-            Predicates::clientsDone(std::vector<Address>{client}));
-        SearchResults result = bfs(scenario.state, settings);
-        tests.check(result.end_condition == SearchResults::EndCondition::GoalFound,
-                    "CLIENTS_DONE should be reachable");
-        tests.check(result.terminal_state.has_value(),
-                    "goal search should return a terminal state");
-        tests.check(clientsDone(*result.terminal_state,
-                                std::vector<Address>{client}).ok,
-                    "terminal state should have the client done");
-    });
-
     tests.test("Single-client Put/Append/Get search", [&] {
         Scenario scenario = oneClientKVScenario(putAppendGetWorkload());
         SearchSettings settings = scenario.settings;
@@ -2460,6 +2479,7 @@ int main() {
         settings.max_states = 10000;
         settings.invariants.push_back(
             Predicates::resultsOk(std::vector<Address>{client}));
+        settings.invariants.push_back(Predicates::atMostOnce(server));
         settings.goals.push_back(
             Predicates::clientsDone(std::vector<Address>{client}));
         SearchResults result = bfs(scenario.state, settings);
@@ -2621,7 +2641,15 @@ int main() {
         Scenario scenario = oneClientScenario();
         SearchSettings settings = scenario.settings;
         settings.invariants.push_back(Predicates::atMostOnce(server));
-        EventRef request{EventRef::Kind::Message, 1};
+        auto requests = scenario.state.messageEventsMatching(
+            settings,
+            [client, server](const MessageEnvelope& envelope) {
+                return envelope.from == client &&
+                       envelope.to == server &&
+                       std::holds_alternative<ClientRequest>(envelope.message);
+            });
+        tests.check(!requests.empty(), "initial client request is missing");
+        EventRef request = requests.front();
         auto after_first = scenario.state.stepEvent(request, settings);
         tests.check(after_first.has_value(), "first request was not deliverable");
         auto after_duplicate = after_first->stepEvent(request, settings);
@@ -2629,6 +2657,68 @@ int main() {
                     "duplicate request was not deliverable");
         tests.check(serverAtMostOnce(*after_duplicate, server).ok,
                     "server executed duplicate request more than once");
+    });
+
+    tests.test("At-most-once cache garbage collects acknowledged requests", [&] {
+        Scenario scenario = oneClientKVScenario(putAppendGetWorkload());
+        SearchSettings settings = scenario.settings;
+        settings.max_depth = 25;
+        settings.max_states = 20000;
+        settings.invariants.push_back(
+            Predicates::resultsOk(std::vector<Address>{client}));
+        settings.invariants.push_back(Predicates::atMostOnce(server));
+        settings.goals.push_back(
+            Predicates::clientsDone(std::vector<Address>{client}));
+
+        SearchResults result = bfs(scenario.state, settings);
+        tests.check(result.end_condition == SearchResults::EndCondition::GoalFound,
+                    "client should finish the KV workload");
+        tests.check(result.terminal_state.has_value(),
+                    "goal search should return a terminal state");
+
+        const auto* server_node =
+            result.terminal_state->nodeAs<AtMostOnceServer>(server);
+        tests.check(server_node != nullptr, "server is missing");
+        tests.check(server_node->acknowledgedRequestId(1) == 2,
+                    "server should have compacted through request 2");
+        tests.check(server_node->cacheSize() == 1,
+                    "only the final unacknowledged request should remain cached");
+        tests.check(!server_node->hasCachedResult(1, 1),
+                    "request 1 should have been removed from the cache");
+        tests.check(!server_node->hasCachedResult(1, 2),
+                    "request 2 should have been removed from the cache");
+        tests.check(server_node->hasCachedResult(1, 3),
+                    "request 3 should remain cached until a later ack");
+
+        SearchState old_duplicate = *result.terminal_state;
+        old_duplicate.send(client, server, ClientRequest{
+            1,
+            1,
+            PutCommand{"foo", "bar"},
+            0
+        });
+        auto after_old = old_duplicate.stepMessageMatching(
+            settings,
+            [client, server](const MessageEnvelope& envelope) {
+                const auto* request =
+                    std::get_if<ClientRequest>(&envelope.message);
+                return envelope.from == client &&
+                       envelope.to == server &&
+                       request != nullptr &&
+                       request->request_id == 1;
+            });
+        tests.check(after_old.has_value(),
+                    "old duplicate request should be deliverable");
+        tests.check(after_old->newMessages().empty(),
+                    "collected old duplicate should not get a fresh reply");
+        tests.check(serverAtMostOnce(*after_old, server).ok,
+                    "old duplicate should not re-execute after compaction");
+        const auto* after_server = after_old->nodeAs<AtMostOnceServer>(server);
+        tests.check(after_server != nullptr, "server is missing after duplicate");
+        tests.check(after_server->cacheSize() == 1,
+                    "old duplicate should not grow the compacted cache");
+        tests.check(after_server->hasCachedResult(1, 3),
+                    "old duplicate should not evict the live cached request");
     });
 
     Workload workload(
@@ -2712,6 +2802,38 @@ int main() {
               << endConditionName(dfs_result.end_condition)
               << " after " << dfs_result.explored << " states"
               << " (" << dfs_result.message << ")" << std::endl;
+
+    tests.test("Bounded infinite-style workload random search finds a safe prefix", [&] {
+        Scenario scenario =
+            oneClientKVScenario(appendDifferentKeyWorkload("stream-key", 12));
+        SearchSettings settings = scenario.settings;
+        settings.deliverTimers(false);
+        settings.max_depth = 35;
+        settings.max_states = 5000;
+        settings.random_dfs_probes = 200;
+        settings.seed = 10842;
+        settings.invariants.push_back(
+            Predicates::resultsOk(std::vector<Address>{client}));
+        settings.invariants.push_back(Predicates::atMostOnce(server));
+        settings.goals.push_back({
+            "BOUNDED_STREAM_PREFIX",
+            [client](const SearchState& state) {
+                return clientHasResult(state, client, 4);
+            }
+        });
+
+        SearchResults result = randomDfs(scenario.state, settings);
+        tests.check(result.end_condition == SearchResults::EndCondition::GoalFound,
+                    "random DFS should find a valid running-workload prefix");
+        tests.check(result.terminal_state.has_value(),
+                    "prefix search should return a terminal state");
+        tests.check(clientHasResult(*result.terminal_state, client, 4).ok,
+                    "client should have at least four prefix results");
+        tests.check(!clientDone(*result.terminal_state, client).ok,
+                    "long stream should not be exhausted at the prefix goal");
+        tests.check(serverAtMostOnce(*result.terminal_state, server).ok,
+                    "prefix search should preserve at-most-once execution");
+    });
 
     SearchResults replay = replayTrace(initial, setup_search, first.terminal_state->history());
     tests.test("Trace replay reaches the same goal", [&] {
