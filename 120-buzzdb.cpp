@@ -13147,13 +13147,37 @@ struct AppendEntries {
     int prev_log_term = 0;
     std::vector<ConsensusLogEntryMessage> entries;
     int leader_commit = 0;
+    int compacted_through = 0;
 };
 
 struct AppendReply {
     int term = 0;
     Address replica;
     int match_index = 0;
+    int applied_index = 0;
     bool success = false;
+};
+
+struct InstallSnapshot {
+    int term = 0;
+    Address leader;
+    int last_included_index = 0;
+    int last_included_term = 0;
+    int leader_commit = 0;
+    BuzzDBCore db;
+    std::map<std::string, Result> session_results;
+    std::map<std::string, int> execution_count;
+};
+
+struct SnapshotReply {
+    int term = 0;
+    Address replica;
+    int last_included_index = 0;
+    bool success = false;
+};
+
+struct CompactLog {
+    int through_index = 0;
 };
 
 using Message = std::variant<
@@ -13163,7 +13187,10 @@ using Message = std::variant<
     RequestVote,
     VoteReply,
     AppendEntries,
-    AppendReply>;
+    AppendReply,
+    InstallSnapshot,
+    SnapshotReply,
+    CompactLog>;
 
 struct RetryTimer {
     int request_id;
@@ -13233,13 +13260,29 @@ std::string describeMessage(const Message& message) {
                     << ", prev=(" << value.prev_log_index
                     << "," << value.prev_log_term << ")"
                     << ", entries=" << value.entries.size()
-                    << ", commit=" << value.leader_commit << ")";
+                    << ", commit=" << value.leader_commit
+                    << ", compacted=" << value.compacted_through << ")";
             } else if constexpr (std::is_same_v<T, AppendReply>) {
                 out << "AppendReply(term=" << value.term
                     << ", replica=" << value.replica
                     << ", match=" << value.match_index
+                    << ", applied=" << value.applied_index
                     << ", success=" << (value.success ? "true" : "false")
                     << ")";
+            } else if constexpr (std::is_same_v<T, InstallSnapshot>) {
+                out << "InstallSnapshot(term=" << value.term
+                    << ", leader=" << value.leader
+                    << ", last=(" << value.last_included_index
+                    << "," << value.last_included_term << ")"
+                    << ", commit=" << value.leader_commit << ")";
+            } else if constexpr (std::is_same_v<T, SnapshotReply>) {
+                out << "SnapshotReply(term=" << value.term
+                    << ", replica=" << value.replica
+                    << ", last=" << value.last_included_index
+                    << ", success=" << (value.success ? "true" : "false")
+                    << ")";
+            } else if constexpr (std::is_same_v<T, CompactLog>) {
+                out << "CompactLog(through=" << value.through_index << ")";
             }
             return out.str();
         },
@@ -15699,7 +15742,7 @@ std::string defaultImdbInputFile() {
 void printV104BootstrapTrace(const std::string& data_file) {
     std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v119-bootstrap-trace-" + std::to_string(::getpid()));
+        ("buzzdb-v120-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
@@ -15793,6 +15836,7 @@ public:
         for (const auto& replica : replicas_) {
             match_index_[replica] = 0;
             next_index_[replica] = 1;
+            follower_applied_index_[replica] = 0;
         }
     }
 
@@ -15819,6 +15863,14 @@ public:
             handleAppendReply(ctx, *reply);
             return;
         }
+        if (const auto* snapshot = std::get_if<InstallSnapshot>(&message)) {
+            handleInstallSnapshot(ctx, from, *snapshot);
+            return;
+        }
+        if (const auto* reply = std::get_if<SnapshotReply>(&message)) {
+            handleSnapshotReply(ctx, *reply);
+            return;
+        }
         if (const auto* request = std::get_if<ClientRequest>(&message)) {
             handleClientRequest(ctx, from.rootAddress(), *request);
             return;
@@ -15826,6 +15878,10 @@ public:
         if (const auto* forward = std::get_if<ClientForward>(&message)) {
             handleClientRequest(ctx, forward->client.rootAddress(),
                                 forward->request);
+            return;
+        }
+        if (const auto* compact = std::get_if<CompactLog>(&message)) {
+            handleCompactLog(ctx, *compact);
             return;
         }
     }
@@ -15865,6 +15921,10 @@ public:
     size_t pendingCount() const { return pending_by_index_.size(); }
     int firstNonCleared() const { return first_non_cleared_; }
     int lastNonEmpty() const { return lastLogIndex(); }
+    int lastIncludedIndex() const { return last_included_index_; }
+    int lastIncludedTerm() const { return last_included_term_; }
+    size_t logEntryCount() const { return log_.size(); }
+    size_t sessionCacheSize() const { return session_results_.size(); }
 
     bool isLeader() const {
         return role_ == ConsensusRole::Leader;
@@ -15955,6 +16015,9 @@ public:
             << ", votes=" << votes_.size()
             << ", commit=" << commit_index_
             << ", applied=" << applied_index_
+            << ", snap=(" << last_included_index_
+            << "," << last_included_term_ << ")"
+            << ", first=" << first_non_cleared_
             << ", pending=" << pending_by_index_.size()
             << ", log=";
         for (const auto& entry : log_) {
@@ -16028,7 +16091,9 @@ private:
     }
 
     int lastLogIndex() const {
-        return log_.empty() ? 0 : log_.rbegin()->first;
+        return log_.empty() ? last_included_index_
+                            : std::max(last_included_index_,
+                                       log_.rbegin()->first);
     }
 
     int lastLogTerm() const {
@@ -16038,6 +16103,9 @@ private:
     int termAt(int index) const {
         if (index == 0) {
             return 0;
+        }
+        if (index == last_included_index_) {
+            return last_included_term_;
         }
         auto it = log_.find(index);
         return it == log_.end() ? 0 : it->second.term;
@@ -16096,6 +16164,10 @@ private:
         if (next < 1) {
             next = 1;
         }
+        if (next <= last_included_index_) {
+            sendInstallSnapshotTo(ctx, root);
+            return;
+        }
         int prev = next - 1;
         std::vector<ConsensusLogEntryMessage> entries;
         for (int index = next; index <= lastLogIndex(); ++index) {
@@ -16117,7 +16189,21 @@ private:
             prev,
             termAt(prev),
             entries,
-            commit_index_
+            commit_index_,
+            last_included_index_
+        });
+    }
+
+    void sendInstallSnapshotTo(NodeContext& ctx, const Address& peer) {
+        ctx.send(peer.rootAddress(), InstallSnapshot{
+            current_term_,
+            address().rootAddress(),
+            last_included_index_,
+            last_included_term_,
+            commit_index_,
+            db_,
+            session_results_,
+            execution_count_
         });
     }
 
@@ -16221,6 +16307,7 @@ private:
                 current_term_,
                 address().rootAddress(),
                 lastLogIndex(),
+                applied_index_,
                 false
             });
             return;
@@ -16237,12 +16324,16 @@ private:
                 current_term_,
                 address().rootAddress(),
                 std::min(lastLogIndex(), append.prev_log_index - 1),
+                applied_index_,
                 false
             });
             return;
         }
 
         for (const auto& message_entry : append.entries) {
+            if (message_entry.index <= last_included_index_) {
+                continue;
+            }
             auto existing = log_.find(message_entry.index);
             if (existing != log_.end()) {
                 ConsensusLogEntry incoming{
@@ -16259,6 +16350,7 @@ private:
                         current_term_,
                         address().rootAddress(),
                         message_entry.index - 1,
+                        applied_index_,
                         false
                     });
                     return;
@@ -16272,6 +16364,9 @@ private:
         }
 
         for (const auto& message_entry : append.entries) {
+            if (message_entry.index <= last_included_index_) {
+                continue;
+            }
             if (log_.count(message_entry.index) != 0) {
                 continue;
             }
@@ -16290,14 +16385,17 @@ private:
             markChosenThrough(commit_index_);
             applyCommitted(ctx);
         }
+        compactThrough(std::min(append.compacted_through, applied_index_));
 
         int match = append.entries.empty()
                         ? append.prev_log_index
                         : append.entries.back().index;
+        match = std::max(match, last_included_index_);
         ctx.send(from, AppendReply{
             current_term_,
             address().rootAddress(),
             match,
+            applied_index_,
             true
         });
     }
@@ -16314,6 +16412,8 @@ private:
         }
 
         Address replica = reply.replica.rootAddress();
+        follower_applied_index_[replica] =
+            std::max(follower_applied_index_[replica], reply.applied_index);
         if (!reply.success) {
             int next = next_index_.count(replica) == 0 ? lastLogIndex() + 1
                                                        : next_index_[replica];
@@ -16330,6 +16430,89 @@ private:
         if (next_index_[replica] <= lastLogIndex()) {
             sendAppendEntriesTo(ctx, replica);
         }
+    }
+
+    void handleInstallSnapshot(NodeContext& ctx,
+                               const Address& from,
+                               const InstallSnapshot& snapshot) {
+        if (snapshot.term < current_term_) {
+            ctx.send(from, SnapshotReply{
+                current_term_,
+                address().rootAddress(),
+                last_included_index_,
+                false
+            });
+            return;
+        }
+        if (snapshot.term > current_term_ ||
+            role_ != ConsensusRole::Follower ||
+            !(leader_ == snapshot.leader.rootAddress())) {
+            stepDownTo(snapshot.term, snapshot.leader);
+        }
+        if (snapshot.last_included_index <= last_included_index_) {
+            ctx.send(from, SnapshotReply{
+                current_term_,
+                address().rootAddress(),
+                last_included_index_,
+                true
+            });
+            return;
+        }
+
+        db_ = snapshot.db;
+        session_results_ = snapshot.session_results;
+        execution_count_ = snapshot.execution_count;
+        last_included_index_ = snapshot.last_included_index;
+        last_included_term_ = snapshot.last_included_term;
+        first_non_cleared_ = last_included_index_ + 1;
+        commit_index_ = std::max(commit_index_, snapshot.last_included_index);
+        commit_index_ = std::max(commit_index_,
+                                 std::min(snapshot.leader_commit,
+                                          snapshot.last_included_index));
+        applied_index_ = std::max(applied_index_, snapshot.last_included_index);
+        follower_applied_index_[address().rootAddress()] = applied_index_;
+
+        auto erase_to = log_.upper_bound(last_included_index_);
+        log_.erase(log_.begin(), erase_to);
+        ctx.send(from, SnapshotReply{
+            current_term_,
+            address().rootAddress(),
+            last_included_index_,
+            true
+        });
+    }
+
+    void handleSnapshotReply(NodeContext& ctx, const SnapshotReply& reply) {
+        if (reply.term > current_term_) {
+            stepDownTo(reply.term);
+            return;
+        }
+        if (role_ != ConsensusRole::Leader ||
+            reply.term != current_term_ ||
+            addressEmpty(reply.replica) ||
+            !reply.success) {
+            return;
+        }
+        Address replica = reply.replica.rootAddress();
+        match_index_[replica] =
+            std::max(match_index_[replica], reply.last_included_index);
+        next_index_[replica] = match_index_[replica] + 1;
+        follower_applied_index_[replica] =
+            std::max(follower_applied_index_[replica],
+                     reply.last_included_index);
+        advanceCommitIndex(ctx);
+        if (next_index_[replica] <= lastLogIndex()) {
+            sendAppendEntriesTo(ctx, replica);
+        }
+    }
+
+    void handleCompactLog(NodeContext& ctx, const CompactLog& compact) {
+        if (role_ != ConsensusRole::Leader) {
+            return;
+        }
+        int stable = std::min(compact.through_index, applied_index_);
+        compactThrough(stable);
+        sendAppendEntriesToPeers(ctx);
     }
 
     void advanceCommitIndex(NodeContext& ctx) {
@@ -16356,6 +16539,38 @@ private:
             sendAppendEntriesToPeers(ctx);
             return;
         }
+    }
+
+    int stableAppliedIndex() const {
+        int stable = applied_index_;
+        for (const auto& replica : replicas_) {
+            Address root = replica.rootAddress();
+            if (root == address().rootAddress()) {
+                stable = std::min(stable, applied_index_);
+                continue;
+            }
+            auto it = follower_applied_index_.find(root);
+            if (it == follower_applied_index_.end()) {
+                return 0;
+            }
+            stable = std::min(stable, it->second);
+        }
+        return stable;
+    }
+
+    void compactThrough(int index) {
+        if (index <= last_included_index_ || index <= 0) {
+            return;
+        }
+        index = std::min(index, applied_index_);
+        if (index <= last_included_index_) {
+            return;
+        }
+        last_included_term_ = termAt(index);
+        last_included_index_ = index;
+        first_non_cleared_ = last_included_index_ + 1;
+        auto erase_to = log_.upper_bound(last_included_index_);
+        log_.erase(log_.begin(), erase_to);
     }
 
     void markChosenThrough(int index) {
@@ -16391,6 +16606,7 @@ private:
             }
 
             applied_index_ = entry.index;
+            follower_applied_index_[address().rootAddress()] = applied_index_;
             auto pending = pending_by_index_.find(entry.index);
             if (pending != pending_by_index_.end()) {
                 ctx.send(pending->second.client, ClientReply{
@@ -16415,10 +16631,13 @@ private:
     int commit_index_ = 0;
     int applied_index_ = 0;
     int first_non_cleared_ = 1;
+    int last_included_index_ = 0;
+    int last_included_term_ = 0;
     BuzzDBCore db_;
     std::map<int, ConsensusLogEntry> log_;
     std::map<Address, int> match_index_;
     std::map<Address, int> next_index_;
+    std::map<Address, int> follower_applied_index_;
     std::map<int, PendingConsensusClient> pending_by_index_;
     std::map<std::string, int> pending_by_request_;
     std::map<std::string, Result> session_results_;
@@ -17020,7 +17239,8 @@ CheckResult consensusSlotValid(const SearchState& state,
         const auto* node = state.nodeAs<ConsensusReplica>(replica);
         ConsensusSlotStatus status = node->slotStatus(slot);
         std::optional<Command> command = node->slotCommand(slot);
-        if (status != ConsensusSlotStatus::Empty && command == chosen) {
+        if (status == ConsensusSlotStatus::Cleared ||
+            (status != ConsensusSlotStatus::Empty && command == chosen)) {
             ++matching;
         }
     }
@@ -17178,8 +17398,195 @@ SearchState fireConsensusAppendRetry(SearchState state,
         settings);
 }
 
-void printLeaderChangeTrace(const std::string& data_file) {
-    std::cout << "Trace: Raft-style leader change under partition" << std::endl;
+SearchState requestConsensusCompaction(SearchState state,
+                                       const SearchSettings& settings,
+                                       const Address& leader,
+                                       int through_index) {
+    Address maintenance = leader.rootAddress();
+    state.send(maintenance, leader, CompactLog{through_index});
+    return stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* compact =
+                    std::get_if<CompactLog>(&envelope.message);
+                return compact != nullptr &&
+                       compact->through_index == through_index &&
+                       envelope.to.rootAddress() == leader.rootAddress();
+            },
+            "compact log through " + std::to_string(through_index)),
+        settings);
+}
+
+SearchState deliverCompactionHeartbeat(SearchState state,
+                                       const SearchSettings& settings,
+                                       const Address& leader,
+                                       const Address& follower,
+                                       int compacted_through) {
+    state = stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* append =
+                    std::get_if<AppendEntries>(&envelope.message);
+                return append != nullptr &&
+                       append->leader == leader.rootAddress() &&
+                       append->compacted_through >= compacted_through &&
+                       envelope.from.rootAddress() == leader.rootAddress() &&
+                       envelope.to.rootAddress() == follower.rootAddress();
+            },
+            "compaction heartbeat " + leader.str() + " -> " +
+                follower.str()),
+        settings);
+    return state;
+}
+
+SearchState deliverConsensusSnapshot(SearchState state,
+                                     const SearchSettings& settings,
+                                     const Address& leader,
+                                     const Address& follower,
+                                     int last_included_index) {
+    state = stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* snapshot =
+                    std::get_if<InstallSnapshot>(&envelope.message);
+                return snapshot != nullptr &&
+                       snapshot->leader == leader.rootAddress() &&
+                       snapshot->last_included_index >=
+                           last_included_index &&
+                       envelope.from.rootAddress() == leader.rootAddress() &&
+                       envelope.to.rootAddress() == follower.rootAddress();
+            },
+            "install snapshot " + leader.str() + " -> " +
+                follower.str()),
+        settings);
+    state = stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply =
+                    std::get_if<SnapshotReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->success &&
+                       reply->last_included_index >= last_included_index &&
+                       envelope.from.rootAddress() ==
+                           follower.rootAddress() &&
+                       envelope.to.rootAddress() == leader.rootAddress();
+            },
+            "snapshot reply " + follower.str()),
+        settings);
+    return state;
+}
+
+uint64_t lastMessageId(const SearchState& state) {
+    uint64_t id = 0;
+    for (const auto& envelope : state.network()) {
+        id = std::max(id, envelope.id);
+    }
+    return id;
+}
+
+SearchState deliverRepairAppendAfter(SearchState state,
+                                     const SearchSettings& settings,
+                                     const Address& leader,
+                                     const Address& follower,
+                                     uint64_t min_message_id,
+                                     int min_entry_index,
+                                     int min_leader_commit) {
+    auto append_matches = [&](const MessageEnvelope& envelope) {
+        const auto* append = std::get_if<AppendEntries>(&envelope.message);
+        if (append == nullptr ||
+            envelope.id <= min_message_id ||
+            !(append->leader == leader.rootAddress()) ||
+            append->leader_commit < min_leader_commit ||
+            !(envelope.from.rootAddress() == leader.rootAddress()) ||
+            !(envelope.to.rootAddress() == follower.rootAddress())) {
+            return false;
+        }
+        return std::any_of(
+            append->entries.begin(),
+            append->entries.end(),
+            [&](const ConsensusLogEntryMessage& entry) {
+                return entry.index >= min_entry_index;
+            });
+    };
+
+    state = stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            append_matches,
+            "repair append " + leader.str() + " -> " + follower.str()),
+        settings);
+
+    EventRef reply_event = requireMessageEvent(
+        state,
+        settings,
+        [&](const MessageEnvelope& envelope) {
+            const auto* reply = std::get_if<AppendReply>(&envelope.message);
+            return reply != nullptr &&
+                   envelope.id > min_message_id &&
+                   envelope.from.rootAddress() == follower.rootAddress() &&
+                   envelope.to.rootAddress() == leader.rootAddress();
+        },
+        "repair append reply " + follower.str());
+    const auto* reply_envelope = messageForEvent(state, reply_event);
+    const auto* reply = std::get_if<AppendReply>(&reply_envelope->message);
+    bool success = reply != nullptr &&
+                   reply->success &&
+                   reply->match_index >= min_entry_index;
+    uint64_t reply_id = reply_envelope == nullptr ? min_message_id
+                                                  : reply_envelope->id;
+    state = stepRequired(state, reply_event, settings);
+    if (success) {
+        return state;
+    }
+
+    state = stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                return envelope.id > reply_id && append_matches(envelope);
+            },
+            "backtracking repair append " + leader.str() + " -> " +
+                follower.str()),
+        settings);
+    state = stepRequired(
+        state,
+        requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* retry_reply =
+                    std::get_if<AppendReply>(&envelope.message);
+                return retry_reply != nullptr &&
+                       envelope.id > reply_id &&
+                       retry_reply->success &&
+                       retry_reply->match_index >= min_entry_index &&
+                       envelope.from.rootAddress() ==
+                           follower.rootAddress() &&
+                       envelope.to.rootAddress() == leader.rootAddress();
+            },
+            "backtracking repair reply " + follower.str()),
+        settings);
+    return state;
+}
+
+void printLogRepairTrace(const std::string& data_file) {
+    std::cout << "Trace: Raft log repair and compaction" << std::endl;
     std::vector<Address> replicas = quorumReplicaAddresses(5);
     Address leader = replicas[0];
     Address client = ScenarioAddress::client1();
@@ -17226,6 +17633,19 @@ void printLeaderChangeTrace(const std::string& data_file) {
                                           CountRowsCommand{"title"})
                                     : Result{TableNotFoundResult{}})
               << std::endl;
+    state = requestConsensusCompaction(state, majority_partition, leader, 2);
+    state = deliverCompactionHeartbeat(state, majority_partition,
+                                       leader, replicas[1], 2);
+    state = deliverCompactionHeartbeat(state, majority_partition,
+                                       leader, replicas[2], 2);
+    leader_node = state.nodeAs<ConsensusReplica>(leader);
+    std::cout << "  compacted prefix through index="
+              << (leader_node ? leader_node->lastIncludedIndex() : 0)
+              << ", firstNonCleared="
+              << (leader_node ? leader_node->firstNonCleared() : 1)
+              << ", live log entries="
+              << (leader_node ? leader_node->logEntryCount() : 0)
+              << std::endl;
 
     Address new_leader = replicas[2];
     SearchSettings switched_partition;
@@ -17248,20 +17668,20 @@ void printLeaderChangeTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v119; "
-                  << "this version focuses on consensus replication."
+        std::cerr << "--measure-restart is not available in v120; "
+                  << "this version focuses on Raft log repair and compaction."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v119: leader changes under partitions" << std::endl;
+    std::cout << "BuzzDB v120: Raft log repair and compaction" << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
-        printLeaderChangeTrace(imdb_file);
+        printLogRepairTrace(imdb_file);
         printV104BootstrapTrace(imdb_file);
     }
 
@@ -18545,6 +18965,291 @@ int main(int argc, char* argv[]) {
                         ": " + result.message);
         tests.check(result.explored > 20,
                     "random search should explore real schedules");
+    });
+
+    tests.test("Follower missing suffix catches up after append retry", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address up_to_date = replicas[1];
+        Address lagging = replicas[2];
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(state, settings, leader,
+                                     {up_to_date, lagging});
+        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 81, 1, commands[0],
+            {up_to_date});
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 81, 2, commands[1],
+            {up_to_date});
+
+        const auto* lagging_node = state.nodeAs<ConsensusReplica>(lagging);
+        tests.check(lagging_node != nullptr &&
+                        lagging_node->appliedIndex() == 0,
+                    "third replica should miss the committed suffix");
+
+        uint64_t before_retry = lastMessageId(state);
+        state = fireConsensusAppendRetry(state, settings, leader);
+        state = deliverRepairAppendAfter(state, settings, leader, lagging,
+                                         before_retry, 2, 2);
+        lagging_node = state.nodeAs<ConsensusReplica>(lagging);
+        tests.check(lagging_node != nullptr &&
+                        lagging_node->commitIndex() == 2 &&
+                        lagging_node->appliedIndex() == 2 &&
+                        lagging_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{1}},
+                    "append retry should repair the missing suffix");
+    });
+
+    tests.test("Old uncommitted leader suffix is overwritten", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address old_leader = replicas[0];
+        Address new_leader = replicas[1];
+        Address client1 = ScenarioAddress::client1();
+        Address client2 = ScenarioAddress::client2();
+        SearchSettings normal;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(state, normal, old_leader,
+                                     {new_leader, replicas[2]});
+
+        SearchSettings isolated;
+        isolated.partition({
+            {old_leader, client1},
+            {new_leader, replicas[2], replicas[3], replicas[4], client2}
+        });
+        state.send(client1, old_leader, ClientRequest{
+            82,
+            1,
+            CreateTableCommand{"stale_table", {"id:int"}}
+        });
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                isolated,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr &&
+                           request->client_id == 82 &&
+                           request->request_id == 1 &&
+                           envelope.to.rootAddress() == old_leader;
+                },
+                "stale request to isolated old leader"),
+            isolated);
+        const auto* old_node = state.nodeAs<ConsensusReplica>(old_leader);
+        tests.check(old_node != nullptr &&
+                        old_node->lastNonEmpty() == 1 &&
+                        old_node->commitIndex() == 0,
+                    "old leader should have only an uncommitted suffix");
+
+        state = electConsensusLeader(state, isolated, new_leader,
+                                     {replicas[2], replicas[3]});
+        state = deliverConsensusCommandToQuorum(
+            state, isolated, new_leader, client2, 83, 1,
+            createTitleTableCommand(), {replicas[2], replicas[3]});
+
+        SearchSettings healed;
+        state = deliverRepairAppendAfter(state, healed, new_leader,
+                                         old_leader, 0, 1, 1);
+        old_node = state.nodeAs<ConsensusReplica>(old_leader);
+        tests.check(old_node != nullptr &&
+                        old_node->slotCommandMatches(
+                            1, createTitleTableCommand()) &&
+                        old_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{0}} &&
+                        old_node->executeReadOnlyForTest(
+                            CountRowsCommand{"stale_table"}) ==
+                            Result{TableNotFoundResult{}},
+                    "new leader should overwrite the stale uncommitted suffix");
+    });
+
+    tests.test("Old-term entry waits for current-term commit", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address first_leader = replicas[0];
+        Address second_leader = replicas[1];
+        Address client1 = ScenarioAddress::client1();
+        Address client2 = ScenarioAddress::client2();
+        SearchSettings first_partition;
+        first_partition.partition({
+            {first_leader, second_leader, replicas[2], client1},
+            {replicas[3], replicas[4], client2}
+        });
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(state, first_partition, first_leader,
+                                     {second_leader, replicas[2]});
+        state.send(client1, first_leader, ClientRequest{
+            84,
+            1,
+            createTitleTableCommand()
+        });
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                first_partition,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr &&
+                           request->client_id == 84 &&
+                           request->request_id == 1 &&
+                           envelope.to.rootAddress() == first_leader;
+                },
+                "old-term client request"),
+            first_partition);
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                first_partition,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* append =
+                        std::get_if<AppendEntries>(&envelope.message);
+                    return append != nullptr &&
+                           !append->entries.empty() &&
+                           append->entries.back().index == 1 &&
+                           envelope.from.rootAddress() == first_leader &&
+                           envelope.to.rootAddress() == second_leader;
+                },
+                "old-term append to future leader"),
+            first_partition);
+
+        SearchSettings second_partition;
+        second_partition.partition({
+            {first_leader},
+            {second_leader, replicas[2], replicas[3], replicas[4], client2}
+        });
+        state = electConsensusLeader(state, second_partition, second_leader,
+                                     {replicas[2], replicas[3]});
+        state = catchUpConsensusFollower(state, second_partition,
+                                         second_leader, replicas[2]);
+        state = catchUpConsensusFollower(state, second_partition,
+                                         second_leader, replicas[3]);
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(second_leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->commitIndex() == 0 &&
+                        leader_node->acceptVoteCount(1) >=
+                            leader_node->majoritySize(),
+                    "old-term slot should be replicated but not committed");
+
+        state = deliverConsensusCommandToQuorum(
+            state, second_partition, second_leader, client2, 85, 1,
+            CountRowsCommand{"title"}, {replicas[2], replicas[3]});
+        leader_node = state.nodeAs<ConsensusReplica>(second_leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->commitIndex() == 2 &&
+                        leader_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{0}},
+                    "current-term slot should commit the old prefix with it");
+    });
+
+    tests.test("Compaction clears prefix and preserves slot markers", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(state, settings, leader,
+                                     {replicas[1], replicas[2]});
+        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 86, 1, commands[0],
+            {replicas[1], replicas[2]});
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 86, 2, commands[1],
+            {replicas[1], replicas[2]});
+
+        state = requestConsensusCompaction(state, settings, leader, 2);
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->firstNonCleared() == 3 &&
+                        leader_node->lastIncludedIndex() == 2 &&
+                        leader_node->slotStatus(1) ==
+                            ConsensusSlotStatus::Cleared &&
+                        leader_node->slotStatus(2) ==
+                            ConsensusSlotStatus::Cleared &&
+                        leader_node->slotStatus(3) ==
+                            ConsensusSlotStatus::Empty &&
+                        leader_node->logEntryCount() == 0,
+                    "leader should compact the applied prefix");
+
+        state = deliverCompactionHeartbeat(state, settings, leader,
+                                           replicas[1], 2);
+        state = deliverCompactionHeartbeat(state, settings, leader,
+                                           replicas[2], 2);
+        for (const auto& replica : replicas) {
+            const auto* node = state.nodeAs<ConsensusReplica>(replica);
+            tests.check(node != nullptr &&
+                            node->firstNonCleared() == 3 &&
+                            node->slotStatus(1) ==
+                                ConsensusSlotStatus::Cleared,
+                        replica.str() + " should learn the compacted prefix");
+        }
+        CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
+        tests.check(logs.ok, logs.message);
+    });
+
+    tests.test("Lagging follower installs snapshot after prefix compaction", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address current = replicas[1];
+        Address lagging = replicas[2];
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(state, settings, leader,
+                                     {current, lagging});
+        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 87, 1, commands[0],
+            {current});
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 87, 2, commands[1],
+            {current});
+        state = requestConsensusCompaction(state, settings, leader, 2);
+        state = deliverConsensusSnapshot(state, settings, leader, lagging, 2);
+
+        const auto* lagging_node = state.nodeAs<ConsensusReplica>(lagging);
+        tests.check(lagging_node != nullptr &&
+                        lagging_node->firstNonCleared() == 3 &&
+                        lagging_node->lastIncludedIndex() == 2 &&
+                        lagging_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{1}} &&
+                        lagging_node->executionCount(87, 2) == 1,
+                    "snapshot should carry BuzzDB and AMO execution state");
+
+        state = electConsensusLeader(state, settings, lagging,
+                                     {leader, current});
+        state.send(client, lagging, ClientRequest{87, 2, commands[1]});
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr &&
+                           request->client_id == 87 &&
+                           request->request_id == 2 &&
+                           envelope.to.rootAddress() == lagging;
+                },
+                "duplicate request to snapshot leader"),
+            settings);
+        lagging_node = state.nodeAs<ConsensusReplica>(lagging);
+        tests.check(lagging_node != nullptr &&
+                        lagging_node->lastNonEmpty() == 2 &&
+                        lagging_node->executionCount(87, 2) == 1 &&
+                        clientReplyInNetworkFor(state, 87, 2),
+                    "duplicate after snapshot should return cached result "
+                    "without a new log slot");
     });
 
     return tests.finish();
