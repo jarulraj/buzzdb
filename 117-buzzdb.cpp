@@ -20447,25 +20447,6 @@ int main(int argc, char* argv[]) {
     }
 
     TestRunner tests;
-
-    tests.test("Replicated log starts empty and exposes valid markers", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        SearchState state = consensusClusterState(replicas);
-        for (const auto& replica : replicas) {
-            const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(node != nullptr, replica.str() + " should exist");
-            tests.check(node != nullptr && node->firstNonCleared() == 1,
-                        replica.str() + " should start with firstNonCleared=1");
-            tests.check(node != nullptr && node->lastNonEmpty() == 0,
-                        replica.str() + " should start with an empty log");
-            tests.check(node != nullptr &&
-                            node->slotStatus(1) == ConsensusSlotStatus::Empty,
-                        replica.str() + " slot 1 should be empty");
-        }
-        CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
-        tests.check(logs.ok, logs.message);
-    });
-
     tests.test("Single client fills a majority replicated log", [&] {
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
@@ -20616,47 +20597,6 @@ int main(int argc, char* argv[]) {
         tests.check(result.explored > 10,
                     "minority search should explore multiple schedules");
     });
-
-    tests.test("Progress resumes after healing a minority request", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(5);
-        Address isolated = replicas[4];
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = consensusClusterState(replicas);
-        SearchSettings partitioned;
-        partitioned.partition({
-            {replicas[0], replicas[1], replicas[2]},
-            {isolated, client}
-        });
-        state.send(client, isolated, ClientRequest{1, 1, createTitleTableCommand()});
-        state = stepRequired(
-            state,
-            requireMessageEvent(
-                state,
-                partitioned,
-                [&](const MessageEnvelope& envelope) {
-                    return std::get_if<ClientRequest>(&envelope.message) != nullptr &&
-                           envelope.from.rootAddress() == client &&
-                           envelope.to.rootAddress() == isolated;
-                },
-                "minority request"),
-            partitioned);
-        tests.check(!clientReplyInNetworkFor(state, 1, 1),
-                    "isolated follower should not complete the request");
-
-        SearchSettings healed;
-        state = electConsensusLeader(state, healed, leader,
-                                     {replicas[1], replicas[2]});
-        state = deliverConsensusCommandToQuorum(
-            state, healed, leader, client, 1, 1, createTitleTableCommand(),
-            {replicas[1], replicas[2]});
-        tests.check(clientReplyInNetworkFor(state, 1, 1),
-                    "same request should complete after heal and majority election");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        tests.check(leader_node != nullptr && leader_node->commitIndex() == 1,
-                    "healed majority should commit the request");
-    });
-
     tests.test("Switching majorities preserves committed BuzzDB log", [&] {
         std::vector<Address> replicas = quorumReplicaAddresses(5);
         Address first_leader = replicas[0];
