@@ -17971,5 +17971,102 @@ int main(int argc, char* argv[]) {
                     "without a new log slot");
     });
 
+    tests.test("Follower rejects log hole and repairs from prefix append", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address up_to_date = replicas[1];
+        Address lagging = replicas[2];
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(state, settings, leader,
+                                     {up_to_date, lagging});
+        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 88, 1, commands[0],
+            {up_to_date});
+        state = deliverConsensusCommandToQuorum(
+            state, settings, leader, client, 88, 2, commands[1],
+            {up_to_date});
+
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->commitIndex() == 2,
+                    "leader should have a committed two-slot prefix");
+        int term = leader_node == nullptr ? 1 : leader_node->currentTerm();
+
+        state.send(leader, lagging, AppendEntries{
+            term,
+            leader,
+            1,
+            term,
+            std::vector<ConsensusLogEntryMessage>{
+                ConsensusLogEntryMessage{2, term, 88, 2, commands[1]}},
+            2,
+            0});
+        state = stepRequired(
+            state,
+            requireMessageEvent(
+                state,
+                settings,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* append =
+                        std::get_if<AppendEntries>(&envelope.message);
+                    return append != nullptr &&
+                           append->prev_log_index == 1 &&
+                           append->entries.size() == 1 &&
+                           append->entries.front().index == 2 &&
+                           envelope.from.rootAddress() ==
+                               leader.rootAddress() &&
+                           envelope.to.rootAddress() ==
+                               lagging.rootAddress();
+                },
+                "hole append containing slot 2 without slot 1"),
+            settings);
+
+        const auto* lagging_node = state.nodeAs<ConsensusReplica>(lagging);
+        tests.check(lagging_node != nullptr &&
+                        lagging_node->slotStatus(1) ==
+                            ConsensusSlotStatus::Empty &&
+                        lagging_node->slotStatus(2) ==
+                            ConsensusSlotStatus::Empty,
+                    "follower should reject an append with a missing prefix");
+
+        EventRef rejection_event = requireMessageEvent(
+            state,
+            settings,
+            [&](const MessageEnvelope& envelope) {
+                const auto* reply = std::get_if<AppendReply>(&envelope.message);
+                return reply != nullptr &&
+                       !reply->success &&
+                       reply->match_index == 0 &&
+                       envelope.from.rootAddress() == lagging.rootAddress() &&
+                       envelope.to.rootAddress() == leader.rootAddress();
+            },
+            "hole rejection reply");
+        const auto* rejection_envelope =
+            messageForEvent(state, rejection_event);
+        uint64_t rejection_id =
+            rejection_envelope == nullptr ? 0 : rejection_envelope->id;
+        state = stepRequired(state, rejection_event, settings);
+
+        state = deliverRepairAppendAfter(
+            state, settings, leader, lagging, rejection_id, 2, 2);
+        lagging_node = state.nodeAs<ConsensusReplica>(lagging);
+        tests.check(lagging_node != nullptr &&
+                        lagging_node->commitIndex() == 2 &&
+                        lagging_node->appliedIndex() == 2 &&
+                        lagging_node->slotStatus(1) ==
+                            ConsensusSlotStatus::Chosen &&
+                        lagging_node->slotStatus(2) ==
+                            ConsensusSlotStatus::Chosen &&
+                        lagging_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{1}},
+                    "backtracking append should fill the missing prefix");
+        CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
+        tests.check(logs.ok, logs.message);
+    });
+
     return tests.finish();
 }

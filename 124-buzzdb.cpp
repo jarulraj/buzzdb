@@ -18680,6 +18680,30 @@ void addConsensusAndConfigInvariants(SearchSettings& settings,
                                invariants.end());
 }
 
+void addConsensusClientResultInvariants(
+    SearchSettings& settings,
+    const std::vector<Address>& clients) {
+    settings.invariants.push_back({
+        "CLIENT_RESULTS_PREFIX_OK",
+        [clients](const SearchState& state) {
+            for (const auto& client : clients) {
+                const auto* worker =
+                    state.nodeAs<ConsensusClientWorker>(client);
+                if (worker == nullptr) {
+                    return CheckResult{false,
+                                       client.str() + " is missing"};
+                }
+                if (!worker->resultsOk()) {
+                    return CheckResult{
+                        false,
+                        client.str() + " has an invalid result prefix"};
+                }
+            }
+            return CheckResult{true, ""};
+        }
+    });
+}
+
 Command bootstrapClusterACommand() {
     return BootstrapClusterCommand{
         "cluster-A", "server1", {"server1", "server2", "server3"}, 1};
@@ -19193,6 +19217,168 @@ int main(int argc, char* argv[]) {
                     "random invariant search failed: " +
                         endConditionName(result.end_condition) + " " +
                         result.message);
+    });
+
+    tests.test("Three-server random search preserves consensus invariants", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client1("client-random-3a");
+        Address client2("client-random-3b");
+        SearchSettings scripted;
+        SearchState state = electedConsensusState(scripted, replicas, leader);
+        state.addNode(std::make_unique<ConsensusClientWorker>(
+            client1,
+            replicas,
+            431,
+            Workload(
+                std::vector<Command>{
+                    CreateTableCommand{"random3_a", {"id:int"}}
+                },
+                std::vector<Result>{Result{CreateTableOkResult{}}})));
+        state.addNode(std::make_unique<ConsensusClientWorker>(
+            client2,
+            replicas,
+            432,
+            Workload(
+                std::vector<Command>{
+                    CreateTableCommand{"random3_b", {"id:int"}}
+                },
+                std::vector<Result>{Result{CreateTableOkResult{}}})));
+
+        SearchSettings search;
+        search.max_depth = 30;
+        search.max_states = 320;
+        search.random_dfs_probes = 12;
+        search.seed = 3124;
+        addConsensusAndConfigInvariants(search, replicas);
+        addConsensusClientResultInvariants(search, {client1, client2});
+        SearchResults result = randomDfs(state, search);
+        tests.check(searchFinishedWithoutInvariantFailure(result),
+                    "three-server random search failed: " +
+                        endConditionName(result.end_condition) + " " +
+                        result.message);
+        tests.check(result.explored > 25,
+                    "three-server random search should explore real schedules");
+    });
+
+    tests.test("Five-server random search preserves consensus invariants", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address leader = replicas[0];
+        Address client1("client-random-5a");
+        Address client2("client-random-5b");
+        SearchSettings scripted;
+        SearchState state = electedConsensusState(scripted, replicas, leader);
+        state.addNode(std::make_unique<ConsensusClientWorker>(
+            client1,
+            replicas,
+            433,
+            Workload(
+                std::vector<Command>{
+                    CreateTableCommand{"random5_a", {"id:int"}}
+                },
+                std::vector<Result>{Result{CreateTableOkResult{}}})));
+        state.addNode(std::make_unique<ConsensusClientWorker>(
+            client2,
+            replicas,
+            434,
+            Workload(
+                std::vector<Command>{
+                    CreateTableCommand{"random5_b", {"id:int"}}
+                },
+                std::vector<Result>{Result{CreateTableOkResult{}}})));
+
+        SearchSettings search;
+        search.max_depth = 32;
+        search.max_states = 360;
+        search.random_dfs_probes = 12;
+        search.seed = 5124;
+        addConsensusAndConfigInvariants(search, replicas);
+        addConsensusClientResultInvariants(search, {client1, client2});
+        SearchResults result = randomDfs(state, search);
+        tests.check(searchFinishedWithoutInvariantFailure(result),
+                    "five-server random search failed: " +
+                        endConditionName(result.end_condition) + " " +
+                        result.message);
+        tests.check(result.explored > 25,
+                    "five-server random search should explore real schedules");
+    });
+
+    tests.test("Majority-partition catalog command preserves invariants", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchSettings scripted;
+        SearchState state = electedConsensusState(scripted, replicas, leader);
+
+        SearchSettings search;
+        search.partition({
+            {leader, replicas[1], replicas[2], client},
+            {replicas[3], replicas[4]}
+        });
+        state = deliverConsensusCommandToQuorum(
+            state,
+            search,
+            leader,
+            client,
+            435,
+            1,
+            BootstrapClusterCommand{
+                "cluster-majority",
+                "server1",
+                {"server1", "server2", "server3", "server4", "server5"},
+                1},
+            {replicas[1], replicas[2]});
+
+        auto invariants = consensusAndConfigInvariants(replicas);
+        CheckResult result = noInvariantViolation(state, invariants);
+        tests.check(result.ok, result.message);
+        tests.check(clientReplyResultInNetworkFor(
+                        state, 435, 1, Result{StatementOkResult{}}),
+                    "majority partition should reply to the client");
+        for (const auto& isolated : std::vector<Address>{replicas[3],
+                                                         replicas[4]}) {
+            const auto* node = state.nodeAs<ConsensusReplica>(isolated);
+            tests.check(node != nullptr && node->commitIndex() == 0,
+                        isolated.str() +
+                            " should not commit while isolated from majority");
+        }
+    });
+
+    tests.test("Healthy five-node catalog command has bounded message cost", [&] {
+        std::vector<Address> replicas = quorumReplicaAddresses(5);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchSettings settings;
+        SearchState state = consensusClusterState(replicas);
+        state = electConsensusLeader(state, settings, leader,
+                                     {replicas[1], replicas[2]});
+        state = deliverConsensusCommandToQuorum(
+            state,
+            settings,
+            leader,
+            client,
+            436,
+            1,
+            BootstrapClusterCommand{
+                "cluster-budget",
+                "server1",
+                {"server1", "server2", "server3", "server4", "server5"},
+                1},
+            {replicas[1], replicas[2]});
+
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(leader_node != nullptr &&
+                        leader_node->commitIndex() == 1,
+                    "healthy catalog command should commit");
+        tests.check(clientReplyResultInNetworkFor(
+                        state, 436, 1, Result{StatementOkResult{}}),
+                    "healthy catalog command should reply to client");
+        tests.check(state.depth() <= 24,
+                    "healthy catalog command took too many delivered events: " +
+                        std::to_string(state.depth()));
+        tests.check(lastMessageId(state) <= 80,
+                    "healthy catalog command generated too many messages: " +
+                        std::to_string(lastMessageId(state)));
     });
 
     tests.test("Invariant suite still permits valid full membership flow", [&] {
