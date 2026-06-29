@@ -10691,6 +10691,23 @@ struct RegisterRangeCommand {
     std::string end_key;
     std::string replica_group_id;
     int descriptor_version = 1;
+    std::string status = "active";
+};
+
+struct SplitRangeCommand {
+    std::string source_range_id;
+    std::string split_key;
+    std::string left_range_id;
+    std::string right_range_id;
+    int descriptor_version = 1;
+};
+
+struct SplitTableCommand {
+    std::string table;
+    std::string source_range_id;
+    std::string left_range_id;
+    std::string right_range_id;
+    int descriptor_version = 1;
 };
 
 struct BootstrapClusterCommand {
@@ -10754,6 +10771,8 @@ using Command = std::variant<
     RegisterClusterNodeCommand,
     RegisterReplicaGroupCommand,
     RegisterRangeCommand,
+    SplitRangeCommand,
+    SplitTableCommand,
     BootstrapClusterCommand,
     DiscoverClusterNodeCommand,
     AddLearnerToGroupCommand,
@@ -10816,6 +10835,23 @@ bool operator==(const RegisterRangeCommand& lhs,
     return lhs.range_id == rhs.range_id && lhs.start_key == rhs.start_key &&
            lhs.end_key == rhs.end_key &&
            lhs.replica_group_id == rhs.replica_group_id &&
+           lhs.descriptor_version == rhs.descriptor_version &&
+           lhs.status == rhs.status;
+}
+bool operator==(const SplitRangeCommand& lhs,
+                const SplitRangeCommand& rhs) {
+    return lhs.source_range_id == rhs.source_range_id &&
+           lhs.split_key == rhs.split_key &&
+           lhs.left_range_id == rhs.left_range_id &&
+           lhs.right_range_id == rhs.right_range_id &&
+           lhs.descriptor_version == rhs.descriptor_version;
+}
+bool operator==(const SplitTableCommand& lhs,
+                const SplitTableCommand& rhs) {
+    return lhs.table == rhs.table &&
+           lhs.source_range_id == rhs.source_range_id &&
+           lhs.left_range_id == rhs.left_range_id &&
+           lhs.right_range_id == rhs.right_range_id &&
            lhs.descriptor_version == rhs.descriptor_version;
 }
 bool operator==(const BootstrapClusterCommand& lhs,
@@ -11026,6 +11062,19 @@ std::string describeCommand(const Command& command) {
                 out << "RegisterRange(" << value.range_id << ", ["
                     << value.start_key << ", " << value.end_key
                     << ") -> " << value.replica_group_id
+                    << ", version=" << value.descriptor_version
+                    << ", status=" << value.status << ")";
+            } else if constexpr (std::is_same_v<T, SplitRangeCommand>) {
+                out << "SplitRange(" << value.source_range_id
+                    << " at " << value.split_key
+                    << " -> " << value.left_range_id
+                    << ", " << value.right_range_id
+                    << ", version=" << value.descriptor_version << ")";
+            } else if constexpr (std::is_same_v<T, SplitTableCommand>) {
+                out << "SplitTable(" << value.table
+                    << ", source=" << value.source_range_id
+                    << " -> " << value.left_range_id
+                    << ", " << value.right_range_id
                     << ", version=" << value.descriptor_version << ")";
             } else if constexpr (std::is_same_v<T, BootstrapClusterCommand>) {
                 out << "BootstrapCluster(" << value.cluster_id
@@ -11448,6 +11497,7 @@ struct RangeDescriptor {
     std::string end_key;
     std::string replica_group_id;
     int descriptor_version = 0;
+    std::string status = "active";
 };
 
 bool keyInRange(const std::string& key, const RangeDescriptor& range) {
@@ -11498,6 +11548,17 @@ std::vector<RangeDescriptor> latestRangeDescriptorsById(
         current.push_back(range);
     }
     return sortRangeDescriptors(std::move(current));
+}
+
+std::vector<RangeDescriptor> latestActiveRangeDescriptors(
+    const std::vector<RangeDescriptor>& ranges) {
+    std::vector<RangeDescriptor> active;
+    for (const auto& range : latestRangeDescriptorsById(ranges)) {
+        if (range.status == "active") {
+            active.push_back(range);
+        }
+    }
+    return sortRangeDescriptors(std::move(active));
 }
 
 RouteResult routeResultFor(const std::string& start_key,
@@ -11727,7 +11788,8 @@ private:
         createSystemCatalogTableIfMissing(
             "__ranges",
             {"range_id:string", "start_key:string", "end_key:string",
-             "replica_group_id:string", "descriptor_version:int"});
+             "replica_group_id:string", "descriptor_version:int",
+             "status:string"});
         createSystemCatalogTableIfMissing(
             "__global_keys",
             {"table_name:string", "primary_key:string", "row_key:string",
@@ -11760,7 +11822,8 @@ private:
                  tableRowPrefix(command.table),
                  tableRowPrefixEnd(command.table),
                  "group-1",
-                 "1"}}
+                 "1",
+                 "active"}}
         });
     }
 
@@ -11883,17 +11946,88 @@ private:
                 row[1],
                 row[2],
                 row[3],
-                std::stoi(row[4])
+                std::stoi(row[4]),
+                row.size() >= 6 ? row[5] : "active"
             });
         }
         return ranges;
     }
 
+    std::optional<RangeDescriptor> latestRangeDescriptorById(
+        const std::string& range_id) {
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if (range.range_id == range_id) return range;
+        }
+        return std::nullopt;
+    }
+
+    struct GlobalKeyRecord {
+        std::string table_name;
+        std::string primary_key;
+        std::string row_key;
+        std::string range_id;
+        std::string replica_group_id;
+        int descriptor_version = 0;
+    };
+
+    std::vector<GlobalKeyRecord> latestGlobalKeyRecords() {
+        SelectAllResult rows = selectSystemCatalogTable("__global_keys");
+        std::map<std::string, GlobalKeyRecord> latest;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 6) continue;
+            GlobalKeyRecord record{
+                row[0], row[1], row[2], row[3], row[4], std::stoi(row[5])};
+            std::string separator(1, '\0');
+            std::string key = record.table_name + separator +
+                              record.primary_key + separator +
+                              record.row_key;
+            auto it = latest.find(key);
+            if (it == latest.end() ||
+                record.descriptor_version >=
+                    it->second.descriptor_version) {
+                latest[key] = record;
+            }
+        }
+
+        std::vector<GlobalKeyRecord> records;
+        records.reserve(latest.size());
+        for (const auto& [key, record] : latest) {
+            (void)key;
+            records.push_back(record);
+        }
+        std::sort(
+            records.begin(),
+            records.end(),
+            [](const GlobalKeyRecord& lhs,
+               const GlobalKeyRecord& rhs) {
+                if (lhs.row_key != rhs.row_key) {
+                    return lhs.row_key < rhs.row_key;
+                }
+                return lhs.primary_key < rhs.primary_key;
+            });
+        return records;
+    }
+
+    std::vector<GlobalKeyRecord> latestGlobalKeyRecordsForRange(
+        const std::string& table,
+        const RangeDescriptor& range) {
+        std::vector<GlobalKeyRecord> records;
+        for (const auto& record : latestGlobalKeyRecords()) {
+            if (record.table_name == table &&
+                record.range_id == range.range_id &&
+                keyInRange(record.row_key, range)) {
+                records.push_back(record);
+            }
+        }
+        return records;
+    }
+
     std::vector<RangeDescriptor> matchingPointRanges(
         const std::string& key) {
         std::vector<RangeDescriptor> matches;
-        for (const auto& range :
-             latestRangeDescriptorsById(rangeDescriptors())) {
+        for (const auto& range : latestActiveRangeDescriptors(
+                 rangeDescriptors())) {
             if (keyInRange(key, range)) matches.push_back(range);
         }
         std::sort(
@@ -11915,8 +12049,8 @@ private:
         const std::string& start_key,
         const std::string& end_key) {
         std::vector<RangeDescriptor> matches;
-        for (const auto& range :
-             latestRangeDescriptorsById(rangeDescriptors())) {
+        for (const auto& range : latestActiveRangeDescriptors(
+                 rangeDescriptors())) {
             if (rangesOverlap(start_key, end_key, range)) {
                 matches.push_back(range);
             }
@@ -12274,13 +12408,169 @@ private:
 
     Result executeOne(const RegisterRangeCommand& command) {
         ensureSystemCatalogTables();
+        if (command.status != "active" && command.status != "superseded") {
+            return ConfigRejectedResult{};
+        }
         insertSystemCatalogRows({
             InsertRowCommand{
                 "__ranges",
                 {command.range_id, command.start_key, command.end_key,
                  command.replica_group_id,
-                 std::to_string(command.descriptor_version)}}
+                 std::to_string(command.descriptor_version),
+                 command.status}}
         });
+        return StatementOkResult{};
+    }
+
+    Result executeOne(const SplitRangeCommand& command) {
+        ensureSystemCatalogTables();
+        if (command.source_range_id.empty() ||
+            command.left_range_id.empty() ||
+            command.right_range_id.empty() ||
+            command.left_range_id == command.right_range_id ||
+            command.left_range_id == command.source_range_id ||
+            command.right_range_id == command.source_range_id) {
+            return ConfigRejectedResult{};
+        }
+
+        std::optional<RangeDescriptor> source;
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if (range.range_id == command.source_range_id) {
+                source = range;
+                break;
+            }
+        }
+        if (!source.has_value() || source->status != "active" ||
+            command.descriptor_version <= source->descriptor_version ||
+            command.split_key <= source->start_key ||
+            (!source->end_key.empty() &&
+             command.split_key >= source->end_key)) {
+            return ConfigRejectedResult{};
+        }
+
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if ((range.range_id == command.left_range_id ||
+                 range.range_id == command.right_range_id) &&
+                range.status == "active") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        insertSystemCatalogRows({
+            InsertRowCommand{
+                "__ranges",
+                {source->range_id,
+                 source->start_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "superseded"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.left_range_id,
+                 source->start_key,
+                 command.split_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.right_range_id,
+                 command.split_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}}
+        });
+        return StatementOkResult{};
+    }
+
+    Result executeOne(const SplitTableCommand& command) {
+        ensureSystemCatalogTables();
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        if (command.table.empty() ||
+            command.source_range_id.empty() ||
+            command.left_range_id.empty() ||
+            command.right_range_id.empty() ||
+            command.left_range_id == command.right_range_id ||
+            command.left_range_id == command.source_range_id ||
+            command.right_range_id == command.source_range_id) {
+            return ConfigRejectedResult{};
+        }
+
+        auto source = latestRangeDescriptorById(command.source_range_id);
+        if (!source.has_value() || source->status != "active" ||
+            command.descriptor_version <= source->descriptor_version ||
+            source->start_key < tableRowPrefix(command.table) ||
+            source->end_key > tableRowPrefixEnd(command.table)) {
+            return ConfigRejectedResult{};
+        }
+
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if ((range.range_id == command.left_range_id ||
+                 range.range_id == command.right_range_id) &&
+                range.status == "active") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        auto records =
+            latestGlobalKeyRecordsForRange(command.table, *source);
+        if (records.size() < 2) return ConfigRejectedResult{};
+
+        size_t split_index = records.size() / 2;
+        std::string split_key = records[split_index].row_key;
+        if (split_key <= source->start_key ||
+            (!source->end_key.empty() && split_key >= source->end_key)) {
+            return ConfigRejectedResult{};
+        }
+
+        std::vector<InsertRowCommand> catalog_rows{
+            InsertRowCommand{
+                "__ranges",
+                {source->range_id,
+                 source->start_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "superseded"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.left_range_id,
+                 source->start_key,
+                 split_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.right_range_id,
+                 split_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}}
+        };
+
+        for (const auto& record : records) {
+            std::string range_id = record.row_key < split_key
+                                       ? command.left_range_id
+                                       : command.right_range_id;
+            catalog_rows.push_back(
+                InsertRowCommand{
+                    "__global_keys",
+                    {record.table_name,
+                     record.primary_key,
+                     record.row_key,
+                     range_id,
+                     source->replica_group_id,
+                     std::to_string(command.descriptor_version)}});
+        }
+
+        insertSystemCatalogRows(catalog_rows);
         return StatementOkResult{};
     }
 
@@ -13034,12 +13324,12 @@ std::vector<std::string> requireTupleLinesFromFile(
     const std::string& data_file,
     const std::string& table,
     size_t count) {
+    std::vector<std::string> rows;
     std::ifstream input(data_file);
     if (!input) {
         throw std::runtime_error("Unable to open tuple file: " + data_file);
     }
 
-    std::vector<std::string> rows;
     std::string line;
     const std::string prefix = table + "|";
     while (std::getline(input, line)) {
@@ -13057,6 +13347,34 @@ std::vector<std::string> requireTupleLinesFromFile(
     throw std::runtime_error(
         "Tuple file " + data_file + " does not contain " +
         std::to_string(count) + " rows for table " + table);
+}
+
+std::vector<std::string> requireAllTupleLinesFromFile(
+    const std::string& data_file,
+    const std::string& table) {
+    std::ifstream input(data_file);
+    if (!input) {
+        throw std::runtime_error("Unable to open tuple file: " + data_file);
+    }
+
+    std::vector<std::string> rows;
+    std::string line;
+    const std::string prefix = table + "|";
+    while (std::getline(input, line)) {
+        line = adapterTrim(line);
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        if (line.rfind(prefix, 0) == 0) {
+            rows.push_back(line);
+        }
+    }
+    if (rows.empty()) {
+        throw std::runtime_error(
+            "Tuple file " + data_file + " does not contain rows for table " +
+            table);
+    }
+    return rows;
 }
 
 std::vector<std::string> tupleValuesFromLine(
@@ -13190,7 +13508,7 @@ std::string defaultImdbInputFile() {
 void printV104BootstrapTrace(const std::string& data_file) {
     std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v125-bootstrap-trace-" + std::to_string(::getpid()));
+        ("buzzdb-v126-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
@@ -14302,6 +14620,56 @@ std::optional<std::string> selectAllValue(
     return row[*index];
 }
 
+size_t currentGlobalKeyCountOn(const ConsensusReplica* node,
+                               const std::string& range_id) {
+    Result storage = TableNotFoundResult{};
+    const auto* rows = catalogRowsOn(node, "__global_keys", &storage);
+    if (rows == nullptr) return size_t{0};
+    auto table_column = catalogColumnIndex(*rows, "table_name");
+    auto primary_column = catalogColumnIndex(*rows, "primary_key");
+    auto row_key_column = catalogColumnIndex(*rows, "row_key");
+    auto range_column = catalogColumnIndex(*rows, "range_id");
+    auto version_column = catalogColumnIndex(*rows, "descriptor_version");
+    if (!table_column.has_value() ||
+        !primary_column.has_value() ||
+        !row_key_column.has_value() ||
+        !range_column.has_value() ||
+        !version_column.has_value()) {
+        return size_t{0};
+    }
+
+    struct LatestGlobalKey {
+        std::string range_id;
+        int version = 0;
+    };
+    std::map<std::string, LatestGlobalKey> latest;
+    std::string separator(1, '\0');
+    for (const auto& row : rows->rows) {
+        if (*table_column >= row.size() ||
+            *primary_column >= row.size() ||
+            *row_key_column >= row.size() ||
+            *range_column >= row.size() ||
+            *version_column >= row.size()) {
+            continue;
+        }
+        std::string key = row[*table_column] + separator +
+                          row[*primary_column] + separator +
+                          row[*row_key_column];
+        int version = std::stoi(row[*version_column]);
+        auto it = latest.find(key);
+        if (it == latest.end() || version >= it->second.version) {
+            latest[key] = LatestGlobalKey{row[*range_column], version};
+        }
+    }
+
+    size_t count = 0;
+    for (const auto& [key, record] : latest) {
+        (void)key;
+        if (record.range_id == range_id) ++count;
+    }
+    return count;
+}
+
 std::vector<RangeDescriptor> rangeDescriptorsFromRows(
     const SelectAllResult& rows) {
     std::vector<RangeDescriptor> ranges;
@@ -14311,6 +14679,7 @@ std::vector<RangeDescriptor> rangeDescriptorsFromRows(
         auto end_key = selectAllValue(rows, row, "end_key");
         auto group = selectAllValue(rows, row, "replica_group_id");
         auto version = selectAllValue(rows, row, "descriptor_version");
+        auto status = selectAllValue(rows, row, "status");
         if (!range_id || !start_key || !end_key || !group || !version) {
             continue;
         }
@@ -14319,7 +14688,8 @@ std::vector<RangeDescriptor> rangeDescriptorsFromRows(
             *start_key,
             *end_key,
             *group,
-            std::stoi(*version)
+            std::stoi(*version),
+            status.value_or("active")
         });
     }
     return ranges;
@@ -14332,7 +14702,7 @@ public:
         const auto* rows = catalogRowsOn(node, "__ranges", &storage);
         cached_ranges_ = rows == nullptr
                              ? std::vector<RangeDescriptor>{}
-                             : latestRangeDescriptorsById(
+                             : latestActiveRangeDescriptors(
                                    rangeDescriptorsFromRows(*rows));
     }
 
@@ -14391,16 +14761,34 @@ SearchState buildInitialReplicaGroupState(
 }
 
 void printPartitionedSQLTrace(const std::string& data_file) {
-    std::cout << "Trace: global keyspace and range routing" << std::endl;
+    std::cout << "Trace: range splits and routing" << std::endl;
     std::vector<Address> replicas = quorumReplicaAddresses(3);
     Address leader = replicas[0];
     Address client = ScenarioAddress::client1();
 
     std::vector<std::string> title_rows =
-        requireTupleLinesFromFile(data_file, "title", 1);
-    std::vector<std::string> title_values =
-        tupleValuesFromLine(title_rows.front(), "title");
-    std::string primary_key = title_values.front();
+        requireAllTupleLinesFromFile(data_file, "title");
+    std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+    for (const auto& row : title_rows) {
+        titles.push_back({row, tupleValuesFromLine(row, "title")});
+    }
+    std::sort(
+        titles.begin(),
+        titles.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return tableRowKey("title", lhs.second.front()) <
+                   tableRowKey("title", rhs.second.front());
+        });
+    if (titles.size() < 2) {
+        throw std::runtime_error(
+            "Need at least two title rows for split trace.");
+    }
+    size_t split_index = titles.size() / 2;
+    std::string left_range = defaultRangeIdForTable("title") + "-left";
+    std::string right_range = defaultRangeIdForTable("title") + "-right";
+    std::string split_key =
+        tableRowKey("title", titles[split_index].second.front());
+    std::string primary_key = titles[split_index].second.front();
 
     SearchState state = buildInitialReplicaGroupState(
         replicas, leader, client, 1);
@@ -14408,9 +14796,20 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         state, leader, client, 1, 3,
         createTitleTableCommand(),
         {replicas[1], replicas[2]});
+    int request_id = 4;
+    for (const auto& title : titles) {
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 1, request_id++,
+            parseSQL("INSERT " + title.first),
+            {replicas[1], replicas[2]});
+    }
     state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, 4,
-        parseSQL("INSERT " + title_rows.front()),
+        state, leader, client, 1, request_id++,
+        SplitTableCommand{"title",
+                          defaultRangeIdForTable("title"),
+                          left_range,
+                          right_range,
+                          2},
         {replicas[1], replicas[2]});
 
     const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
@@ -14425,6 +14824,8 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     std::cout << "  leader=" << leader
               << ", commit_index=" << leader_node->commitIndex()
               << ", table=title"
+              << ", rows=" << titles.size()
+              << ", split_key=" << split_key
               << ", primary_key=" << primary_key << std::endl;
     if (route != nullptr && !route->range_ids.empty()) {
         std::cout << "  row key=" << route->start_key
@@ -14436,19 +14837,24 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     }
     std::cout << "  __ranges rows="
               << catalogRowCountOn(leader_node, "__ranges")
-              << ", __global_keys rows="
+              << ", __global_key_versions="
               << catalogRowCountOn(leader_node, "__global_keys")
+              << ", current_left_keys="
+              << currentGlobalKeyCountOn(leader_node, left_range)
+              << ", current_right_keys="
+              << currentGlobalKeyCountOn(leader_node, right_range)
               << std::endl;
     for (const auto& replica : replicas) {
         const auto* node = state.nodeAs<ConsensusReplica>(replica);
-        std::cout << "  " << replica << " has title range="
+        std::cout << "  " << replica << " has split children="
                   << (catalogHasRowOn(
                           node, "__ranges",
-                          {{"range_id", defaultRangeIdForTable("title")},
-                           {"start_key", tableRowPrefix("title")},
-                           {"end_key", tableRowPrefixEnd("title")},
-                           {"replica_group_id", "group-1"},
-                           {"descriptor_version", "1"}})
+                          {{"range_id", left_range},
+                           {"status", "active"}}) &&
+                      catalogHasRowOn(
+                          node, "__ranges",
+                          {{"range_id", right_range},
+                           {"status", "active"}})
                           ? "yes" : "no")
                   << std::endl;
     }
@@ -14457,16 +14863,16 @@ void printPartitionedSQLTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v125; "
+        std::cerr << "--measure-restart is not available in v126; "
                   << "this version focuses on the first partitioned-SQL "
-                  << "routing boundary."
+                  << "range split boundary."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v125: global keyspace and range routing" << std::endl;
+    std::cout << "BuzzDB v126: range splits and routing" << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
@@ -14477,10 +14883,65 @@ int main(int argc, char* argv[]) {
 
     TestRunner tests;
 
-    auto firstTitleTuple = [&]() {
-        std::string line =
-            requireTupleLinesFromFile(imdb_file, "title", 1).front();
-        return std::make_pair(line, tupleValuesFromLine(line, "title"));
+    struct TitleSplitFixture {
+        std::vector<std::pair<std::string, std::vector<std::string>>> rows;
+        std::vector<std::string> left_values;
+        std::vector<std::string> right_values;
+        std::string split_key;
+        size_t split_index = 0;
+
+        size_t leftCount() const { return split_index; }
+        size_t rightCount() const { return rows.size() - split_index; }
+    };
+
+    auto titleLeftRangeId = []() {
+        return defaultRangeIdForTable("title") + "-left";
+    };
+
+    auto titleRightRangeId = []() {
+        return defaultRangeIdForTable("title") + "-right";
+    };
+
+    auto titleSplitFixture = [&]() {
+        std::vector<std::string> lines =
+            requireAllTupleLinesFromFile(imdb_file, "title");
+        std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+        for (const auto& line : lines) {
+            titles.push_back({line, tupleValuesFromLine(line, "title")});
+        }
+        std::sort(
+            titles.begin(),
+            titles.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return tableRowKey("title", lhs.second.front()) <
+                       tableRowKey("title", rhs.second.front());
+            });
+        if (titles.size() < 2 ||
+            titles.front().second.empty() ||
+            titles.back().second.empty()) {
+            throw std::runtime_error(
+                "Need at least two title primary keys for split tests.");
+        }
+        size_t split_index = titles.size() / 2;
+        if (split_index == 0 || split_index >= titles.size()) {
+            throw std::runtime_error("Invalid title split index.");
+        }
+        return TitleSplitFixture{
+            titles,
+            titles[0].second,
+            titles[split_index].second,
+            tableRowKey("title", titles[split_index].second.front()),
+            split_index
+        };
+    };
+
+    auto splitTitleCommand = [&](int version = 2) {
+        return SplitTableCommand{
+            "title",
+            defaultRangeIdForTable("title"),
+            titleLeftRangeId(),
+            titleRightRangeId(),
+            version};
     };
 
     auto buildTitleTableState = [&](int client_id) {
@@ -14494,15 +14955,32 @@ int main(int argc, char* argv[]) {
             createTitleTableCommand(), {replicas[1], replicas[2]});
     };
 
-    auto buildTitleRowState = [&](int client_id) {
-        auto title = firstTitleTuple();
+    auto buildLoadedTitleTableState = [&](int client_id,
+                                          const TitleSplitFixture& fixture) {
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
         SearchState state = buildTitleTableState(client_id);
+        int request_id = 4;
+        for (const auto& row : fixture.rows) {
+            state = deliverConsensusCommandToQuorum(
+                state, leader, client, client_id, request_id++,
+                parseSQL("INSERT " + row.first),
+                {replicas[1], replicas[2]});
+        }
+        return state;
+    };
+
+    auto buildTitleSplitState = [&](int client_id) {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildLoadedTitleTableState(client_id, fixture);
         return deliverConsensusCommandToQuorum(
-            state, leader, client, client_id, 4,
-            parseSQL("INSERT " + title.first), {replicas[1], replicas[2]});
+            state, leader, client, client_id,
+            static_cast<int>(fixture.rows.size()) + 4,
+            splitTitleCommand(), {replicas[1], replicas[2]});
     };
 
     auto routeFor = [&](const ConsensusReplica* node,
@@ -14519,88 +14997,24 @@ int main(int argc, char* argv[]) {
         return *route;
     };
 
-    tests.test("Network controls filter simulator messages and timers", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address follower = replicas[1];
-        Address client = ScenarioAddress::client1();
-        SearchState state = consensusClusterState(replicas);
-        state.send(client, leader,
-                   ClientRequest{600, 1, createTitleTableCommand()});
-
-        auto clientRequestVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* message = messageForEvent(state, event);
-                if (message == nullptr) continue;
-                const auto* request =
-                    std::get_if<ClientRequest>(&message->message);
-                if (request != nullptr &&
-                    message->from.rootAddress() == client.rootAddress() &&
-                    message->to.rootAddress() == leader.rootAddress()) {
-                    return true;
-                }
+    auto clientReplyResult = [&](const SearchState& state,
+                                 int client_id,
+                                 int request_id) {
+        for (const auto& envelope : state.network()) {
+            const auto* reply = std::get_if<ClientReply>(&envelope.message);
+            if (reply != nullptr &&
+                reply->client_id == client_id &&
+                reply->request_id == request_id) {
+                return std::optional<Result>{reply->result};
             }
-            return false;
-        };
+        }
+        return std::optional<Result>{};
+    };
 
-        auto electionTimerVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* timer = timerForEvent(state, event);
-                if (timer != nullptr &&
-                    timer->to.rootAddress() == leader.rootAddress() &&
-                    std::get_if<ElectionTimer>(&timer->timer) != nullptr) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        SearchSettings network_off;
-        network_off.networkActive(false);
-        tests.check(!clientRequestVisible(network_off),
-                    "global network disable should hide client request");
-        network_off.linkActive(client, leader, true);
-        tests.check(clientRequestVisible(network_off),
-                    "explicit link enable should override global network off");
-
-        SearchSettings sender_off;
-        sender_off.senderActive(client, false);
-        tests.check(!clientRequestVisible(sender_off),
-                    "sender disable should hide client request");
-
-        SearchSettings receiver_off;
-        receiver_off.receiverActive(leader, false);
-        tests.check(!clientRequestVisible(receiver_off),
-                    "receiver disable should hide client request");
-
-        SearchSettings node_off;
-        node_off.nodeActive(leader, false);
-        tests.check(!clientRequestVisible(node_off),
-                    "node disable should hide messages and timers");
-        tests.check(!electionTimerVisible(node_off),
-                    "node disable should hide its timers");
-
-        SearchSettings partitioned;
-        partitioned.partition({{client}, {leader, follower}});
-        tests.check(!clientRequestVisible(partitioned),
-                    "partition should block cross-group message delivery");
-        partitioned.resetNetwork();
-        tests.check(clientRequestVisible(partitioned),
-                    "resetNetwork should restore message delivery");
-
-        SearchSettings timer_off;
-        timer_off.timerActive(leader, false);
-        tests.check(!electionTimerVisible(timer_off),
-                    "timerActive(false) should hide that node's timer");
-        timer_off.timerActive(leader, true);
-        timer_off.deliverTimers(false);
-        tests.check(electionTimerVisible(timer_off),
-                    "node timer override should beat global timer disable");
-    });
-
-    tests.test("Create table creates a default range descriptor through consensus", [&] {
+    tests.test("Split table records parent history and active children", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
-        SearchState state = buildTitleTableState(501);
+        SearchState state = buildTitleSplitState(505);
 
         for (const auto& replica : replicas) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
@@ -14609,178 +15023,217 @@ int main(int argc, char* argv[]) {
                             {{"range_id", defaultRangeIdForTable("title")},
                              {"start_key", tableRowPrefix("title")},
                              {"end_key", tableRowPrefixEnd("title")},
-                             {"replica_group_id", "group-1"},
-                             {"descriptor_version", "1"}}),
+                             {"descriptor_version", "1"},
+                             {"status", "active"}}),
                         replica.str() +
-                            " should have the replicated title range");
-        }
-    });
-
-    tests.test("Insert records an encoded global row key", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        SearchState state = buildTitleRowState(502);
-
-        for (const auto& replica : replicas) {
-            const auto* node = state.nodeAs<ConsensusReplica>(replica);
+                            " should keep the original descriptor history");
             tests.check(catalogHasRowOn(
-                            node, "__global_keys",
-                            {{"table_name", "title"},
-                             {"primary_key", primary_key},
-                             {"row_key",
-                              tableRowKey("title", primary_key)},
-                             {"range_id", defaultRangeIdForTable("title")},
-                             {"replica_group_id", "group-1"},
-                             {"descriptor_version", "1"}}),
+                            node, "__ranges",
+                            {{"range_id", defaultRangeIdForTable("title")},
+                             {"descriptor_version", "2"},
+                             {"status", "superseded"}}),
                         replica.str() +
-                            " should record the replicated row key");
+                            " should supersede the parent descriptor");
+            tests.check(catalogHasRowOn(
+                            node, "__ranges",
+                            {{"range_id", titleLeftRangeId()},
+                             {"start_key", tableRowPrefix("title")},
+                             {"end_key", fixture.split_key},
+                             {"descriptor_version", "2"},
+                             {"status", "active"}}),
+                        replica.str() +
+                            " should have the active left child range");
+            tests.check(catalogHasRowOn(
+                            node, "__ranges",
+                            {{"range_id", titleRightRangeId()},
+                             {"start_key", fixture.split_key},
+                             {"end_key", tableRowPrefixEnd("title")},
+                             {"descriptor_version", "2"},
+                             {"status", "active"}}),
+                        replica.str() +
+                            " should have the active right child range");
         }
+        auto split_reply = clientReplyResult(
+            state, 505, static_cast<int>(fixture.rows.size()) + 4);
+        tests.check(split_reply.has_value() &&
+                        *split_reply == Result{StatementOkResult{}},
+                    "split command should commit with StatementOk");
     });
 
-    tests.test("Primary-key route targets one range", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
+    tests.test("Point lookups route to the correct split child", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
-        SearchState state = buildTitleTableState(503);
+        SearchState state = buildTitleSplitState(506);
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
 
-        tests.check(route.start_key == tableRowKey("title", primary_key),
-                    "point route should start at encoded row key");
-        tests.check(route.range_ids.size() == 1,
-                    "point route should target one range");
-        tests.check(route.range_ids.front() ==
-                        defaultRangeIdForTable("title"),
-                    "point route should target the title range");
-        tests.check(route.replica_group_ids.front() == "group-1",
-                    "point route should name the replica group");
-        tests.check(route.descriptor_versions.front() == 1,
-                    "point route should use descriptor version 1");
+        RouteResult left = routeFor(
+            leader_node,
+            ExplainRouteCommand{
+                "title", fixture.left_values.front(), false});
+        tests.check(left.range_ids.size() == 1 &&
+                        left.range_ids.front() == titleLeftRangeId(),
+                    "key below split should route to left child");
+        tests.check(left.descriptor_versions.front() == 2,
+                    "left child should use split descriptor version");
+
+        RouteResult right = routeFor(
+            leader_node,
+            ExplainRouteCommand{
+                "title", fixture.right_values.front(), false});
+        tests.check(right.range_ids.size() == 1 &&
+                        right.range_ids.front() == titleRightRangeId(),
+                    "key at split should route to right child");
+        tests.check(right.descriptor_versions.front() == 2,
+                    "right child should use split descriptor version");
     });
 
-    tests.test("Full scan routes through matching table ranges", [&] {
+    tests.test("Full scan routes across both split ranges", [&] {
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
-        SearchState state = buildTitleTableState(504);
+        SearchState state = buildTitleSplitState(507);
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
         RouteResult route = routeFor(
             leader_node, ExplainRouteCommand{"title", "", true});
 
-        tests.check(route.start_key == tableRowPrefix("title"),
-                    "scan route should start at the table row prefix");
-        tests.check(route.end_key == tableRowPrefixEnd("title"),
-                    "scan route should end at the table row prefix boundary");
-        tests.check(route.range_ids.size() == 1,
-                    "single-range scan should target one range");
-        tests.check(route.range_ids.front() ==
-                        defaultRangeIdForTable("title"),
-                    "scan route should include the title range");
+        tests.check(route.range_ids.size() == 2,
+                    "split table scan should route both children");
+        tests.check(route.range_ids[0] == titleLeftRangeId() &&
+                        route.range_ids[1] == titleRightRangeId(),
+                    "split scan should preserve key order");
+        tests.check(route.replica_group_ids[0] == "group-1" &&
+                        route.replica_group_ids[1] == "group-1",
+                    "split children should stay in the source group");
     });
 
-    tests.test("Range descriptor changes are versioned and latest wins", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
+    tests.test("Invalid split does not change active routing", [&] {
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleTableState(505);
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
+        SearchState state = buildTitleTableState(508);
         state = deliverConsensusCommandToQuorum(
-            state, leader, client, 505, 4,
-            RegisterRangeCommand{defaultRangeIdForTable("title"),
-                                 tableRowPrefix("title"),
-                                 new_end,
-                                 "group-1",
-                                 2},
+            state, leader, client, 508, 4,
+            SplitTableCommand{
+                "title",
+                defaultRangeIdForTable("title"),
+                titleLeftRangeId(),
+                titleRightRangeId(),
+                2},
             {replicas[1], replicas[2]});
 
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        tests.check(catalogHasRowOn(
+        auto reply = clientReplyResult(state, 508, 4);
+        tests.check(reply.has_value() &&
+                        *reply == Result{ConfigRejectedResult{}},
+                    "invalid split should return ConfigRejected");
+        tests.check(!catalogHasRowOn(
                         leader_node, "__ranges",
-                        {{"range_id", defaultRangeIdForTable("title")},
-                         {"end_key", tableRowPrefixEnd("title")},
-                         {"descriptor_version", "1"}}),
-                    "catalog should retain descriptor history");
-        tests.check(catalogHasRowOn(
-                        leader_node, "__ranges",
-                        {{"range_id", defaultRangeIdForTable("title")},
-                         {"end_key", new_end},
-                         {"descriptor_version", "2"}}),
-                    "catalog should store the new descriptor version");
-
+                        {{"range_id", titleLeftRangeId()}}),
+                    "invalid split should not create a left child");
         RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
-        tests.check(route.range_ids.size() == 1,
-                    "router should use one current descriptor per range id");
-        tests.check(route.descriptor_versions.front() == 2,
-                    "router should use the latest descriptor version");
-        tests.check(route.end_key == tableRowKey("title", primary_key) + "\x7F",
-                    "point lookup route should still describe the point key");
+            leader_node, ExplainRouteCommand{"title", "", true});
+        tests.check(route.range_ids.size() == 1 &&
+                        route.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "invalid split should leave the parent active");
     });
 
-    tests.test("Router cache refreshes after descriptor change", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
+    tests.test("Stale parent descriptor is ignored after split", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleTableState(506);
+        SearchState state = buildTitleSplitState(509);
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 509,
+            static_cast<int>(fixture.rows.size()) + 5,
+            RegisterRangeCommand{defaultRangeIdForTable("title"),
+                                 tableRowPrefix("title"),
+                                 tableRowPrefixEnd("title"),
+                                 "stale-group",
+                                 1,
+                                 "active"},
+            {replicas[1], replicas[2]});
+
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        RouteResult route = routeFor(
+            leader_node,
+            ExplainRouteCommand{
+                "title", fixture.right_values.front(), false});
+        tests.check(route.range_ids.size() == 1 &&
+                        route.range_ids.front() == titleRightRangeId(),
+                    "lower-version parent descriptor should be ignored");
+        tests.check(route.descriptor_versions.front() == 2,
+                    "split child should remain the latest active route");
+    });
+
+    tests.test("Router cache refreshes after split", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildLoadedTitleTableState(510, fixture);
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
         RangeRouter router;
         router.refreshFrom(leader_node);
-        RouteResult before = router.routePoint("title", primary_key);
-        tests.check(!before.descriptor_versions.empty() &&
-                        before.descriptor_versions.front() == 1,
-                    "fresh router should see descriptor version 1");
+        RouteResult before = router.routePoint(
+            "title", fixture.right_values.front());
+        tests.check(before.range_ids.size() == 1 &&
+                        before.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "fresh router should initially see the parent range");
 
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
         state = deliverConsensusCommandToQuorum(
-            state, leader, client, 506, 4,
-            RegisterRangeCommand{defaultRangeIdForTable("title"),
-                                 tableRowPrefix("title"),
-                                 new_end,
-                                 "group-1",
-                                 2},
-            {replicas[1], replicas[2]});
-        RouteResult stale = router.routePoint("title", primary_key);
-        tests.check(stale.descriptor_versions.front() == 1,
-                    "stale router cache should still expose old metadata");
+            state, leader, client, 510,
+            static_cast<int>(fixture.rows.size()) + 4,
+            splitTitleCommand(), {replicas[1], replicas[2]});
+        RouteResult stale = router.routePoint(
+            "title", fixture.right_values.front());
+        tests.check(stale.range_ids.front() ==
+                        defaultRangeIdForTable("title"),
+                    "stale router cache should expose old metadata");
 
         leader_node = state.nodeAs<ConsensusReplica>(leader);
         router.refreshFrom(leader_node);
-        RouteResult refreshed = router.routePoint("title", primary_key);
-        tests.check(refreshed.descriptor_versions.front() == 2,
-                    "router refresh should load the latest descriptor");
+        RouteResult refreshed = router.routePoint(
+            "title", fixture.right_values.front());
+        tests.check(refreshed.range_ids.size() == 1 &&
+                        refreshed.range_ids.front() == titleRightRangeId(),
+                    "router refresh should load split metadata");
     });
 
-    tests.test("Single-range SQL behavior is preserved", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
+    tests.test("Full title table is assigned across split ranges", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
-        SearchState state = buildTitleRowState(507);
+        SearchState state = buildTitleSplitState(511);
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
 
         Result count = leader_node->executeReadOnlyForTest(
             CountRowsCommand{"title"});
-        tests.check(count == Result{CountRowsResult{1}},
-                    "single-range row count should still be one");
+        tests.check(count == Result{CountRowsResult{fixture.rows.size()}},
+                    "row count should include the full title table");
 
         Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", primary_key});
+            SelectWhereCommand{"title", "id",
+                               fixture.right_values.front()});
         const auto* rows = std::get_if<SelectAllResult>(&selected);
         tests.check(rows != nullptr && rows->rows.size() == 1,
                     "select by primary key should still find the row");
 
         RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
+            leader_node,
+            ExplainRouteCommand{
+                "title", fixture.right_values.front(), false});
         tests.check(route.range_ids.size() == 1 &&
-                        route.range_ids.front() ==
-                            defaultRangeIdForTable("title"),
-                    "the inserted row should route to the single title range");
+                        route.range_ids.front() == titleRightRangeId(),
+                    "the inserted row should route to the right child");
+        tests.check(currentGlobalKeyCountOn(leader_node, titleLeftRangeId()) ==
+                        fixture.leftCount(),
+                    "left child should own the lower half of title row keys");
+        tests.check(currentGlobalKeyCountOn(leader_node, titleRightRangeId()) ==
+                        fixture.rightCount(),
+                    "right child should own the upper half of title row keys");
     });
 
     return tests.finish();

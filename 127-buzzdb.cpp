@@ -10667,6 +10667,10 @@ struct ExplainRouteCommand {
     bool full_scan = false;
 };
 
+struct RoutedSQLCommand {
+    std::string sql;
+};
+
 struct QuerySQLCommand { std::string sql; };
 struct CountRowsCommand { std::string table; };
 struct CheckpointCommand {};
@@ -10690,6 +10694,23 @@ struct RegisterRangeCommand {
     std::string start_key;
     std::string end_key;
     std::string replica_group_id;
+    int descriptor_version = 1;
+    std::string status = "active";
+};
+
+struct SplitRangeCommand {
+    std::string source_range_id;
+    std::string split_key;
+    std::string left_range_id;
+    std::string right_range_id;
+    int descriptor_version = 1;
+};
+
+struct SplitTableCommand {
+    std::string table;
+    std::string source_range_id;
+    std::string left_range_id;
+    std::string right_range_id;
     int descriptor_version = 1;
 };
 
@@ -10748,12 +10769,15 @@ using Command = std::variant<
     SelectAllCommand,
     SelectWhereCommand,
     ExplainRouteCommand,
+    RoutedSQLCommand,
     QuerySQLCommand,
     CountRowsCommand,
     CheckpointCommand,
     RegisterClusterNodeCommand,
     RegisterReplicaGroupCommand,
     RegisterRangeCommand,
+    SplitRangeCommand,
+    SplitTableCommand,
     BootstrapClusterCommand,
     DiscoverClusterNodeCommand,
     AddLearnerToGroupCommand,
@@ -10791,6 +10815,9 @@ bool operator==(const ExplainRouteCommand& lhs,
     return lhs.table == rhs.table && lhs.primary_key == rhs.primary_key &&
            lhs.full_scan == rhs.full_scan;
 }
+bool operator==(const RoutedSQLCommand& lhs, const RoutedSQLCommand& rhs) {
+    return lhs.sql == rhs.sql;
+}
 bool operator==(const QuerySQLCommand& lhs, const QuerySQLCommand& rhs) {
     return lhs.sql == rhs.sql;
 }
@@ -10816,6 +10843,23 @@ bool operator==(const RegisterRangeCommand& lhs,
     return lhs.range_id == rhs.range_id && lhs.start_key == rhs.start_key &&
            lhs.end_key == rhs.end_key &&
            lhs.replica_group_id == rhs.replica_group_id &&
+           lhs.descriptor_version == rhs.descriptor_version &&
+           lhs.status == rhs.status;
+}
+bool operator==(const SplitRangeCommand& lhs,
+                const SplitRangeCommand& rhs) {
+    return lhs.source_range_id == rhs.source_range_id &&
+           lhs.split_key == rhs.split_key &&
+           lhs.left_range_id == rhs.left_range_id &&
+           lhs.right_range_id == rhs.right_range_id &&
+           lhs.descriptor_version == rhs.descriptor_version;
+}
+bool operator==(const SplitTableCommand& lhs,
+                const SplitTableCommand& rhs) {
+    return lhs.table == rhs.table &&
+           lhs.source_range_id == rhs.source_range_id &&
+           lhs.left_range_id == rhs.left_range_id &&
+           lhs.right_range_id == rhs.right_range_id &&
            lhs.descriptor_version == rhs.descriptor_version;
 }
 bool operator==(const BootstrapClusterCommand& lhs,
@@ -10906,6 +10950,7 @@ struct SchemaMismatchResult {};
 struct InvalidSchemaResult {};
 struct ClusterRejectedResult {};
 struct ConfigRejectedResult {};
+struct RouteRejectedResult {};
 
 using Result = std::variant<
     CreateTableOkResult,
@@ -10923,7 +10968,8 @@ using Result = std::variant<
     SchemaMismatchResult,
     InvalidSchemaResult,
     ClusterRejectedResult,
-    ConfigRejectedResult>;
+    ConfigRejectedResult,
+    RouteRejectedResult>;
 
 bool operator==(const CreateTableOkResult&, const CreateTableOkResult&) { return true; }
 bool operator==(const InsertOkResult&, const InsertOkResult&) { return true; }
@@ -10946,6 +10992,7 @@ bool operator==(const SchemaMismatchResult&, const SchemaMismatchResult&) { retu
 bool operator==(const InvalidSchemaResult&, const InvalidSchemaResult&) { return true; }
 bool operator==(const ClusterRejectedResult&, const ClusterRejectedResult&) { return true; }
 bool operator==(const ConfigRejectedResult&, const ConfigRejectedResult&) { return true; }
+bool operator==(const RouteRejectedResult&, const RouteRejectedResult&) { return true; }
 
 bool operator==(const Result& lhs, const Result& rhs) {
     return lhs.index() == rhs.index() &&
@@ -10998,6 +11045,8 @@ std::string describeCommand(const Command& command) {
                     out << ", pk=" << value.primary_key;
                 }
                 out << ")";
+            } else if constexpr (std::is_same_v<T, RoutedSQLCommand>) {
+                out << "RoutedSQL(" << value.sql << ")";
             } else if constexpr (std::is_same_v<T, QuerySQLCommand>) {
                 out << "QuerySQL(" << value.sql << ")";
             } else if constexpr (std::is_same_v<T, CountRowsCommand>) {
@@ -11026,6 +11075,19 @@ std::string describeCommand(const Command& command) {
                 out << "RegisterRange(" << value.range_id << ", ["
                     << value.start_key << ", " << value.end_key
                     << ") -> " << value.replica_group_id
+                    << ", version=" << value.descriptor_version
+                    << ", status=" << value.status << ")";
+            } else if constexpr (std::is_same_v<T, SplitRangeCommand>) {
+                out << "SplitRange(" << value.source_range_id
+                    << " at " << value.split_key
+                    << " -> " << value.left_range_id
+                    << ", " << value.right_range_id
+                    << ", version=" << value.descriptor_version << ")";
+            } else if constexpr (std::is_same_v<T, SplitTableCommand>) {
+                out << "SplitTable(" << value.table
+                    << ", source=" << value.source_range_id
+                    << " -> " << value.left_range_id
+                    << ", " << value.right_range_id
                     << ", version=" << value.descriptor_version << ")";
             } else if constexpr (std::is_same_v<T, BootstrapClusterCommand>) {
                 out << "BootstrapCluster(" << value.cluster_id
@@ -11100,6 +11162,7 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, InvalidSchemaResult>) out << "InvalidSchema";
             else if constexpr (std::is_same_v<T, ClusterRejectedResult>) out << "ClusterRejected";
             else if constexpr (std::is_same_v<T, ConfigRejectedResult>) out << "ConfigRejected";
+            else if constexpr (std::is_same_v<T, RouteRejectedResult>) out << "RouteRejected";
             return out.str();
         },
         result);
@@ -11448,6 +11511,7 @@ struct RangeDescriptor {
     std::string end_key;
     std::string replica_group_id;
     int descriptor_version = 0;
+    std::string status = "active";
 };
 
 bool keyInRange(const std::string& key, const RangeDescriptor& range) {
@@ -11498,6 +11562,17 @@ std::vector<RangeDescriptor> latestRangeDescriptorsById(
         current.push_back(range);
     }
     return sortRangeDescriptors(std::move(current));
+}
+
+std::vector<RangeDescriptor> latestActiveRangeDescriptors(
+    const std::vector<RangeDescriptor>& ranges) {
+    std::vector<RangeDescriptor> active;
+    for (const auto& range : latestRangeDescriptorsById(ranges)) {
+        if (range.status == "active") {
+            active.push_back(range);
+        }
+    }
+    return sortRangeDescriptors(std::move(active));
 }
 
 RouteResult routeResultFor(const std::string& start_key,
@@ -11727,7 +11802,8 @@ private:
         createSystemCatalogTableIfMissing(
             "__ranges",
             {"range_id:string", "start_key:string", "end_key:string",
-             "replica_group_id:string", "descriptor_version:int"});
+             "replica_group_id:string", "descriptor_version:int",
+             "status:string"});
         createSystemCatalogTableIfMissing(
             "__global_keys",
             {"table_name:string", "primary_key:string", "row_key:string",
@@ -11760,7 +11836,8 @@ private:
                  tableRowPrefix(command.table),
                  tableRowPrefixEnd(command.table),
                  "group-1",
-                 "1"}}
+                 "1",
+                 "active"}}
         });
     }
 
@@ -11883,17 +11960,88 @@ private:
                 row[1],
                 row[2],
                 row[3],
-                std::stoi(row[4])
+                std::stoi(row[4]),
+                row.size() >= 6 ? row[5] : "active"
             });
         }
         return ranges;
     }
 
+    std::optional<RangeDescriptor> latestRangeDescriptorById(
+        const std::string& range_id) {
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if (range.range_id == range_id) return range;
+        }
+        return std::nullopt;
+    }
+
+    struct GlobalKeyRecord {
+        std::string table_name;
+        std::string primary_key;
+        std::string row_key;
+        std::string range_id;
+        std::string replica_group_id;
+        int descriptor_version = 0;
+    };
+
+    std::vector<GlobalKeyRecord> latestGlobalKeyRecords() {
+        SelectAllResult rows = selectSystemCatalogTable("__global_keys");
+        std::map<std::string, GlobalKeyRecord> latest;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 6) continue;
+            GlobalKeyRecord record{
+                row[0], row[1], row[2], row[3], row[4], std::stoi(row[5])};
+            std::string separator(1, '\0');
+            std::string key = record.table_name + separator +
+                              record.primary_key + separator +
+                              record.row_key;
+            auto it = latest.find(key);
+            if (it == latest.end() ||
+                record.descriptor_version >=
+                    it->second.descriptor_version) {
+                latest[key] = record;
+            }
+        }
+
+        std::vector<GlobalKeyRecord> records;
+        records.reserve(latest.size());
+        for (const auto& [key, record] : latest) {
+            (void)key;
+            records.push_back(record);
+        }
+        std::sort(
+            records.begin(),
+            records.end(),
+            [](const GlobalKeyRecord& lhs,
+               const GlobalKeyRecord& rhs) {
+                if (lhs.row_key != rhs.row_key) {
+                    return lhs.row_key < rhs.row_key;
+                }
+                return lhs.primary_key < rhs.primary_key;
+            });
+        return records;
+    }
+
+    std::vector<GlobalKeyRecord> latestGlobalKeyRecordsForRange(
+        const std::string& table,
+        const RangeDescriptor& range) {
+        std::vector<GlobalKeyRecord> records;
+        for (const auto& record : latestGlobalKeyRecords()) {
+            if (record.table_name == table &&
+                record.range_id == range.range_id &&
+                keyInRange(record.row_key, range)) {
+                records.push_back(record);
+            }
+        }
+        return records;
+    }
+
     std::vector<RangeDescriptor> matchingPointRanges(
         const std::string& key) {
         std::vector<RangeDescriptor> matches;
-        for (const auto& range :
-             latestRangeDescriptorsById(rangeDescriptors())) {
+        for (const auto& range : latestActiveRangeDescriptors(
+                 rangeDescriptors())) {
             if (keyInRange(key, range)) matches.push_back(range);
         }
         std::sort(
@@ -11915,8 +12063,8 @@ private:
         const std::string& start_key,
         const std::string& end_key) {
         std::vector<RangeDescriptor> matches;
-        for (const auto& range :
-             latestRangeDescriptorsById(rangeDescriptors())) {
+        for (const auto& range : latestActiveRangeDescriptors(
+                 rangeDescriptors())) {
             if (rangesOverlap(start_key, end_key, range)) {
                 matches.push_back(range);
             }
@@ -11936,6 +12084,70 @@ private:
             command.full_scan ? matchingScanRanges(start_key, end_key)
                               : matchingPointRanges(start_key);
         return routeResultFor(start_key, end_key, std::move(matches));
+    }
+
+    bool routesToExactlyOneRange(const ExplainRouteCommand& command) {
+        RouteResult route = explainRoute(command);
+        return route.range_ids.size() == 1 &&
+               route.replica_group_ids.size() == 1 &&
+               route.descriptor_versions.size() == 1;
+    }
+
+    Result executeRoutedParsedCommand(const Command& parsed) {
+        if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+            if (!tableExists(insert->table)) return TableNotFoundResult{};
+            if (insert->values.empty()) return SchemaMismatchResult{};
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        insert->table, insert->values.front(), false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*insert);
+        }
+
+        if (const auto* select = std::get_if<SelectWhereCommand>(&parsed)) {
+            if (!tableExists(select->table)) return TableNotFoundResult{};
+            if (select->column != "id") return RouteRejectedResult{};
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        select->table, select->value, false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*select);
+        }
+
+        if (const auto* update = std::get_if<UpdateRowsCommand>(&parsed)) {
+            if (!tableExists(update->table)) return TableNotFoundResult{};
+            if (update->where_column != "id") return RouteRejectedResult{};
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        update->table, update->where_value, false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*update);
+        }
+
+        if (const auto* remove = std::get_if<DeleteRowsCommand>(&parsed)) {
+            if (!tableExists(remove->table)) return TableNotFoundResult{};
+            if (remove->column != "id") return RouteRejectedResult{};
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        remove->table, remove->value, false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*remove);
+        }
+
+        if (const auto* scan = std::get_if<SelectAllCommand>(&parsed)) {
+            if (!tableExists(scan->table)) return TableNotFoundResult{};
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{scan->table, "", true})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*scan);
+        }
+
+        return RouteRejectedResult{};
     }
 
     RangeDescriptor bestRangeForKey(const std::string& key) {
@@ -12127,6 +12339,14 @@ private:
         return explainRoute(command);
     }
 
+    Result executeOne(const RoutedSQLCommand& command) {
+        try {
+            return executeRoutedParsedCommand(parseSQL(command.sql));
+        } catch (const std::exception&) {
+            return RouteRejectedResult{};
+        }
+    }
+
     Result executeOne(const QuerySQLCommand& command) {
         try {
             return executeQueryRowCount(command.sql);
@@ -12274,13 +12494,169 @@ private:
 
     Result executeOne(const RegisterRangeCommand& command) {
         ensureSystemCatalogTables();
+        if (command.status != "active" && command.status != "superseded") {
+            return ConfigRejectedResult{};
+        }
         insertSystemCatalogRows({
             InsertRowCommand{
                 "__ranges",
                 {command.range_id, command.start_key, command.end_key,
                  command.replica_group_id,
-                 std::to_string(command.descriptor_version)}}
+                 std::to_string(command.descriptor_version),
+                 command.status}}
         });
+        return StatementOkResult{};
+    }
+
+    Result executeOne(const SplitRangeCommand& command) {
+        ensureSystemCatalogTables();
+        if (command.source_range_id.empty() ||
+            command.left_range_id.empty() ||
+            command.right_range_id.empty() ||
+            command.left_range_id == command.right_range_id ||
+            command.left_range_id == command.source_range_id ||
+            command.right_range_id == command.source_range_id) {
+            return ConfigRejectedResult{};
+        }
+
+        std::optional<RangeDescriptor> source;
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if (range.range_id == command.source_range_id) {
+                source = range;
+                break;
+            }
+        }
+        if (!source.has_value() || source->status != "active" ||
+            command.descriptor_version <= source->descriptor_version ||
+            command.split_key <= source->start_key ||
+            (!source->end_key.empty() &&
+             command.split_key >= source->end_key)) {
+            return ConfigRejectedResult{};
+        }
+
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if ((range.range_id == command.left_range_id ||
+                 range.range_id == command.right_range_id) &&
+                range.status == "active") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        insertSystemCatalogRows({
+            InsertRowCommand{
+                "__ranges",
+                {source->range_id,
+                 source->start_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "superseded"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.left_range_id,
+                 source->start_key,
+                 command.split_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.right_range_id,
+                 command.split_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}}
+        });
+        return StatementOkResult{};
+    }
+
+    Result executeOne(const SplitTableCommand& command) {
+        ensureSystemCatalogTables();
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        if (command.table.empty() ||
+            command.source_range_id.empty() ||
+            command.left_range_id.empty() ||
+            command.right_range_id.empty() ||
+            command.left_range_id == command.right_range_id ||
+            command.left_range_id == command.source_range_id ||
+            command.right_range_id == command.source_range_id) {
+            return ConfigRejectedResult{};
+        }
+
+        auto source = latestRangeDescriptorById(command.source_range_id);
+        if (!source.has_value() || source->status != "active" ||
+            command.descriptor_version <= source->descriptor_version ||
+            source->start_key < tableRowPrefix(command.table) ||
+            source->end_key > tableRowPrefixEnd(command.table)) {
+            return ConfigRejectedResult{};
+        }
+
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if ((range.range_id == command.left_range_id ||
+                 range.range_id == command.right_range_id) &&
+                range.status == "active") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        auto records =
+            latestGlobalKeyRecordsForRange(command.table, *source);
+        if (records.size() < 2) return ConfigRejectedResult{};
+
+        size_t split_index = records.size() / 2;
+        std::string split_key = records[split_index].row_key;
+        if (split_key <= source->start_key ||
+            (!source->end_key.empty() && split_key >= source->end_key)) {
+            return ConfigRejectedResult{};
+        }
+
+        std::vector<InsertRowCommand> catalog_rows{
+            InsertRowCommand{
+                "__ranges",
+                {source->range_id,
+                 source->start_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "superseded"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.left_range_id,
+                 source->start_key,
+                 split_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.right_range_id,
+                 split_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}}
+        };
+
+        for (const auto& record : records) {
+            std::string range_id = record.row_key < split_key
+                                       ? command.left_range_id
+                                       : command.right_range_id;
+            catalog_rows.push_back(
+                InsertRowCommand{
+                    "__global_keys",
+                    {record.table_name,
+                     record.primary_key,
+                     record.row_key,
+                     range_id,
+                     source->replica_group_id,
+                     std::to_string(command.descriptor_version)}});
+        }
+
+        insertSystemCatalogRows(catalog_rows);
         return StatementOkResult{};
     }
 
@@ -13034,12 +13410,12 @@ std::vector<std::string> requireTupleLinesFromFile(
     const std::string& data_file,
     const std::string& table,
     size_t count) {
+    std::vector<std::string> rows;
     std::ifstream input(data_file);
     if (!input) {
         throw std::runtime_error("Unable to open tuple file: " + data_file);
     }
 
-    std::vector<std::string> rows;
     std::string line;
     const std::string prefix = table + "|";
     while (std::getline(input, line)) {
@@ -13057,6 +13433,34 @@ std::vector<std::string> requireTupleLinesFromFile(
     throw std::runtime_error(
         "Tuple file " + data_file + " does not contain " +
         std::to_string(count) + " rows for table " + table);
+}
+
+std::vector<std::string> requireAllTupleLinesFromFile(
+    const std::string& data_file,
+    const std::string& table) {
+    std::ifstream input(data_file);
+    if (!input) {
+        throw std::runtime_error("Unable to open tuple file: " + data_file);
+    }
+
+    std::vector<std::string> rows;
+    std::string line;
+    const std::string prefix = table + "|";
+    while (std::getline(input, line)) {
+        line = adapterTrim(line);
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        if (line.rfind(prefix, 0) == 0) {
+            rows.push_back(line);
+        }
+    }
+    if (rows.empty()) {
+        throw std::runtime_error(
+            "Tuple file " + data_file + " does not contain rows for table " +
+            table);
+    }
+    return rows;
 }
 
 std::vector<std::string> tupleValuesFromLine(
@@ -13190,7 +13594,7 @@ std::string defaultImdbInputFile() {
 void printV104BootstrapTrace(const std::string& data_file) {
     std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v125-bootstrap-trace-" + std::to_string(::getpid()));
+        ("buzzdb-v127-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
@@ -14302,62 +14706,55 @@ std::optional<std::string> selectAllValue(
     return row[*index];
 }
 
-std::vector<RangeDescriptor> rangeDescriptorsFromRows(
-    const SelectAllResult& rows) {
-    std::vector<RangeDescriptor> ranges;
-    for (const auto& row : rows.rows) {
-        auto range_id = selectAllValue(rows, row, "range_id");
-        auto start_key = selectAllValue(rows, row, "start_key");
-        auto end_key = selectAllValue(rows, row, "end_key");
-        auto group = selectAllValue(rows, row, "replica_group_id");
-        auto version = selectAllValue(rows, row, "descriptor_version");
-        if (!range_id || !start_key || !end_key || !group || !version) {
+size_t currentGlobalKeyCountOn(const ConsensusReplica* node,
+                               const std::string& range_id) {
+    Result storage = TableNotFoundResult{};
+    const auto* rows = catalogRowsOn(node, "__global_keys", &storage);
+    if (rows == nullptr) return size_t{0};
+    auto table_column = catalogColumnIndex(*rows, "table_name");
+    auto primary_column = catalogColumnIndex(*rows, "primary_key");
+    auto row_key_column = catalogColumnIndex(*rows, "row_key");
+    auto range_column = catalogColumnIndex(*rows, "range_id");
+    auto version_column = catalogColumnIndex(*rows, "descriptor_version");
+    if (!table_column.has_value() ||
+        !primary_column.has_value() ||
+        !row_key_column.has_value() ||
+        !range_column.has_value() ||
+        !version_column.has_value()) {
+        return size_t{0};
+    }
+
+    struct LatestGlobalKey {
+        std::string range_id;
+        int version = 0;
+    };
+    std::map<std::string, LatestGlobalKey> latest;
+    std::string separator(1, '\0');
+    for (const auto& row : rows->rows) {
+        if (*table_column >= row.size() ||
+            *primary_column >= row.size() ||
+            *row_key_column >= row.size() ||
+            *range_column >= row.size() ||
+            *version_column >= row.size()) {
             continue;
         }
-        ranges.push_back(RangeDescriptor{
-            *range_id,
-            *start_key,
-            *end_key,
-            *group,
-            std::stoi(*version)
-        });
-    }
-    return ranges;
-}
-
-class RangeRouter {
-public:
-    void refreshFrom(const ConsensusReplica* node) {
-        Result storage = TableNotFoundResult{};
-        const auto* rows = catalogRowsOn(node, "__ranges", &storage);
-        cached_ranges_ = rows == nullptr
-                             ? std::vector<RangeDescriptor>{}
-                             : latestRangeDescriptorsById(
-                                   rangeDescriptorsFromRows(*rows));
-    }
-
-    RouteResult routePoint(const std::string& table,
-                           const std::string& primary_key) const {
-        std::string key = tableRowKey(table, primary_key);
-        std::vector<RangeDescriptor> matches;
-        for (const auto& range : cached_ranges_) {
-            if (keyInRange(key, range)) matches.push_back(range);
+        std::string key = row[*table_column] + separator +
+                          row[*primary_column] + separator +
+                          row[*row_key_column];
+        int version = std::stoi(row[*version_column]);
+        auto it = latest.find(key);
+        if (it == latest.end() || version >= it->second.version) {
+            latest[key] = LatestGlobalKey{row[*range_column], version};
         }
-        std::sort(
-            matches.begin(),
-            matches.end(),
-            [](const RangeDescriptor& lhs, const RangeDescriptor& rhs) {
-                if (lhs.descriptor_version != rhs.descriptor_version) {
-                    return lhs.descriptor_version > rhs.descriptor_version;
-                }
-                return lhs.range_id < rhs.range_id;
-            });
-        return routeResultFor(key, key + "\x7F", std::move(matches));
     }
 
-private:
-    std::vector<RangeDescriptor> cached_ranges_;
-};
+    size_t count = 0;
+    for (const auto& [key, record] : latest) {
+        (void)key;
+        if (record.range_id == range_id) ++count;
+    }
+    return count;
+}
 
 Command bootstrapClusterACommand() {
     return BootstrapClusterCommand{
@@ -14391,16 +14788,34 @@ SearchState buildInitialReplicaGroupState(
 }
 
 void printPartitionedSQLTrace(const std::string& data_file) {
-    std::cout << "Trace: global keyspace and range routing" << std::endl;
+    std::cout << "Trace: router-backed single-range SQL" << std::endl;
     std::vector<Address> replicas = quorumReplicaAddresses(3);
     Address leader = replicas[0];
     Address client = ScenarioAddress::client1();
 
     std::vector<std::string> title_rows =
-        requireTupleLinesFromFile(data_file, "title", 1);
-    std::vector<std::string> title_values =
-        tupleValuesFromLine(title_rows.front(), "title");
-    std::string primary_key = title_values.front();
+        requireAllTupleLinesFromFile(data_file, "title");
+    std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+    for (const auto& row : title_rows) {
+        titles.push_back({row, tupleValuesFromLine(row, "title")});
+    }
+    std::sort(
+        titles.begin(),
+        titles.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return tableRowKey("title", lhs.second.front()) <
+                   tableRowKey("title", rhs.second.front());
+        });
+    if (titles.size() < 2) {
+        throw std::runtime_error(
+            "Need at least two title rows for split trace.");
+    }
+    size_t split_index = titles.size() / 2;
+    std::string left_range = defaultRangeIdForTable("title") + "-left";
+    std::string right_range = defaultRangeIdForTable("title") + "-right";
+    std::string split_key =
+        tableRowKey("title", titles[split_index].second.front());
+    std::string primary_key = titles[split_index].second.front();
 
     SearchState state = buildInitialReplicaGroupState(
         replicas, leader, client, 1);
@@ -14408,9 +14823,20 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         state, leader, client, 1, 3,
         createTitleTableCommand(),
         {replicas[1], replicas[2]});
+    int request_id = 4;
+    for (const auto& title : titles) {
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 1, request_id++,
+            parseSQL("INSERT " + title.first),
+            {replicas[1], replicas[2]});
+    }
     state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, 4,
-        parseSQL("INSERT " + title_rows.front()),
+        state, leader, client, 1, request_id++,
+        SplitTableCommand{"title",
+                          defaultRangeIdForTable("title"),
+                          left_range,
+                          right_range,
+                          2},
         {replicas[1], replicas[2]});
 
     const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
@@ -14421,10 +14847,19 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         leader_node->executeReadOnlyForTest(
             ExplainRouteCommand{"title", primary_key, false});
     const auto* route = std::get_if<RouteResult>(&route_result);
+    Result point_select =
+        leader_node->executeReadOnlyForTest(
+            RoutedSQLCommand{
+                "PROJECT * FROM title WHERE id=" + primary_key});
+    Result full_scan =
+        leader_node->executeReadOnlyForTest(
+            RoutedSQLCommand{"PROJECT * FROM title"});
 
     std::cout << "  leader=" << leader
               << ", commit_index=" << leader_node->commitIndex()
               << ", table=title"
+              << ", rows=" << titles.size()
+              << ", split_key=" << split_key
               << ", primary_key=" << primary_key << std::endl;
     if (route != nullptr && !route->range_ids.empty()) {
         std::cout << "  row key=" << route->start_key
@@ -14436,19 +14871,28 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     }
     std::cout << "  __ranges rows="
               << catalogRowCountOn(leader_node, "__ranges")
-              << ", __global_keys rows="
+              << ", __global_key_versions="
               << catalogRowCountOn(leader_node, "__global_keys")
+              << ", current_left_keys="
+              << currentGlobalKeyCountOn(leader_node, left_range)
+              << ", current_right_keys="
+              << currentGlobalKeyCountOn(leader_node, right_range)
               << std::endl;
+    std::cout << "  routed point select -> "
+              << describeResult(point_select) << std::endl;
+    std::cout << "  routed full scan -> "
+              << describeResult(full_scan) << std::endl;
     for (const auto& replica : replicas) {
         const auto* node = state.nodeAs<ConsensusReplica>(replica);
-        std::cout << "  " << replica << " has title range="
+        std::cout << "  " << replica << " has split children="
                   << (catalogHasRowOn(
                           node, "__ranges",
-                          {{"range_id", defaultRangeIdForTable("title")},
-                           {"start_key", tableRowPrefix("title")},
-                           {"end_key", tableRowPrefixEnd("title")},
-                           {"replica_group_id", "group-1"},
-                           {"descriptor_version", "1"}})
+                          {{"range_id", left_range},
+                           {"status", "active"}}) &&
+                      catalogHasRowOn(
+                          node, "__ranges",
+                          {{"range_id", right_range},
+                           {"status", "active"}})
                           ? "yes" : "no")
                   << std::endl;
     }
@@ -14457,16 +14901,16 @@ void printPartitionedSQLTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v125; "
-                  << "this version focuses on the first partitioned-SQL "
-                  << "routing boundary."
+        std::cerr << "--measure-restart is not available in v127; "
+                  << "this version focuses on router-backed "
+                  << "single-range SQL."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v125: global keyspace and range routing" << std::endl;
+    std::cout << "BuzzDB v127: router-backed single-range SQL" << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
@@ -14477,10 +14921,100 @@ int main(int argc, char* argv[]) {
 
     TestRunner tests;
 
-    auto firstTitleTuple = [&]() {
-        std::string line =
-            requireTupleLinesFromFile(imdb_file, "title", 1).front();
-        return std::make_pair(line, tupleValuesFromLine(line, "title"));
+    struct TitleSplitFixture {
+        std::vector<std::pair<std::string, std::vector<std::string>>> rows;
+        std::vector<std::string> left_values;
+        std::vector<std::string> right_values;
+        std::string split_key;
+        size_t split_index = 0;
+
+        size_t rightCount() const { return rows.size() - split_index; }
+    };
+
+    auto titleLeftRangeId = []() {
+        return defaultRangeIdForTable("title") + "-left";
+    };
+
+    auto titleRightRangeId = []() {
+        return defaultRangeIdForTable("title") + "-right";
+    };
+
+    auto readTitleRows = [&]() {
+        std::vector<std::string> lines =
+            requireAllTupleLinesFromFile(imdb_file, "title");
+        std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+        for (const auto& line : lines) {
+            titles.push_back({line, tupleValuesFromLine(line, "title")});
+        }
+        return titles;
+    };
+
+    auto makeTitleSplitFixture =
+        [&](std::vector<std::pair<std::string,
+                                  std::vector<std::string>>> titles) {
+        std::sort(
+            titles.begin(),
+            titles.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return tableRowKey("title", lhs.second.front()) <
+                       tableRowKey("title", rhs.second.front());
+            });
+        if (titles.size() < 2 ||
+            titles.front().second.empty() ||
+            titles.back().second.empty()) {
+            throw std::runtime_error(
+                "Need at least two title primary keys for split tests.");
+        }
+        size_t split_index = titles.size() / 2;
+        if (split_index == 0 || split_index >= titles.size()) {
+            throw std::runtime_error("Invalid title split index.");
+        }
+        return TitleSplitFixture{
+            titles,
+            titles[0].second,
+            titles[split_index].second,
+            tableRowKey("title", titles[split_index].second.front()),
+            split_index
+        };
+    };
+
+    auto titleSplitFixture = [&]() {
+        return makeTitleSplitFixture(readTitleRows());
+    };
+
+    struct TitleInsertFixture {
+        TitleSplitFixture split_fixture;
+        std::pair<std::string, std::vector<std::string>> held_out_row;
+    };
+
+    auto titleInsertFixture = [&]() {
+        auto titles = readTitleRows();
+        std::sort(
+            titles.begin(),
+            titles.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return tableRowKey("title", lhs.second.front()) <
+                       tableRowKey("title", rhs.second.front());
+            });
+        if (titles.size() < 3) {
+            throw std::runtime_error(
+                "Need at least three title rows for insert routing tests.");
+        }
+        auto held_out = titles.back();
+        titles.pop_back();
+        return TitleInsertFixture{
+            makeTitleSplitFixture(std::move(titles)),
+            held_out
+        };
+    };
+
+    auto splitTitleCommand = [&](int version = 2) {
+        return SplitTableCommand{
+            "title",
+            defaultRangeIdForTable("title"),
+            titleLeftRangeId(),
+            titleRightRangeId(),
+            version};
     };
 
     auto buildTitleTableState = [&](int client_id) {
@@ -14494,15 +15028,36 @@ int main(int argc, char* argv[]) {
             createTitleTableCommand(), {replicas[1], replicas[2]});
     };
 
-    auto buildTitleRowState = [&](int client_id) {
-        auto title = firstTitleTuple();
+    auto buildLoadedTitleTableState = [&](int client_id,
+                                          const TitleSplitFixture& fixture) {
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
         SearchState state = buildTitleTableState(client_id);
+        int request_id = 4;
+        for (const auto& row : fixture.rows) {
+            state = deliverConsensusCommandToQuorum(
+                state, leader, client, client_id, request_id++,
+                parseSQL("INSERT " + row.first),
+                {replicas[1], replicas[2]});
+        }
+        return state;
+    };
+
+    auto buildTitleSplitStateFor = [&](int client_id,
+                                       const TitleSplitFixture& fixture) {
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildLoadedTitleTableState(client_id, fixture);
         return deliverConsensusCommandToQuorum(
-            state, leader, client, client_id, 4,
-            parseSQL("INSERT " + title.first), {replicas[1], replicas[2]});
+            state, leader, client, client_id,
+            static_cast<int>(fixture.rows.size()) + 4,
+            splitTitleCommand(), {replicas[1], replicas[2]});
+    };
+
+    auto buildTitleSplitState = [&](int client_id) {
+        return buildTitleSplitStateFor(client_id, titleSplitFixture());
     };
 
     auto routeFor = [&](const ConsensusReplica* node,
@@ -14519,268 +15074,195 @@ int main(int argc, char* argv[]) {
         return *route;
     };
 
-    tests.test("Network controls filter simulator messages and timers", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address follower = replicas[1];
-        Address client = ScenarioAddress::client1();
-        SearchState state = consensusClusterState(replicas);
-        state.send(client, leader,
-                   ClientRequest{600, 1, createTitleTableCommand()});
-
-        auto clientRequestVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* message = messageForEvent(state, event);
-                if (message == nullptr) continue;
-                const auto* request =
-                    std::get_if<ClientRequest>(&message->message);
-                if (request != nullptr &&
-                    message->from.rootAddress() == client.rootAddress() &&
-                    message->to.rootAddress() == leader.rootAddress()) {
-                    return true;
-                }
+    auto clientReplyResult = [&](const SearchState& state,
+                                 int client_id,
+                                 int request_id) {
+        for (const auto& envelope : state.network()) {
+            const auto* reply = std::get_if<ClientReply>(&envelope.message);
+            if (reply != nullptr &&
+                reply->client_id == client_id &&
+                reply->request_id == request_id) {
+                return std::optional<Result>{reply->result};
             }
-            return false;
-        };
-
-        auto electionTimerVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* timer = timerForEvent(state, event);
-                if (timer != nullptr &&
-                    timer->to.rootAddress() == leader.rootAddress() &&
-                    std::get_if<ElectionTimer>(&timer->timer) != nullptr) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        SearchSettings network_off;
-        network_off.networkActive(false);
-        tests.check(!clientRequestVisible(network_off),
-                    "global network disable should hide client request");
-        network_off.linkActive(client, leader, true);
-        tests.check(clientRequestVisible(network_off),
-                    "explicit link enable should override global network off");
-
-        SearchSettings sender_off;
-        sender_off.senderActive(client, false);
-        tests.check(!clientRequestVisible(sender_off),
-                    "sender disable should hide client request");
-
-        SearchSettings receiver_off;
-        receiver_off.receiverActive(leader, false);
-        tests.check(!clientRequestVisible(receiver_off),
-                    "receiver disable should hide client request");
-
-        SearchSettings node_off;
-        node_off.nodeActive(leader, false);
-        tests.check(!clientRequestVisible(node_off),
-                    "node disable should hide messages and timers");
-        tests.check(!electionTimerVisible(node_off),
-                    "node disable should hide its timers");
-
-        SearchSettings partitioned;
-        partitioned.partition({{client}, {leader, follower}});
-        tests.check(!clientRequestVisible(partitioned),
-                    "partition should block cross-group message delivery");
-        partitioned.resetNetwork();
-        tests.check(clientRequestVisible(partitioned),
-                    "resetNetwork should restore message delivery");
-
-        SearchSettings timer_off;
-        timer_off.timerActive(leader, false);
-        tests.check(!electionTimerVisible(timer_off),
-                    "timerActive(false) should hide that node's timer");
-        timer_off.timerActive(leader, true);
-        timer_off.deliverTimers(false);
-        tests.check(electionTimerVisible(timer_off),
-                    "node timer override should beat global timer disable");
-    });
-
-    tests.test("Create table creates a default range descriptor through consensus", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        SearchState state = buildTitleTableState(501);
-
-        for (const auto& replica : replicas) {
-            const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(catalogHasRowOn(
-                            node, "__ranges",
-                            {{"range_id", defaultRangeIdForTable("title")},
-                             {"start_key", tableRowPrefix("title")},
-                             {"end_key", tableRowPrefixEnd("title")},
-                             {"replica_group_id", "group-1"},
-                             {"descriptor_version", "1"}}),
-                        replica.str() +
-                            " should have the replicated title range");
         }
-    });
+        return std::optional<Result>{};
+    };
 
-    tests.test("Insert records an encoded global row key", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        SearchState state = buildTitleRowState(502);
-
-        for (const auto& replica : replicas) {
-            const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(catalogHasRowOn(
-                            node, "__global_keys",
-                            {{"table_name", "title"},
-                             {"primary_key", primary_key},
-                             {"row_key",
-                              tableRowKey("title", primary_key)},
-                             {"range_id", defaultRangeIdForTable("title")},
-                             {"replica_group_id", "group-1"},
-                             {"descriptor_version", "1"}}),
-                        replica.str() +
-                            " should record the replicated row key");
-        }
-    });
-
-    tests.test("Primary-key route targets one range", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        SearchState state = buildTitleTableState(503);
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
-
-        tests.check(route.start_key == tableRowKey("title", primary_key),
-                    "point route should start at encoded row key");
-        tests.check(route.range_ids.size() == 1,
-                    "point route should target one range");
-        tests.check(route.range_ids.front() ==
-                        defaultRangeIdForTable("title"),
-                    "point route should target the title range");
-        tests.check(route.replica_group_ids.front() == "group-1",
-                    "point route should name the replica group");
-        tests.check(route.descriptor_versions.front() == 1,
-                    "point route should use descriptor version 1");
-    });
-
-    tests.test("Full scan routes through matching table ranges", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        SearchState state = buildTitleTableState(504);
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", "", true});
-
-        tests.check(route.start_key == tableRowPrefix("title"),
-                    "scan route should start at the table row prefix");
-        tests.check(route.end_key == tableRowPrefixEnd("title"),
-                    "scan route should end at the table row prefix boundary");
-        tests.check(route.range_ids.size() == 1,
-                    "single-range scan should target one range");
-        tests.check(route.range_ids.front() ==
-                        defaultRangeIdForTable("title"),
-                    "scan route should include the title range");
-    });
-
-    tests.test("Range descriptor changes are versioned and latest wins", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
+    tests.test("Routed point select executes on one split child", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleTableState(505);
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
+        SearchState state = buildTitleSplitState(506);
+        int request_id = static_cast<int>(fixture.rows.size()) + 5;
         state = deliverConsensusCommandToQuorum(
-            state, leader, client, 505, 4,
-            RegisterRangeCommand{defaultRangeIdForTable("title"),
-                                 tableRowPrefix("title"),
-                                 new_end,
-                                 "group-1",
-                                 2},
+            state, leader, client, 506, request_id,
+            RoutedSQLCommand{
+                "PROJECT * FROM title WHERE id=" +
+                fixture.right_values.front()},
             {replicas[1], replicas[2]});
 
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        tests.check(catalogHasRowOn(
-                        leader_node, "__ranges",
-                        {{"range_id", defaultRangeIdForTable("title")},
-                         {"end_key", tableRowPrefixEnd("title")},
-                         {"descriptor_version", "1"}}),
-                    "catalog should retain descriptor history");
-        tests.check(catalogHasRowOn(
-                        leader_node, "__ranges",
-                        {{"range_id", defaultRangeIdForTable("title")},
-                         {"end_key", new_end},
-                         {"descriptor_version", "2"}}),
-                    "catalog should store the new descriptor version");
+        auto reply = clientReplyResult(state, 506, request_id);
+        const auto* selected = reply.has_value()
+                                   ? std::get_if<SelectAllResult>(&*reply)
+                                   : nullptr;
+        tests.check(selected != nullptr && selected->rows.size() == 1,
+                    "routed primary-key select should return one row");
 
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
-        tests.check(route.range_ids.size() == 1,
-                    "router should use one current descriptor per range id");
-        tests.check(route.descriptor_versions.front() == 2,
-                    "router should use the latest descriptor version");
-        tests.check(route.end_key == tableRowKey("title", primary_key) + "\x7F",
-                    "point lookup route should still describe the point key");
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        RouteResult right = routeFor(
+            leader_node,
+            ExplainRouteCommand{
+                "title", fixture.right_values.front(), false});
+        tests.check(right.range_ids.size() == 1 &&
+                        right.range_ids.front() == titleRightRangeId(),
+                    "selected key should route to the right child");
+        tests.check(right.descriptor_versions.front() == 2,
+                    "routed select should use the split descriptor version");
     });
 
-    tests.test("Router cache refreshes after descriptor change", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
+    tests.test("Routed update by primary key changes one row", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleTableState(506);
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RangeRouter router;
-        router.refreshFrom(leader_node);
-        RouteResult before = router.routePoint("title", primary_key);
-        tests.check(!before.descriptor_versions.empty() &&
-                        before.descriptor_versions.front() == 1,
-                    "fresh router should see descriptor version 1");
-
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
+        SearchState state = buildTitleSplitState(507);
+        int request_id = static_cast<int>(fixture.rows.size()) + 5;
         state = deliverConsensusCommandToQuorum(
-            state, leader, client, 506, 4,
-            RegisterRangeCommand{defaultRangeIdForTable("title"),
-                                 tableRowPrefix("title"),
-                                 new_end,
-                                 "group-1",
-                                 2},
+            state, leader, client, 507, request_id,
+            RoutedSQLCommand{
+                "UPDATE title SET production_year=1998 WHERE id=" +
+                fixture.right_values.front()},
             {replicas[1], replicas[2]});
-        RouteResult stale = router.routePoint("title", primary_key);
-        tests.check(stale.descriptor_versions.front() == 1,
-                    "stale router cache should still expose old metadata");
 
-        leader_node = state.nodeAs<ConsensusReplica>(leader);
-        router.refreshFrom(leader_node);
-        RouteResult refreshed = router.routePoint("title", primary_key);
-        tests.check(refreshed.descriptor_versions.front() == 2,
-                    "router refresh should load the latest descriptor");
-    });
-
-    tests.test("Single-range SQL behavior is preserved", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        SearchState state = buildTitleRowState(507);
+        auto reply = clientReplyResult(state, 507, request_id);
+        tests.check(reply.has_value() &&
+                        *reply == Result{UpdateRowsResult{1}},
+                    "routed update should affect one row");
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-
-        Result count = leader_node->executeReadOnlyForTest(
-            CountRowsCommand{"title"});
-        tests.check(count == Result{CountRowsResult{1}},
-                    "single-range row count should still be one");
-
         Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", primary_key});
+            SelectWhereCommand{"title", "id",
+                               fixture.right_values.front()});
         const auto* rows = std::get_if<SelectAllResult>(&selected);
-        tests.check(rows != nullptr && rows->rows.size() == 1,
-                    "select by primary key should still find the row");
+        tests.check(rows != nullptr &&
+                        !rows->rows.empty() &&
+                        selectAllValue(*rows, rows->rows.front(),
+                                       "production_year") == "1998",
+                    "updated row should be visible after routed write");
+    });
 
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
-        tests.check(route.range_ids.size() == 1 &&
-                        route.range_ids.front() ==
-                            defaultRangeIdForTable("title"),
-                    "the inserted row should route to the single title range");
+    tests.test("Routed delete by primary key removes one row", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildTitleSplitState(508);
+        int request_id = static_cast<int>(fixture.rows.size()) + 5;
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 508, request_id,
+            RoutedSQLCommand{
+                "DELETE FROM title WHERE id=" +
+                fixture.left_values.front()},
+            {replicas[1], replicas[2]});
+
+        auto reply = clientReplyResult(state, 508, request_id);
+        tests.check(reply.has_value() &&
+                        *reply == Result{DeleteRowsResult{1}},
+                    "routed delete should affect one row");
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        Result selected = leader_node->executeReadOnlyForTest(
+            SelectWhereCommand{"title", "id", fixture.left_values.front()});
+        const auto* rows = std::get_if<SelectAllResult>(&selected);
+        tests.check(rows != nullptr && rows->rows.empty(),
+                    "deleted row should no longer be visible");
+    });
+
+    tests.test("Routed insert after split records child ownership", [&] {
+        TitleInsertFixture insert_fixture = titleInsertFixture();
+        const auto& fixture = insert_fixture.split_fixture;
+        const auto& held_out = insert_fixture.held_out_row;
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildTitleSplitStateFor(509, fixture);
+        int request_id = static_cast<int>(fixture.rows.size()) + 5;
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 509, request_id,
+            RoutedSQLCommand{"INSERT " + held_out.first},
+            {replicas[1], replicas[2]});
+
+        auto reply = clientReplyResult(state, 509, request_id);
+        tests.check(reply.has_value() &&
+                        *reply == Result{InsertOkResult{}},
+                    "routed insert should succeed");
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+        tests.check(catalogHasRowOn(
+                        leader_node, "__global_keys",
+                        {{"table_name", "title"},
+                         {"primary_key", held_out.second.front()},
+                         {"range_id", titleRightRangeId()},
+                         {"descriptor_version", "2"}}),
+                    "inserted held-out IMDB row should land in right child");
+        tests.check(currentGlobalKeyCountOn(leader_node,
+                                            titleRightRangeId()) ==
+                        fixture.rightCount() + 1,
+                    "right child should own the inserted row key");
+    });
+
+    tests.test("Routed full scan before split still executes", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildLoadedTitleTableState(510, fixture);
+        int request_id = static_cast<int>(fixture.rows.size()) + 4;
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 510, request_id,
+            RoutedSQLCommand{"PROJECT * FROM title"},
+            {replicas[1], replicas[2]});
+
+        auto reply = clientReplyResult(state, 510, request_id);
+        const auto* rows = reply.has_value()
+                               ? std::get_if<SelectAllResult>(&*reply)
+                               : nullptr;
+        tests.check(rows != nullptr && rows->rows.size() == fixture.rows.size(),
+                    "single-range routed scan should still execute");
+    });
+
+    tests.test("Routed full scan after split is rejected", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildTitleSplitState(511);
+        int request_id = static_cast<int>(fixture.rows.size()) + 5;
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 511, request_id,
+            RoutedSQLCommand{"PROJECT * FROM title"},
+            {replicas[1], replicas[2]});
+
+        auto reply = clientReplyResult(state, 511, request_id);
+        tests.check(reply.has_value() &&
+                        *reply == Result{RouteRejectedResult{}},
+                    "multi-range routed scan should be rejected in v127");
+    });
+
+    tests.test("Routed non-primary-key predicate is rejected", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        Address client = ScenarioAddress::client1();
+        SearchState state = buildTitleSplitState(512);
+        int request_id = static_cast<int>(fixture.rows.size()) + 5;
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 512, request_id,
+            RoutedSQLCommand{"PROJECT * FROM title WHERE production_year=2011"},
+            {replicas[1], replicas[2]});
+
+        auto reply = clientReplyResult(state, 512, request_id);
+        tests.check(reply.has_value() &&
+                        *reply == Result{RouteRejectedResult{}},
+                    "non-primary-key predicate needs a later planner");
     });
 
     return tests.finish();

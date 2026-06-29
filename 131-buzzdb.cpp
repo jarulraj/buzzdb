@@ -522,8 +522,9 @@ public:
         getHeader()->page_lsn = page_lsn;
     }
 
-    // Add a tuple, returns true if it fits, false otherwise.
-    bool addTuple(std::unique_ptr<Tuple> tuple) {
+    // Add a tuple, returning the slot it occupies when it fits.
+    std::optional<size_t> addTupleAndReturnSlot(
+        std::unique_ptr<Tuple> tuple) {
 
         // Serialize the tuple into a char array
         auto serializedTuple = tuple->serialize();
@@ -542,7 +543,7 @@ public:
         }
         if (slot_itr == MAX_SLOTS){
             //std::cout << "Page does not contain an empty slot with sufficient space to store the tuple.";
-            return false;
+            return std::nullopt;
         }
 
         // Identify the offset where the tuple will be placed in the page
@@ -568,7 +569,7 @@ public:
         if(offset + tuple_size >= PAGE_SIZE){
             slot_array[slot_itr].empty = true;
             slot_array[slot_itr].offset = INVALID_VALUE;
-            return false;
+            return std::nullopt;
         }
 
         assert(offset != INVALID_VALUE);
@@ -584,6 +585,61 @@ public:
                     serializedTuple.c_str(), 
                     tuple_size);
 
+        return slot_itr;
+    }
+
+    bool addTuple(std::unique_ptr<Tuple> tuple) {
+        return addTupleAndReturnSlot(std::move(tuple)).has_value();
+    }
+
+    bool insertTupleAtSlot(size_t index, std::unique_ptr<Tuple> tuple) {
+        if (index >= MAX_SLOTS) {
+            return false;
+        }
+
+        auto serializedTuple = tuple->serialize();
+        size_t tuple_size = serializedTuple.size();
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        Slot& slot = slot_array[index];
+
+        if (slot.offset == INVALID_VALUE) {
+            size_t offset = metadata_size;
+            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+                if (slot_itr == index) continue;
+                if (slot_array[slot_itr].offset == INVALID_VALUE ||
+                    slot_array[slot_itr].length == INVALID_VALUE) {
+                    continue;
+                }
+                offset = std::max(
+                    offset,
+                    static_cast<size_t>(slot_array[slot_itr].offset) +
+                    static_cast<size_t>(slot_array[slot_itr].length)
+                );
+            }
+            slot.offset = static_cast<uint16_t>(offset);
+        }
+
+        if (slot.length != INVALID_VALUE && tuple_size > slot.length) {
+            throw std::runtime_error(
+                "Recovered tuple is too large to fit in existing slot."
+            );
+        }
+
+        if (slot.offset + tuple_size >= PAGE_SIZE) {
+            if (slot.empty) {
+                slot.offset = INVALID_VALUE;
+            }
+            return false;
+        }
+
+        if (slot.length == INVALID_VALUE) {
+            slot.length = static_cast<uint16_t>(tuple_size);
+        }
+        slot.empty = false;
+        std::memset(page_data.get() + slot.offset, 0, slot.length);
+        std::memcpy(page_data.get() + slot.offset,
+                    serializedTuple.c_str(),
+                    tuple_size);
         return true;
     }
 
@@ -1236,8 +1292,15 @@ public:
     }
 };
 
-// In-memory copy of one ARIES page-update record for runtime undo.
+enum class PageUpdateKind {
+    Update,
+    Insert,
+    Delete
+};
+
+// In-memory copy of one ARIES page-change record for runtime undo.
 struct PageUpdateLogRecord {
+    PageUpdateKind kind = PageUpdateKind::Update;
     LSN lsn = 0;
     LSN prev_lsn = 0;
     TableId table_id = 0;
@@ -1246,6 +1309,8 @@ struct PageUpdateLogRecord {
     std::unique_ptr<Tuple> before_tuple;
     std::unique_ptr<Tuple> after_tuple;
 };
+
+class TableHeap;
 
 // Recovery infrastructure carried forward from v64.
 class RecoveryManager {
@@ -1392,6 +1457,60 @@ private:
         return clr_lsn;
     }
 
+    LSN appendInsertUndoClrRecord(int txn_id,
+                                  LSN prev_lsn,
+                                  LSN undo_next_lsn,
+                                  TableId table_id,
+                                  PageID page_id,
+                                  size_t slot_id) {
+        LSN clr_lsn = log_manager.append(
+            "CLR_INSERT " + std::to_string(txn_id) + " " +
+            std::to_string(prev_lsn) + " " +
+            std::to_string(undo_next_lsn) + " " +
+            std::to_string(table_id) + " " +
+            std::to_string(page_id) + " " +
+            std::to_string(slot_id)
+        );
+        clr_records_logged++;
+        if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
+            dirty_page_table[page_id] = clr_lsn;
+        }
+        return clr_lsn;
+    }
+
+    LSN appendDeleteUndoClrRecord(int txn_id,
+                                  LSN prev_lsn,
+                                  LSN undo_next_lsn,
+                                  TableId table_id,
+                                  PageID page_id,
+                                  size_t slot_id,
+                                  Tuple& after_undo_tuple) {
+        auto after_undo_image = after_undo_tuple.serialize();
+        LSN clr_lsn = log_manager.append(
+            "CLR_DELETE " + std::to_string(txn_id) + " " +
+            std::to_string(prev_lsn) + " " +
+            std::to_string(undo_next_lsn) + " " +
+            std::to_string(table_id) + " " +
+            std::to_string(page_id) + " " +
+            std::to_string(slot_id) + " " +
+            after_undo_image
+        );
+        clr_records_logged++;
+        if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
+            dirty_page_table[page_id] = clr_lsn;
+        }
+        return clr_lsn;
+    }
+
+    LSN appendUndoClrRecord(int txn_id,
+                            LSN prev_lsn,
+                            const PageUpdateLogRecord& record);
+
+    static void applyUndoRecord(TableHeap& table,
+                                const PageUpdateLogRecord& record,
+                                LSN page_lsn,
+                                const std::string& flush_tag);
+
 public:
     RecoveryManager(BufferManager& buffer_manager, Catalog& catalog)
         : buffer_manager(buffer_manager), catalog(catalog) {
@@ -1438,6 +1557,24 @@ public:
                    size_t slot_id,
                    std::unique_ptr<Tuple> before_tuple,
                    std::unique_ptr<Tuple> after_tuple);
+    LSN logInsert(TableId table_id,
+                  PageID page_id,
+                  size_t slot_id,
+                  std::unique_ptr<Tuple> after_tuple);
+    LSN logInsert(int txn_id,
+                  TableId table_id,
+                  PageID page_id,
+                  size_t slot_id,
+                  std::unique_ptr<Tuple> after_tuple);
+    LSN logDelete(TableId table_id,
+                  PageID page_id,
+                  size_t slot_id,
+                  std::unique_ptr<Tuple> before_tuple);
+    LSN logDelete(int txn_id,
+                  TableId table_id,
+                  PageID page_id,
+                  size_t slot_id,
+                  std::unique_ptr<Tuple> before_tuple);
     bool forceLogUpTo(LSN lsn);
     void notePageFlushed(PageID page_id, LSN page_lsn, const std::string& tag);
     void maybeCrashAfterSteal(PageID page_id);
@@ -1674,7 +1811,10 @@ public:
         }
     }
 
-    size_t deleteTuples(size_t where_column, const Field& where_value) {
+    size_t deleteTuples(size_t where_column,
+                        const Field& where_value,
+                        RecoveryManager* recovery_manager = nullptr,
+                        int txn_id = 0) {
         size_t deleted_count = 0;
 
         for (PageID page_id : metadata.page_ids) {
@@ -1699,19 +1839,119 @@ public:
                     continue;
                 }
 
+                LSN delete_lsn = 0;
+                if (recovery_manager != nullptr) {
+                    if (txn_id != 0) {
+                        delete_lsn = recovery_manager->logDelete(
+                            txn_id,
+                            metadata.table_id,
+                            page_id,
+                            slot_itr,
+                            tuple->clone()
+                        );
+                    } else {
+                        delete_lsn = recovery_manager->logDelete(
+                            metadata.table_id,
+                            page_id,
+                            slot_itr,
+                            tuple->clone()
+                        );
+                    }
+                }
+
                 page->deleteTuple(slot_itr);
                 markDirty(page_id);
+                if (recovery_manager != nullptr) {
+                    page->setPageLSN(delete_lsn);
+                    printThreadSafe(
+                        "  pageLSN: page " + std::to_string(page_id) +
+                        " = " + std::to_string(delete_lsn)
+                    );
+                    recovery_manager->maybeCrashAfterSteal(page_id);
+                }
                 page_updated = true;
                 deleted_count++;
             }
 
-            if (page_updated) {
+            if (page_updated && recovery_manager == nullptr) {
                 buffer_manager.flushPage(page_id, "delete");
             }
         }
 
         metadata.row_count -= deleted_count;
         return deleted_count;
+    }
+
+    bool deletePhysicalTuple(PageID page_id,
+                             size_t slot_id,
+                             const std::string& flush_tag,
+                             LSN page_lsn = 0) {
+        if (slot_id >= MAX_SLOTS) return false;
+        auto& page = getPage(page_id);
+        Slot* slot_array =
+            reinterpret_cast<Slot*>(page->page_data.get());
+        if (slot_array[slot_id].empty) return false;
+
+        page->deleteTuple(slot_id);
+        markDirty(page_id);
+        if (page_lsn != 0) {
+            page->setPageLSN(page_lsn);
+        }
+        buffer_manager.flushPage(page_id, flush_tag);
+        if (metadata.row_count > 0) {
+            metadata.row_count--;
+        }
+        return true;
+    }
+
+    bool applyPhysiologicalInsert(PageID page_id,
+                                  size_t slot_id,
+                                  std::unique_ptr<Tuple> tuple,
+                                  bool flush_page = true,
+                                  const std::string& flush_tag = "recovery insert",
+                                  LSN page_lsn = 0) {
+        auto& page = getPage(page_id);
+        Slot* slot_array =
+            reinterpret_cast<Slot*>(page->page_data.get());
+        bool was_empty = slot_id < MAX_SLOTS && slot_array[slot_id].empty;
+        bool status = page->insertTupleAtSlot(slot_id, std::move(tuple));
+        if (!status) return false;
+        markDirty(page_id);
+        if (page_lsn != 0) {
+            page->setPageLSN(page_lsn);
+        }
+        if (flush_page) {
+            buffer_manager.flushPage(page_id, flush_tag);
+        }
+        if (was_empty) {
+            metadata.row_count++;
+        }
+        return true;
+    }
+
+    bool applyPhysiologicalDelete(PageID page_id,
+                                  size_t slot_id,
+                                  bool flush_page = true,
+                                  const std::string& flush_tag = "recovery delete",
+                                  LSN page_lsn = 0) {
+        if (slot_id >= MAX_SLOTS) return false;
+        auto& page = getPage(page_id);
+        Slot* slot_array =
+            reinterpret_cast<Slot*>(page->page_data.get());
+        if (slot_array[slot_id].empty) return false;
+
+        page->deleteTuple(slot_id);
+        markDirty(page_id);
+        if (page_lsn != 0) {
+            page->setPageLSN(page_lsn);
+        }
+        if (flush_page) {
+            buffer_manager.flushPage(page_id, flush_tag);
+        }
+        if (metadata.row_count > 0) {
+            metadata.row_count--;
+        }
+        return true;
     }
 
     std::vector<std::unique_ptr<Tuple>> readAllTuples() {
@@ -1750,33 +1990,140 @@ private:
     }
 };
 
-bool insertTupleIntoTable(TableHeap& table, std::unique_ptr<Tuple> tuple) {
-    auto insertIntoPage = [&](PageID page_id) {
+std::optional<TupleId> insertTupleIntoTableWithId(
+    TableHeap& table,
+    std::unique_ptr<Tuple> tuple,
+    RecoveryManager* recovery_manager = nullptr,
+    int txn_id = 0) {
+    auto insertIntoPage = [&](PageID page_id, const Tuple& tuple_to_insert) {
         auto& page = table.getPage(page_id);
-        if (page->addTuple(tuple->clone())) {
+        auto slot_id = page->addTupleAndReturnSlot(tuple_to_insert.clone());
+        if (slot_id.has_value()) {
+            LSN insert_lsn = 0;
+            if (recovery_manager != nullptr) {
+                if (txn_id != 0) {
+                    insert_lsn = recovery_manager->logInsert(
+                        txn_id,
+                        table.getTableId(),
+                        page_id,
+                        *slot_id,
+                        tuple_to_insert.clone()
+                    );
+                } else {
+                    insert_lsn = recovery_manager->logInsert(
+                        table.getTableId(),
+                        page_id,
+                        *slot_id,
+                        tuple_to_insert.clone()
+                    );
+                }
+            }
             table.markDirty(page_id);
+            if (recovery_manager != nullptr) {
+                page->setPageLSN(insert_lsn);
+                printThreadSafe(
+                    "  pageLSN: page " + std::to_string(page_id) +
+                    " = " + std::to_string(insert_lsn)
+                );
+                recovery_manager->maybeCrashAfterSteal(page_id);
+            }
             table.flushInsertedPage(page_id);
             table.recordInsertedTuple();
-            return true;
+            return std::optional<TupleId>{
+                TupleId{table.getTableId(), page_id, *slot_id}};
         }
-        return false;
+        return std::optional<TupleId>{};
     };
 
     PageID last_page = table.getLastPage();
-    if (last_page != INVALID_PAGE_ID && insertIntoPage(last_page)) {
-        return true;
+    if (last_page != INVALID_PAGE_ID) {
+        auto inserted = insertIntoPage(last_page, *tuple);
+        if (inserted.has_value()) return inserted;
     }
 
     PageID page_id = table.allocatePage();
-    auto& page = table.getPage(page_id);
-    if (page->addTuple(std::move(tuple))) {
-        table.markDirty(page_id);
-        table.flushInsertedPage(page_id);
-        table.recordInsertedTuple();
-        return true;
-    }
+    return insertIntoPage(page_id, *tuple);
+}
 
-    return false;
+bool insertTupleIntoTable(TableHeap& table, std::unique_ptr<Tuple> tuple) {
+    return insertTupleIntoTableWithId(table, std::move(tuple)).has_value();
+}
+
+LSN RecoveryManager::appendUndoClrRecord(
+    int txn_id,
+    LSN prev_lsn,
+    const PageUpdateLogRecord& record) {
+    switch (record.kind) {
+        case PageUpdateKind::Update:
+            return appendClrRecord(
+                txn_id,
+                prev_lsn,
+                record.prev_lsn,
+                record.table_id,
+                record.page_id,
+                record.slot_id,
+                *record.before_tuple
+            );
+        case PageUpdateKind::Insert:
+            return appendInsertUndoClrRecord(
+                txn_id,
+                prev_lsn,
+                record.prev_lsn,
+                record.table_id,
+                record.page_id,
+                record.slot_id
+            );
+        case PageUpdateKind::Delete:
+            return appendDeleteUndoClrRecord(
+                txn_id,
+                prev_lsn,
+                record.prev_lsn,
+                record.table_id,
+                record.page_id,
+                record.slot_id,
+                *record.before_tuple
+            );
+    }
+    throw std::runtime_error("Unknown page update kind during undo.");
+}
+
+void RecoveryManager::applyUndoRecord(
+    TableHeap& table,
+    const PageUpdateLogRecord& record,
+    LSN page_lsn,
+    const std::string& flush_tag) {
+    switch (record.kind) {
+        case PageUpdateKind::Update:
+            table.applyPhysiologicalUpdate(
+                record.page_id,
+                record.slot_id,
+                record.before_tuple->clone(),
+                true,
+                flush_tag,
+                page_lsn
+            );
+            return;
+        case PageUpdateKind::Insert:
+            table.applyPhysiologicalDelete(
+                record.page_id,
+                record.slot_id,
+                true,
+                flush_tag,
+                page_lsn
+            );
+            return;
+        case PageUpdateKind::Delete:
+            table.applyPhysiologicalInsert(
+                record.page_id,
+                record.slot_id,
+                record.before_tuple->clone(),
+                true,
+                flush_tag,
+                page_lsn
+            );
+            return;
+    }
+    throw std::runtime_error("Unknown page update kind during undo.");
 }
 
 // Catalog records are stored as ordinary tuples in system tables.
@@ -2720,14 +3067,10 @@ void RecoveryManager::rollbackTo(const std::string& name) {
         auto& metadata = catalog.getTable(update.table_id);
         TableHeap table(metadata, buffer_manager);
         LSN clr_prev_lsn = current_txn_last_lsn;
-        LSN clr_lsn = appendClrRecord(
+        LSN clr_lsn = appendUndoClrRecord(
             current_txn_id,
             clr_prev_lsn,
-            update.prev_lsn,
-            update.table_id,
-            update.page_id,
-            update.slot_id,
-            *update.before_tuple
+            update
         );
         current_txn_last_lsn = clr_lsn;
         active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, clr_lsn};
@@ -2736,10 +3079,7 @@ void RecoveryManager::rollbackTo(const std::string& name) {
                   << " prevLSN " << clr_prev_lsn
                   << " undoNextLSN " << update.prev_lsn
                   << " for rollback to " << name << std::endl;
-        table.applyPhysiologicalUpdate(
-            update.page_id, update.slot_id, update.before_tuple->clone(),
-            true, "partial rollback undo", clr_lsn
-        );
+        applyUndoRecord(table, update, clr_lsn, "partial rollback undo");
         page_update_log_records.pop_back();
         runtime_undo_records++;
         partial_rollback_records++;
@@ -2755,7 +3095,7 @@ void RecoveryManager::rollbackTo(const std::string& name) {
     }
 
     std::cout << "  recovery: partial rollback restored "
-              << undone << " update record(s); transaction remains active"
+              << undone << " page-change record(s); transaction remains active"
               << std::endl;
 }
 
@@ -2770,14 +3110,10 @@ void RecoveryManager::abort() {
             auto& metadata = catalog.getTable(it->table_id);
             TableHeap table(metadata, buffer_manager);
             LSN clr_prev_lsn = current_txn_last_lsn;
-            LSN clr_lsn = appendClrRecord(
+            LSN clr_lsn = appendUndoClrRecord(
                 current_txn_id,
                 clr_prev_lsn,
-                it->prev_lsn,
-                it->table_id,
-                it->page_id,
-                it->slot_id,
-                *it->before_tuple
+                *it
             );
             current_txn_last_lsn = clr_lsn;
             active_transaction_table[current_txn_id] = {TxnStatus::ABORTING, clr_lsn};
@@ -2785,10 +3121,7 @@ void RecoveryManager::abort() {
                       << " LSN " << clr_lsn
                       << " prevLSN " << clr_prev_lsn
                       << " undoNextLSN " << it->prev_lsn << std::endl;
-            table.applyPhysiologicalUpdate(
-                it->page_id, it->slot_id, it->before_tuple->clone(),
-                true, "runtime abort undo", clr_lsn
-            );
+            applyUndoRecord(table, *it, clr_lsn, "runtime abort undo");
             runtime_undo_records++;
         }
         LSN abort_prev_lsn = 0;
@@ -2802,7 +3135,7 @@ void RecoveryManager::abort() {
         abort_log_records++;
         std::cout << "  recovery: restored "
                   << page_update_log_records.size()
-                  << " before-image record(s), forced restored page(s), wrote CLR+ABORT logs" << std::endl;
+                  << " page-change record(s), forced restored page(s), wrote CLR+ABORT logs" << std::endl;
     } else {
         std::cout << "  recovery: no updates to discard" << std::endl;
     }
@@ -2905,6 +3238,7 @@ void RecoveryManager::createFuzzyImageCopy() {
 
 void RecoveryManager::recover() {
     struct WalRecord {
+        PageUpdateKind kind = PageUpdateKind::Update;
         LSN lsn = 0;
         LSN prev_lsn = 0;
         int txn_id = 0;
@@ -2978,6 +3312,7 @@ void RecoveryManager::recover() {
             size_t slot_id;
             input >> table_id >> page_id >> slot_id;
             wal_records.push_back({
+                PageUpdateKind::Update,
                 record_lsn,
                 prev_lsn,
                 txn_id,
@@ -2989,6 +3324,42 @@ void RecoveryManager::recover() {
                 Tuple::deserialize(input),
                 Tuple::deserialize(input)
             });
+        } else if (type == "INSERT") {
+            int table_id;
+            int page_id;
+            size_t slot_id;
+            input >> table_id >> page_id >> slot_id;
+            wal_records.push_back({
+                PageUpdateKind::Insert,
+                record_lsn,
+                prev_lsn,
+                txn_id,
+                static_cast<TableId>(table_id),
+                static_cast<PageID>(page_id),
+                slot_id,
+                false,
+                0,
+                nullptr,
+                Tuple::deserialize(input)
+            });
+        } else if (type == "DELETE") {
+            int table_id;
+            int page_id;
+            size_t slot_id;
+            input >> table_id >> page_id >> slot_id;
+            wal_records.push_back({
+                PageUpdateKind::Delete,
+                record_lsn,
+                prev_lsn,
+                txn_id,
+                static_cast<TableId>(table_id),
+                static_cast<PageID>(page_id),
+                slot_id,
+                false,
+                0,
+                Tuple::deserialize(input),
+                nullptr
+            });
         } else if (type == "CLR") {
             LSN undo_next_lsn;
             int table_id;
@@ -2996,6 +3367,45 @@ void RecoveryManager::recover() {
             size_t slot_id;
             input >> undo_next_lsn >> table_id >> page_id >> slot_id;
             wal_records.push_back({
+                PageUpdateKind::Update,
+                record_lsn,
+                prev_lsn,
+                txn_id,
+                static_cast<TableId>(table_id),
+                static_cast<PageID>(page_id),
+                slot_id,
+                true,
+                undo_next_lsn,
+                nullptr,
+                Tuple::deserialize(input)
+            });
+        } else if (type == "CLR_INSERT") {
+            LSN undo_next_lsn;
+            int table_id;
+            int page_id;
+            size_t slot_id;
+            input >> undo_next_lsn >> table_id >> page_id >> slot_id;
+            wal_records.push_back({
+                PageUpdateKind::Delete,
+                record_lsn,
+                prev_lsn,
+                txn_id,
+                static_cast<TableId>(table_id),
+                static_cast<PageID>(page_id),
+                slot_id,
+                true,
+                undo_next_lsn,
+                nullptr,
+                nullptr
+            });
+        } else if (type == "CLR_DELETE") {
+            LSN undo_next_lsn;
+            int table_id;
+            int page_id;
+            size_t slot_id;
+            input >> undo_next_lsn >> table_id >> page_id >> slot_id;
+            wal_records.push_back({
+                PageUpdateKind::Insert,
                 record_lsn,
                 prev_lsn,
                 txn_id,
@@ -3023,6 +3433,20 @@ void RecoveryManager::recover() {
         }
     }
 
+    auto isPageChangeRecord = [](const std::string& type) {
+        return type == "UPDATE" ||
+               type == "INSERT" ||
+               type == "DELETE" ||
+               type == "CLR" ||
+               type == "CLR_INSERT" ||
+               type == "CLR_DELETE";
+    };
+    auto isClrRecord = [](const std::string& type) {
+        return type == "CLR" ||
+               type == "CLR_INSERT" ||
+               type == "CLR_DELETE";
+    };
+
     checkpoint_analysis_start_lsn = master_checkpoint_begin_lsn;
     restart_analysis_records_total = log_records.size();
     restart_analysis_records_replayed = log_records.size();
@@ -3047,7 +3471,7 @@ void RecoveryManager::recover() {
         }
         prev_lsn_by_lsn[record_lsn] = prev_lsn;
         bool in_analysis_scan = record_lsn >= analysis_start_lsn;
-        if (type == "UPDATE" || type == "CLR") {
+        if (isPageChangeRecord(type)) {
             collectWalRecord(record);
         }
 
@@ -3067,35 +3491,30 @@ void RecoveryManager::recover() {
             if (in_analysis_scan) {
                 analysis_table.erase(txn_id);
             }
-        } else if (type == "UPDATE") {
+        } else if (isPageChangeRecord(type)) {
             int table_id;
             int page_id;
             size_t slot_id;
+            if (isClrRecord(type)) {
+                LSN undo_next_lsn = 0;
+                input >> undo_next_lsn;
+            }
             input >> table_id >> page_id >> slot_id;
             PageID dirty_page_id = static_cast<PageID>(page_id);
             if (in_analysis_scan) {
                 if (restart_dirty_page_table.find(dirty_page_id) == restart_dirty_page_table.end()) {
                     restart_dirty_page_table[dirty_page_id] = record_lsn;
                 }
-                analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
-            }
-        } else if (type == "CLR") {
-            LSN undo_next_lsn;
-            int table_id;
-            int page_id;
-            size_t slot_id;
-            input >> undo_next_lsn >> table_id >> page_id >> slot_id;
-            PageID dirty_page_id = static_cast<PageID>(page_id);
-            if (in_analysis_scan) {
-                if (restart_dirty_page_table.find(dirty_page_id) == restart_dirty_page_table.end()) {
-                    restart_dirty_page_table[dirty_page_id] = record_lsn;
+                if (isClrRecord(type)) {
+                    auto status = TxnStatus::RUNNING;
+                    auto txn_entry = analysis_table.find(txn_id);
+                    if (txn_entry != analysis_table.end()) {
+                        status = txn_entry->second.status;
+                    }
+                    analysis_table[txn_id] = {status, record_lsn};
+                } else {
+                    analysis_table[txn_id] = {TxnStatus::RUNNING, record_lsn};
                 }
-                auto status = TxnStatus::RUNNING;
-                auto txn_entry = analysis_table.find(txn_id);
-                if (txn_entry != analysis_table.end()) {
-                    status = txn_entry->second.status;
-                }
-                analysis_table[txn_id] = {status, record_lsn};
             }
         } else if (type == "END_CHECKPOINT" && in_analysis_scan) {
             readCheckpoint(input);
@@ -3196,10 +3615,28 @@ void RecoveryManager::recover() {
             restart_redo_records_skipped_by_page_lsn++;
             continue;
         }
-        table.applyPhysiologicalUpdate(
-            record.page_id, record.slot_id, record.after_tuple->clone(),
-            true, "restart redo", record.lsn
-        );
+        switch (record.kind) {
+            case PageUpdateKind::Update:
+                table.applyPhysiologicalUpdate(
+                    record.page_id, record.slot_id,
+                    record.after_tuple->clone(),
+                    true, "restart redo", record.lsn
+                );
+                break;
+            case PageUpdateKind::Insert:
+                table.applyPhysiologicalInsert(
+                    record.page_id, record.slot_id,
+                    record.after_tuple->clone(),
+                    true, "restart redo insert", record.lsn
+                );
+                break;
+            case PageUpdateKind::Delete:
+                table.applyPhysiologicalDelete(
+                    record.page_id, record.slot_id,
+                    true, "restart redo delete", record.lsn
+                );
+                break;
+        }
         redone++;
     }
 
@@ -3252,14 +3689,25 @@ void RecoveryManager::recover() {
                     restart_undo_deadlocks_resolved++;
                 }
             }
-            LSN clr_lsn = appendClrRecord(
+            PageUpdateLogRecord undo_record;
+            undo_record.kind = record->second->kind;
+            undo_record.lsn = record->second->lsn;
+            undo_record.prev_lsn = record->second->prev_lsn;
+            undo_record.table_id = record->second->table_id;
+            undo_record.page_id = record->second->page_id;
+            undo_record.slot_id = record->second->slot_id;
+            if (record->second->before_tuple) {
+                undo_record.before_tuple =
+                    record->second->before_tuple->clone();
+            }
+            if (record->second->after_tuple) {
+                undo_record.after_tuple =
+                    record->second->after_tuple->clone();
+            }
+            LSN clr_lsn = appendUndoClrRecord(
                 txn_id,
                 loser->second.last_lsn,
-                record->second->prev_lsn,
-                record->second->table_id,
-                record->second->page_id,
-                record->second->slot_id,
-                *record->second->before_tuple
+                undo_record
             );
             std::cout << "  log: CLR txn " << txn_id
                       << " LSN " << clr_lsn
@@ -3267,12 +3715,7 @@ void RecoveryManager::recover() {
                       << " undoNextLSN " << record->second->prev_lsn
                       << " during restart" << std::endl;
             loser->second.last_lsn = clr_lsn;
-            table.applyPhysiologicalUpdate(
-                record->second->page_id,
-                record->second->slot_id,
-                record->second->before_tuple->clone(),
-                true, "restart undo", clr_lsn
-            );
+            applyUndoRecord(table, undo_record, clr_lsn, "restart undo");
             undone++;
             if (record->second->prev_lsn != 0) {
                 to_undo[record->second->prev_lsn] = txn_id;
@@ -3327,7 +3770,7 @@ void RecoveryManager::recover() {
     if (redone != 0 || undone != 0) {
         std::cout << "Restart recovery: redid " << redone
                   << " history record(s), undid " << undone
-                  << " loser update record(s)." << std::endl;
+                  << " loser page-change record(s)." << std::endl;
     }
 }
 
@@ -3397,6 +3840,134 @@ LSN RecoveryManager::logUpdate(TableId table_id,
               << " in place; WAL logged before+after image at LSN "
               << update_lsn << std::endl;
     return update_lsn;
+}
+
+LSN RecoveryManager::logInsert(TableId table_id,
+                                PageID page_id,
+                                size_t slot_id,
+                                std::unique_ptr<Tuple> after_tuple) {
+    if (!txn_active) {
+        throw std::runtime_error("WAL recovery insert requested without BEGIN.");
+    }
+
+    auto& metadata = catalog.getTable(table_id);
+    if (!txn_logged) {
+        throw std::runtime_error("WAL recovery insert requested without BEGIN log record.");
+    }
+
+    bool page_seen = false;
+    for (PageID dirty_page : dirty_pages) {
+        if (dirty_page == page_id) {
+            page_seen = true;
+            break;
+        }
+    }
+    if (!page_seen) {
+        dirty_pages.push_back(page_id);
+    }
+
+    auto after_image = after_tuple->serialize();
+    after_image_bytes_logged += after_image.size();
+    after_image_records_logged++;
+    LSN insert_prev_lsn = current_txn_last_lsn;
+    LSN insert_lsn = log_manager.append(
+        "INSERT " + std::to_string(current_txn_id) + " " +
+        std::to_string(insert_prev_lsn) + " " +
+        std::to_string(table_id) + " " +
+        std::to_string(page_id) + " " +
+        std::to_string(slot_id) + " " +
+        after_image
+    );
+    current_txn_last_lsn = insert_lsn;
+    active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, insert_lsn};
+    if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
+        dirty_page_table[page_id] = insert_lsn;
+    }
+    std::cout << "  log: INSERT txn " << current_txn_id
+              << " page " << page_id
+              << " slot " << slot_id
+              << " LSN " << insert_lsn
+              << " prevLSN " << insert_prev_lsn << std::endl;
+
+    PageUpdateLogRecord update;
+    update.kind = PageUpdateKind::Insert;
+    update.lsn = insert_lsn;
+    update.prev_lsn = insert_prev_lsn;
+    update.table_id = table_id;
+    update.page_id = page_id;
+    update.slot_id = slot_id;
+    update.after_tuple = std::move(after_tuple);
+    page_update_log_records.push_back(std::move(update));
+    std::cout << "  recovery: insert " << metadata.name
+              << " page " << page_id
+              << " slot " << slot_id
+              << "; WAL logged after image at LSN "
+              << insert_lsn << std::endl;
+    return insert_lsn;
+}
+
+LSN RecoveryManager::logDelete(TableId table_id,
+                                PageID page_id,
+                                size_t slot_id,
+                                std::unique_ptr<Tuple> before_tuple) {
+    if (!txn_active) {
+        throw std::runtime_error("WAL recovery delete requested without BEGIN.");
+    }
+
+    auto& metadata = catalog.getTable(table_id);
+    if (!txn_logged) {
+        throw std::runtime_error("WAL recovery delete requested without BEGIN log record.");
+    }
+
+    bool page_seen = false;
+    for (PageID dirty_page : dirty_pages) {
+        if (dirty_page == page_id) {
+            page_seen = true;
+            break;
+        }
+    }
+    if (!page_seen) {
+        dirty_pages.push_back(page_id);
+    }
+
+    auto before_image = before_tuple->serialize();
+    before_image_bytes_logged += before_image.size();
+    before_image_records_logged++;
+    LSN delete_prev_lsn = current_txn_last_lsn;
+    LSN delete_lsn = log_manager.append(
+        "DELETE " + std::to_string(current_txn_id) + " " +
+        std::to_string(delete_prev_lsn) + " " +
+        std::to_string(table_id) + " " +
+        std::to_string(page_id) + " " +
+        std::to_string(slot_id) + " " +
+        before_image
+    );
+    current_txn_last_lsn = delete_lsn;
+    active_transaction_table[current_txn_id] = {TxnStatus::RUNNING, delete_lsn};
+    if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
+        dirty_page_table[page_id] = delete_lsn;
+    }
+    std::cout << "  log: DELETE txn " << current_txn_id
+              << " page " << page_id
+              << " slot " << slot_id
+              << " LSN " << delete_lsn
+              << " prevLSN " << delete_prev_lsn << std::endl;
+
+    PageUpdateLogRecord update;
+    update.kind = PageUpdateKind::Delete;
+    update.lsn = delete_lsn;
+    update.prev_lsn = delete_prev_lsn;
+    update.table_id = table_id;
+    update.page_id = page_id;
+    update.slot_id = slot_id;
+    update.before_tuple = std::move(before_tuple);
+    page_update_log_records.push_back(std::move(update));
+    std::cout << "  recovery: delete " << metadata.name
+              << " page " << page_id
+              << " slot " << slot_id
+              << "; WAL logged before image at LSN "
+              << delete_lsn << std::endl;
+    return delete_lsn;
 }
 
 void RecoveryManager::beginTxn(int txn_id) {
@@ -3480,6 +4051,120 @@ LSN RecoveryManager::logUpdate(int txn_id,
     return update_lsn;
 }
 
+LSN RecoveryManager::logInsert(int txn_id,
+                                TableId table_id,
+                                PageID page_id,
+                                size_t slot_id,
+                                std::unique_ptr<Tuple> after_tuple) {
+    std::lock_guard<std::mutex> guard(recovery_latch);
+    auto txn_state = txn_states.find(txn_id);
+    if (txn_state == txn_states.end()) {
+        throw std::runtime_error("WAL insert requested without BEGIN.");
+    }
+
+    auto& metadata = catalog.getTable(table_id);
+    auto after_image = after_tuple->serialize();
+    after_image_bytes_logged += after_image.size();
+    after_image_records_logged++;
+    LSN insert_prev_lsn = txn_state->second.last_lsn;
+    LSN insert_lsn = log_manager.append(
+        "INSERT " + std::to_string(txn_id) + " " +
+        std::to_string(insert_prev_lsn) + " " +
+        std::to_string(table_id) + " " +
+        std::to_string(page_id) + " " +
+        std::to_string(slot_id) + " " +
+        after_image
+    );
+    txn_state->second.last_lsn = insert_lsn;
+    active_transaction_table[txn_id] = {TxnStatus::RUNNING, insert_lsn};
+    if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
+        dirty_page_table[page_id] = insert_lsn;
+    }
+
+    PageUpdateLogRecord update;
+    update.kind = PageUpdateKind::Insert;
+    update.lsn = insert_lsn;
+    update.prev_lsn = insert_prev_lsn;
+    update.table_id = table_id;
+    update.page_id = page_id;
+    update.slot_id = slot_id;
+    update.after_tuple = std::move(after_tuple);
+    txn_state->second.page_update_log_records.push_back(std::move(update));
+
+    printThreadSafe(
+        "  log: INSERT txn " + std::to_string(txn_id) +
+        " page " + std::to_string(page_id) +
+        " slot " + std::to_string(slot_id) +
+        " LSN " + std::to_string(insert_lsn) +
+        " prevLSN " + std::to_string(insert_prev_lsn)
+    );
+    printThreadSafe(
+        "  recovery: insert " + metadata.name +
+        " page " + std::to_string(page_id) +
+        " slot " + std::to_string(slot_id) +
+        "; WAL logged after image at LSN " +
+        std::to_string(insert_lsn)
+    );
+    return insert_lsn;
+}
+
+LSN RecoveryManager::logDelete(int txn_id,
+                                TableId table_id,
+                                PageID page_id,
+                                size_t slot_id,
+                                std::unique_ptr<Tuple> before_tuple) {
+    std::lock_guard<std::mutex> guard(recovery_latch);
+    auto txn_state = txn_states.find(txn_id);
+    if (txn_state == txn_states.end()) {
+        throw std::runtime_error("WAL delete requested without BEGIN.");
+    }
+
+    auto& metadata = catalog.getTable(table_id);
+    auto before_image = before_tuple->serialize();
+    before_image_bytes_logged += before_image.size();
+    before_image_records_logged++;
+    LSN delete_prev_lsn = txn_state->second.last_lsn;
+    LSN delete_lsn = log_manager.append(
+        "DELETE " + std::to_string(txn_id) + " " +
+        std::to_string(delete_prev_lsn) + " " +
+        std::to_string(table_id) + " " +
+        std::to_string(page_id) + " " +
+        std::to_string(slot_id) + " " +
+        before_image
+    );
+    txn_state->second.last_lsn = delete_lsn;
+    active_transaction_table[txn_id] = {TxnStatus::RUNNING, delete_lsn};
+    if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
+        dirty_page_table[page_id] = delete_lsn;
+    }
+
+    PageUpdateLogRecord update;
+    update.kind = PageUpdateKind::Delete;
+    update.lsn = delete_lsn;
+    update.prev_lsn = delete_prev_lsn;
+    update.table_id = table_id;
+    update.page_id = page_id;
+    update.slot_id = slot_id;
+    update.before_tuple = std::move(before_tuple);
+    txn_state->second.page_update_log_records.push_back(std::move(update));
+
+    printThreadSafe(
+        "  log: DELETE txn " + std::to_string(txn_id) +
+        " page " + std::to_string(page_id) +
+        " slot " + std::to_string(slot_id) +
+        " LSN " + std::to_string(delete_lsn) +
+        " prevLSN " + std::to_string(delete_prev_lsn)
+    );
+    printThreadSafe(
+        "  recovery: delete " + metadata.name +
+        " page " + std::to_string(page_id) +
+        " slot " + std::to_string(slot_id) +
+        "; WAL logged before image at LSN " +
+        std::to_string(delete_lsn)
+    );
+    return delete_lsn;
+}
+
 LSN RecoveryManager::queueCommit(int txn_id) {
     std::lock_guard<std::mutex> guard(recovery_latch);
     auto txn_state = txn_states.find(txn_id);
@@ -3513,14 +4198,10 @@ void RecoveryManager::abortTxn(int txn_id) {
             auto& metadata = catalog.getTable(it->table_id);
             TableHeap table(metadata, buffer_manager);
             LSN clr_prev_lsn = txn_state->second.last_lsn;
-            LSN clr_lsn = appendClrRecord(
+            LSN clr_lsn = appendUndoClrRecord(
                 txn_id,
                 clr_prev_lsn,
-                it->prev_lsn,
-                it->table_id,
-                it->page_id,
-                it->slot_id,
-                *it->before_tuple
+                *it
             );
             txn_state->second.last_lsn = clr_lsn;
             active_transaction_table[txn_id] = {TxnStatus::ABORTING, clr_lsn};
@@ -3530,10 +4211,7 @@ void RecoveryManager::abortTxn(int txn_id) {
                 " prevLSN " + std::to_string(clr_prev_lsn) +
                 " undoNextLSN " + std::to_string(it->prev_lsn)
             );
-            table.applyPhysiologicalUpdate(
-                it->page_id, it->slot_id, it->before_tuple->clone(),
-                true, "runtime abort undo", clr_lsn
-            );
+            applyUndoRecord(table, *it, clr_lsn, "runtime abort undo");
             runtime_undo_records++;
         }
     }
@@ -3551,7 +4229,7 @@ void RecoveryManager::abortTxn(int txn_id) {
     abort_log_records++;
     printThreadSafe(
         "  recovery: abort restored " + std::to_string(updates.size()) +
-        " before-image record(s); locks can now be released"
+        " page-change record(s); locks can now be released"
     );
 }
 
@@ -3623,6 +4301,7 @@ struct TxnContext {
     int id = 0;
     std::string label;
     enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
+    std::vector<TupleId> inserted_tuple_ids;
 };
 
 using TxnPtr = std::shared_ptr<TxnContext>;
@@ -3639,7 +4318,7 @@ public:
             label;
         printThreadSafe(txn_label + " BEGIN");
         return std::make_shared<TxnContext>(
-            TxnContext{txn_id, txn_label, TxnContext::RUNNING}
+            TxnContext{txn_id, txn_label, TxnContext::RUNNING, {}}
         );
     }
     void commit(TxnContext& tx) {
@@ -5109,10 +5788,14 @@ class InsertOperator : public Operator {
 private:
     TableHeap& tableHeap;
     std::unique_ptr<Tuple> tupleToInsert;
+    RecoveryManager* recoveryManager = nullptr;
     Tuple emptyOutput;
 
 public:
-    explicit InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+    explicit InsertOperator(TableHeap& tableHeap,
+                            RecoveryManager* recoveryManager = nullptr)
+        : tableHeap(tableHeap),
+          recoveryManager(recoveryManager) {}
 
     void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
         tupleToInsert = std::move(tuple);
@@ -5124,7 +5807,18 @@ public:
         if (!tupleToInsert) {
             return false;
         }
-        return insertTupleIntoTable(tableHeap, std::move(tupleToInsert));
+        auto inserted =
+            insertTupleIntoTableWithId(
+                tableHeap,
+                std::move(tupleToInsert),
+                recoveryManager,
+                txn_ ? txn_->id : 0
+            );
+        if (!inserted.has_value()) return false;
+        if (txn_) {
+            txn_->inserted_tuple_ids.push_back(*inserted);
+        }
+        return true;
     }
 
     void close() override {}
@@ -5190,6 +5884,7 @@ private:
     TableHeap& tableHeap;
     size_t whereColumn;
     Field whereValue;
+    RecoveryManager* recoveryManager = nullptr;
     bool executed = false;
     size_t deletedCount = 0;
     Tuple emptyOutput;
@@ -5197,10 +5892,12 @@ private:
 public:
     DeleteOperator(TableHeap& tableHeap,
                    size_t whereColumn,
-                   const Field& whereValue)
+                   const Field& whereValue,
+                   RecoveryManager* recoveryManager = nullptr)
         : tableHeap(tableHeap),
           whereColumn(whereColumn),
-          whereValue(whereValue) {}
+          whereValue(whereValue),
+          recoveryManager(recoveryManager) {}
 
     void open() override {
         executed = false;
@@ -5212,7 +5909,12 @@ public:
             return false;
         }
 
-        deletedCount = tableHeap.deleteTuples(whereColumn, whereValue);
+        deletedCount = tableHeap.deleteTuples(
+            whereColumn,
+            whereValue,
+            recoveryManager,
+            txn_ ? txn_->id : 0
+        );
         executed = true;
         return deletedCount > 0;
     }
@@ -9747,9 +10449,24 @@ public:
             recovery_manager.finishTxn(tx->id);
         }
         txn_manager.commit(*tx);
+        tx->inserted_tuple_ids.clear();
         concurrency_control_policy->commit(tx->id);
         logConcurrencyControl(txnLabel(tx) + " COMMIT; release strict 2PL locks");
         return true;
+    }
+
+    void undoInsertedTuples(const TxnPtr& tx) {
+        for (auto it = tx->inserted_tuple_ids.rbegin();
+             it != tx->inserted_tuple_ids.rend();
+             ++it) {
+            auto& metadata = catalog.getTable(it->table_id);
+            TableHeap table(metadata, buffer_manager);
+            if (table.deletePhysicalTuple(
+                    it->page_id, it->slot_id, "runtime insert abort undo")) {
+                catalog.persistTableMetadata(metadata);
+            }
+        }
+        tx->inserted_tuple_ids.clear();
     }
 
     void abort(const TxnPtr& tx) {
@@ -9757,6 +10474,7 @@ public:
             recovery_manager.abortTxn(tx->id);
             recovery_manager.finishTxn(tx->id);
         }
+        undoInsertedTuples(tx);
         txn_manager.abort(*tx);
         concurrency_control_policy->abort(tx->id);
         logConcurrencyControl(txnLabel(tx) + " ABORT; release strict 2PL locks");
@@ -10271,10 +10989,15 @@ public:
             );
 
             TableHeap table(metadata, buffer_manager);
+            bool txn_has_recovery =
+                txn && recovery_manager.hasTxn(txn->id);
             DeleteOperator deleteOp(
                 table,
                 static_cast<size_t>(where_column),
-                where_value
+                where_value,
+                (txn_has_recovery || recovery_manager.isActive()) ?
+                    &recovery_manager :
+                    nullptr
             );
             deleteOp.setTxnContext(txn);
             deleteOp.open();
@@ -10293,9 +11016,8 @@ public:
                     lineContext(line_number)
                 );
             }
-            if (recovery_manager.isActive()) {
-                throw std::runtime_error("INSERT inside an undo/redo WAL update transaction is not supported in v83.");
-            }
+            bool txn_has_recovery =
+                txn && recovery_manager.hasTxn(txn->id);
 
             auto tuple = std::make_unique<Tuple>();
 
@@ -10315,7 +11037,12 @@ public:
                 table = local_table.get();
             }
 
-            InsertOperator insertOp(*table);
+            InsertOperator insertOp(
+                *table,
+                (txn_has_recovery || recovery_manager.isActive()) ?
+                    &recovery_manager :
+                    nullptr
+            );
             insertOp.setTxnContext(txn);
             insertOp.setTupleToInsert(std::move(tuple));
             insertOp.open();
@@ -10667,6 +11394,14 @@ struct ExplainRouteCommand {
     bool full_scan = false;
 };
 
+struct RoutedSQLCommand {
+    std::string sql;
+};
+
+struct RoutedTransactionCommand {
+    std::vector<std::string> statements;
+};
+
 struct QuerySQLCommand { std::string sql; };
 struct CountRowsCommand { std::string table; };
 struct CheckpointCommand {};
@@ -10691,6 +11426,25 @@ struct RegisterRangeCommand {
     std::string end_key;
     std::string replica_group_id;
     int descriptor_version = 1;
+    std::string status = "active";
+};
+
+struct SplitRangeCommand {
+    std::string source_range_id;
+    std::string split_key;
+    std::string left_range_id;
+    std::string right_range_id;
+    int descriptor_version = 1;
+};
+
+struct SplitTableCommand {
+    std::string table;
+    std::string source_range_id;
+    std::string left_range_id;
+    std::string right_range_id;
+    int descriptor_version = 1;
+    std::string left_replica_group_id = "";
+    std::string right_replica_group_id = "";
 };
 
 struct BootstrapClusterCommand {
@@ -10738,6 +11492,11 @@ struct FinalizeJointConfigCommand {
 
 struct ReadClusterIdentityCommand {};
 
+struct ReadRangeOwnershipCommand {
+    std::string table;
+    bool active_only = true;
+};
+
 struct ReadSystemCatalogCommand { std::string table; };
 
 using Command = std::variant<
@@ -10748,12 +11507,16 @@ using Command = std::variant<
     SelectAllCommand,
     SelectWhereCommand,
     ExplainRouteCommand,
+    RoutedSQLCommand,
+    RoutedTransactionCommand,
     QuerySQLCommand,
     CountRowsCommand,
     CheckpointCommand,
     RegisterClusterNodeCommand,
     RegisterReplicaGroupCommand,
     RegisterRangeCommand,
+    SplitRangeCommand,
+    SplitTableCommand,
     BootstrapClusterCommand,
     DiscoverClusterNodeCommand,
     AddLearnerToGroupCommand,
@@ -10761,6 +11524,7 @@ using Command = std::variant<
     BeginJointConfigCommand,
     FinalizeJointConfigCommand,
     ReadClusterIdentityCommand,
+    ReadRangeOwnershipCommand,
     ReadSystemCatalogCommand>;
 
 bool operator==(const CreateTableCommand& lhs, const CreateTableCommand& rhs) {
@@ -10791,6 +11555,13 @@ bool operator==(const ExplainRouteCommand& lhs,
     return lhs.table == rhs.table && lhs.primary_key == rhs.primary_key &&
            lhs.full_scan == rhs.full_scan;
 }
+bool operator==(const RoutedSQLCommand& lhs, const RoutedSQLCommand& rhs) {
+    return lhs.sql == rhs.sql;
+}
+bool operator==(const RoutedTransactionCommand& lhs,
+                const RoutedTransactionCommand& rhs) {
+    return lhs.statements == rhs.statements;
+}
 bool operator==(const QuerySQLCommand& lhs, const QuerySQLCommand& rhs) {
     return lhs.sql == rhs.sql;
 }
@@ -10816,7 +11587,26 @@ bool operator==(const RegisterRangeCommand& lhs,
     return lhs.range_id == rhs.range_id && lhs.start_key == rhs.start_key &&
            lhs.end_key == rhs.end_key &&
            lhs.replica_group_id == rhs.replica_group_id &&
+           lhs.descriptor_version == rhs.descriptor_version &&
+           lhs.status == rhs.status;
+}
+bool operator==(const SplitRangeCommand& lhs,
+                const SplitRangeCommand& rhs) {
+    return lhs.source_range_id == rhs.source_range_id &&
+           lhs.split_key == rhs.split_key &&
+           lhs.left_range_id == rhs.left_range_id &&
+           lhs.right_range_id == rhs.right_range_id &&
            lhs.descriptor_version == rhs.descriptor_version;
+}
+bool operator==(const SplitTableCommand& lhs,
+                const SplitTableCommand& rhs) {
+    return lhs.table == rhs.table &&
+           lhs.source_range_id == rhs.source_range_id &&
+           lhs.left_range_id == rhs.left_range_id &&
+           lhs.right_range_id == rhs.right_range_id &&
+           lhs.descriptor_version == rhs.descriptor_version &&
+           lhs.left_replica_group_id == rhs.left_replica_group_id &&
+           lhs.right_replica_group_id == rhs.right_replica_group_id;
 }
 bool operator==(const BootstrapClusterCommand& lhs,
                 const BootstrapClusterCommand& rhs) {
@@ -10861,6 +11651,10 @@ bool operator==(const ReadClusterIdentityCommand&,
                 const ReadClusterIdentityCommand&) {
     return true;
 }
+bool operator==(const ReadRangeOwnershipCommand& lhs,
+                const ReadRangeOwnershipCommand& rhs) {
+    return lhs.table == rhs.table && lhs.active_only == rhs.active_only;
+}
 bool operator==(const ReadSystemCatalogCommand& lhs,
                 const ReadSystemCatalogCommand& rhs) {
     return lhs.table == rhs.table;
@@ -10896,6 +11690,10 @@ struct RouteResult {
     std::vector<std::string> replica_group_ids;
     std::vector<int> descriptor_versions;
 };
+struct TransactionOkResult {
+    std::string range_id;
+    size_t statement_count = 0;
+};
 struct QueryRowsResult { size_t count; };
 struct CountRowsResult { size_t count; };
 struct CheckpointOkResult {};
@@ -10906,6 +11704,7 @@ struct SchemaMismatchResult {};
 struct InvalidSchemaResult {};
 struct ClusterRejectedResult {};
 struct ConfigRejectedResult {};
+struct RouteRejectedResult {};
 
 using Result = std::variant<
     CreateTableOkResult,
@@ -10914,6 +11713,7 @@ using Result = std::variant<
     UpdateRowsResult,
     SelectAllResult,
     RouteResult,
+    TransactionOkResult,
     QueryRowsResult,
     CountRowsResult,
     CheckpointOkResult,
@@ -10923,7 +11723,8 @@ using Result = std::variant<
     SchemaMismatchResult,
     InvalidSchemaResult,
     ClusterRejectedResult,
-    ConfigRejectedResult>;
+    ConfigRejectedResult,
+    RouteRejectedResult>;
 
 bool operator==(const CreateTableOkResult&, const CreateTableOkResult&) { return true; }
 bool operator==(const InsertOkResult&, const InsertOkResult&) { return true; }
@@ -10936,6 +11737,11 @@ bool operator==(const RouteResult& lhs, const RouteResult& rhs) {
            lhs.replica_group_ids == rhs.replica_group_ids &&
            lhs.descriptor_versions == rhs.descriptor_versions;
 }
+bool operator==(const TransactionOkResult& lhs,
+                const TransactionOkResult& rhs) {
+    return lhs.range_id == rhs.range_id &&
+           lhs.statement_count == rhs.statement_count;
+}
 bool operator==(const QueryRowsResult& lhs, const QueryRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const CountRowsResult& lhs, const CountRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const CheckpointOkResult&, const CheckpointOkResult&) { return true; }
@@ -10946,6 +11752,7 @@ bool operator==(const SchemaMismatchResult&, const SchemaMismatchResult&) { retu
 bool operator==(const InvalidSchemaResult&, const InvalidSchemaResult&) { return true; }
 bool operator==(const ClusterRejectedResult&, const ClusterRejectedResult&) { return true; }
 bool operator==(const ConfigRejectedResult&, const ConfigRejectedResult&) { return true; }
+bool operator==(const RouteRejectedResult&, const RouteRejectedResult&) { return true; }
 
 bool operator==(const Result& lhs, const Result& rhs) {
     return lhs.index() == rhs.index() &&
@@ -10998,6 +11805,10 @@ std::string describeCommand(const Command& command) {
                     out << ", pk=" << value.primary_key;
                 }
                 out << ")";
+            } else if constexpr (std::is_same_v<T, RoutedSQLCommand>) {
+                out << "RoutedSQL(" << value.sql << ")";
+            } else if constexpr (std::is_same_v<T, RoutedTransactionCommand>) {
+                out << "RoutedTxn(statements=" << value.statements.size() << ")";
             } else if constexpr (std::is_same_v<T, QuerySQLCommand>) {
                 out << "QuerySQL(" << value.sql << ")";
             } else if constexpr (std::is_same_v<T, CountRowsCommand>) {
@@ -11026,6 +11837,25 @@ std::string describeCommand(const Command& command) {
                 out << "RegisterRange(" << value.range_id << ", ["
                     << value.start_key << ", " << value.end_key
                     << ") -> " << value.replica_group_id
+                    << ", version=" << value.descriptor_version
+                    << ", status=" << value.status << ")";
+            } else if constexpr (std::is_same_v<T, SplitRangeCommand>) {
+                out << "SplitRange(" << value.source_range_id
+                    << " at " << value.split_key
+                    << " -> " << value.left_range_id
+                    << ", " << value.right_range_id
+                    << ", version=" << value.descriptor_version << ")";
+            } else if constexpr (std::is_same_v<T, SplitTableCommand>) {
+                out << "SplitTable(" << value.table
+                    << ", source=" << value.source_range_id
+                    << " -> " << value.left_range_id
+                    << "@" << (value.left_replica_group_id.empty()
+                                   ? "source-group"
+                                   : value.left_replica_group_id)
+                    << ", " << value.right_range_id
+                    << "@" << (value.right_replica_group_id.empty()
+                                   ? "source-group"
+                                   : value.right_replica_group_id)
                     << ", version=" << value.descriptor_version << ")";
             } else if constexpr (std::is_same_v<T, BootstrapClusterCommand>) {
                 out << "BootstrapCluster(" << value.cluster_id
@@ -11071,6 +11901,10 @@ std::string describeCommand(const Command& command) {
                 out << "])";
             } else if constexpr (std::is_same_v<T, ReadClusterIdentityCommand>) {
                 out << "ReadClusterIdentity";
+            } else if constexpr (std::is_same_v<T, ReadRangeOwnershipCommand>) {
+                out << "ReadRangeOwnership(" << value.table
+                    << ", active_only="
+                    << (value.active_only ? "true" : "false") << ")";
             } else if constexpr (std::is_same_v<T, ReadSystemCatalogCommand>) {
                 out << "ReadSystemCatalog(" << value.table << ")";
             }
@@ -11090,6 +11924,7 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, UpdateRowsResult>) out << "UpdateRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, SelectAllResult>) out << "SelectAll(columns=" << value.columns.size() << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, RouteResult>) out << "RouteResult(ranges=" << value.range_ids.size() << ")";
+            else if constexpr (std::is_same_v<T, TransactionOkResult>) out << "TransactionOk(range=" << value.range_id << ", statements=" << value.statement_count << ")";
             else if constexpr (std::is_same_v<T, QueryRowsResult>) out << "QueryRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, CountRowsResult>) out << "CountRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, CheckpointOkResult>) out << "CheckpointOk";
@@ -11100,6 +11935,7 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, InvalidSchemaResult>) out << "InvalidSchema";
             else if constexpr (std::is_same_v<T, ClusterRejectedResult>) out << "ClusterRejected";
             else if constexpr (std::is_same_v<T, ConfigRejectedResult>) out << "ConfigRejected";
+            else if constexpr (std::is_same_v<T, RouteRejectedResult>) out << "RouteRejected";
             return out.str();
         },
         result);
@@ -11327,6 +12163,7 @@ const std::vector<std::string>& systemCatalogTableNames() {
         "__replica_groups",
         "__tables",
         "__ranges",
+        "__range_ownership",
         "__global_keys",
         "__schema_versions"
     };
@@ -11448,6 +12285,7 @@ struct RangeDescriptor {
     std::string end_key;
     std::string replica_group_id;
     int descriptor_version = 0;
+    std::string status = "active";
 };
 
 bool keyInRange(const std::string& key, const RangeDescriptor& range) {
@@ -11500,6 +12338,17 @@ std::vector<RangeDescriptor> latestRangeDescriptorsById(
     return sortRangeDescriptors(std::move(current));
 }
 
+std::vector<RangeDescriptor> latestActiveRangeDescriptors(
+    const std::vector<RangeDescriptor>& ranges) {
+    std::vector<RangeDescriptor> active;
+    for (const auto& range : latestRangeDescriptorsById(ranges)) {
+        if (range.status == "active") {
+            active.push_back(range);
+        }
+    }
+    return sortRangeDescriptors(std::move(active));
+}
+
 RouteResult routeResultFor(const std::string& start_key,
                            const std::string& end_key,
                            std::vector<RangeDescriptor> ranges) {
@@ -11532,7 +12381,15 @@ public:
     BuzzDBCore(const BuzzDBCore& other)
         : database_file_(makeScratchBuzzDBFile()),
           owns_bundle_(true) {
-        const_cast<BuzzDBCore&>(other).flushForSnapshot();
+        std::ostringstream sink;
+        auto* old_buffer = std::cout.rdbuf(sink.rdbuf());
+        try {
+            const_cast<BuzzDBCore&>(other).flushForSnapshot();
+            std::cout.rdbuf(old_buffer);
+        } catch (...) {
+            std::cout.rdbuf(old_buffer);
+            throw;
+        }
         copyBundle(other.database_file_, database_file_);
         open();
     }
@@ -11542,7 +12399,15 @@ public:
         cleanupOwnedBundle();
         database_file_ = makeScratchBuzzDBFile();
         owns_bundle_ = true;
-        const_cast<BuzzDBCore&>(other).flushForSnapshot();
+        std::ostringstream sink;
+        auto* old_buffer = std::cout.rdbuf(sink.rdbuf());
+        try {
+            const_cast<BuzzDBCore&>(other).flushForSnapshot();
+            std::cout.rdbuf(old_buffer);
+        } catch (...) {
+            std::cout.rdbuf(old_buffer);
+            throw;
+        }
         copyBundle(other.database_file_, database_file_);
         open();
         return *this;
@@ -11727,12 +12592,19 @@ private:
         createSystemCatalogTableIfMissing(
             "__ranges",
             {"range_id:string", "start_key:string", "end_key:string",
-             "replica_group_id:string", "descriptor_version:int"});
+             "replica_group_id:string", "descriptor_version:int",
+             "status:string"});
+        createSystemCatalogTableIfMissing(
+            "__range_ownership",
+            {"table_name:string", "index_name:string", "range_id:string",
+             "start_key:string", "end_key:string",
+             "replica_group_id:string", "owner_version:int",
+             "status:string"});
         createSystemCatalogTableIfMissing(
             "__global_keys",
             {"table_name:string", "primary_key:string", "row_key:string",
              "range_id:string", "replica_group_id:string",
-             "descriptor_version:int"});
+             "descriptor_version:int", "status:string"});
         createSystemCatalogTableIfMissing(
             "__schema_versions",
             {"table_name:string", "schema_version:int"});
@@ -11747,20 +12619,47 @@ private:
         db_->commit(txn);
     }
 
+    InsertRowCommand rangeOwnershipCatalogRow(
+        const std::string& table,
+        const std::string& range_id,
+        const std::string& start_key,
+        const std::string& end_key,
+        const std::string& replica_group_id,
+        int owner_version,
+        const std::string& status) {
+        return InsertRowCommand{
+            "__range_ownership",
+            {table,
+             "primary",
+             range_id,
+             start_key,
+             end_key,
+             replica_group_id,
+             std::to_string(owner_version),
+             status}};
+    }
+
     void recordUserTableCreated(const CreateTableCommand& command) {
         if (isSystemCatalogTable(command.table)) return;
         ensureSystemCatalogTables();
+        std::string range_id = defaultRangeIdForTable(command.table);
+        std::string start_key = tableRowPrefix(command.table);
+        std::string end_key = tableRowPrefixEnd(command.table);
         insertSystemCatalogRows({
             InsertRowCommand{
                 "__schema_versions",
                 {command.table, "1"}},
             InsertRowCommand{
                 "__ranges",
-                {defaultRangeIdForTable(command.table),
-                 tableRowPrefix(command.table),
-                 tableRowPrefixEnd(command.table),
+                {range_id,
+                 start_key,
+                 end_key,
                  "group-1",
-                 "1"}}
+                 "1",
+                 "active"}},
+            rangeOwnershipCatalogRow(
+                command.table, range_id, start_key, end_key,
+                "group-1", 1, "active")
         });
     }
 
@@ -11883,17 +12782,180 @@ private:
                 row[1],
                 row[2],
                 row[3],
-                std::stoi(row[4])
+                std::stoi(row[4]),
+                row.size() >= 6 ? row[5] : "active"
             });
         }
         return ranges;
     }
 
+    std::optional<RangeDescriptor> latestRangeDescriptorById(
+        const std::string& range_id) {
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if (range.range_id == range_id) return range;
+        }
+        return std::nullopt;
+    }
+
+    struct RangeOwnershipRecord {
+        std::string table_name;
+        std::string index_name;
+        std::string range_id;
+        std::string start_key;
+        std::string end_key;
+        std::string replica_group_id;
+        int owner_version = 0;
+        std::string status = "active";
+    };
+
+    std::vector<RangeOwnershipRecord> latestRangeOwnershipRecords(
+        const std::string& table,
+        bool active_only) {
+        SelectAllResult rows = selectSystemCatalogTable("__range_ownership");
+        std::map<std::string, RangeOwnershipRecord> latest;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 8) continue;
+            if (!table.empty() && row[0] != table) continue;
+            RangeOwnershipRecord record{
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                std::stoi(row[6]),
+                row[7]};
+            std::string separator(1, '\0');
+            std::string key = record.table_name + separator +
+                              record.index_name + separator +
+                              record.range_id;
+            auto it = latest.find(key);
+            if (it == latest.end() ||
+                record.owner_version >= it->second.owner_version) {
+                latest[key] = record;
+            }
+        }
+
+        std::vector<RangeOwnershipRecord> records;
+        for (const auto& [key, record] : latest) {
+            (void)key;
+            if (!active_only || record.status == "active") {
+                records.push_back(record);
+            }
+        }
+        std::sort(
+            records.begin(),
+            records.end(),
+            [](const RangeOwnershipRecord& lhs,
+               const RangeOwnershipRecord& rhs) {
+                if (lhs.start_key != rhs.start_key) {
+                    return lhs.start_key < rhs.start_key;
+                }
+                if (lhs.end_key != rhs.end_key) {
+                    return lhs.end_key < rhs.end_key;
+                }
+                return lhs.range_id < rhs.range_id;
+            });
+        return records;
+    }
+
+    SelectAllResult rangeOwnershipView(const ReadRangeOwnershipCommand& command) {
+        ensureSystemCatalogTables();
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& record :
+             latestRangeOwnershipRecords(command.table,
+                                         command.active_only)) {
+            rows.push_back({
+                record.table_name,
+                record.index_name,
+                record.range_id,
+                record.start_key,
+                record.end_key,
+                record.replica_group_id,
+                std::to_string(record.owner_version),
+                record.status});
+        }
+        return SelectAllResult{
+            {"table_name", "index_name", "range_id", "start_key",
+             "end_key", "replica_group_id", "owner_version", "status"},
+            std::move(rows)};
+    }
+
+    struct GlobalKeyRecord {
+        std::string table_name;
+        std::string primary_key;
+        std::string row_key;
+        std::string range_id;
+        std::string replica_group_id;
+        int descriptor_version = 0;
+        std::string status = "active";
+    };
+
+    std::vector<GlobalKeyRecord> latestGlobalKeyRecords() {
+        SelectAllResult rows = selectSystemCatalogTable("__global_keys");
+        std::map<std::string, GlobalKeyRecord> latest;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 6) continue;
+            GlobalKeyRecord record{
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                std::stoi(row[5]),
+                row.size() >= 7 ? row[6] : "active"};
+            std::string separator(1, '\0');
+            std::string key = record.table_name + separator +
+                              record.primary_key + separator +
+                              record.row_key;
+            auto it = latest.find(key);
+            if (it == latest.end() ||
+                record.descriptor_version >=
+                    it->second.descriptor_version) {
+                latest[key] = record;
+            }
+        }
+
+        std::vector<GlobalKeyRecord> records;
+        records.reserve(latest.size());
+        for (const auto& [key, record] : latest) {
+            (void)key;
+            records.push_back(record);
+        }
+        std::sort(
+            records.begin(),
+            records.end(),
+            [](const GlobalKeyRecord& lhs,
+               const GlobalKeyRecord& rhs) {
+                if (lhs.row_key != rhs.row_key) {
+                    return lhs.row_key < rhs.row_key;
+                }
+                return lhs.primary_key < rhs.primary_key;
+            });
+        return records;
+    }
+
+    std::vector<GlobalKeyRecord> latestGlobalKeyRecordsForRange(
+        const std::string& table,
+        const RangeDescriptor& range) {
+        std::vector<GlobalKeyRecord> records;
+        for (const auto& record : latestGlobalKeyRecords()) {
+            if (record.table_name == table &&
+                record.range_id == range.range_id &&
+                record.status == "active" &&
+                keyInRange(record.row_key, range)) {
+                records.push_back(record);
+            }
+        }
+        return records;
+    }
+
     std::vector<RangeDescriptor> matchingPointRanges(
         const std::string& key) {
         std::vector<RangeDescriptor> matches;
-        for (const auto& range :
-             latestRangeDescriptorsById(rangeDescriptors())) {
+        for (const auto& range : latestActiveRangeDescriptors(
+                 rangeDescriptors())) {
             if (keyInRange(key, range)) matches.push_back(range);
         }
         std::sort(
@@ -11915,8 +12977,8 @@ private:
         const std::string& start_key,
         const std::string& end_key) {
         std::vector<RangeDescriptor> matches;
-        for (const auto& range :
-             latestRangeDescriptorsById(rangeDescriptors())) {
+        for (const auto& range : latestActiveRangeDescriptors(
+                 rangeDescriptors())) {
             if (rangesOverlap(start_key, end_key, range)) {
                 matches.push_back(range);
             }
@@ -11938,6 +13000,243 @@ private:
         return routeResultFor(start_key, end_key, std::move(matches));
     }
 
+    bool routesToExactlyOneRange(const ExplainRouteCommand& command) {
+        RouteResult route = explainRoute(command);
+        return route.range_ids.size() == 1 &&
+               route.replica_group_ids.size() == 1 &&
+               route.descriptor_versions.size() == 1;
+    }
+
+    std::optional<std::string> primaryKeyColumnName(
+        const std::string& table) {
+        if (!tableExists(table)) return std::nullopt;
+        auto& metadata = db_->catalog.getTable(table);
+        if (metadata.schema.columns.empty()) return std::nullopt;
+        return metadata.schema.columns.front().name;
+    }
+
+    std::optional<std::string> primaryKeyValueFromInsert(
+        const InsertRowCommand& command) {
+        if (!tableExists(command.table) || command.values.empty()) {
+            return std::nullopt;
+        }
+        auto& metadata = db_->catalog.getTable(command.table);
+        if (metadata.schema.columns.empty()) return std::nullopt;
+        return command.values.front();
+    }
+
+    bool isPrimaryKeyColumn(const std::string& table,
+                            const std::string& column) {
+        auto primary_key = primaryKeyColumnName(table);
+        return primary_key.has_value() && *primary_key == column;
+    }
+
+    std::optional<std::string> singleRangeForParsedCommand(
+        const Command& parsed) {
+        RouteResult route;
+        if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+            auto primary_key = primaryKeyValueFromInsert(*insert);
+            if (!primary_key.has_value()) {
+                return std::nullopt;
+            }
+            route = explainRoute(
+                ExplainRouteCommand{insert->table,
+                                    *primary_key,
+                                    false});
+        } else if (const auto* select =
+                       std::get_if<SelectWhereCommand>(&parsed)) {
+            if (!isPrimaryKeyColumn(select->table, select->column)) {
+                return std::nullopt;
+            }
+            route = explainRoute(
+                ExplainRouteCommand{select->table, select->value, false});
+        } else if (const auto* update =
+                       std::get_if<UpdateRowsCommand>(&parsed)) {
+            if (!isPrimaryKeyColumn(update->table, update->where_column) ||
+                isPrimaryKeyColumn(update->table, update->set_column)) {
+                return std::nullopt;
+            }
+            route = explainRoute(
+                ExplainRouteCommand{update->table,
+                                    update->where_value,
+                                    false});
+        } else if (const auto* remove =
+                       std::get_if<DeleteRowsCommand>(&parsed)) {
+            if (!isPrimaryKeyColumn(remove->table, remove->column)) {
+                return std::nullopt;
+            }
+            route = explainRoute(
+                ExplainRouteCommand{remove->table, remove->value, false});
+        } else if (const auto* scan = std::get_if<SelectAllCommand>(&parsed)) {
+            if (!tableExists(scan->table)) return std::nullopt;
+            route = explainRoute(ExplainRouteCommand{scan->table, "", true});
+        } else {
+            return std::nullopt;
+        }
+
+        if (route.range_ids.size() != 1) return std::nullopt;
+        return route.range_ids.front();
+    }
+
+    Result executeRoutedParsedCommand(const Command& parsed) {
+        if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+            if (!tableExists(insert->table)) return TableNotFoundResult{};
+            auto primary_key = primaryKeyValueFromInsert(*insert);
+            if (!primary_key.has_value()) return SchemaMismatchResult{};
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        insert->table, *primary_key, false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*insert);
+        }
+
+        if (const auto* select = std::get_if<SelectWhereCommand>(&parsed)) {
+            if (!tableExists(select->table)) return TableNotFoundResult{};
+            if (!isPrimaryKeyColumn(select->table, select->column)) {
+                return RouteRejectedResult{};
+            }
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        select->table, select->value, false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*select);
+        }
+
+        if (const auto* update = std::get_if<UpdateRowsCommand>(&parsed)) {
+            if (!tableExists(update->table)) return TableNotFoundResult{};
+            if (!isPrimaryKeyColumn(update->table, update->where_column) ||
+                isPrimaryKeyColumn(update->table, update->set_column)) {
+                return RouteRejectedResult{};
+            }
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        update->table, update->where_value, false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*update);
+        }
+
+        if (const auto* remove = std::get_if<DeleteRowsCommand>(&parsed)) {
+            if (!tableExists(remove->table)) return TableNotFoundResult{};
+            if (!isPrimaryKeyColumn(remove->table, remove->column)) {
+                return RouteRejectedResult{};
+            }
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{
+                        remove->table, remove->value, false})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*remove);
+        }
+
+        if (const auto* scan = std::get_if<SelectAllCommand>(&parsed)) {
+            if (!tableExists(scan->table)) return TableNotFoundResult{};
+            if (!routesToExactlyOneRange(
+                    ExplainRouteCommand{scan->table, "", true})) {
+                return RouteRejectedResult{};
+            }
+            return executeOne(*scan);
+        }
+
+        return RouteRejectedResult{};
+    }
+
+    Result executeInTxn(const Command& parsed, const TxnPtr& txn) {
+        if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+            db_->executeStatement(insertStatement(*insert), txn, 0, false);
+            return InsertOkResult{};
+        }
+        if (const auto* select = std::get_if<SelectWhereCommand>(&parsed)) {
+            return selectWhere(select->table, select->column,
+                               select->value, txn);
+        }
+        if (const auto* update = std::get_if<UpdateRowsCommand>(&parsed)) {
+            size_t count = selectWhere(update->table,
+                                       update->where_column,
+                                       update->where_value,
+                                       txn).rows.size();
+            db_->executeStatement(updateStatement(*update), txn, 0, false);
+            return UpdateRowsResult{count};
+        }
+        if (const auto* remove = std::get_if<DeleteRowsCommand>(&parsed)) {
+            size_t count = selectWhere(remove->table,
+                                       remove->column,
+                                       remove->value,
+                                       txn).rows.size();
+            db_->executeStatement(deleteStatement(*remove), txn, 0, false);
+            return DeleteRowsResult{count};
+        }
+        if (const auto* scan = std::get_if<SelectAllCommand>(&parsed)) {
+            auto rows = db_->executeQuery(projectAllQuery(scan->table),
+                                          txn,
+                                          false);
+            return queryResultToSelectAll(scan->table, rows);
+        }
+        return RouteRejectedResult{};
+    }
+
+    Result executeOne(const RoutedTransactionCommand& command) {
+        if (command.statements.empty()) return RouteRejectedResult{};
+
+        std::vector<Command> parsed;
+        parsed.reserve(command.statements.size());
+        std::optional<std::string> transaction_range;
+        try {
+            for (const auto& statement : command.statements) {
+                parsed.push_back(parseSQL(statement));
+                auto range = singleRangeForParsedCommand(parsed.back());
+                if (!range.has_value()) return RouteRejectedResult{};
+                if (!transaction_range.has_value()) {
+                    transaction_range = *range;
+                } else if (*transaction_range != *range) {
+                    return RouteRejectedResult{};
+                }
+            }
+        } catch (const std::exception&) {
+            return RouteRejectedResult{};
+        }
+
+        auto txn = db_->beginLoggedTxn("routed-txn");
+        std::vector<InsertRowCommand> catalog_rows;
+        try {
+            for (const auto& parsed_command : parsed) {
+                Result result = executeInTxn(parsed_command, txn);
+                if (std::holds_alternative<RouteRejectedResult>(result)) {
+                    db_->abort(txn);
+                    return RouteRejectedResult{};
+                }
+                if (const auto* insert =
+                        std::get_if<InsertRowCommand>(&parsed_command)) {
+                    auto catalog_row = globalKeyCatalogRow(*insert);
+                    if (catalog_row.has_value()) {
+                        catalog_rows.push_back(*catalog_row);
+                    }
+                }
+                const auto* remove =
+                    std::get_if<DeleteRowsCommand>(&parsed_command);
+                const auto* deleted = std::get_if<DeleteRowsResult>(&result);
+                if (remove != nullptr && deleted != nullptr &&
+                    deleted->count > 0) {
+                    auto catalog_row = globalKeyDeleteCatalogRow(*remove);
+                    if (catalog_row.has_value()) {
+                        catalog_rows.push_back(*catalog_row);
+                    }
+                }
+            }
+            executeSystemCatalogRowsInTxn(catalog_rows, txn);
+            db_->commit(txn);
+        } catch (const std::exception&) {
+            db_->abort(txn);
+            return SchemaMismatchResult{};
+        }
+
+        return TransactionOkResult{
+            transaction_range.value_or("-"),
+            command.statements.size()};
+    }
+
     RangeDescriptor bestRangeForKey(const std::string& key) {
         auto matches = matchingPointRanges(key);
         if (matches.empty()) {
@@ -11946,24 +13245,54 @@ private:
         return matches.front();
     }
 
-    void recordGlobalRowKey(const InsertRowCommand& command) {
-        if (isSystemCatalogTable(command.table) || command.values.empty()) {
-            return;
+    std::optional<InsertRowCommand> globalKeyCatalogRow(
+        const InsertRowCommand& command) {
+        if (isSystemCatalogTable(command.table)) {
+            return std::nullopt;
+        }
+        auto primary_key = primaryKeyValueFromInsert(command);
+        if (!primary_key.has_value()) return std::nullopt;
+        ensureSystemCatalogTables();
+        std::string row_key = tableRowKey(command.table, *primary_key);
+        RangeDescriptor range = bestRangeForKey(row_key);
+        return InsertRowCommand{
+            "__global_keys",
+            {command.table,
+             *primary_key,
+             row_key,
+             range.range_id,
+             range.replica_group_id,
+             std::to_string(range.descriptor_version),
+             "active"}};
+    }
+
+    std::optional<InsertRowCommand> globalKeyDeleteCatalogRow(
+        const DeleteRowsCommand& command) {
+        if (isSystemCatalogTable(command.table) ||
+            !isPrimaryKeyColumn(command.table, command.column)) {
+            return std::nullopt;
         }
         ensureSystemCatalogTables();
-        std::string primary_key = command.values.front();
+        std::string primary_key = command.value;
         std::string row_key = tableRowKey(command.table, primary_key);
         RangeDescriptor range = bestRangeForKey(row_key);
-        insertSystemCatalogRows({
-            InsertRowCommand{
-                "__global_keys",
-                {command.table,
-                 primary_key,
-                 row_key,
-                 range.range_id,
-                 range.replica_group_id,
-                 std::to_string(range.descriptor_version)}}
-        });
+        return InsertRowCommand{
+            "__global_keys",
+            {command.table,
+             primary_key,
+             row_key,
+             range.range_id,
+             range.replica_group_id,
+             std::to_string(range.descriptor_version),
+             "deleted"}};
+    }
+
+    void executeSystemCatalogRowsInTxn(
+        const std::vector<InsertRowCommand>& rows,
+        const TxnPtr& txn) {
+        for (const auto& row : rows) {
+            db_->executeStatement(insertStatement(row), txn, 0, false);
+        }
     }
 
     SelectAllResult tableCatalogView() {
@@ -12068,10 +13397,13 @@ private:
     Result executeOne(const InsertRowCommand& command) {
         if (!tableExists(command.table)) return TableNotFoundResult{};
         try {
+            auto catalog_row = globalKeyCatalogRow(command);
             auto txn = db_->beginLoggedTxn("sim-insert");
             db_->executeStatement(insertStatement(command), txn, 0, false);
+            if (catalog_row.has_value()) {
+                executeSystemCatalogRowsInTxn({*catalog_row}, txn);
+            }
             db_->commit(txn);
-            recordGlobalRowKey(command);
             return InsertOkResult{};
         } catch (const std::exception&) {
             return SchemaMismatchResult{};
@@ -12082,8 +13414,15 @@ private:
         if (!tableExists(command.table)) return TableNotFoundResult{};
         try {
             size_t count = selectWhere(command.table, command.column, command.value).rows.size();
+            std::optional<InsertRowCommand> catalog_row;
+            if (count > 0) {
+                catalog_row = globalKeyDeleteCatalogRow(command);
+            }
             auto txn = db_->beginLoggedTxn("sim-delete");
             db_->executeStatement(deleteStatement(command), txn, 0, false);
+            if (catalog_row.has_value()) {
+                executeSystemCatalogRowsInTxn({*catalog_row}, txn);
+            }
             db_->commit(txn);
             return DeleteRowsResult{count};
         } catch (const std::exception&) {
@@ -12093,6 +13432,10 @@ private:
 
     Result executeOne(const UpdateRowsCommand& command) {
         if (!tableExists(command.table)) return TableNotFoundResult{};
+        if (!isSystemCatalogTable(command.table) &&
+            isPrimaryKeyColumn(command.table, command.set_column)) {
+            return RouteRejectedResult{};
+        }
         try {
             size_t count = selectWhere(command.table, command.where_column, command.where_value).rows.size();
             auto txn = db_->beginLoggedTxn("sim-update");
@@ -12125,6 +13468,14 @@ private:
 
     Result executeOne(const ExplainRouteCommand& command) {
         return explainRoute(command);
+    }
+
+    Result executeOne(const RoutedSQLCommand& command) {
+        try {
+            return executeRoutedParsedCommand(parseSQL(command.sql));
+        } catch (const std::exception&) {
+            return RouteRejectedResult{};
+        }
     }
 
     Result executeOne(const QuerySQLCommand& command) {
@@ -12274,13 +13625,257 @@ private:
 
     Result executeOne(const RegisterRangeCommand& command) {
         ensureSystemCatalogTables();
+        if (command.range_id.empty() ||
+            command.start_key.empty() ||
+            command.replica_group_id.empty() ||
+            command.descriptor_version <= 0 ||
+            (!command.end_key.empty() &&
+             command.end_key <= command.start_key) ||
+            (command.status != "active" &&
+             command.status != "superseded")) {
+            return ConfigRejectedResult{};
+        }
+
+        auto group = latestReplicaGroupConfig(command.replica_group_id);
+        if (!group.exists || group.phase != "stable") {
+            return ConfigRejectedResult{};
+        }
+
+        auto previous = latestRangeDescriptorById(command.range_id);
+        if (previous.has_value()) {
+            if (command.descriptor_version <=
+                previous->descriptor_version) {
+                return ConfigRejectedResult{};
+            }
+            if (command.status == "active" &&
+                previous->status == "active") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        if (command.status == "active") {
+            for (const auto& range : latestActiveRangeDescriptors(
+                     rangeDescriptors())) {
+                if (range.range_id != command.range_id &&
+                    rangesOverlap(command.start_key,
+                                  command.end_key,
+                                  range)) {
+                    return ConfigRejectedResult{};
+                }
+            }
+        }
+
         insertSystemCatalogRows({
             InsertRowCommand{
                 "__ranges",
                 {command.range_id, command.start_key, command.end_key,
                  command.replica_group_id,
-                 std::to_string(command.descriptor_version)}}
+                 std::to_string(command.descriptor_version),
+                 command.status}}
         });
+        return StatementOkResult{};
+    }
+
+    Result executeOne(const SplitRangeCommand& command) {
+        ensureSystemCatalogTables();
+        if (command.source_range_id.empty() ||
+            command.left_range_id.empty() ||
+            command.right_range_id.empty() ||
+            command.left_range_id == command.right_range_id ||
+            command.left_range_id == command.source_range_id ||
+            command.right_range_id == command.source_range_id) {
+            return ConfigRejectedResult{};
+        }
+
+        std::optional<RangeDescriptor> source;
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if (range.range_id == command.source_range_id) {
+                source = range;
+                break;
+            }
+        }
+        if (!source.has_value() || source->status != "active" ||
+            command.descriptor_version <= source->descriptor_version ||
+            command.split_key <= source->start_key ||
+            (!source->end_key.empty() &&
+             command.split_key >= source->end_key)) {
+            return ConfigRejectedResult{};
+        }
+
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if ((range.range_id == command.left_range_id ||
+                 range.range_id == command.right_range_id) &&
+                range.status == "active") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        insertSystemCatalogRows({
+            InsertRowCommand{
+                "__ranges",
+                {source->range_id,
+                 source->start_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "superseded"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.left_range_id,
+                 source->start_key,
+                 command.split_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.right_range_id,
+                 command.split_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "active"}}
+        });
+        return StatementOkResult{};
+    }
+
+    Result executeOne(const SplitTableCommand& command) {
+        ensureSystemCatalogTables();
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        if (command.table.empty() ||
+            command.source_range_id.empty() ||
+            command.left_range_id.empty() ||
+            command.right_range_id.empty() ||
+            command.left_range_id == command.right_range_id ||
+            command.left_range_id == command.source_range_id ||
+            command.right_range_id == command.source_range_id) {
+            return ConfigRejectedResult{};
+        }
+
+        auto source = latestRangeDescriptorById(command.source_range_id);
+        if (!source.has_value() || source->status != "active" ||
+            command.descriptor_version <= source->descriptor_version ||
+            source->start_key < tableRowPrefix(command.table) ||
+            source->end_key > tableRowPrefixEnd(command.table)) {
+            return ConfigRejectedResult{};
+        }
+
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if ((range.range_id == command.left_range_id ||
+                 range.range_id == command.right_range_id) &&
+                range.status == "active") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        auto records =
+            latestGlobalKeyRecordsForRange(command.table, *source);
+        if (records.size() < 2) return ConfigRejectedResult{};
+
+        std::string left_group =
+            command.left_replica_group_id.empty()
+                ? source->replica_group_id
+                : command.left_replica_group_id;
+        std::string right_group =
+            command.right_replica_group_id.empty()
+                ? source->replica_group_id
+                : command.right_replica_group_id;
+        if (!command.left_replica_group_id.empty()) {
+            auto group = latestReplicaGroupConfig(left_group);
+            if (!group.exists || group.phase != "stable") {
+                return ConfigRejectedResult{};
+            }
+        }
+        if (!command.right_replica_group_id.empty()) {
+            auto group = latestReplicaGroupConfig(right_group);
+            if (!group.exists || group.phase != "stable") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        size_t split_index = records.size() / 2;
+        std::string split_key = records[split_index].row_key;
+        if (split_key <= source->start_key ||
+            (!source->end_key.empty() && split_key >= source->end_key)) {
+            return ConfigRejectedResult{};
+        }
+
+        std::vector<InsertRowCommand> catalog_rows{
+            InsertRowCommand{
+                "__ranges",
+                {source->range_id,
+                 source->start_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(command.descriptor_version),
+                 "superseded"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.left_range_id,
+                 source->start_key,
+                 split_key,
+                 left_group,
+                 std::to_string(command.descriptor_version),
+                 "active"}},
+            InsertRowCommand{
+                "__ranges",
+                {command.right_range_id,
+                 split_key,
+                 source->end_key,
+                 right_group,
+                 std::to_string(command.descriptor_version),
+                 "active"}}
+        };
+        catalog_rows.push_back(
+            rangeOwnershipCatalogRow(
+                command.table,
+                source->range_id,
+                source->start_key,
+                source->end_key,
+                source->replica_group_id,
+                command.descriptor_version,
+                "superseded"));
+        catalog_rows.push_back(
+            rangeOwnershipCatalogRow(
+                command.table,
+                command.left_range_id,
+                source->start_key,
+                split_key,
+                left_group,
+                command.descriptor_version,
+                "active"));
+        catalog_rows.push_back(
+            rangeOwnershipCatalogRow(
+                command.table,
+                command.right_range_id,
+                split_key,
+                source->end_key,
+                right_group,
+                command.descriptor_version,
+                "active"));
+
+        for (const auto& record : records) {
+            bool goes_left = record.row_key < split_key;
+            std::string range_id = goes_left ? command.left_range_id
+                                             : command.right_range_id;
+            std::string replica_group_id = goes_left ? left_group
+                                                     : right_group;
+            catalog_rows.push_back(
+                InsertRowCommand{
+                    "__global_keys",
+                    {record.table_name,
+                     record.primary_key,
+                     record.row_key,
+                     range_id,
+                     replica_group_id,
+                     std::to_string(command.descriptor_version),
+                     "active"}});
+        }
+
+        insertSystemCatalogRows(catalog_rows);
         return StatementOkResult{};
     }
 
@@ -12334,6 +13929,10 @@ private:
 
     Result executeOne(const ReadClusterIdentityCommand&) {
         return executeOne(ReadSystemCatalogCommand{"__cluster_identity"});
+    }
+
+    Result executeOne(const ReadRangeOwnershipCommand& command) {
+        return rangeOwnershipView(command);
     }
 
     Result executeOne(const ReadSystemCatalogCommand& command) {
@@ -13034,12 +14633,12 @@ std::vector<std::string> requireTupleLinesFromFile(
     const std::string& data_file,
     const std::string& table,
     size_t count) {
+    std::vector<std::string> rows;
     std::ifstream input(data_file);
     if (!input) {
         throw std::runtime_error("Unable to open tuple file: " + data_file);
     }
 
-    std::vector<std::string> rows;
     std::string line;
     const std::string prefix = table + "|";
     while (std::getline(input, line)) {
@@ -13057,6 +14656,34 @@ std::vector<std::string> requireTupleLinesFromFile(
     throw std::runtime_error(
         "Tuple file " + data_file + " does not contain " +
         std::to_string(count) + " rows for table " + table);
+}
+
+std::vector<std::string> requireAllTupleLinesFromFile(
+    const std::string& data_file,
+    const std::string& table) {
+    std::ifstream input(data_file);
+    if (!input) {
+        throw std::runtime_error("Unable to open tuple file: " + data_file);
+    }
+
+    std::vector<std::string> rows;
+    std::string line;
+    const std::string prefix = table + "|";
+    while (std::getline(input, line)) {
+        line = adapterTrim(line);
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        if (line.rfind(prefix, 0) == 0) {
+            rows.push_back(line);
+        }
+    }
+    if (rows.empty()) {
+        throw std::runtime_error(
+            "Tuple file " + data_file + " does not contain rows for table " +
+            table);
+    }
+    return rows;
 }
 
 std::vector<std::string> tupleValuesFromLine(
@@ -13190,7 +14817,7 @@ std::string defaultImdbInputFile() {
 void printV104BootstrapTrace(const std::string& data_file) {
     std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
-        ("buzzdb-v125-bootstrap-trace-" + std::to_string(::getpid()));
+        ("buzzdb-v131-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
 
@@ -13362,8 +14989,8 @@ public:
     int commitIndex() const { return commit_index_; }
 
     Result executeReadOnlyForTest(const Command& command) const {
-        BuzzDBCore copy = db_;
         return runWithSuppressedStdout([&] {
+            BuzzDBCore copy = db_;
             return copy.execute(command);
         });
     }
@@ -14302,62 +15929,65 @@ std::optional<std::string> selectAllValue(
     return row[*index];
 }
 
-std::vector<RangeDescriptor> rangeDescriptorsFromRows(
-    const SelectAllResult& rows) {
-    std::vector<RangeDescriptor> ranges;
-    for (const auto& row : rows.rows) {
-        auto range_id = selectAllValue(rows, row, "range_id");
-        auto start_key = selectAllValue(rows, row, "start_key");
-        auto end_key = selectAllValue(rows, row, "end_key");
-        auto group = selectAllValue(rows, row, "replica_group_id");
-        auto version = selectAllValue(rows, row, "descriptor_version");
-        if (!range_id || !start_key || !end_key || !group || !version) {
+size_t currentGlobalKeyCountOn(const ConsensusReplica* node,
+                               const std::string& range_id) {
+    Result storage = TableNotFoundResult{};
+    const auto* rows = catalogRowsOn(node, "__global_keys", &storage);
+    if (rows == nullptr) return size_t{0};
+    auto table_column = catalogColumnIndex(*rows, "table_name");
+    auto primary_column = catalogColumnIndex(*rows, "primary_key");
+    auto row_key_column = catalogColumnIndex(*rows, "row_key");
+    auto range_column = catalogColumnIndex(*rows, "range_id");
+    auto version_column = catalogColumnIndex(*rows, "descriptor_version");
+    auto status_column = catalogColumnIndex(*rows, "status");
+    if (!table_column.has_value() ||
+        !primary_column.has_value() ||
+        !row_key_column.has_value() ||
+        !range_column.has_value() ||
+        !version_column.has_value()) {
+        return size_t{0};
+    }
+
+    struct LatestGlobalKey {
+        std::string range_id;
+        int version = 0;
+        std::string status = "active";
+    };
+    std::map<std::string, LatestGlobalKey> latest;
+    std::string separator(1, '\0');
+    for (const auto& row : rows->rows) {
+        if (*table_column >= row.size() ||
+            *primary_column >= row.size() ||
+            *row_key_column >= row.size() ||
+            *range_column >= row.size() ||
+            *version_column >= row.size()) {
             continue;
         }
-        ranges.push_back(RangeDescriptor{
-            *range_id,
-            *start_key,
-            *end_key,
-            *group,
-            std::stoi(*version)
-        });
-    }
-    return ranges;
-}
-
-class RangeRouter {
-public:
-    void refreshFrom(const ConsensusReplica* node) {
-        Result storage = TableNotFoundResult{};
-        const auto* rows = catalogRowsOn(node, "__ranges", &storage);
-        cached_ranges_ = rows == nullptr
-                             ? std::vector<RangeDescriptor>{}
-                             : latestRangeDescriptorsById(
-                                   rangeDescriptorsFromRows(*rows));
-    }
-
-    RouteResult routePoint(const std::string& table,
-                           const std::string& primary_key) const {
-        std::string key = tableRowKey(table, primary_key);
-        std::vector<RangeDescriptor> matches;
-        for (const auto& range : cached_ranges_) {
-            if (keyInRange(key, range)) matches.push_back(range);
+        std::string key = row[*table_column] + separator +
+                          row[*primary_column] + separator +
+                          row[*row_key_column];
+        int version = std::stoi(row[*version_column]);
+        std::string status = "active";
+        if (status_column.has_value() && *status_column < row.size()) {
+            status = row[*status_column];
         }
-        std::sort(
-            matches.begin(),
-            matches.end(),
-            [](const RangeDescriptor& lhs, const RangeDescriptor& rhs) {
-                if (lhs.descriptor_version != rhs.descriptor_version) {
-                    return lhs.descriptor_version > rhs.descriptor_version;
-                }
-                return lhs.range_id < rhs.range_id;
-            });
-        return routeResultFor(key, key + "\x7F", std::move(matches));
+        auto it = latest.find(key);
+        if (it == latest.end() || version >= it->second.version) {
+            latest[key] = LatestGlobalKey{row[*range_column],
+                                          version,
+                                          status};
+        }
     }
 
-private:
-    std::vector<RangeDescriptor> cached_ranges_;
-};
+    size_t count = 0;
+    for (const auto& [key, record] : latest) {
+        (void)key;
+        if (record.range_id == range_id && record.status == "active") {
+            ++count;
+        }
+    }
+    return count;
+}
 
 Command bootstrapClusterACommand() {
     return BootstrapClusterCommand{
@@ -14391,26 +16021,69 @@ SearchState buildInitialReplicaGroupState(
 }
 
 void printPartitionedSQLTrace(const std::string& data_file) {
-    std::cout << "Trace: global keyspace and range routing" << std::endl;
+    std::cout << "Trace: replicated range ownership catalog" << std::endl;
     std::vector<Address> replicas = quorumReplicaAddresses(3);
     Address leader = replicas[0];
     Address client = ScenarioAddress::client1();
 
     std::vector<std::string> title_rows =
-        requireTupleLinesFromFile(data_file, "title", 1);
-    std::vector<std::string> title_values =
-        tupleValuesFromLine(title_rows.front(), "title");
-    std::string primary_key = title_values.front();
+        requireTupleLinesFromFile(data_file, "title", 8);
+    std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+    for (const auto& row : title_rows) {
+        titles.push_back({row, tupleValuesFromLine(row, "title")});
+    }
+    std::sort(
+        titles.begin(),
+        titles.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return tableRowKey("title", lhs.second.front()) <
+                   tableRowKey("title", rhs.second.front());
+        });
+    if (titles.size() < 2) {
+        throw std::runtime_error(
+            "Need at least two title rows for split trace.");
+    }
+    size_t split_index = titles.size() / 2;
+    std::string left_range = defaultRangeIdForTable("title") + "-left";
+    std::string right_range = defaultRangeIdForTable("title") + "-right";
+    std::string left_group = "group-title-left";
+    std::string right_group = "group-title-right";
+    std::string split_key =
+        tableRowKey("title", titles[split_index].second.front());
+    std::string primary_key = titles[split_index].second.front();
 
     SearchState state = buildInitialReplicaGroupState(
         replicas, leader, client, 1);
+    int request_id = 3;
     state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, 3,
-        createTitleTableCommand(),
+        state, leader, client, 1, request_id++,
+        RegisterReplicaGroupCommand{
+            left_group, {"left1", "left2", "left3"}, 1},
         {replicas[1], replicas[2]});
     state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, 4,
-        parseSQL("INSERT " + title_rows.front()),
+        state, leader, client, 1, request_id++,
+        RegisterReplicaGroupCommand{
+            right_group, {"right1", "right2", "right3"}, 1},
+        {replicas[1], replicas[2]});
+    state = deliverConsensusCommandToQuorum(
+        state, leader, client, 1, request_id++,
+        createTitleTableCommand(),
+        {replicas[1], replicas[2]});
+    for (const auto& title : titles) {
+        state = deliverConsensusCommandToQuorum(
+            state, leader, client, 1, request_id++,
+            parseSQL("INSERT " + title.first),
+            {replicas[1], replicas[2]});
+    }
+    state = deliverConsensusCommandToQuorum(
+        state, leader, client, 1, request_id++,
+        SplitTableCommand{"title",
+                          defaultRangeIdForTable("title"),
+                          left_range,
+                          right_range,
+                          2,
+                          left_group,
+                          right_group},
         {replicas[1], replicas[2]});
 
     const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
@@ -14421,10 +16094,20 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         leader_node->executeReadOnlyForTest(
             ExplainRouteCommand{"title", primary_key, false});
     const auto* route = std::get_if<RouteResult>(&route_result);
+    Result full_scan =
+        leader_node->executeReadOnlyForTest(
+            RoutedSQLCommand{"PROJECT * FROM title"});
+    Result ownership_result =
+        leader_node->executeReadOnlyForTest(
+            ReadRangeOwnershipCommand{"title", true});
+    const auto* ownership =
+        std::get_if<SelectAllResult>(&ownership_result);
 
     std::cout << "  leader=" << leader
               << ", commit_index=" << leader_node->commitIndex()
               << ", table=title"
+              << ", rows=" << titles.size()
+              << ", split_key=" << split_key
               << ", primary_key=" << primary_key << std::endl;
     if (route != nullptr && !route->range_ids.empty()) {
         std::cout << "  row key=" << route->start_key
@@ -14436,19 +16119,29 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     }
     std::cout << "  __ranges rows="
               << catalogRowCountOn(leader_node, "__ranges")
-              << ", __global_keys rows="
+              << ", __global_key_versions="
               << catalogRowCountOn(leader_node, "__global_keys")
+              << ", active_ownership_rows="
+              << (ownership == nullptr ? 0 : ownership->rows.size())
+              << ", current_left_keys="
+              << currentGlobalKeyCountOn(leader_node, left_range)
+              << ", current_right_keys="
+              << currentGlobalKeyCountOn(leader_node, right_range)
               << std::endl;
+    std::cout << "  single-group full scan -> "
+              << describeResult(full_scan)
+              << " (multi-range scatter is introduced later)" << std::endl;
     for (const auto& replica : replicas) {
         const auto* node = state.nodeAs<ConsensusReplica>(replica);
-        std::cout << "  " << replica << " has title range="
+        std::cout << "  " << replica << " has split children="
                   << (catalogHasRowOn(
                           node, "__ranges",
-                          {{"range_id", defaultRangeIdForTable("title")},
-                           {"start_key", tableRowPrefix("title")},
-                           {"end_key", tableRowPrefixEnd("title")},
-                           {"replica_group_id", "group-1"},
-                           {"descriptor_version", "1"}})
+                          {{"range_id", left_range},
+                           {"status", "active"}}) &&
+                      catalogHasRowOn(
+                          node, "__ranges",
+                          {{"range_id", right_range},
+                           {"status", "active"}})
                           ? "yes" : "no")
                   << std::endl;
     }
@@ -14457,16 +16150,16 @@ void printPartitionedSQLTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v125; "
-                  << "this version focuses on the first partitioned-SQL "
-                  << "routing boundary."
+        std::cerr << "--measure-restart is not available in v131; "
+                  << "this version focuses on replicated range "
+                  << "ownership metadata."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v125: global keyspace and range routing" << std::endl;
+    std::cout << "BuzzDB v131: replicated range ownership catalog" << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
@@ -14477,310 +16170,440 @@ int main(int argc, char* argv[]) {
 
     TestRunner tests;
 
-    auto firstTitleTuple = [&]() {
-        std::string line =
-            requireTupleLinesFromFile(imdb_file, "title", 1).front();
-        return std::make_pair(line, tupleValuesFromLine(line, "title"));
+    struct TitleSplitFixture {
+        std::vector<std::pair<std::string, std::vector<std::string>>> rows;
+        std::vector<std::string> left_values;
+        std::vector<std::string> right_values;
+        std::string split_key;
+        size_t split_index = 0;
+
+        size_t leftCount() const { return split_index; }
+        size_t rightCount() const { return rows.size() - split_index; }
     };
 
-    auto buildTitleTableState = [&](int client_id) {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildInitialReplicaGroupState(
-            replicas, leader, client, client_id);
-        return deliverConsensusCommandToQuorum(
-            state, leader, client, client_id, 3,
-            createTitleTableCommand(), {replicas[1], replicas[2]});
+    auto titleLeftRangeId = []() {
+        return defaultRangeIdForTable("title") + "-left";
     };
 
-    auto buildTitleRowState = [&](int client_id) {
-        auto title = firstTitleTuple();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleTableState(client_id);
-        return deliverConsensusCommandToQuorum(
-            state, leader, client, client_id, 4,
-            parseSQL("INSERT " + title.first), {replicas[1], replicas[2]});
+    auto titleRightRangeId = []() {
+        return defaultRangeIdForTable("title") + "-right";
     };
 
-    auto routeFor = [&](const ConsensusReplica* node,
-                        const ExplainRouteCommand& command) {
-        if (node == nullptr) {
-            throw std::runtime_error("missing consensus replica");
+    auto readTitleRows = [&]() {
+        std::vector<std::string> lines =
+            requireTupleLinesFromFile(imdb_file, "title", 8);
+        std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+        for (const auto& line : lines) {
+            titles.push_back({line, tupleValuesFromLine(line, "title")});
         }
-        Result result = node->executeReadOnlyForTest(command);
+        return titles;
+    };
+
+    auto makeTitleSplitFixture =
+        [&](std::vector<std::pair<std::string,
+                                  std::vector<std::string>>> titles) {
+        std::sort(
+            titles.begin(),
+            titles.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return tableRowKey("title", lhs.second.front()) <
+                       tableRowKey("title", rhs.second.front());
+            });
+        if (titles.size() < 2 ||
+            titles.front().second.empty() ||
+            titles.back().second.empty()) {
+            throw std::runtime_error(
+                "Need at least two title primary keys for split tests.");
+        }
+        size_t split_index = titles.size() / 2;
+        if (split_index == 0 || split_index >= titles.size()) {
+            throw std::runtime_error("Invalid title split index.");
+        }
+        return TitleSplitFixture{
+            titles,
+            titles[0].second,
+            titles[split_index].second,
+            tableRowKey("title", titles[split_index].second.front()),
+            split_index
+        };
+    };
+
+    auto titleSplitFixture = [&]() {
+        return makeTitleSplitFixture(readTitleRows());
+    };
+
+    auto splitTitleCommand = [&](int version = 2,
+                                 const std::string& left_group = "",
+                                 const std::string& right_group = "") {
+        return SplitTableCommand{
+            "title",
+            defaultRangeIdForTable("title"),
+            titleLeftRangeId(),
+            titleRightRangeId(),
+            version,
+            left_group,
+            right_group};
+    };
+
+    auto addressNames = [](const std::vector<Address>& addresses) {
+        std::vector<std::string> names;
+        names.reserve(addresses.size());
+        for (const auto& address : addresses) {
+            names.push_back(address.str());
+        }
+        return names;
+    };
+
+    auto prefixedReplicas = [](const std::string& prefix) {
+        std::vector<Address> replicas;
+        for (size_t i = 1; i <= 3; ++i) {
+            replicas.emplace_back(prefix + std::to_string(i));
+        }
+        return replicas;
+    };
+
+    struct ConsensusGroupHarness {
+        std::string group_id;
+        std::vector<Address> replicas;
+        Address leader;
+        Address client;
+        SearchState state;
+        int client_id = 0;
+        int next_request_id = 1;
+    };
+
+    auto makeConsensusGroup =
+        [&](const std::string& group_id,
+            const std::string& prefix,
+            int client_id) {
+        ConsensusGroupHarness group;
+        group.group_id = group_id;
+        group.replicas = prefixedReplicas(prefix);
+        group.leader = group.replicas.front();
+        group.client = Address("client-" + group_id);
+        group.state = electedConsensusState(group.replicas, group.leader);
+        group.client_id = client_id;
+        return group;
+    };
+
+    auto clientReplyFor = [](const SearchState& state,
+                             int client_id,
+                             int request_id) -> std::optional<Result> {
+        for (auto it = state.network().rbegin();
+             it != state.network().rend(); ++it) {
+            const auto* reply = std::get_if<ClientReply>(&it->message);
+            if (reply != nullptr &&
+                reply->client_id == client_id &&
+                reply->request_id == request_id) {
+                return reply->result;
+            }
+        }
+        return std::nullopt;
+    };
+
+    auto commitCommand = [&](ConsensusGroupHarness& group,
+                             const Command& command) {
+        int request_id = group.next_request_id++;
+        group.state = deliverConsensusCommandToQuorum(
+            group.state,
+            group.leader,
+            group.client,
+            group.client_id,
+            request_id,
+            command,
+            {group.replicas[1], group.replicas[2]});
+        auto reply =
+            clientReplyFor(group.state, group.client_id, request_id);
+        if (!reply.has_value()) {
+            throw std::runtime_error(
+                "missing client reply for " + describeCommand(command));
+        }
+        return *reply;
+    };
+
+    struct RangeReplicaScenario {
+        TitleSplitFixture fixture;
+        ConsensusGroupHarness catalog;
+        ConsensusGroupHarness left;
+        ConsensusGroupHarness right;
+    };
+
+    auto seedRangeGroup = [&](ConsensusGroupHarness& group,
+                              const std::vector<
+                                  std::pair<std::string,
+                                            std::vector<std::string>>>& rows) {
+        tests.check(commitCommand(group, createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "range group should create the title table");
+        for (const auto& row : rows) {
+            tests.check(commitCommand(group,
+                                      parseSQL("INSERT " + row.first)) ==
+                            Result{InsertOkResult{}},
+                        "range group should load its assigned title row");
+        }
+    };
+
+    auto buildRangeReplicaScenario = [&]() {
+        RangeReplicaScenario scenario;
+        scenario.fixture = titleSplitFixture();
+        scenario.catalog =
+            makeConsensusGroup("group-catalog", "server", 1);
+        scenario.left =
+            makeConsensusGroup("group-title-left", "left", 2);
+        scenario.right =
+            makeConsensusGroup("group-title-right", "right", 3);
+
+        tests.check(commitCommand(scenario.catalog,
+                                  bootstrapClusterACommand()) ==
+                        Result{StatementOkResult{}},
+                    "catalog group should bootstrap the cluster");
+        tests.check(commitCommand(scenario.catalog,
+                                  registerGroup1Command()) ==
+                        Result{StatementOkResult{}},
+                    "catalog group should register the initial group");
+        tests.check(
+            commitCommand(
+                scenario.catalog,
+                RegisterReplicaGroupCommand{
+                    scenario.left.group_id,
+                    addressNames(scenario.left.replicas),
+                    1}) == Result{StatementOkResult{}},
+            "catalog should register the left range group");
+        tests.check(
+            commitCommand(
+                scenario.catalog,
+                RegisterReplicaGroupCommand{
+                    scenario.right.group_id,
+                    addressNames(scenario.right.replicas),
+                    1}) == Result{StatementOkResult{}},
+            "catalog should register the right range group");
+        tests.check(commitCommand(scenario.catalog,
+                                  createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "catalog should create the title table metadata");
+        for (const auto& row : scenario.fixture.rows) {
+            tests.check(
+                commitCommand(scenario.catalog,
+                              parseSQL("INSERT " + row.first)) ==
+                    Result{InsertOkResult{}},
+                "catalog should record a real IMDB title key");
+        }
+        tests.check(
+            commitCommand(
+                scenario.catalog,
+                splitTitleCommand(2,
+                                  scenario.left.group_id,
+                                  scenario.right.group_id)) ==
+                Result{StatementOkResult{}},
+            "catalog should split title into two replica groups");
+
+        std::vector<std::pair<std::string, std::vector<std::string>>>
+            left_rows(
+                scenario.fixture.rows.begin(),
+                scenario.fixture.rows.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        scenario.fixture.split_index));
+        std::vector<std::pair<std::string, std::vector<std::string>>>
+            right_rows(
+                scenario.fixture.rows.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        scenario.fixture.split_index),
+                scenario.fixture.rows.end());
+        seedRangeGroup(scenario.left, left_rows);
+        seedRangeGroup(scenario.right, right_rows);
+        return scenario;
+    };
+
+    auto catalogLeader = [](const ConsensusGroupHarness& group) {
+        const auto* node =
+            group.state.nodeAs<ConsensusReplica>(group.leader);
+        if (node == nullptr) {
+            throw std::runtime_error("missing consensus leader");
+        }
+        return node;
+    };
+
+    auto catalogRowsForGroup = [&](const ConsensusGroupHarness& group,
+                                   const std::string& table) {
+        Result storage = TableNotFoundResult{};
+        const auto* rows =
+            catalogRowsOn(catalogLeader(group), table, &storage);
+        if (rows == nullptr) {
+            throw std::runtime_error("missing catalog rows for " + table);
+        }
+        return *rows;
+    };
+
+    auto routeOnCatalog = [&](const RangeReplicaScenario& scenario,
+                              const std::string& primary_key,
+                              bool full_scan = false) {
+        Result result = catalogLeader(scenario.catalog)
+            ->executeReadOnlyForTest(
+                ExplainRouteCommand{"title", primary_key, full_scan});
         const auto* route = std::get_if<RouteResult>(&result);
         if (route == nullptr) {
-            throw std::runtime_error(
-                "expected RouteResult, got " + describeResult(result));
+            throw std::runtime_error("route lookup did not return a route");
         }
         return *route;
     };
 
-    tests.test("Network controls filter simulator messages and timers", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address follower = replicas[1];
-        Address client = ScenarioAddress::client1();
-        SearchState state = consensusClusterState(replicas);
-        state.send(client, leader,
-                   ClientRequest{600, 1, createTitleTableCommand()});
-
-        auto clientRequestVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* message = messageForEvent(state, event);
-                if (message == nullptr) continue;
-                const auto* request =
-                    std::get_if<ClientRequest>(&message->message);
-                if (request != nullptr &&
-                    message->from.rootAddress() == client.rootAddress() &&
-                    message->to.rootAddress() == leader.rootAddress()) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        auto electionTimerVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* timer = timerForEvent(state, event);
-                if (timer != nullptr &&
-                    timer->to.rootAddress() == leader.rootAddress() &&
-                    std::get_if<ElectionTimer>(&timer->timer) != nullptr) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        SearchSettings network_off;
-        network_off.networkActive(false);
-        tests.check(!clientRequestVisible(network_off),
-                    "global network disable should hide client request");
-        network_off.linkActive(client, leader, true);
-        tests.check(clientRequestVisible(network_off),
-                    "explicit link enable should override global network off");
-
-        SearchSettings sender_off;
-        sender_off.senderActive(client, false);
-        tests.check(!clientRequestVisible(sender_off),
-                    "sender disable should hide client request");
-
-        SearchSettings receiver_off;
-        receiver_off.receiverActive(leader, false);
-        tests.check(!clientRequestVisible(receiver_off),
-                    "receiver disable should hide client request");
-
-        SearchSettings node_off;
-        node_off.nodeActive(leader, false);
-        tests.check(!clientRequestVisible(node_off),
-                    "node disable should hide messages and timers");
-        tests.check(!electionTimerVisible(node_off),
-                    "node disable should hide its timers");
-
-        SearchSettings partitioned;
-        partitioned.partition({{client}, {leader, follower}});
-        tests.check(!clientRequestVisible(partitioned),
-                    "partition should block cross-group message delivery");
-        partitioned.resetNetwork();
-        tests.check(clientRequestVisible(partitioned),
-                    "resetNetwork should restore message delivery");
-
-        SearchSettings timer_off;
-        timer_off.timerActive(leader, false);
-        tests.check(!electionTimerVisible(timer_off),
-                    "timerActive(false) should hide that node's timer");
-        timer_off.timerActive(leader, true);
-        timer_off.deliverTimers(false);
-        tests.check(electionTimerVisible(timer_off),
-                    "node timer override should beat global timer disable");
-    });
-
-    tests.test("Create table creates a default range descriptor through consensus", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        SearchState state = buildTitleTableState(501);
-
-        for (const auto& replica : replicas) {
-            const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(catalogHasRowOn(
-                            node, "__ranges",
-                            {{"range_id", defaultRangeIdForTable("title")},
-                             {"start_key", tableRowPrefix("title")},
-                             {"end_key", tableRowPrefixEnd("title")},
-                             {"replica_group_id", "group-1"},
-                             {"descriptor_version", "1"}}),
-                        replica.str() +
-                            " should have the replicated title range");
+    auto ownershipRowsOn = [&](const ConsensusGroupHarness& group,
+                               const Address& replica,
+                               const std::string& table,
+                               bool active_only = true) {
+        const auto* node = group.state.nodeAs<ConsensusReplica>(replica);
+        if (node == nullptr) {
+            throw std::runtime_error("missing ownership replica");
         }
-    });
-
-    tests.test("Insert records an encoded global row key", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        SearchState state = buildTitleRowState(502);
-
-        for (const auto& replica : replicas) {
-            const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(catalogHasRowOn(
-                            node, "__global_keys",
-                            {{"table_name", "title"},
-                             {"primary_key", primary_key},
-                             {"row_key",
-                              tableRowKey("title", primary_key)},
-                             {"range_id", defaultRangeIdForTable("title")},
-                             {"replica_group_id", "group-1"},
-                             {"descriptor_version", "1"}}),
-                        replica.str() +
-                            " should record the replicated row key");
+        Result result = node->executeReadOnlyForTest(
+            ReadRangeOwnershipCommand{table, active_only});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) {
+            throw std::runtime_error("ownership read failed");
         }
-    });
+        return *rows;
+    };
 
-    tests.test("Primary-key route targets one range", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        SearchState state = buildTitleTableState(503);
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
+    auto ownershipRowsForGroup = [&](const ConsensusGroupHarness& group,
+                                     const std::string& table,
+                                     bool active_only = true) {
+        return ownershipRowsOn(group, group.leader, table, active_only);
+    };
 
-        tests.check(route.start_key == tableRowKey("title", primary_key),
-                    "point route should start at encoded row key");
-        tests.check(route.range_ids.size() == 1,
-                    "point route should target one range");
-        tests.check(route.range_ids.front() ==
-                        defaultRangeIdForTable("title"),
-                    "point route should target the title range");
-        tests.check(route.replica_group_ids.front() == "group-1",
-                    "point route should name the replica group");
-        tests.check(route.descriptor_versions.front() == 1,
-                    "point route should use descriptor version 1");
-    });
+    tests.test("Create table records ownership in replicated catalog", [&] {
+        ConsensusGroupHarness catalog =
+            makeConsensusGroup("group-catalog", "server", 1);
+        tests.check(commitCommand(catalog, bootstrapClusterACommand()) ==
+                        Result{StatementOkResult{}},
+                    "catalog group should bootstrap the cluster");
+        tests.check(commitCommand(catalog, registerGroup1Command()) ==
+                        Result{StatementOkResult{}},
+                    "catalog group should register the initial group");
+        tests.check(commitCommand(catalog, createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "CREATE TABLE should commit through the catalog group");
 
-    tests.test("Full scan routes through matching table ranges", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        SearchState state = buildTitleTableState(504);
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", "", true});
-
-        tests.check(route.start_key == tableRowPrefix("title"),
-                    "scan route should start at the table row prefix");
-        tests.check(route.end_key == tableRowPrefixEnd("title"),
-                    "scan route should end at the table row prefix boundary");
-        tests.check(route.range_ids.size() == 1,
-                    "single-range scan should target one range");
-        tests.check(route.range_ids.front() ==
-                        defaultRangeIdForTable("title"),
-                    "scan route should include the title range");
-    });
-
-    tests.test("Range descriptor changes are versioned and latest wins", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleTableState(505);
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 505, 4,
-            RegisterRangeCommand{defaultRangeIdForTable("title"),
-                                 tableRowPrefix("title"),
-                                 new_end,
-                                 "group-1",
-                                 2},
-            {replicas[1], replicas[2]});
-
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        tests.check(catalogHasRowOn(
-                        leader_node, "__ranges",
-                        {{"range_id", defaultRangeIdForTable("title")},
+        SelectAllResult ownership =
+            ownershipRowsForGroup(catalog, "title");
+        tests.check(ownership.rows.size() == 1,
+                    "initial table should have one active owner row");
+        tests.check(selectAllHasRow(
+                        ownership,
+                        {{"table_name", "title"},
+                         {"index_name", "primary"},
+                         {"range_id", defaultRangeIdForTable("title")},
+                         {"start_key", tableRowPrefix("title")},
                          {"end_key", tableRowPrefixEnd("title")},
-                         {"descriptor_version", "1"}}),
-                    "catalog should retain descriptor history");
-        tests.check(catalogHasRowOn(
-                        leader_node, "__ranges",
+                         {"replica_group_id", "group-1"},
+                         {"owner_version", "1"},
+                         {"status", "active"}}),
+                    "ownership should name the table, primary index, range, and group");
+        tests.check(ownershipRowsOn(catalog, catalog.replicas[1],
+                                    "title") == ownership,
+                    "follower should learn the initial ownership row");
+    });
+
+    tests.test("Split ownership catalog maps active ranges to groups", [&] {
+        auto scenario = buildRangeReplicaScenario();
+        SelectAllResult raw_ownership =
+            catalogRowsForGroup(scenario.catalog, "__range_ownership");
+        tests.check(raw_ownership.rows.size() == 4,
+                    "ownership history should keep initial, superseded, left, and right rows");
+        SelectAllResult ownership =
+            ownershipRowsForGroup(scenario.catalog, "title");
+        tests.check(selectAllHasRow(
+                        ownership,
+                        {{"range_id", titleLeftRangeId()},
+                         {"table_name", "title"},
+                         {"index_name", "primary"},
+                         {"replica_group_id", scenario.left.group_id},
+                         {"owner_version", "2"},
+                         {"status", "active"}}),
+                    "left child ownership should name the left group");
+        tests.check(selectAllHasRow(
+                        ownership,
+                        {{"range_id", titleRightRangeId()},
+                         {"table_name", "title"},
+                         {"index_name", "primary"},
+                         {"replica_group_id", scenario.right.group_id},
+                         {"owner_version", "2"},
+                         {"status", "active"}}),
+                    "right child ownership should name the right group");
+
+        RouteResult left =
+            routeOnCatalog(scenario, scenario.fixture.left_values.front());
+        RouteResult right =
+            routeOnCatalog(scenario, scenario.fixture.right_values.front());
+        tests.check(left.range_ids == std::vector<std::string>{titleLeftRangeId()} &&
+                        left.replica_group_ids ==
+                            std::vector<std::string>{
+                                scenario.left.group_id},
+                    "left route should agree with ownership catalog");
+        tests.check(right.range_ids == std::vector<std::string>{titleRightRangeId()} &&
+                        right.replica_group_ids ==
+                            std::vector<std::string>{
+                                scenario.right.group_id},
+                    "right route should agree with ownership catalog");
+    });
+
+    tests.test("Ownership catalog is replicated to followers", [&] {
+        auto scenario = buildRangeReplicaScenario();
+        SelectAllResult leader =
+            ownershipRowsForGroup(scenario.catalog, "title");
+        tests.check(leader.rows.size() == 2,
+                    "split table should have two active ownership rows");
+        for (const auto& replica : scenario.catalog.replicas) {
+            tests.check(ownershipRowsOn(scenario.catalog, replica,
+                                        "title") == leader,
+                        "catalog follower should have same ownership view as leader");
+        }
+    });
+
+    tests.test("Stale ownership history is ignored by latest view", [&] {
+        auto scenario = buildRangeReplicaScenario();
+        tests.check(
+            commitCommand(
+                scenario.catalog,
+                InsertRowCommand{
+                    "__range_ownership",
+                    {"title",
+                     "primary",
+                     titleRightRangeId(),
+                     scenario.fixture.split_key,
+                     tableRowPrefixEnd("title"),
+                     scenario.left.group_id,
+                     "1",
+                     "active"}}) == Result{InsertOkResult{}},
+            "stale ownership row should be ordinary replicated catalog data");
+
+        SelectAllResult active =
+            ownershipRowsForGroup(scenario.catalog, "title");
+        tests.check(active.rows.size() == 2,
+                    "latest active view should still have two child owners");
+        tests.check(selectAllHasRow(
+                        active,
+                        {{"range_id", titleRightRangeId()},
+                         {"replica_group_id", scenario.right.group_id},
+                         {"owner_version", "2"},
+                         {"status", "active"}}),
+                    "newer right owner should beat stale version 1 row");
+        tests.check(!selectAllHasRow(
+                        active,
+                        {{"range_id", titleRightRangeId()},
+                         {"replica_group_id", scenario.left.group_id},
+                         {"owner_version", "1"}}),
+                    "latest view should not expose stale owner row");
+
+        SelectAllResult latest_all =
+            ownershipRowsForGroup(scenario.catalog, "title", false);
+        tests.check(latest_all.rows.size() == 3,
+                    "latest history view should include superseded source plus two active children");
+        tests.check(selectAllHasRow(
+                        latest_all,
                         {{"range_id", defaultRangeIdForTable("title")},
-                         {"end_key", new_end},
-                         {"descriptor_version", "2"}}),
-                    "catalog should store the new descriptor version");
-
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
-        tests.check(route.range_ids.size() == 1,
-                    "router should use one current descriptor per range id");
-        tests.check(route.descriptor_versions.front() == 2,
-                    "router should use the latest descriptor version");
-        tests.check(route.end_key == tableRowKey("title", primary_key) + "\x7F",
-                    "point lookup route should still describe the point key");
-    });
-
-    tests.test("Router cache refreshes after descriptor change", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleTableState(506);
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RangeRouter router;
-        router.refreshFrom(leader_node);
-        RouteResult before = router.routePoint("title", primary_key);
-        tests.check(!before.descriptor_versions.empty() &&
-                        before.descriptor_versions.front() == 1,
-                    "fresh router should see descriptor version 1");
-
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 506, 4,
-            RegisterRangeCommand{defaultRangeIdForTable("title"),
-                                 tableRowPrefix("title"),
-                                 new_end,
-                                 "group-1",
-                                 2},
-            {replicas[1], replicas[2]});
-        RouteResult stale = router.routePoint("title", primary_key);
-        tests.check(stale.descriptor_versions.front() == 1,
-                    "stale router cache should still expose old metadata");
-
-        leader_node = state.nodeAs<ConsensusReplica>(leader);
-        router.refreshFrom(leader_node);
-        RouteResult refreshed = router.routePoint("title", primary_key);
-        tests.check(refreshed.descriptor_versions.front() == 2,
-                    "router refresh should load the latest descriptor");
-    });
-
-    tests.test("Single-range SQL behavior is preserved", [&] {
-        auto title = firstTitleTuple();
-        const std::string& primary_key = title.second.front();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        SearchState state = buildTitleRowState(507);
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-
-        Result count = leader_node->executeReadOnlyForTest(
-            CountRowsCommand{"title"});
-        tests.check(count == Result{CountRowsResult{1}},
-                    "single-range row count should still be one");
-
-        Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", primary_key});
-        const auto* rows = std::get_if<SelectAllResult>(&selected);
-        tests.check(rows != nullptr && rows->rows.size() == 1,
-                    "select by primary key should still find the row");
-
-        RouteResult route = routeFor(
-            leader_node, ExplainRouteCommand{"title", primary_key, false});
-        tests.check(route.range_ids.size() == 1 &&
-                        route.range_ids.front() ==
-                            defaultRangeIdForTable("title"),
-                    "the inserted row should route to the single title range");
+                         {"owner_version", "2"},
+                         {"status", "superseded"}}),
+                    "source range should remain as superseded latest ownership");
     });
 
     return tests.finish();
