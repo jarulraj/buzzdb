@@ -11527,6 +11527,29 @@ struct CommitRangeTransferCommand {
     int transfer_epoch = 1;
 };
 
+struct ExportRangeRowsCommand {
+    std::string table;
+    std::string range_id;
+    std::string start_key;
+    std::string end_key;
+};
+
+struct ImportRangeRowsCommand {
+    std::string table;
+    std::string range_id;
+    std::string target_replica_group_id;
+    std::string start_key;
+    std::string end_key;
+    std::vector<std::vector<std::string>> rows;
+};
+
+struct DeleteRangeRowsCommand {
+    std::string table;
+    std::string range_id;
+    std::string start_key;
+    std::string end_key;
+};
+
 struct AbortRangeTransferCommand {
     std::string range_id;
     int transfer_epoch = 1;
@@ -11575,6 +11598,9 @@ using Command = std::variant<
     PrepareRangeTransferCommand,
     CatchUpRangeTransferCommand,
     CommitRangeTransferCommand,
+    ExportRangeRowsCommand,
+    ImportRangeRowsCommand,
+    DeleteRangeRowsCommand,
     AbortRangeTransferCommand,
     RebalanceRangesCommand,
     QueryRangeConfigCommand,
@@ -11737,6 +11763,23 @@ bool operator==(const CommitRangeTransferCommand& lhs,
     return lhs.range_id == rhs.range_id &&
            lhs.transfer_epoch == rhs.transfer_epoch;
 }
+bool operator==(const ExportRangeRowsCommand& lhs,
+                const ExportRangeRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key;
+}
+bool operator==(const ImportRangeRowsCommand& lhs,
+                const ImportRangeRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.target_replica_group_id == rhs.target_replica_group_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
+           lhs.rows == rhs.rows;
+}
+bool operator==(const DeleteRangeRowsCommand& lhs,
+                const DeleteRangeRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key;
+}
 bool operator==(const AbortRangeTransferCommand& lhs,
                 const AbortRangeTransferCommand& rhs) {
     return lhs.range_id == rhs.range_id &&
@@ -11775,6 +11818,14 @@ struct InsertOkResult {};
 struct DeleteRowsResult { size_t count; };
 struct UpdateRowsResult { size_t count; };
 struct SelectAllResult {
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
+struct RangeRowsResult {
+    std::string table;
+    std::string range_id;
+    std::string start_key;
+    std::string end_key;
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
 };
@@ -11826,6 +11877,7 @@ using Result = std::variant<
     DeleteRowsResult,
     UpdateRowsResult,
     SelectAllResult,
+    RangeRowsResult,
     RouteResult,
     RangeConfigResult,
     TransactionOkResult,
@@ -11847,6 +11899,11 @@ bool operator==(const InsertOkResult&, const InsertOkResult&) { return true; }
 bool operator==(const DeleteRowsResult& lhs, const DeleteRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const UpdateRowsResult& lhs, const UpdateRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const SelectAllResult& lhs, const SelectAllResult& rhs) { return lhs.columns == rhs.columns && lhs.rows == rhs.rows; }
+bool operator==(const RangeRowsResult& lhs, const RangeRowsResult& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
+           lhs.columns == rhs.columns && lhs.rows == rhs.rows;
+}
 bool operator==(const RouteResult& lhs, const RouteResult& rhs) {
     return lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
            lhs.range_ids == rhs.range_ids &&
@@ -12065,6 +12122,16 @@ std::string describeCommand(const Command& command) {
             } else if constexpr (std::is_same_v<T, CommitRangeTransferCommand>) {
                 out << "CommitRangeTransfer(" << value.range_id
                     << ", epoch=" << value.transfer_epoch << ")";
+            } else if constexpr (std::is_same_v<T, ExportRangeRowsCommand>) {
+                out << "ExportRangeRows(" << value.table
+                    << ", range=" << value.range_id << ")";
+            } else if constexpr (std::is_same_v<T, ImportRangeRowsCommand>) {
+                out << "ImportRangeRows(" << value.table
+                    << ", range=" << value.range_id
+                    << ", rows=" << value.rows.size() << ")";
+            } else if constexpr (std::is_same_v<T, DeleteRangeRowsCommand>) {
+                out << "DeleteRangeRows(" << value.table
+                    << ", range=" << value.range_id << ")";
             } else if constexpr (std::is_same_v<T, AbortRangeTransferCommand>) {
                 out << "AbortRangeTransfer(" << value.range_id
                     << ", epoch=" << value.transfer_epoch << ")";
@@ -12091,6 +12158,7 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, DeleteRowsResult>) out << "DeleteRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, UpdateRowsResult>) out << "UpdateRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, SelectAllResult>) out << "SelectAll(columns=" << value.columns.size() << ", rows=" << value.rows.size() << ")";
+            else if constexpr (std::is_same_v<T, RangeRowsResult>) out << "RangeRows(table=" << value.table << ", range=" << value.range_id << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, RouteResult>) out << "RouteResult(ranges=" << value.range_ids.size() << ")";
             else if constexpr (std::is_same_v<T, RangeConfigResult>) out << "RangeConfig(num=" << value.config_num << ", ranges=" << value.range_ids.size() << ")";
             else if constexpr (std::is_same_v<T, TransactionOkResult>) out << "TransactionOk(range=" << value.range_id << ", statements=" << value.statement_count << ")";
@@ -12110,6 +12178,354 @@ std::string describeResult(const Result& result) {
         },
         result);
 }
+
+class RangeTransferProtocol {
+public:
+    using Executor = std::function<Result(const Command&)>;
+
+    RangeTransferProtocol(Executor catalog,
+                          Executor source,
+                          Executor target,
+                          std::string table,
+                          std::string range_id,
+                          std::string target_replica_group_id,
+                          std::string start_key,
+                          std::string end_key,
+                          int transfer_epoch)
+        : catalog_(std::move(catalog)),
+          source_(std::move(source)),
+          target_(std::move(target)),
+          table_(std::move(table)),
+          range_id_(std::move(range_id)),
+          target_replica_group_id_(std::move(target_replica_group_id)),
+          start_key_(std::move(start_key)),
+          end_key_(std::move(end_key)),
+          transfer_epoch_(transfer_epoch) {}
+
+    Result prepare() {
+        Result prepared = catalog_(
+            Command{PrepareRangeTransferCommand{
+                range_id_, target_replica_group_id_, transfer_epoch_}});
+        if (!std::holds_alternative<StatementOkResult>(prepared)) {
+            return prepared;
+        }
+        return copySourceToTarget();
+    }
+
+    Result catchUp() {
+        Result copied = copySourceToTarget();
+        if (!std::holds_alternative<StatementOkResult>(copied)) {
+            return copied;
+        }
+        return catalog_(
+            Command{CatchUpRangeTransferCommand{range_id_, transfer_epoch_}});
+    }
+
+    Result commit() {
+        Result committed = catalog_(
+            Command{CommitRangeTransferCommand{range_id_, transfer_epoch_}});
+        if (!std::holds_alternative<StatementOkResult>(committed)) {
+            return committed;
+        }
+        Result deleted = source_(
+            Command{DeleteRangeRowsCommand{
+                table_, range_id_, start_key_, end_key_}});
+        if (!std::holds_alternative<DeleteRowsResult>(deleted)) {
+            return deleted;
+        }
+        return StatementOkResult{};
+    }
+
+    Result abort() {
+        Result aborted = catalog_(
+            Command{AbortRangeTransferCommand{range_id_, transfer_epoch_}});
+        if (!std::holds_alternative<StatementOkResult>(aborted)) {
+            return aborted;
+        }
+        Result deleted = target_(
+            Command{DeleteRangeRowsCommand{
+                table_, range_id_, start_key_, end_key_}});
+        if (!std::holds_alternative<DeleteRowsResult>(deleted)) {
+            return deleted;
+        }
+        return StatementOkResult{};
+    }
+
+private:
+    Result copySourceToTarget() {
+        Result exported = source_(
+            Command{ExportRangeRowsCommand{
+                table_, range_id_, start_key_, end_key_}});
+        const auto* rows = std::get_if<RangeRowsResult>(&exported);
+        if (rows == nullptr) return exported;
+        Result imported = target_(
+            Command{ImportRangeRowsCommand{
+                table_,
+                range_id_,
+                target_replica_group_id_,
+                start_key_,
+                end_key_,
+                rows->rows}});
+        if (!std::holds_alternative<CountRowsResult>(imported)) {
+            return imported;
+        }
+        return StatementOkResult{};
+    }
+
+    Executor catalog_;
+    Executor source_;
+    Executor target_;
+    std::string table_;
+    std::string range_id_;
+    std::string target_replica_group_id_;
+    std::string start_key_;
+    std::string end_key_;
+    int transfer_epoch_ = 1;
+};
+
+class ControlPlaneRuntime {
+public:
+    using Executor = RangeTransferProtocol::Executor;
+
+    struct StepResult {
+        bool advanced = false;
+        std::string range_id;
+        std::string status_before;
+        std::string status_after;
+        Result result = StatementOkResult{};
+    };
+
+    explicit ControlPlaneRuntime(Executor catalog)
+        : catalog_(std::move(catalog)) {}
+
+    void registerReplicaGroup(std::string group_id, Executor executor) {
+        replica_groups_[std::move(group_id)] = std::move(executor);
+    }
+
+    StepResult tick() {
+        std::vector<TransferRecord> transfers = activeTransfers();
+        if (transfers.empty()) return StepResult{};
+        std::sort(
+            transfers.begin(),
+            transfers.end(),
+            [](const TransferRecord& lhs, const TransferRecord& rhs) {
+                int lhs_priority = activeStatusPriority(lhs.status);
+                int rhs_priority = activeStatusPriority(rhs.status);
+                if (lhs_priority != rhs_priority) {
+                    return lhs_priority < rhs_priority;
+                }
+                if (lhs.prepared_config_num != rhs.prepared_config_num) {
+                    return lhs.prepared_config_num < rhs.prepared_config_num;
+                }
+                return lhs.range_id < rhs.range_id;
+            });
+        return advance(transfers.front());
+    }
+
+    size_t runUntilIdle(size_t max_steps = 1000) {
+        size_t steps = 0;
+        while (steps < max_steps) {
+            StepResult step = tick();
+            if (!step.advanced) break;
+            ++steps;
+        }
+        return steps;
+    }
+
+private:
+    struct TransferRecord {
+        std::string range_id;
+        std::string source_group_id;
+        std::string target_group_id;
+        int transfer_epoch = 0;
+        int prepared_config_num = 0;
+        std::string status;
+    };
+
+    struct RangeSpec {
+        std::string table;
+        std::string start_key;
+        std::string end_key;
+    };
+
+    static int statusRank(const std::string& status) {
+        if (status == "requested") return 0;
+        if (status == "prepared") return 1;
+        if (status == "caught_up") return 2;
+        if (status == "committed") return 3;
+        if (status == "aborted") return 4;
+        return -1;
+    }
+
+    static int activeStatusPriority(const std::string& status) {
+        int rank = statusRank(status);
+        return rank >= 0 && rank <= 2 ? rank : 100;
+    }
+
+    static bool activeStatus(const std::string& status) {
+        return status == "requested" ||
+               status == "prepared" ||
+               status == "caught_up";
+    }
+
+    static std::optional<size_t> columnIndex(const SelectAllResult& rows,
+                                             const std::string& column) {
+        for (size_t i = 0; i < rows.columns.size(); ++i) {
+            if (rows.columns[i] == column) return i;
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<std::string> valueAt(
+        const SelectAllResult& rows,
+        const std::vector<std::string>& row,
+        const std::string& column) {
+        auto index = columnIndex(rows, column);
+        if (!index.has_value() || *index >= row.size()) {
+            return std::nullopt;
+        }
+        return row[*index];
+    }
+
+    std::optional<SelectAllResult> readCatalogTable(
+        const std::string& table) const {
+        Result result = catalog_(Command{ReadSystemCatalogCommand{table}});
+        if (const auto* rows = std::get_if<SelectAllResult>(&result)) {
+            return *rows;
+        }
+        return std::nullopt;
+    }
+
+    std::vector<TransferRecord> activeTransfers() const {
+        auto rows = readCatalogTable("__range_transfers");
+        if (!rows.has_value()) return {};
+
+        std::map<std::string, TransferRecord> latest;
+        for (const auto& row : rows->rows) {
+            auto range_id = valueAt(*rows, row, "range_id");
+            auto source_group_id = valueAt(*rows, row, "source_group_id");
+            auto target_group_id = valueAt(*rows, row, "target_group_id");
+            auto epoch = valueAt(*rows, row, "transfer_epoch");
+            auto config_num = valueAt(*rows, row, "prepared_config_num");
+            auto status = valueAt(*rows, row, "status");
+            if (!range_id.has_value() ||
+                !source_group_id.has_value() ||
+                !target_group_id.has_value() ||
+                !epoch.has_value() ||
+                !config_num.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+
+            TransferRecord record{
+                *range_id,
+                *source_group_id,
+                *target_group_id,
+                std::stoi(*epoch),
+                std::stoi(*config_num),
+                *status};
+            auto it = latest.find(record.range_id);
+            if (it == latest.end() ||
+                record.transfer_epoch > it->second.transfer_epoch ||
+                (record.transfer_epoch == it->second.transfer_epoch &&
+                 statusRank(record.status) >= statusRank(it->second.status))) {
+                latest[record.range_id] = std::move(record);
+            }
+        }
+
+        std::vector<TransferRecord> transfers;
+        for (const auto& [range_id, record] : latest) {
+            (void)range_id;
+            if (activeStatus(record.status)) transfers.push_back(record);
+        }
+        return transfers;
+    }
+
+    std::optional<RangeSpec> rangeSpecFor(
+        const TransferRecord& transfer) const {
+        auto rows = readCatalogTable("__range_ownership");
+        if (!rows.has_value()) return std::nullopt;
+
+        std::optional<RangeSpec> best;
+        int best_version = -1;
+        for (const auto& row : rows->rows) {
+            auto range_id = valueAt(*rows, row, "range_id");
+            auto table = valueAt(*rows, row, "table_name");
+            auto index = valueAt(*rows, row, "index_name");
+            auto start_key = valueAt(*rows, row, "start_key");
+            auto end_key = valueAt(*rows, row, "end_key");
+            auto version = valueAt(*rows, row, "owner_version");
+            auto status = valueAt(*rows, row, "status");
+            if (!range_id.has_value() ||
+                *range_id != transfer.range_id ||
+                !table.has_value() ||
+                !index.has_value() ||
+                !start_key.has_value() ||
+                !end_key.has_value() ||
+                !version.has_value() ||
+                !status.has_value() ||
+                *status != "active") {
+                continue;
+            }
+            int owner_version = std::stoi(*version);
+            RangeSpec candidate{
+                *index == "primary" ? *table : "__index_entries",
+                *start_key,
+                *end_key};
+            if (owner_version == transfer.prepared_config_num) {
+                return candidate;
+            }
+            if (owner_version > best_version) {
+                best_version = owner_version;
+                best = std::move(candidate);
+            }
+        }
+        return best;
+    }
+
+    StepResult advance(const TransferRecord& transfer) {
+        StepResult step;
+        step.range_id = transfer.range_id;
+        step.status_before = transfer.status;
+        step.result = ConfigRejectedResult{};
+
+        auto spec = rangeSpecFor(transfer);
+        auto source = replica_groups_.find(transfer.source_group_id);
+        auto target = replica_groups_.find(transfer.target_group_id);
+        if (!spec.has_value() ||
+            source == replica_groups_.end() ||
+            target == replica_groups_.end()) {
+            return step;
+        }
+
+        RangeTransferProtocol protocol{
+            catalog_,
+            source->second,
+            target->second,
+            spec->table,
+            transfer.range_id,
+            transfer.target_group_id,
+            spec->start_key,
+            spec->end_key,
+            transfer.transfer_epoch};
+
+        if (transfer.status == "requested") {
+            step.status_after = "prepared";
+            step.result = protocol.prepare();
+        } else if (transfer.status == "prepared") {
+            step.status_after = "caught_up";
+            step.result = protocol.catchUp();
+        } else if (transfer.status == "caught_up") {
+            step.status_after = "committed";
+            step.result = protocol.commit();
+        }
+        step.advanced = std::holds_alternative<StatementOkResult>(step.result);
+        return step;
+    }
+
+    Executor catalog_;
+    std::map<std::string, Executor> replica_groups_;
+};
 
 std::string adapterTrim(const std::string& input) {
     if (input.empty()) {
@@ -13869,6 +14285,136 @@ private:
         return queryResultToSelectAll(table, rows);
     }
 
+    std::optional<size_t> columnIndex(
+        const std::vector<std::string>& columns,
+        const std::string& column) const {
+        auto it = std::find(columns.begin(), columns.end(), column);
+        if (it == columns.end()) return std::nullopt;
+        return static_cast<size_t>(std::distance(columns.begin(), it));
+    }
+
+    bool rowBelongsToRange(const std::string& table,
+                           const std::vector<std::string>& columns,
+                           const std::vector<std::string>& row,
+                           const std::string& range_id,
+                           const std::string& start_key,
+                           const std::string& end_key) const {
+        auto range_column = columnIndex(columns, "range_id");
+        if (range_column.has_value()) {
+            if (*range_column >= row.size() || row[*range_column] != range_id) {
+                return false;
+            }
+            auto status_column = columnIndex(columns, "status");
+            return !status_column.has_value() || *status_column >= row.size() ||
+                   row[*status_column] == "active";
+        }
+        if (row.empty()) return false;
+        std::string row_key = tableRowKey(table, row.front());
+        return row_key >= start_key && (end_key.empty() || row_key < end_key);
+    }
+
+    Result executeOne(const ExportRangeRowsCommand& command) {
+        if (!tableExists(command.table) || command.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        SelectAllResult all = queryResultToSelectAll(
+            command.table, db_->executeQuery("PROJECT * FROM " + command.table,
+                                             nullptr, false));
+        RangeRowsResult result{
+            command.table,
+            command.range_id,
+            command.start_key,
+            command.end_key,
+            all.columns,
+            {}};
+        for (const auto& row : all.rows) {
+            if (rowBelongsToRange(command.table,
+                                  all.columns,
+                                  row,
+                                  command.range_id,
+                                  command.start_key,
+                                  command.end_key)) {
+                result.rows.push_back(row);
+            }
+        }
+        return result;
+    }
+
+    Result executeOne(const DeleteRangeRowsCommand& command) {
+        if (!tableExists(command.table) || command.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        SelectAllResult all = queryResultToSelectAll(
+            command.table, db_->executeQuery("PROJECT * FROM " + command.table,
+                                             nullptr, false));
+        auto range_column = columnIndex(all.columns, "range_id");
+        if (range_column.has_value()) {
+            Result result =
+                executeOne(DeleteRowsCommand{command.table,
+                                             "range_id",
+                                             command.range_id});
+            if (const auto* count = std::get_if<DeleteRowsResult>(&result)) {
+                return *count;
+            }
+            return result;
+        }
+        auto primary_column = all.columns.empty()
+                                  ? std::optional<size_t>{}
+                                  : std::optional<size_t>{0};
+        if (!primary_column.has_value()) return SchemaMismatchResult{};
+        size_t deleted = 0;
+        for (const auto& row : all.rows) {
+            if (!rowBelongsToRange(command.table,
+                                   all.columns,
+                                   row,
+                                   command.range_id,
+                                   command.start_key,
+                                   command.end_key) ||
+                *primary_column >= row.size()) {
+                continue;
+            }
+            Result result = executeOne(
+                DeleteRowsCommand{command.table,
+                                  all.columns[*primary_column],
+                                  row[*primary_column]});
+            if (const auto* count = std::get_if<DeleteRowsResult>(&result)) {
+                deleted += count->count;
+            } else if (!std::holds_alternative<TableNotFoundResult>(result)) {
+                return result;
+            }
+        }
+        return DeleteRowsResult{deleted};
+    }
+
+    Result executeOne(const ImportRangeRowsCommand& command) {
+        if (!tableExists(command.table) || command.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        Result cleared = executeOne(
+            DeleteRangeRowsCommand{command.table,
+                                   command.range_id,
+                                   command.start_key,
+                                   command.end_key});
+        if (!std::holds_alternative<DeleteRowsResult>(cleared)) return cleared;
+
+        std::vector<std::string> columns = columnNames(command.table);
+        auto range_column = columnIndex(columns, "range_id");
+        auto group_column = columnIndex(columns, "replica_group_id");
+        size_t inserted = 0;
+        for (auto row : command.rows) {
+            if (range_column.has_value() && *range_column < row.size()) {
+                row[*range_column] = command.range_id;
+            }
+            if (group_column.has_value() && *group_column < row.size()) {
+                row[*group_column] = command.target_replica_group_id;
+            }
+            Result result = executeOne(InsertRowCommand{command.table, row});
+            if (!std::holds_alternative<InsertOkResult>(result)) return result;
+            ++inserted;
+        }
+        return CountRowsResult{inserted};
+    }
+
     QueryRowsResult executeQueryRowCount(const std::string& sql) {
         auto components = parseQuery(sql);
         std::vector<PhysicalJoinKind> join_kinds(
@@ -14534,8 +15080,7 @@ private:
             if (command.transfer_epoch == previous->transfer_epoch) {
                 if (previous->status != "requested" ||
                     previous->target_group_id !=
-                        command.target_replica_group_id ||
-                    previous->prepared_config_num != latest_config) {
+                        command.target_replica_group_id) {
                     return ConfigRejectedResult{};
                 }
             } else if (rangeTransferInFlight(*previous)) {
@@ -14579,10 +15124,16 @@ private:
     Result executeOne(const CatchUpRangeTransferCommand& command) {
         ensureSystemCatalogTables();
         auto transfer = latestRangeTransferRecord(command.range_id);
+        int latest_config = latestRangeConfigNumber();
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
-            transfer->status != "prepared" ||
-            latestRangeConfigNumber() != transfer->prepared_config_num) {
+            transfer->status != "prepared") {
+            return ConfigRejectedResult{};
+        }
+        auto source = ownershipRecordForRange(
+            rangeOwnershipRecordsAtConfig(latest_config), command.range_id);
+        if (!source.has_value() ||
+            source->replica_group_id != transfer->source_group_id) {
             return ConfigRejectedResult{};
         }
         size_t current_keys =
@@ -14591,6 +15142,7 @@ private:
             current_keys > transfer->snapshot_key_count
                 ? current_keys - transfer->snapshot_key_count
                 : 0;
+        transfer->prepared_config_num = latest_config;
         transfer->status = "caught_up";
         appendRangeTransferRecord(*transfer);
         return StatementOkResult{};
@@ -14602,8 +15154,7 @@ private:
         int latest_config = latestRangeConfigNumber();
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
-            transfer->status != "caught_up" ||
-            latest_config != transfer->prepared_config_num) {
+            transfer->status != "caught_up") {
             return ConfigRejectedResult{};
         }
 
@@ -14626,6 +15177,7 @@ private:
         appendGlobalKeyGroupRows(command.range_id,
                                  transfer->target_group_id,
                                  committed_config);
+        transfer->prepared_config_num = latest_config;
         transfer->status = "committed";
         appendRangeTransferRecord(*transfer);
         return StatementOkResult{};
@@ -16987,26 +17539,6 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         }
         return filtered;
     };
-    auto upsertTarget = [&](const std::vector<std::string>& row) {
-        commit(target, DeleteRowsCommand{"title", "id", row.front()});
-        Result inserted = commit(target, InsertRowCommand{"title", row});
-        if (!(inserted == Result{InsertOkResult{}})) {
-            throw std::runtime_error("unable to copy trace row");
-        }
-    };
-    auto copyRange = [&](const std::string& range_id) {
-        SelectAllResult rows = rowsInRange(source, range_id);
-        for (const auto& row : rows.rows) upsertTarget(row);
-        return rows.rows.size();
-    };
-    auto deleteRange = [&](const std::string& range_id) {
-        SelectAllResult rows = rowsInRange(source, range_id);
-        for (const auto& row : rows.rows) {
-            auto id = selectAllValue(rows, row, "id");
-            if (id.has_value()) commit(source, DeleteRowsCommand{"title", "id", *id});
-        }
-    };
-
     commit(catalog, bootstrapClusterACommand());
     commit(catalog, registerGroup1Command());
     commit(catalog, RegisterReplicaGroupCommand{target.group_id, {"target1", "target2", "target3"}, 1});
@@ -17027,13 +17559,21 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     auto requested = leaderNode(catalog)->executeReadOnlyForTest(
         ReadSystemCatalogCommand{"__range_transfers"});
     (void)requested;
-    commit(catalog, PrepareRangeTransferCommand{rebalance->range_id,
-                                                rebalance->target_group_id, 1});
-    size_t copied = copyRange(rebalance->range_id);
-    commit(catalog, CatchUpRangeTransferCommand{rebalance->range_id, 1});
-    copyRange(rebalance->range_id);
-    commit(catalog, CommitRangeTransferCommand{rebalance->range_id, 1});
-    deleteRange(rebalance->range_id);
+    ControlPlaneRuntime runtime{
+        [&](const Command& command) { return commit(catalog, command); }
+    };
+    runtime.registerReplicaGroup(
+        source.group_id,
+        [&](const Command& command) { return commit(source, command); }
+    );
+    runtime.registerReplicaGroup(
+        target.group_id,
+        [&](const Command& command) { return commit(target, command); }
+    );
+    if (runtime.runUntilIdle() != 3) {
+        throw std::runtime_error("trace control plane runtime failed");
+    }
+    size_t copied = rowsInRange(target, rebalance->range_id).rows.size();
 
     Result config_result = leaderNode(catalog)->executeReadOnlyForTest(QueryRangeConfigCommand{-1});
     const auto* config = std::get_if<RangeConfigResult>(&config_result);
@@ -17513,48 +18053,6 @@ int main(int argc, char* argv[]) {
         return selectTitleInGroup(group, primary_key);
     };
 
-    auto upsertPhysicalTitleRow = [&](ConsensusGroupHarness& group,
-                                      const std::vector<std::string>& row) {
-        if (row.empty()) {
-            throw std::runtime_error("cannot upsert title row without id");
-        }
-        Result removed = commitCommand(
-            group, DeleteRowsCommand{"title", "id", row.front()});
-        tests.check(std::holds_alternative<DeleteRowsResult>(removed),
-                    group.group_id + " should accept idempotent title delete");
-        tests.check(commitCommand(group, InsertRowCommand{"title", row}) ==
-                        Result{InsertOkResult{}},
-                    group.group_id + " should store copied title row " +
-                        row.front());
-    };
-
-    auto copyRangeRows = [&](RebalanceScenario& scenario,
-                             ConsensusGroupHarness& source,
-                             ConsensusGroupHarness& target,
-                             const std::string& range_id) {
-        SelectAllResult rows = physicalRowsInRange(scenario, source, range_id);
-        for (const auto& row : rows.rows) {
-            upsertPhysicalTitleRow(target, row);
-        }
-        return rows.rows.size();
-    };
-
-    auto deleteRangeRows = [&](RebalanceScenario& scenario,
-                               ConsensusGroupHarness& group,
-                               const std::string& range_id) {
-        SelectAllResult rows = physicalRowsInRange(scenario, group, range_id);
-        for (const auto& row : rows.rows) {
-            auto id = selectAllValue(rows, row, "id");
-            if (!id.has_value()) continue;
-            tests.check(commitCommand(
-                            group,
-                            DeleteRowsCommand{"title", "id", *id}) ==
-                            Result{DeleteRowsResult{1}},
-                        group.group_id + " should delete moved title row " +
-                            *id);
-        }
-    };
-
     auto updateRoutedTitleYear = [&](RebalanceScenario& scenario,
                                      const std::string& primary_key,
                                      const std::string& year) {
@@ -17588,35 +18086,50 @@ int main(int argc, char* argv[]) {
         return *rebalance_result;
     };
 
-    auto moveRangePhysically = [&](RebalanceScenario& scenario,
-                                   const std::string& range_id,
-                                   const std::string& target_group_id,
-                                   int epoch) {
-        std::string source_group_id = groupForRange(configOn(scenario.catalog),
-                                                    range_id);
-        ConsensusGroupHarness& source = groupForReplicaGroup(scenario,
-                                                             source_group_id);
-        ConsensusGroupHarness& target = groupForReplicaGroup(scenario,
-                                                             target_group_id);
+    auto controlPlaneRuntime = [&](RebalanceScenario& scenario) {
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            }
+        };
+        runtime.registerReplicaGroup(
+            scenario.source_group.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.source_group, command);
+            }
+        );
+        runtime.registerReplicaGroup(
+            scenario.target_group.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.target_group, command);
+            }
+        );
+        return runtime;
+    };
+
+    auto drainTransfers = [&](RebalanceScenario& scenario,
+                              const std::string& reason) {
+        ControlPlaneRuntime runtime = controlPlaneRuntime(scenario);
+        tests.check(runtime.runUntilIdle() == 3,
+                    reason + " should be driven by the control plane runtime");
+    };
+
+    auto moveRangeThroughRuntime = [&](RebalanceScenario& scenario,
+                                       const std::string& range_id,
+                                       const std::string& target_group_id,
+                                       int expected_epoch) {
         tests.check(commitCommand(
                         scenario.catalog,
-                        PrepareRangeTransferCommand{
-                            range_id, target_group_id, epoch}) ==
+                        MoveRangeCommand{range_id, target_group_id}) ==
                         Result{StatementOkResult{}},
-                    "range transfer should prepare in catalog");
-        copyRangeRows(scenario, source, target, range_id);
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        CatchUpRangeTransferCommand{range_id, epoch}) ==
-                        Result{StatementOkResult{}},
-                    "range transfer should catch up in catalog");
-        copyRangeRows(scenario, source, target, range_id);
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        CommitRangeTransferCommand{range_id, epoch}) ==
-                        Result{StatementOkResult{}},
-                    "range transfer should commit in catalog");
-        deleteRangeRows(scenario, source, range_id);
+                    "move should enqueue a transfer request");
+        auto requested = latestTransferOn(scenario.catalog, range_id);
+        tests.check(requested.has_value() &&
+                        requested->target_group_id == target_group_id &&
+                        requested->transfer_epoch == expected_epoch &&
+                        requested->status == "requested",
+                    "move should be visible to the runtime before data movement");
+        drainTransfers(scenario, "requested move");
     };
 
     auto completeTransfer = [&](RebalanceScenario& scenario,
@@ -17629,10 +18142,7 @@ int main(int argc, char* argv[]) {
                         requested->status == "requested",
                     "rebalance should leave a planned transfer request");
         if (!requested.has_value()) return;
-        moveRangePhysically(scenario,
-                            result.range_id,
-                            result.target_group_id,
-                            requested->transfer_epoch);
+        drainTransfers(scenario, "rebalance request");
     };
 
     auto buildRebalanceScenario = [&]() {
@@ -17850,11 +18360,11 @@ int main(int argc, char* argv[]) {
         };
 
         updateAndCheck("1998", scenario.source_group.group_id);
-        moveRangePhysically(scenario, range_id, scenario.target_group.group_id, 1);
+        moveRangeThroughRuntime(scenario, range_id, scenario.target_group.group_id, 1);
         updateAndCheck("1999", scenario.target_group.group_id);
-        moveRangePhysically(scenario, range_id, scenario.source_group.group_id, 2);
+        moveRangeThroughRuntime(scenario, range_id, scenario.source_group.group_id, 2);
         updateAndCheck("2000", scenario.source_group.group_id);
-        moveRangePhysically(scenario, range_id, scenario.target_group.group_id, 3);
+        moveRangeThroughRuntime(scenario, range_id, scenario.target_group.group_id, 3);
 
         tests.check(routeGroupFor(scenario, moved_id) ==
                         scenario.target_group.group_id,
@@ -17878,6 +18388,64 @@ int main(int argc, char* argv[]) {
                             scenario, scenario.target_group, range_id) ==
                             final_key_count,
                     "repeated movement should leave one active physical owner and latest row contents");
+    });
+
+    tests.test("Join and leave requests are driven by control plane runtime", [&] {
+        auto scenario = buildRebalanceScenario();
+        const std::string range_id = titleRightRangeId();
+        size_t moved_key_count =
+            currentGlobalKeyCount(scenario.catalog, range_id);
+
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        JoinReplicaGroupCommand{
+                            scenario.target_group.group_id,
+                            {"target1", "target2", "target3"}}) ==
+                        Result{StatementOkResult{}},
+                    "join should enqueue ownership transfers for the new group");
+        auto join_request = latestTransferOn(scenario.catalog, range_id);
+        tests.check(join_request.has_value() &&
+                        join_request->status == "requested" &&
+                        join_request->source_group_id ==
+                            scenario.source_group.group_id &&
+                        join_request->target_group_id ==
+                            scenario.target_group.group_id,
+                    "join should expose a requested range transfer");
+        drainTransfers(scenario, "join request");
+        RangeConfigResult after_join = configOn(scenario.catalog);
+        tests.check(groupForRange(after_join, range_id) ==
+                        scenario.target_group.group_id &&
+                        physicalRowCountInRange(
+                            scenario, scenario.source_group, range_id) == 0 &&
+                        physicalRowCountInRange(
+                            scenario, scenario.target_group, range_id) ==
+                            moved_key_count,
+                    "runtime should complete the join's physical movement");
+
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        LeaveReplicaGroupCommand{
+                            scenario.target_group.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "leave should enqueue transfers away from the group");
+        auto leave_request = latestTransferOn(scenario.catalog, range_id);
+        tests.check(leave_request.has_value() &&
+                        leave_request->status == "requested" &&
+                        leave_request->source_group_id ==
+                            scenario.target_group.group_id &&
+                        leave_request->target_group_id ==
+                            scenario.source_group.group_id,
+                    "leave should expose a requested range transfer");
+        drainTransfers(scenario, "leave request");
+        RangeConfigResult after_leave = configOn(scenario.catalog);
+        tests.check(groupForRange(after_leave, range_id) ==
+                        scenario.source_group.group_id &&
+                        physicalRowCountInRange(
+                            scenario, scenario.source_group, range_id) ==
+                            moved_key_count &&
+                        physicalRowCountInRange(
+                            scenario, scenario.target_group, range_id) == 0,
+                    "runtime should complete the leave's physical movement");
     });
 
     tests.test("Balanced range placement is a no-op", [&] {

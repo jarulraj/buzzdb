@@ -1380,11 +1380,11 @@ private:
     size_t log_force_skips = 0;
     size_t checkpoints_written = 0;
     size_t checkpoint_analysis_start_lsn = 0;
-    size_t restart_undo_locks_reacquired = 0;
-    size_t restart_undo_deadlocks_resolved = 0;
+    size_t restart_undo_intents_acquired = 0;
+    size_t restart_undo_conflicts_resolved = 0;
     std::map<int, TxnTableEntry> active_transaction_table;
     std::map<int, TxnRecoveryState> txn_states;
-    std::function<bool(TableId, PageID, size_t)> restart_undo_lock_callback;
+    std::function<bool(TableId, PageID, size_t)> restart_undo_intent_callback;
     std::function<void()> restart_undo_release_callback;
 
     static std::string txnStatusName(TxnStatus status) {
@@ -1540,9 +1540,9 @@ public:
     void checkpoint();
     void createFuzzyImageCopy();
     void recover();
-    void setRestartUndoLockCallback(
+    void setRestartUndoIntentCallback(
         std::function<bool(TableId, PageID, size_t)> callback) {
-        restart_undo_lock_callback = std::move(callback);
+        restart_undo_intent_callback = std::move(callback);
     }
     void setRestartUndoReleaseCallback(std::function<void()> callback) {
         restart_undo_release_callback = std::move(callback);
@@ -3678,16 +3678,15 @@ void RecoveryManager::recover() {
             }
             auto& metadata = catalog.getTable(record->second->table_id);
             TableHeap table(metadata, buffer_manager);
-            if (restart_undo_lock_callback) {
-                // Early availability: recovery must lock rows before undoing them.
-                bool resolved_deadlock = restart_undo_lock_callback(
+            if (restart_undo_intent_callback) {
+                bool resolved_conflict = restart_undo_intent_callback(
                     record->second->table_id,
                     record->second->page_id,
                     record->second->slot_id
                 );
-                restart_undo_locks_reacquired++;
-                if (resolved_deadlock) {
-                    restart_undo_deadlocks_resolved++;
+                restart_undo_intents_acquired++;
+                if (resolved_conflict) {
+                    restart_undo_conflicts_resolved++;
                 }
             }
             PageUpdateLogRecord undo_record;
@@ -4230,7 +4229,7 @@ void RecoveryManager::abortTxn(int txn_id) {
     abort_log_records++;
     printThreadSafe(
         "  recovery: abort restored " + std::to_string(updates.size()) +
-        " page-change record(s); locks can now be released"
+        " page-change record(s); MVCC restart intents can now be released"
     );
 }
 
@@ -4466,6 +4465,8 @@ struct TxnContext {
     std::string label;
     enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
     std::vector<TupleId> inserted_tuple_ids;
+    std::string read_timestamp;
+    std::string commit_timestamp;
 };
 
 using TxnPtr = std::shared_ptr<TxnContext>;
@@ -4481,9 +4482,11 @@ public:
             "T" + std::to_string(txn_id) :
             label;
         printThreadSafe(txn_label + " BEGIN");
-        return std::make_shared<TxnContext>(
-            TxnContext{txn_id, txn_label, TxnContext::RUNNING, {}}
-        );
+        auto txn = std::make_shared<TxnContext>();
+        txn->id = txn_id;
+        txn->label = txn_label;
+        txn->state = TxnContext::RUNNING;
+        return txn;
     }
     void commit(TxnContext& tx) {
         std::lock_guard<std::mutex> guard(latch);
@@ -4492,299 +4495,6 @@ public:
     void abort (TxnContext& tx) {
         std::lock_guard<std::mutex> guard(latch);
         tx.state = TxnContext::ABORTED;
-    }
-};
-
-class DirectedGraph {
-public:
-    void setOutgoingEdges(int from, const std::vector<int>& to_nodes) {
-        adjacency[from] = to_nodes;
-        for (int to : to_nodes) {
-            adjacency[to];
-        }
-    }
-
-    void removeNode(int node) {
-        adjacency.erase(node);
-        for (auto& entry : adjacency) {
-            auto& edges = entry.second;
-            edges.erase(
-                std::remove(edges.begin(), edges.end(), node),
-                edges.end()
-            );
-        }
-    }
-
-    std::vector<int> cycleFrom(int node) const {
-        std::vector<int> path;
-        std::map<int, bool> visited;
-        if (findCycleToTarget(node, node, visited, path)) {
-            path.push_back(node);
-            return path;
-        }
-        return {};
-    }
-
-private:
-    std::map<int, std::vector<int>> adjacency;
-
-    bool findCycleToTarget(int current,
-                           int target,
-                           std::map<int, bool>& visited,
-                           std::vector<int>& path) const {
-        visited[current] = true;
-        path.push_back(current);
-
-        auto it = adjacency.find(current);
-        if (it != adjacency.end()) {
-            for (int next : it->second) {
-                if (next == target) {
-                    return true;
-                }
-                if (!visited[next] &&
-                    findCycleToTarget(next, target, visited, path)) {
-                    return true;
-                }
-            }
-        }
-
-        path.pop_back();
-        return false;
-    }
-};
-
-enum class LockMode { S, X };
-
-class LockManager {
-    struct LockGrant {
-        int txn_id;
-        LockMode mode;
-    };
-
-    struct LockState {
-        std::vector<LockGrant> grants;
-    };
-
-public:
-    struct LockRequestResult {
-        bool granted = false;
-        bool deadlock = false;
-        bool timed_out = false;
-        bool canceled = false;
-        std::string reason;
-        std::vector<int> blockers;
-        std::vector<int> cycle;
-    };
-
-    void setWaitObserver(
-        std::function<void(int, const std::vector<int>&)> observer) {
-        wait_observer = std::move(observer);
-    }
-
-    static std::string modeName(LockMode mode) {
-        switch (mode) {
-            case LockMode::S:
-                return "S";
-            case LockMode::X:
-                return "X";
-        }
-        throw std::runtime_error("Unknown lock mode.");
-    }
-
-    LockRequestResult waitFor(int txn_id,
-                              const std::string& resource,
-                              LockMode mode,
-                              std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> guard(latch);
-        LockRequestResult result;
-        if (canceled_txns.find(txn_id) != canceled_txns.end()) {
-            result.canceled = true;
-            result.reason = "transaction was canceled to resolve a deadlock";
-            return result;
-        }
-        while (!canGrant(txn_id, resource, mode)) {
-            if (canceled_txns.find(txn_id) != canceled_txns.end()) {
-                result.canceled = true;
-                result.reason = "transaction was canceled to resolve a deadlock";
-                removeWaitEdges(txn_id);
-                return result;
-            }
-            auto blockers = blockersFor(txn_id, resource, mode);
-            setWaitEdges(txn_id, blockers);
-            notifyWaitObserver(txn_id, blockers);
-            result.blockers = blockers;
-            result.cycle = findCycleFrom(txn_id);
-            if (!result.cycle.empty()) {
-                result.deadlock = true;
-                result.reason = "waits-for cycle detected";
-                removeWaitEdges(txn_id);
-                return result;
-            }
-
-            if (lock_cv.wait_for(guard, timeout) == std::cv_status::timeout) {
-                result.timed_out = true;
-                result.reason = incompatibleHolderLabel(
-                    locks[resource], txn_id, mode
-                );
-                removeWaitEdges(txn_id);
-                return result;
-            }
-        }
-
-        removeWaitEdges(txn_id);
-        grantLock(locks[resource], txn_id, mode);
-        result.granted = true;
-        return result;
-    }
-
-    bool cancel(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        bool released = false;
-        canceled_txns.insert(txn_id);
-        removeWaitEdges(txn_id);
-        for (auto& entry : locks) {
-            auto& state = entry.second;
-            auto old_size = state.grants.size();
-            state.grants.erase(
-                std::remove_if(state.grants.begin(),
-                               state.grants.end(),
-                               [txn_id](const LockGrant& grant) {
-                                   return grant.txn_id == txn_id;
-                               }),
-                state.grants.end()
-            );
-            released = released || old_size != state.grants.size();
-        }
-        lock_cv.notify_all();
-        return released;
-    }
-
-    bool releaseAll(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        bool released = false;
-        removeWaitEdges(txn_id);
-        for (auto& entry : locks) {
-            auto& state = entry.second;
-            auto old_size = state.grants.size();
-            state.grants.erase(
-                std::remove_if(state.grants.begin(),
-                               state.grants.end(),
-                               [txn_id](const LockGrant& grant) {
-                                   return grant.txn_id == txn_id;
-                               }),
-                state.grants.end()
-            );
-            released = released || old_size != state.grants.size();
-        }
-        if (released) {
-            lock_cv.notify_all();
-        }
-        return released;
-    }
-
-private:
-    std::mutex latch;
-    std::condition_variable lock_cv;
-    std::map<std::string, LockState> locks;
-    DirectedGraph waits_for;
-    std::set<int> canceled_txns;
-    std::function<void(int, const std::vector<int>&)> wait_observer;
-
-    bool canGrant(int txn_id, const std::string& resource, LockMode mode) {
-        auto& state = locks[resource];
-        return std::all_of(
-            state.grants.begin(),
-            state.grants.end(),
-            [txn_id, mode](const LockGrant& grant) {
-                return grant.txn_id == txn_id ||
-                       compatible(mode, grant.mode);
-            }
-        );
-    }
-
-    std::vector<int> blockersFor(int txn_id,
-                                 const std::string& resource,
-                                 LockMode mode) {
-        std::vector<int> blockers;
-        auto& state = locks[resource];
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id != txn_id &&
-                !compatible(mode, grant.mode) &&
-                std::find(blockers.begin(), blockers.end(), grant.txn_id) ==
-                    blockers.end()) {
-                blockers.push_back(grant.txn_id);
-            }
-        }
-        return blockers;
-    }
-
-    void setWaitEdges(int txn_id, const std::vector<int>& blockers) {
-        waits_for.setOutgoingEdges(txn_id, blockers);
-    }
-
-    void notifyWaitObserver(int txn_id, const std::vector<int>& blockers) {
-        if (wait_observer) {
-            wait_observer(txn_id, blockers);
-        }
-    }
-
-    void removeWaitEdges(int txn_id) {
-        waits_for.removeNode(txn_id);
-    }
-
-    std::vector<int> findCycleFrom(int txn_id) const {
-        return waits_for.cycleFrom(txn_id);
-    }
-
-    static bool compatible(LockMode requested, LockMode held) {
-        if (requested == LockMode::S) {
-            return held == LockMode::S;
-        }
-        return false;
-    }
-
-    static bool strongerOrEqual(LockMode held, LockMode requested) {
-        if (held == requested || held == LockMode::X) {
-            return true;
-        }
-        return false;
-    }
-
-    static void grantLock(LockState& state, int txn_id, LockMode mode) {
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id == txn_id &&
-                strongerOrEqual(grant.mode, mode)) {
-                return;
-            }
-        }
-
-        state.grants.erase(
-            std::remove_if(state.grants.begin(),
-                           state.grants.end(),
-                           [txn_id, mode](const LockGrant& grant) {
-                               return grant.txn_id == txn_id &&
-                                      strongerOrEqual(mode, grant.mode);
-                           }),
-            state.grants.end()
-        );
-        state.grants.push_back({txn_id, mode});
-    }
-
-    static std::string incompatibleHolderLabel(const LockState& state,
-                                               int txn_id,
-                                               LockMode mode) {
-        std::string label;
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id == txn_id || compatible(mode, grant.mode)) {
-                continue;
-            }
-            if (!label.empty()) {
-                label += ", ";
-            }
-            label += modeName(grant.mode) + " lock is held by T" +
-                     std::to_string(grant.txn_id);
-        }
-        return label.empty() ? "lock is not compatible" : label;
     }
 };
 
@@ -4805,87 +4515,283 @@ struct ConcurrencyControlRequest {
 
 struct ConcurrencyControlResult {
     bool granted = true;
-    bool deadlock = false;
-    bool canceled = false;
     std::string reason;
-    std::vector<int> cycle;
+};
+
+struct HybridLogicalTimestamp {
+    uint64_t physical = 0;
+    uint64_t logical = 0;
+};
+
+bool operator<(const HybridLogicalTimestamp& lhs,
+               const HybridLogicalTimestamp& rhs) {
+    if (lhs.physical != rhs.physical) return lhs.physical < rhs.physical;
+    return lhs.logical < rhs.logical;
+}
+
+bool operator<=(const HybridLogicalTimestamp& lhs,
+                const HybridLogicalTimestamp& rhs) {
+    return !(rhs < lhs);
+}
+
+std::string encodeHybridLogicalTimestamp(
+    const HybridLogicalTimestamp& timestamp) {
+    return std::to_string(timestamp.physical) + "." +
+           std::to_string(timestamp.logical);
+}
+
+std::optional<HybridLogicalTimestamp> decodeHybridLogicalTimestamp(
+    const std::string& encoded) {
+    if (encoded.empty() || encoded == "-") return std::nullopt;
+    size_t separator = encoded.find('.');
+    if (separator == std::string::npos) return std::nullopt;
+    try {
+        return HybridLogicalTimestamp{
+            static_cast<uint64_t>(
+                std::stoull(encoded.substr(0, separator))),
+            static_cast<uint64_t>(
+                std::stoull(encoded.substr(separator + 1)))};
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+class HybridLogicalClock {
+public:
+    HybridLogicalTimestamp now() {
+        std::lock_guard<std::mutex> guard(latch_);
+        HybridLogicalTimestamp physical_now{physicalMillis(), 0};
+        if (last_ < physical_now) {
+            last_ = physical_now;
+        } else {
+            ++last_.logical;
+        }
+        return last_;
+    }
+
+    HybridLogicalTimestamp after(const HybridLogicalTimestamp& floor) {
+        std::lock_guard<std::mutex> guard(latch_);
+        HybridLogicalTimestamp physical_now{physicalMillis(), 0};
+        HybridLogicalTimestamp next = last_;
+        if (next < physical_now) next = physical_now;
+        if (next <= floor) {
+            next.physical = floor.physical;
+            next.logical = floor.logical + 1;
+        }
+        last_ = next;
+        return last_;
+    }
+
+    HybridLogicalTimestamp observe(const HybridLogicalTimestamp& remote) {
+        std::lock_guard<std::mutex> guard(latch_);
+        HybridLogicalTimestamp physical_now{physicalMillis(), 0};
+        HybridLogicalTimestamp next = last_;
+        if (next < physical_now) next = physical_now;
+        if (next < remote) next = remote;
+        ++next.logical;
+        last_ = next;
+        return last_;
+    }
+
+private:
+    static uint64_t physicalMillis() {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    std::mutex latch_;
+    HybridLogicalTimestamp last_;
 };
 
 class ConcurrencyControlPolicy {
 public:
     virtual ~ConcurrencyControlPolicy() = default;
+    virtual std::string name() const { return "Concurrency Control"; }
     virtual void begin(int txn_id, const std::string& txn_label) = 0;
     virtual ConcurrencyControlResult beforeAccess(
         const ConcurrencyControlRequest& request) = 0;
     virtual void commit(int txn_id) = 0;
     virtual void abort(int txn_id) = 0;
-    virtual bool cancel(int txn_id) = 0;
+    virtual void assignHybridTimestamps(int txn_id,
+                                        const std::string& read_ts,
+                                        const std::string& commit_ts) {
+        (void)txn_id;
+        (void)read_ts;
+        (void)commit_ts;
+    }
+    virtual std::string readTimestamp(int txn_id) const {
+        (void)txn_id;
+        return "";
+    }
+    virtual std::string commitTimestamp(int txn_id) const {
+        (void)txn_id;
+        return "";
+    }
+    virtual std::string oldestActiveReadTimestamp() const { return ""; }
 };
 
-class TwoPhaseLockingPolicy : public ConcurrencyControlPolicy {
-    LockManager& lock_manager;
-    std::function<void(const std::string&)> log;
-    std::function<std::string(const std::vector<int>&)> path_label;
-
-    static LockMode modeFor(AccessType type) {
-        return type == AccessType::Read ? LockMode::S : LockMode::X;
-    }
+class HybridMVCCPolicy : public ConcurrencyControlPolicy {
+    struct TxnState {
+        HybridLogicalTimestamp read_ts;
+        std::optional<HybridLogicalTimestamp> commit_ts;
+        bool has_writes = false;
+        std::string label;
+        std::set<std::string> write_resources;
+    };
 
 public:
-    TwoPhaseLockingPolicy(
-        LockManager& lock_manager,
-        std::function<void(const std::string&)> log,
-        std::function<std::string(const std::vector<int>&)> path_label)
-        : lock_manager(lock_manager),
-          log(std::move(log)),
-          path_label(std::move(path_label)) {}
+    explicit HybridMVCCPolicy(std::function<void(const std::string&)> log)
+        : log_(std::move(log)) {}
+
+    std::string name() const override { return "Hybrid MVCC"; }
+
+    void begin(int txn_id, const std::string& txn_label) override {
+        std::lock_guard<std::mutex> guard(latch_);
+        HybridLogicalTimestamp read_ts = clock_.now();
+        txns_[txn_id] = TxnState{read_ts, std::nullopt, false, txn_label, {}};
+        log_(txn_label + " MVCC read_ts=" +
+             encodeHybridLogicalTimestamp(read_ts));
+    }
 
     ConcurrencyControlResult beforeAccess(
         const ConcurrencyControlRequest& request) override {
-        LockMode mode = modeFor(request.type);
-        auto mode_name = LockManager::modeName(mode);
-        for (const auto& resource : request.resources) {
-            log(request.txn_label + " inferred " + mode_name +
-                " lock on " + resource.label + " for " + request.reason);
-            auto result = lock_manager.waitFor(
-                request.txn_id,
-                resource.key,
-                mode,
-                std::chrono::milliseconds(500)
-            );
-
-            if (result.granted) {
-                continue;
+        std::lock_guard<std::mutex> guard(latch_);
+        auto txn_it = txns_.find(request.txn_id);
+        if (txn_it == txns_.end()) {
+            if (request.txn_id == RECOVERY_TXN_ID) {
+                HybridLogicalTimestamp read_ts = clock_.now();
+                txn_it = txns_.emplace(
+                    request.txn_id,
+                    TxnState{read_ts,
+                             std::nullopt,
+                             false,
+                             request.txn_label,
+                             {}}).first;
+            } else {
+                return {false, "transaction has no Hybrid MVCC state"};
             }
-            if (result.deadlock) {
-                return {false, true, false,
-                        "waits-for graph cycle: " + path_label(result.cycle),
-                        result.cycle};
-            }
-            if (result.canceled) {
-                return {false, false, true, result.reason, result.cycle};
-            }
-            return {false, false, false, result.reason, result.cycle};
         }
+
+        if (request.type == AccessType::Read) {
+            for (const auto& resource : request.resources) {
+                log_(request.txn_label + " MVCC snapshot read " +
+                     resource.label + " at read_ts=" +
+                     encodeHybridLogicalTimestamp(txn_it->second.read_ts));
+            }
+            return {};
+        }
+
+        for (const auto& resource : request.resources) {
+            auto writer = active_writers_.find(resource.key);
+            if (writer != active_writers_.end() &&
+                writer->second != request.txn_id) {
+                return {false,
+                        resource.label + " has active MVCC writer T" +
+                            std::to_string(writer->second)};
+            }
+        }
+
+        for (const auto& resource : request.resources) {
+            active_writers_[resource.key] = request.txn_id;
+            txn_it->second.write_resources.insert(resource.key);
+            log_(request.txn_label + " MVCC write intent on " +
+                 resource.label + " at read_ts=" +
+                 encodeHybridLogicalTimestamp(txn_it->second.read_ts));
+        }
+        txn_it->second.has_writes = true;
         return {};
     }
 
-    void begin(int txn_id, const std::string& txn_label) override {
-        (void)txn_id;
-        (void)txn_label;
-    }
-
     void commit(int txn_id) override {
-        lock_manager.releaseAll(txn_id);
+        std::lock_guard<std::mutex> guard(latch_);
+        auto txn_it = txns_.find(txn_id);
+        if (txn_it == txns_.end()) return;
+        TxnState state = txn_it->second;
+        HybridLogicalTimestamp commit_ts =
+            state.commit_ts.has_value()
+                ? *state.commit_ts
+                : (state.has_writes ? clock_.after(state.read_ts)
+                                    : state.read_ts);
+        for (const auto& resource : state.write_resources) {
+            auto writer = active_writers_.find(resource);
+            if (writer != active_writers_.end() && writer->second == txn_id) {
+                active_writers_.erase(writer);
+            }
+        }
+        committed_timestamps_[txn_id] = commit_ts;
+        txns_.erase(txn_it);
+        log_(state.label + " MVCC commit_ts=" +
+             encodeHybridLogicalTimestamp(commit_ts));
     }
 
     void abort(int txn_id) override {
-        lock_manager.releaseAll(txn_id);
+        std::lock_guard<std::mutex> guard(latch_);
+        auto txn_it = txns_.find(txn_id);
+        if (txn_it == txns_.end()) return;
+        for (const auto& resource : txn_it->second.write_resources) {
+            auto writer = active_writers_.find(resource);
+            if (writer != active_writers_.end() && writer->second == txn_id) {
+                active_writers_.erase(writer);
+            }
+        }
+        txns_.erase(txn_it);
     }
 
-    bool cancel(int txn_id) override {
-        return lock_manager.cancel(txn_id);
+    void assignHybridTimestamps(int txn_id,
+                                const std::string& read_ts,
+                                const std::string& commit_ts) override {
+        std::lock_guard<std::mutex> guard(latch_);
+        auto txn_it = txns_.find(txn_id);
+        if (txn_it == txns_.end()) return;
+        auto decoded_read = decodeHybridLogicalTimestamp(read_ts);
+        if (decoded_read.has_value()) {
+            txn_it->second.read_ts = *decoded_read;
+            clock_.observe(*decoded_read);
+        }
+        auto decoded_commit = decodeHybridLogicalTimestamp(commit_ts);
+        if (decoded_commit.has_value()) {
+            txn_it->second.commit_ts = *decoded_commit;
+            clock_.observe(*decoded_commit);
+        }
     }
+
+    std::string readTimestamp(int txn_id) const override {
+        std::lock_guard<std::mutex> guard(latch_);
+        auto txn_it = txns_.find(txn_id);
+        if (txn_it == txns_.end()) return "";
+        return encodeHybridLogicalTimestamp(txn_it->second.read_ts);
+    }
+
+    std::string commitTimestamp(int txn_id) const override {
+        std::lock_guard<std::mutex> guard(latch_);
+        auto active = txns_.find(txn_id);
+        if (active != txns_.end() && active->second.commit_ts.has_value()) {
+            return encodeHybridLogicalTimestamp(*active->second.commit_ts);
+        }
+        auto committed = committed_timestamps_.find(txn_id);
+        if (committed == committed_timestamps_.end()) return "";
+        return encodeHybridLogicalTimestamp(committed->second);
+    }
+
+    std::string oldestActiveReadTimestamp() const override {
+        std::lock_guard<std::mutex> guard(latch_);
+        if (txns_.empty()) return "";
+        auto best = txns_.begin()->second.read_ts;
+        for (const auto& [txn_id, state] : txns_) {
+            (void)txn_id;
+            if (state.read_ts < best) best = state.read_ts;
+        }
+        return encodeHybridLogicalTimestamp(best);
+    }
+
+private:
+    mutable std::mutex latch_;
+    mutable HybridLogicalClock clock_;
+    std::function<void(const std::string&)> log_;
+    std::map<int, TxnState> txns_;
+    std::map<int, HybridLogicalTimestamp> committed_timestamps_;
+    std::map<std::string, int> active_writers_;
 };
 
 class Operator {
@@ -10502,7 +10408,6 @@ public:
     Catalog catalog;
     RecoveryManager recovery_manager;
     TransactionManager txn_manager;
-    LockManager concurrency_control_lock_manager;
     std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
     std::mutex execution_latch;
     std::mutex txn_label_latch;
@@ -10514,27 +10419,15 @@ public:
         : buffer_manager(),
           catalog(buffer_manager),
           recovery_manager(buffer_manager, catalog) {
-        concurrency_control_lock_manager.setWaitObserver(
-            [this](int txn_id, const std::vector<int>& blockers) {
-                for (int blocker : blockers) {
-                    logConcurrencyControl("waits-for edge: " + txnIdLabel(txn_id) +
-                          " -> " + txnIdLabel(blocker));
-                }
-            }
-        );
-        concurrency_control_policy = std::make_unique<TwoPhaseLockingPolicy>(
-            concurrency_control_lock_manager,
-            [this](const std::string& line) { logConcurrencyControl(line); },
-            [this](const std::vector<int>& path) { return txnPathLabel(path); }
-        );
-        recovery_manager.setRestartUndoLockCallback(
+        useHybridMVCCPolicy();
+        recovery_manager.setRestartUndoIntentCallback(
             [this](TableId table_id, PageID page_id, size_t slot_id) {
-                return acquireRestartUndoLock(table_id, page_id, slot_id);
+                return acquireRestartUndoIntent(table_id, page_id, slot_id);
             }
         );
         recovery_manager.setRestartUndoReleaseCallback(
             [this]() {
-                releaseRestartUndoLocks();
+                releaseRestartUndoIntents();
             }
         );
         catalog.bootstrap();
@@ -10547,6 +10440,20 @@ public:
 
     std::vector<std::string> userTableNames() {
         return catalog.listUserTableNames();
+    }
+
+    void useHybridMVCCPolicy() {
+        concurrency_control_policy =
+            std::make_unique<HybridMVCCPolicy>(
+                [this](const std::string& line) {
+                    logConcurrencyControl(line);
+                });
+    }
+
+    std::string localConcurrencyPolicyName() const {
+        return concurrency_control_policy
+                   ? concurrency_control_policy->name()
+                   : std::string("none");
     }
 
     void analyze(const std::string& table_name = "", bool print_output = true) {
@@ -10590,11 +10497,31 @@ public:
         std::lock_guard<std::mutex> guard(txn_label_latch);
         txn_labels[txn->id] = txnLabel(txn);
         concurrency_control_policy->begin(txn->id, txnLabel(txn));
+        hydrateTxnTimestamps(txn);
         return txn;
     }
 
     TxnPtr beginLoggedTxn(const std::string& label) {
         auto txn = begin(label);
+        recovery_manager.beginTxn(txn->id);
+        return txn;
+    }
+
+    TxnPtr beginWithHybridTimestamps(const std::string& label,
+                                     const std::string& read_ts,
+                                     const std::string& commit_ts) {
+        auto txn = begin(label);
+        concurrency_control_policy->assignHybridTimestamps(
+            txn->id, read_ts, commit_ts);
+        hydrateTxnTimestamps(txn);
+        return txn;
+    }
+
+    TxnPtr beginLoggedTxnWithHybridTimestamps(
+        const std::string& label,
+        const std::string& read_ts,
+        const std::string& commit_ts) {
+        auto txn = beginWithHybridTimestamps(label, read_ts, commit_ts);
         recovery_manager.beginTxn(txn->id);
         return txn;
     }
@@ -10615,7 +10542,11 @@ public:
         txn_manager.commit(*tx);
         tx->inserted_tuple_ids.clear();
         concurrency_control_policy->commit(tx->id);
-        logConcurrencyControl(txnLabel(tx) + " COMMIT; release strict 2PL locks");
+        hydrateTxnTimestamps(tx);
+        logConcurrencyControl(txnLabel(tx) + " COMMIT; " +
+                              localConcurrencyPolicyName() +
+                              " complete read_ts=" + tx->read_timestamp +
+                              " commit_ts=" + tx->commit_timestamp);
         return true;
     }
 
@@ -10641,7 +10572,26 @@ public:
         undoInsertedTuples(tx);
         txn_manager.abort(*tx);
         concurrency_control_policy->abort(tx->id);
-        logConcurrencyControl(txnLabel(tx) + " ABORT; release strict 2PL locks");
+        logConcurrencyControl(txnLabel(tx) + " ABORT; " +
+                              localConcurrencyPolicyName() + " cleanup");
+    }
+
+    std::string txnReadTimestamp(const TxnPtr& txn) const {
+        if (!txn) return "";
+        return txn->read_timestamp.empty()
+                   ? concurrency_control_policy->readTimestamp(txn->id)
+                   : txn->read_timestamp;
+    }
+
+    std::string txnCommitTimestamp(const TxnPtr& txn) const {
+        if (!txn) return "";
+        return txn->commit_timestamp.empty()
+                   ? concurrency_control_policy->commitTimestamp(txn->id)
+                   : txn->commit_timestamp;
+    }
+
+    std::string oldestActiveReadTimestamp() const {
+        return concurrency_control_policy->oldestActiveReadTimestamp();
     }
 
     CreateTableResult createTable(const std::string& name,
@@ -10747,6 +10697,16 @@ public:
         return label.empty() ? "none" : label;
     }
 
+    void hydrateTxnTimestamps(const TxnPtr& txn) const {
+        if (!txn || !concurrency_control_policy) return;
+        std::string read_ts =
+            concurrency_control_policy->readTimestamp(txn->id);
+        if (!read_ts.empty()) txn->read_timestamp = read_ts;
+        std::string commit_ts =
+            concurrency_control_policy->commitTimestamp(txn->id);
+        if (!commit_ts.empty()) txn->commit_timestamp = commit_ts;
+    }
+
     static std::string tableResourceKey(const std::string& table_name) {
         return "table:" + table_name;
     }
@@ -10776,7 +10736,7 @@ public:
             case StatementType::DELETE:
                 return "DELETE";
             default:
-                throw std::runtime_error("Statement type does not need a table lock.");
+                throw std::runtime_error("Statement type does not need a table write intent.");
         }
     }
 
@@ -10805,22 +10765,14 @@ public:
         if (result.granted) {
             return true;
         }
-        if (result.deadlock) {
-            logConcurrencyControl("deadlock detected; " + result.reason);
-            abort(txn);
-            return false;
-        }
-        if (result.canceled) {
-            logConcurrencyControl(txnLabel(txn) + " access canceled; " + result.reason);
-            txn_manager.abort(*txn);
-            return false;
-        }
 
-        logConcurrencyControl(txnLabel(txn) + " access blocked; " + result.reason);
+        logConcurrencyControl(txnLabel(txn) +
+                              " MVCC access rejected; " + result.reason);
+        abort(txn);
         return false;
     }
 
-    bool acquireRestartUndoLock(TableId table_id, PageID page_id, size_t slot_id) {
+    bool acquireRestartUndoIntent(TableId table_id, PageID page_id, size_t slot_id) {
         ConcurrencyControlResource resource{
             tupleResourceKey(table_id, page_id, slot_id),
             "tuple " + std::to_string(table_id) + "." +
@@ -10836,32 +10788,12 @@ public:
         if (result.granted) {
             return false;
         }
-        if (!result.deadlock) {
-            throw std::runtime_error(
-                "Recovery could not reacquire restart undo lock: " + result.reason
-            );
-        }
-
-        logConcurrencyControl("deadlock during restart undo; " + result.reason);
-        for (int txn_id : result.cycle) {
-            if (txn_id > 0) {
-                concurrency_control_policy->cancel(txn_id);
-            }
-        }
-        auto retry = concurrency_control_policy->beforeAccess({
-            RECOVERY_TXN_ID,
-            "RECOVERY",
-            AccessType::Write,
-            {resource},
-            "physiological restart undo"
-        });
-        if (!retry.granted) {
-            throw std::runtime_error("Recovery lock retry failed after deadlock.");
-        }
-        return true;
+        throw std::runtime_error(
+            "Recovery could not acquire MVCC restart undo intent: " +
+            result.reason);
     }
 
-    void releaseRestartUndoLocks() {
+    void releaseRestartUndoIntents() {
         concurrency_control_policy->abort(RECOVERY_TXN_ID);
     }
 
@@ -10876,8 +10808,8 @@ public:
         return table_names;
     }
 
-    bool acquireStatementLocks(const TxnPtr& txn,
-                               const StatementComponents& components) {
+    bool acquireStatementAccess(const TxnPtr& txn,
+                                const StatementComponents& components) {
         if (!txn || (components.type != StatementType::INSERT &&
                      components.type != StatementType::UPDATE &&
                      components.type != StatementType::DELETE)) {
@@ -10891,8 +10823,8 @@ public:
         );
     }
 
-    bool acquireQueryLocks(const TxnPtr& txn,
-                           const QueryComponents& components) {
+    bool acquireQueryAccess(const TxnPtr& txn,
+                            const QueryComponents& components) {
         if (!txn) {
             return true;
         }
@@ -11083,7 +11015,7 @@ public:
         }
 
         if (acquire_concurrency_control &&
-            !acquireStatementLocks(txn, components)) {
+            !acquireStatementAccess(txn, components)) {
             return;
         }
 
@@ -11335,7 +11267,7 @@ public:
                             const std::vector<size_t>& final_sort_attrs = {}) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
-        if (!acquireQueryLocks(txn, components)) {
+        if (!acquireQueryAccess(txn, components)) {
             return {};
         }
 
@@ -11576,6 +11508,8 @@ struct ApplyParticipantTransactionCommand {
     std::string participant_range_id;
     std::string participant_replica_group_id;
     std::vector<std::string> statements;
+    std::string read_timestamp;
+    std::string commit_timestamp;
 };
 
 struct PrepareDistributedTransactionCommand {
@@ -11719,6 +11653,29 @@ struct CommitRangeTransferCommand {
     int transfer_epoch = 1;
 };
 
+struct ExportRangeRowsCommand {
+    std::string table;
+    std::string range_id;
+    std::string start_key;
+    std::string end_key;
+};
+
+struct ImportRangeRowsCommand {
+    std::string table;
+    std::string range_id;
+    std::string target_replica_group_id;
+    std::string start_key;
+    std::string end_key;
+    std::vector<std::vector<std::string>> rows;
+};
+
+struct DeleteRangeRowsCommand {
+    std::string table;
+    std::string range_id;
+    std::string start_key;
+    std::string end_key;
+};
+
 struct AbortRangeTransferCommand {
     std::string range_id;
     int transfer_epoch = 1;
@@ -11790,6 +11747,9 @@ using Command = std::variant<
     PrepareRangeTransferCommand,
     CatchUpRangeTransferCommand,
     CommitRangeTransferCommand,
+    ExportRangeRowsCommand,
+    ImportRangeRowsCommand,
+    DeleteRangeRowsCommand,
     AbortRangeTransferCommand,
     RebalanceRangesCommand,
     CreateSecondaryIndexCommand,
@@ -11843,7 +11803,9 @@ bool operator==(const ApplyParticipantTransactionCommand& lhs,
     return lhs.txn_id == rhs.txn_id &&
            lhs.participant_range_id == rhs.participant_range_id &&
            lhs.participant_replica_group_id == rhs.participant_replica_group_id &&
-           lhs.statements == rhs.statements;
+           lhs.statements == rhs.statements &&
+           lhs.read_timestamp == rhs.read_timestamp &&
+           lhs.commit_timestamp == rhs.commit_timestamp;
 }
 bool operator==(const PrepareDistributedTransactionCommand& lhs,
                 const PrepareDistributedTransactionCommand& rhs) {
@@ -11984,6 +11946,23 @@ bool operator==(const CommitRangeTransferCommand& lhs,
     return lhs.range_id == rhs.range_id &&
            lhs.transfer_epoch == rhs.transfer_epoch;
 }
+bool operator==(const ExportRangeRowsCommand& lhs,
+                const ExportRangeRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key;
+}
+bool operator==(const ImportRangeRowsCommand& lhs,
+                const ImportRangeRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.target_replica_group_id == rhs.target_replica_group_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
+           lhs.rows == rhs.rows;
+}
+bool operator==(const DeleteRangeRowsCommand& lhs,
+                const DeleteRangeRowsCommand& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key;
+}
 bool operator==(const AbortRangeTransferCommand& lhs,
                 const AbortRangeTransferCommand& rhs) {
     return lhs.range_id == rhs.range_id &&
@@ -12041,6 +12020,14 @@ struct SelectAllResult {
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
 };
+struct RangeRowsResult {
+    std::string table;
+    std::string range_id;
+    std::string start_key;
+    std::string end_key;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
 struct RouteResult {
     std::string start_key;
     std::string end_key;
@@ -12065,6 +12052,8 @@ struct DistributedTxnResult {
     std::vector<std::string> participant_replica_group_ids;
     size_t statement_count = 0;
     std::string status = "committed";
+    std::string read_timestamp;
+    std::string commit_timestamp;
 };
 struct RebalanceResult {
     bool moved = false;
@@ -12107,6 +12096,7 @@ using Result = std::variant<
     DeleteRowsResult,
     UpdateRowsResult,
     SelectAllResult,
+    RangeRowsResult,
     RouteResult,
     RangeConfigResult,
     TransactionOkResult,
@@ -12130,6 +12120,11 @@ bool operator==(const InsertOkResult&, const InsertOkResult&) { return true; }
 bool operator==(const DeleteRowsResult& lhs, const DeleteRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const UpdateRowsResult& lhs, const UpdateRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const SelectAllResult& lhs, const SelectAllResult& rhs) { return lhs.columns == rhs.columns && lhs.rows == rhs.rows; }
+bool operator==(const RangeRowsResult& lhs, const RangeRowsResult& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
+           lhs.columns == rhs.columns && lhs.rows == rhs.rows;
+}
 bool operator==(const RouteResult& lhs, const RouteResult& rhs) {
     return lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
            lhs.range_ids == rhs.range_ids &&
@@ -12156,7 +12151,9 @@ bool operator==(const DistributedTxnResult& lhs,
            lhs.participant_replica_group_ids ==
                rhs.participant_replica_group_ids &&
            lhs.statement_count == rhs.statement_count &&
-           lhs.status == rhs.status;
+           lhs.status == rhs.status &&
+           lhs.read_timestamp == rhs.read_timestamp &&
+           lhs.commit_timestamp == rhs.commit_timestamp;
 }
 bool operator==(const RebalanceResult& lhs,
                 const RebalanceResult& rhs) {
@@ -12257,7 +12254,9 @@ std::string describeCommand(const Command& command) {
                 out << "ApplyParticipantTxn(" << value.txn_id
                     << ", range=" << value.participant_range_id
                     << ", group=" << value.participant_replica_group_id
-                    << ", statements=" << value.statements.size() << ")";
+                    << ", statements=" << value.statements.size()
+                    << ", read_ts=" << value.read_timestamp
+                    << ", commit_ts=" << value.commit_timestamp << ")";
             } else if constexpr (std::is_same_v<T, PrepareDistributedTransactionCommand>) {
                 out << "PrepareDistributedTxn(" << value.txn_id
                     << ", statements=" << value.statements.size() << ")";
@@ -12388,6 +12387,16 @@ std::string describeCommand(const Command& command) {
             } else if constexpr (std::is_same_v<T, CommitRangeTransferCommand>) {
                 out << "CommitRangeTransfer(" << value.range_id
                     << ", epoch=" << value.transfer_epoch << ")";
+            } else if constexpr (std::is_same_v<T, ExportRangeRowsCommand>) {
+                out << "ExportRangeRows(" << value.table
+                    << ", range=" << value.range_id << ")";
+            } else if constexpr (std::is_same_v<T, ImportRangeRowsCommand>) {
+                out << "ImportRangeRows(" << value.table
+                    << ", range=" << value.range_id
+                    << ", rows=" << value.rows.size() << ")";
+            } else if constexpr (std::is_same_v<T, DeleteRangeRowsCommand>) {
+                out << "DeleteRangeRows(" << value.table
+                    << ", range=" << value.range_id << ")";
             } else if constexpr (std::is_same_v<T, AbortRangeTransferCommand>) {
                 out << "AbortRangeTransfer(" << value.range_id
                     << ", epoch=" << value.transfer_epoch << ")";
@@ -12424,10 +12433,11 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, DeleteRowsResult>) out << "DeleteRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, UpdateRowsResult>) out << "UpdateRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, SelectAllResult>) out << "SelectAll(columns=" << value.columns.size() << ", rows=" << value.rows.size() << ")";
+            else if constexpr (std::is_same_v<T, RangeRowsResult>) out << "RangeRows(table=" << value.table << ", range=" << value.range_id << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, RouteResult>) out << "RouteResult(ranges=" << value.range_ids.size() << ")";
             else if constexpr (std::is_same_v<T, RangeConfigResult>) out << "RangeConfig(num=" << value.config_num << ", ranges=" << value.range_ids.size() << ")";
             else if constexpr (std::is_same_v<T, TransactionOkResult>) out << "TransactionOk(range=" << value.range_id << ", statements=" << value.statement_count << ")";
-            else if constexpr (std::is_same_v<T, DistributedTxnResult>) out << "DistributedTxn(" << value.txn_id << ", participants=" << value.participant_range_ids.size() << ", status=" << value.status << ")";
+            else if constexpr (std::is_same_v<T, DistributedTxnResult>) out << "DistributedTxn(" << value.txn_id << ", participants=" << value.participant_range_ids.size() << ", status=" << value.status << ", commit_ts=" << value.commit_timestamp << ")";
             else if constexpr (std::is_same_v<T, RebalanceResult>) out << "Rebalance(moved=" << (value.moved ? "true" : "false") << ", range=" << value.range_id << ")";
             else if constexpr (std::is_same_v<T, IndexLookupResult>) out << "IndexLookup(" << value.index_name << ", key=" << value.index_key << ", pks=" << value.primary_keys.size() << ", ranges=" << value.range_ids.size() << ", hash_slot=" << value.hash_slot << ")";
             else if constexpr (std::is_same_v<T, QueryRowsResult>) out << "QueryRows(" << value.count << ")";
@@ -12445,6 +12455,601 @@ std::string describeResult(const Result& result) {
         },
         result);
 }
+
+class RangeTransferProtocol {
+public:
+    using Executor = std::function<Result(const Command&)>;
+
+    RangeTransferProtocol(Executor catalog,
+                          Executor source,
+                          Executor target,
+                          std::string table,
+                          std::string range_id,
+                          std::string target_replica_group_id,
+                          std::string start_key,
+                          std::string end_key,
+                          int transfer_epoch)
+        : catalog_(std::move(catalog)),
+          source_(std::move(source)),
+          target_(std::move(target)),
+          table_(std::move(table)),
+          range_id_(std::move(range_id)),
+          target_replica_group_id_(std::move(target_replica_group_id)),
+          start_key_(std::move(start_key)),
+          end_key_(std::move(end_key)),
+          transfer_epoch_(transfer_epoch) {}
+
+    Result prepare() {
+        Result prepared = catalog_(
+            Command{PrepareRangeTransferCommand{
+                range_id_, target_replica_group_id_, transfer_epoch_}});
+        if (!std::holds_alternative<StatementOkResult>(prepared)) {
+            return prepared;
+        }
+        return copySourceToTarget();
+    }
+
+    Result catchUp() {
+        Result copied = copySourceToTarget();
+        if (!std::holds_alternative<StatementOkResult>(copied)) {
+            return copied;
+        }
+        return catalog_(
+            Command{CatchUpRangeTransferCommand{range_id_, transfer_epoch_}});
+    }
+
+    Result commit() {
+        Result committed = catalog_(
+            Command{CommitRangeTransferCommand{range_id_, transfer_epoch_}});
+        if (!std::holds_alternative<StatementOkResult>(committed)) {
+            return committed;
+        }
+        Result deleted = source_(
+            Command{DeleteRangeRowsCommand{
+                table_, range_id_, start_key_, end_key_}});
+        if (!std::holds_alternative<DeleteRowsResult>(deleted)) {
+            return deleted;
+        }
+        return StatementOkResult{};
+    }
+
+    Result abort() {
+        Result aborted = catalog_(
+            Command{AbortRangeTransferCommand{range_id_, transfer_epoch_}});
+        if (!std::holds_alternative<StatementOkResult>(aborted)) {
+            return aborted;
+        }
+        Result deleted = target_(
+            Command{DeleteRangeRowsCommand{
+                table_, range_id_, start_key_, end_key_}});
+        if (!std::holds_alternative<DeleteRowsResult>(deleted)) {
+            return deleted;
+        }
+        return StatementOkResult{};
+    }
+
+private:
+    Result copySourceToTarget() {
+        Result exported = source_(
+            Command{ExportRangeRowsCommand{
+                table_, range_id_, start_key_, end_key_}});
+        const auto* rows = std::get_if<RangeRowsResult>(&exported);
+        if (rows == nullptr) return exported;
+        Result imported = target_(
+            Command{ImportRangeRowsCommand{
+                table_,
+                range_id_,
+                target_replica_group_id_,
+                start_key_,
+                end_key_,
+                rows->rows}});
+        if (!std::holds_alternative<CountRowsResult>(imported)) {
+            return imported;
+        }
+        return StatementOkResult{};
+    }
+
+    Executor catalog_;
+    Executor source_;
+    Executor target_;
+    std::string table_;
+    std::string range_id_;
+    std::string target_replica_group_id_;
+    std::string start_key_;
+    std::string end_key_;
+    int transfer_epoch_ = 1;
+};
+
+class ControlPlaneRuntime {
+public:
+    using Executor = RangeTransferProtocol::Executor;
+
+    struct StepResult {
+        bool advanced = false;
+        std::string range_id;
+        std::string status_before;
+        std::string status_after;
+        Result result = StatementOkResult{};
+    };
+
+    explicit ControlPlaneRuntime(Executor catalog, bool leader = true)
+        : catalog_(std::move(catalog)), leader_(leader) {}
+
+    void setLeader(bool leader) { leader_ = leader; }
+
+    void registerReplicaGroup(std::string group_id, Executor executor) {
+        replica_groups_[std::move(group_id)] = std::move(executor);
+    }
+
+    StepResult tick() {
+        if (!leader_) return StepResult{};
+        std::vector<TransferRecord> transfers = activeTransfers();
+        if (!transfers.empty()) {
+            std::sort(
+                transfers.begin(),
+                transfers.end(),
+                [](const TransferRecord& lhs, const TransferRecord& rhs) {
+                    int lhs_priority = activeStatusPriority(lhs.status);
+                    int rhs_priority = activeStatusPriority(rhs.status);
+                    if (lhs_priority != rhs_priority) {
+                        return lhs_priority < rhs_priority;
+                    }
+                    if (lhs.prepared_config_num != rhs.prepared_config_num) {
+                        return lhs.prepared_config_num < rhs.prepared_config_num;
+                    }
+                    return lhs.range_id < rhs.range_id;
+                });
+            return advance(transfers.front());
+        }
+
+        std::vector<TxnRecord> transactions = recoverableTransactions();
+        if (transactions.empty()) return StepResult{};
+        std::sort(
+            transactions.begin(),
+            transactions.end(),
+            [](const TxnRecord& lhs, const TxnRecord& rhs) {
+                return lhs.txn_id < rhs.txn_id;
+            });
+        return advance(transactions.front());
+    }
+
+    size_t runUntilIdle(size_t max_steps = 1000) {
+        size_t steps = 0;
+        while (steps < max_steps) {
+            StepResult step = tick();
+            if (!step.advanced) break;
+            ++steps;
+        }
+        return steps;
+    }
+
+private:
+    struct TransferRecord {
+        std::string range_id;
+        std::string source_group_id;
+        std::string target_group_id;
+        int transfer_epoch = 0;
+        int prepared_config_num = 0;
+        std::string status;
+    };
+
+    struct RangeSpec {
+        std::string table;
+        std::string start_key;
+        std::string end_key;
+    };
+
+    struct TxnRecord {
+        std::string txn_id;
+        size_t statement_count = 0;
+        size_t participant_count = 0;
+        std::string status;
+        std::string read_ts = "-";
+        std::string commit_ts = "-";
+    };
+
+    struct TxnParticipantRecord {
+        std::string range_id;
+        std::string replica_group_id;
+        size_t participant_index = 0;
+    };
+
+    static int statusRank(const std::string& status) {
+        if (status == "requested") return 0;
+        if (status == "prepared") return 1;
+        if (status == "caught_up") return 2;
+        if (status == "committed") return 3;
+        if (status == "aborted") return 4;
+        return -1;
+    }
+
+    static int activeStatusPriority(const std::string& status) {
+        int rank = statusRank(status);
+        return rank >= 0 && rank <= 2 ? rank : 100;
+    }
+
+    static int txnStatusRank(const std::string& status) {
+        if (status == "ended") return 4;
+        if (status == "committed") return 3;
+        if (status == "aborted") return 2;
+        if (status == "prepared") return 1;
+        return 0;
+    }
+
+    static bool activeStatus(const std::string& status) {
+        return status == "requested" ||
+               status == "prepared" ||
+               status == "caught_up";
+    }
+
+    static bool recoverableTxnStatus(const std::string& status) {
+        return status == "committed";
+    }
+
+    static constexpr uint64_t hybrid_timestamp_chunk_base = 1000000000ULL;
+
+    static int hexDigit(char ch) {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+        if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+        return -1;
+    }
+
+    static std::string hexDecode(const std::string& value) {
+        std::string out;
+        for (size_t i = 0; i + 1 < value.size(); i += 2) {
+            int hi = hexDigit(value[i]);
+            int lo = hexDigit(value[i + 1]);
+            if (hi < 0 || lo < 0) break;
+            out.push_back(static_cast<char>((hi << 4) | lo));
+        }
+        return out;
+    }
+
+    static std::optional<size_t> columnIndex(const SelectAllResult& rows,
+                                             const std::string& column) {
+        for (size_t i = 0; i < rows.columns.size(); ++i) {
+            if (rows.columns[i] == column) return i;
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<std::string> valueAt(
+        const SelectAllResult& rows,
+        const std::vector<std::string>& row,
+        const std::string& column) {
+        auto index = columnIndex(rows, column);
+        if (!index.has_value() || *index >= row.size()) {
+            return std::nullopt;
+        }
+        return row[*index];
+    }
+
+    std::optional<SelectAllResult> readCatalogTable(
+        const std::string& table) const {
+        Result result = catalog_(Command{ReadSystemCatalogCommand{table}});
+        if (const auto* rows = std::get_if<SelectAllResult>(&result)) {
+            return *rows;
+        }
+        return std::nullopt;
+    }
+
+    std::vector<TransferRecord> activeTransfers() const {
+        auto rows = readCatalogTable("__range_transfers");
+        if (!rows.has_value()) return {};
+
+        std::map<std::string, TransferRecord> latest;
+        for (const auto& row : rows->rows) {
+            auto range_id = valueAt(*rows, row, "range_id");
+            auto source_group_id = valueAt(*rows, row, "source_group_id");
+            auto target_group_id = valueAt(*rows, row, "target_group_id");
+            auto epoch = valueAt(*rows, row, "transfer_epoch");
+            auto config_num = valueAt(*rows, row, "prepared_config_num");
+            auto status = valueAt(*rows, row, "status");
+            if (!range_id.has_value() ||
+                !source_group_id.has_value() ||
+                !target_group_id.has_value() ||
+                !epoch.has_value() ||
+                !config_num.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+
+            TransferRecord record{
+                *range_id,
+                *source_group_id,
+                *target_group_id,
+                std::stoi(*epoch),
+                std::stoi(*config_num),
+                *status};
+            auto it = latest.find(record.range_id);
+            if (it == latest.end() ||
+                record.transfer_epoch > it->second.transfer_epoch ||
+                (record.transfer_epoch == it->second.transfer_epoch &&
+                 statusRank(record.status) >= statusRank(it->second.status))) {
+                latest[record.range_id] = std::move(record);
+            }
+        }
+
+        std::vector<TransferRecord> transfers;
+        for (const auto& [range_id, record] : latest) {
+            (void)range_id;
+            if (activeStatus(record.status)) transfers.push_back(record);
+        }
+        return transfers;
+    }
+
+    std::vector<TxnRecord> recoverableTransactions() const {
+        auto rows = readCatalogTable("__distributed_txns");
+        if (!rows.has_value()) return {};
+
+        std::map<std::string, TxnRecord> latest;
+        for (const auto& row : rows->rows) {
+            auto txn_id = valueAt(*rows, row, "txn_id");
+            auto statement_count = valueAt(*rows, row, "statement_count");
+            auto participant_count = valueAt(*rows, row, "participant_count");
+            auto status = valueAt(*rows, row, "status");
+            if (!txn_id.has_value() ||
+                !statement_count.has_value() ||
+                !participant_count.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+            TxnRecord record;
+            record.txn_id = *txn_id;
+            record.statement_count =
+                static_cast<size_t>(std::stoull(*statement_count));
+            record.participant_count =
+                static_cast<size_t>(std::stoull(*participant_count));
+            record.status = *status;
+            auto read_physical_hi = valueAt(*rows, row, "read_physical_hi");
+            auto read_physical_lo = valueAt(*rows, row, "read_physical_lo");
+            auto read_logical = valueAt(*rows, row, "read_logical");
+            auto commit_physical_hi = valueAt(*rows, row, "commit_physical_hi");
+            auto commit_physical_lo = valueAt(*rows, row, "commit_physical_lo");
+            auto commit_logical = valueAt(*rows, row, "commit_logical");
+            if (!read_physical_hi.has_value() ||
+                !read_physical_lo.has_value() ||
+                !read_logical.has_value() ||
+                !commit_physical_hi.has_value() ||
+                !commit_physical_lo.has_value() ||
+                !commit_logical.has_value()) {
+                continue;
+            }
+            uint64_t read_physical =
+                static_cast<uint64_t>(std::stoull(*read_physical_hi)) *
+                    hybrid_timestamp_chunk_base +
+                static_cast<uint64_t>(std::stoull(*read_physical_lo));
+            uint64_t commit_physical =
+                static_cast<uint64_t>(std::stoull(*commit_physical_hi)) *
+                    hybrid_timestamp_chunk_base +
+                static_cast<uint64_t>(std::stoull(*commit_physical_lo));
+            record.read_ts =
+                std::to_string(read_physical) + "." + *read_logical;
+            record.commit_ts =
+                std::to_string(commit_physical) + "." + *commit_logical;
+
+            auto it = latest.find(record.txn_id);
+            if (it == latest.end() ||
+                txnStatusRank(record.status) >=
+                    txnStatusRank(it->second.status)) {
+                latest[record.txn_id] = std::move(record);
+            }
+        }
+
+        std::vector<TxnRecord> transactions;
+        for (const auto& [txn_id, record] : latest) {
+            (void)txn_id;
+            if (recoverableTxnStatus(record.status)) {
+                transactions.push_back(record);
+            }
+        }
+        return transactions;
+    }
+
+    std::vector<TxnParticipantRecord> txnParticipants(
+        const std::string& txn_id) const {
+        auto rows = readCatalogTable("__txn_participants");
+        if (!rows.has_value()) return {};
+
+        std::vector<TxnParticipantRecord> participants;
+        for (const auto& row : rows->rows) {
+            auto row_txn_id = valueAt(*rows, row, "txn_id");
+            auto range_id = valueAt(*rows, row, "range_id");
+            auto replica_group_id = valueAt(*rows, row, "replica_group_id");
+            auto participant_index = valueAt(*rows, row, "participant_index");
+            auto status = valueAt(*rows, row, "status");
+            if (!row_txn_id.has_value() ||
+                *row_txn_id != txn_id ||
+                !range_id.has_value() ||
+                !replica_group_id.has_value() ||
+                !participant_index.has_value() ||
+                !status.has_value() ||
+                *status != "prepared") {
+                continue;
+            }
+            participants.push_back(
+                TxnParticipantRecord{
+                    *range_id,
+                    *replica_group_id,
+                    static_cast<size_t>(std::stoull(*participant_index))});
+        }
+        std::sort(participants.begin(),
+                  participants.end(),
+                  [](const TxnParticipantRecord& lhs,
+                     const TxnParticipantRecord& rhs) {
+                      return lhs.participant_index < rhs.participant_index;
+                  });
+        return participants;
+    }
+
+    std::vector<std::string> txnStatements(
+        const std::string& txn_id) const {
+        auto rows = readCatalogTable("__txn_statements");
+        if (!rows.has_value()) return {};
+
+        std::vector<std::pair<size_t, std::string>> indexed;
+        for (const auto& row : rows->rows) {
+            auto row_txn_id = valueAt(*rows, row, "txn_id");
+            auto statement_index = valueAt(*rows, row, "statement_index");
+            auto statement = valueAt(*rows, row, "statement_hex");
+            auto status = valueAt(*rows, row, "status");
+            if (!row_txn_id.has_value() ||
+                *row_txn_id != txn_id ||
+                !statement_index.has_value() ||
+                !statement.has_value() ||
+                !status.has_value() ||
+                *status != "prepared") {
+                continue;
+            }
+            indexed.push_back({
+                static_cast<size_t>(std::stoull(*statement_index)),
+                hexDecode(*statement)});
+        }
+        std::sort(indexed.begin(),
+                  indexed.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return lhs.first < rhs.first;
+                  });
+
+        std::vector<std::string> statements;
+        for (const auto& [index, statement] : indexed) {
+            (void)index;
+            statements.push_back(statement);
+        }
+        return statements;
+    }
+
+    std::optional<RangeSpec> rangeSpecFor(
+        const TransferRecord& transfer) const {
+        auto rows = readCatalogTable("__range_ownership");
+        if (!rows.has_value()) return std::nullopt;
+
+        std::optional<RangeSpec> best;
+        int best_version = -1;
+        for (const auto& row : rows->rows) {
+            auto range_id = valueAt(*rows, row, "range_id");
+            auto table = valueAt(*rows, row, "table_name");
+            auto index = valueAt(*rows, row, "index_name");
+            auto start_key = valueAt(*rows, row, "start_key");
+            auto end_key = valueAt(*rows, row, "end_key");
+            auto version = valueAt(*rows, row, "owner_version");
+            auto status = valueAt(*rows, row, "status");
+            if (!range_id.has_value() ||
+                *range_id != transfer.range_id ||
+                !table.has_value() ||
+                !index.has_value() ||
+                !start_key.has_value() ||
+                !end_key.has_value() ||
+                !version.has_value() ||
+                !status.has_value() ||
+                *status != "active") {
+                continue;
+            }
+            int owner_version = std::stoi(*version);
+            RangeSpec candidate{
+                *index == "primary" ? *table : "__index_entries",
+                *start_key,
+                *end_key};
+            if (owner_version == transfer.prepared_config_num) {
+                return candidate;
+            }
+            if (owner_version > best_version) {
+                best_version = owner_version;
+                best = std::move(candidate);
+            }
+        }
+        return best;
+    }
+
+    StepResult advance(const TransferRecord& transfer) {
+        StepResult step;
+        step.range_id = transfer.range_id;
+        step.status_before = transfer.status;
+        step.result = ConfigRejectedResult{};
+
+        auto spec = rangeSpecFor(transfer);
+        auto source = replica_groups_.find(transfer.source_group_id);
+        auto target = replica_groups_.find(transfer.target_group_id);
+        if (!spec.has_value() ||
+            source == replica_groups_.end() ||
+            target == replica_groups_.end()) {
+            return step;
+        }
+
+        RangeTransferProtocol protocol{
+            catalog_,
+            source->second,
+            target->second,
+            spec->table,
+            transfer.range_id,
+            transfer.target_group_id,
+            spec->start_key,
+            spec->end_key,
+            transfer.transfer_epoch};
+
+        if (transfer.status == "requested") {
+            step.status_after = "prepared";
+            step.result = protocol.prepare();
+        } else if (transfer.status == "prepared") {
+            step.status_after = "caught_up";
+            step.result = protocol.catchUp();
+        } else if (transfer.status == "caught_up") {
+            step.status_after = "committed";
+            step.result = protocol.commit();
+        }
+        step.advanced = std::holds_alternative<StatementOkResult>(step.result);
+        return step;
+    }
+
+    StepResult advance(const TxnRecord& transaction) {
+        StepResult step;
+        step.range_id = transaction.txn_id;
+        step.status_before = transaction.status;
+        step.status_after = "ended";
+        step.result = ConfigRejectedResult{};
+
+        std::vector<TxnParticipantRecord> participants =
+            txnParticipants(transaction.txn_id);
+        std::vector<std::string> statements =
+            txnStatements(transaction.txn_id);
+        if (participants.size() != transaction.participant_count ||
+            statements.size() != transaction.statement_count) {
+            return step;
+        }
+
+        for (const auto& participant : participants) {
+            auto executor =
+                replica_groups_.find(participant.replica_group_id);
+            if (executor == replica_groups_.end()) return step;
+            Result applied = executor->second(
+                Command{ApplyParticipantTransactionCommand{
+                    transaction.txn_id,
+                    participant.range_id,
+                    participant.replica_group_id,
+                    statements,
+                    transaction.read_ts,
+                    transaction.commit_ts}});
+            if (!std::holds_alternative<DistributedTxnResult>(applied)) {
+                step.result = std::move(applied);
+                return step;
+            }
+        }
+
+        step.result = catalog_(
+            Command{CommitPreparedDistributedTransactionCommand{
+                transaction.txn_id, true}});
+        const auto* committed =
+            std::get_if<DistributedTxnResult>(&step.result);
+        step.advanced =
+            committed != nullptr && committed->status == "committed";
+        return step;
+    }
+
+    Executor catalog_;
+    std::map<std::string, Executor> replica_groups_;
+    bool leader_ = true;
+};
 
 std::string adapterTrim(const std::string& input) {
     if (input.empty()) {
@@ -12673,8 +13278,10 @@ const std::vector<std::string>& systemCatalogTableNames() {
         "__global_keys",
         "__indexes",
         "__index_entries",
+        "__hybrid_time",
         "__distributed_txns",
         "__txn_participants",
+        "__txn_intents",
         "__txn_statements",
         "__schema_versions"
     };
@@ -13158,13 +13765,27 @@ private:
              "entry_key:string", "range_id:string", "replica_group_id:string",
              "descriptor_version:int", "hash_slot:int", "status:string"});
         createSystemCatalogTableIfMissing(
+            "__hybrid_time",
+            {"node_id:string", "physical_hi:int", "physical_lo:int",
+             "logical:int", "status:string"});
+        createSystemCatalogTableIfMissing(
             "__distributed_txns",
             {"txn_id:string", "coordinator:string", "statement_count:int",
-             "participant_count:int", "status:string"});
+             "participant_count:int", "status:string",
+             "read_physical_hi:int", "read_physical_lo:int",
+             "read_logical:int", "commit_physical_hi:int",
+             "commit_physical_lo:int", "commit_logical:int"});
         createSystemCatalogTableIfMissing(
             "__txn_participants",
             {"txn_id:string", "range_id:string", "replica_group_id:string",
              "participant_index:int", "status:string"});
+        createSystemCatalogTableIfMissing(
+            "__txn_intents",
+            {"txn_id:string", "range_id:string", "replica_group_id:string",
+             "write_key:string", "read_physical_hi:int",
+             "read_physical_lo:int", "read_logical:int",
+             "commit_physical_hi:int", "commit_physical_lo:int",
+             "commit_logical:int", "status:string"});
         createSystemCatalogTableIfMissing(
             "__txn_statements",
             {"txn_id:string", "statement_index:int", "statement_hex:string",
@@ -14058,6 +14679,93 @@ private:
         });
     }
 
+    bool rangeTransferInFlight(const RangeTransferRecord& record) {
+        return record.status == "requested" ||
+               record.status == "prepared" ||
+               record.status == "caught_up";
+    }
+
+    int nextRangeTransferEpoch(const std::string& range_id) {
+        auto previous = latestRangeTransferRecord(range_id);
+        return previous.has_value() ? previous->transfer_epoch + 1 : 1;
+    }
+
+    std::optional<RangeOwnershipRecord> ownershipRecordForRange(
+        const std::vector<RangeOwnershipRecord>& records,
+        const std::string& range_id) {
+        for (const auto& record : records) {
+            if (record.range_id == range_id) return record;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<RangeTransferRecord> buildRangeTransferRequest(
+        const std::vector<RangeOwnershipRecord>& current,
+        const std::string& range_id,
+        const std::string& target_group_id,
+        int config_num) {
+        auto source = ownershipRecordForRange(current, range_id);
+        if (!source.has_value() ||
+            source->replica_group_id == target_group_id) {
+            return std::nullopt;
+        }
+        auto target = latestReplicaGroupConfig(target_group_id);
+        if (!target.exists || target.phase != "stable") {
+            return std::nullopt;
+        }
+        auto previous = latestRangeTransferRecord(range_id);
+        if (previous.has_value() && rangeTransferInFlight(*previous)) {
+            return std::nullopt;
+        }
+        return RangeTransferRecord{
+            range_id,
+            source->replica_group_id,
+            target_group_id,
+            nextRangeTransferEpoch(range_id),
+            0,
+            0,
+            config_num,
+            "requested"};
+    }
+
+    bool appendRangeTransferRequest(
+        const std::vector<RangeOwnershipRecord>& current,
+        const std::string& range_id,
+        const std::string& target_group_id,
+        int config_num) {
+        auto request = buildRangeTransferRequest(
+            current, range_id, target_group_id, config_num);
+        if (!request.has_value()) return false;
+        appendRangeTransferRecord(*request);
+        return true;
+    }
+
+    bool appendRangeTransferRequests(
+        const std::vector<RangeOwnershipRecord>& records,
+        const std::map<std::string, std::string>& assignments,
+        int config_num) {
+        std::vector<RangeTransferRecord> requests;
+        for (const auto& record : records) {
+            auto assignment = assignments.find(record.range_id);
+            if (assignment == assignments.end()) {
+                throw std::runtime_error("missing range assignment");
+            }
+            if (assignment->second == record.replica_group_id) {
+                continue;
+            }
+            auto request = buildRangeTransferRequest(
+                records, record.range_id, assignment->second, config_num);
+            if (!request.has_value()) return false;
+            requests.push_back(*request);
+        }
+        if (requests.empty()) return false;
+        for (const auto& request : requests) {
+            appendRangeTransferRecord(request);
+        }
+        return true;
+    }
+
+
     std::vector<RangeDescriptor> matchingPointRanges(
         const std::string& key) {
         std::vector<RangeDescriptor> matches;
@@ -14494,11 +15202,207 @@ private:
         }
     }
 
+    using HybridTimestamp = HybridLogicalTimestamp;
+    static constexpr uint64_t hybrid_timestamp_chunk_base = 1000000000ULL;
+
+    static std::string encodeHybridTimestamp(
+        const HybridTimestamp& timestamp) {
+        return std::to_string(timestamp.physical) + "." +
+               std::to_string(timestamp.logical);
+    }
+
+    HybridTimestamp latestHybridTimestamp() {
+        ensureSystemCatalogTables();
+        SelectAllResult rows = selectSystemCatalogTable("__hybrid_time");
+        HybridTimestamp latest;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 4) continue;
+            uint64_t physical =
+                static_cast<uint64_t>(std::stoull(row[1])) *
+                    hybrid_timestamp_chunk_base +
+                static_cast<uint64_t>(std::stoull(row[2]));
+            HybridTimestamp current{
+                physical,
+                static_cast<uint64_t>(std::stoull(row[3]))};
+            if (current.physical > latest.physical ||
+                (current.physical == latest.physical &&
+                 current.logical > latest.logical)) {
+                latest = current;
+            }
+        }
+        return latest;
+    }
+
+    std::pair<HybridTimestamp, HybridTimestamp>
+    allocateReadAndCommitTimestamps() {
+        HybridTimestamp latest = latestHybridTimestamp();
+        uint64_t physical_now = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        HybridTimestamp read;
+        if (physical_now > latest.physical) {
+            read = HybridTimestamp{physical_now, 0};
+        } else {
+            read = HybridTimestamp{latest.physical, latest.logical + 1};
+        }
+        HybridTimestamp commit{read.physical, read.logical + 1};
+        return {read, commit};
+    }
+
+    std::vector<InsertRowCommand> hybridTimestampRows(
+        const std::vector<HybridTimestamp>& timestamps,
+        const std::string& status = "allocated") {
+        std::vector<InsertRowCommand> rows;
+        for (const auto& timestamp : timestamps) {
+            rows.push_back(
+                InsertRowCommand{
+                    "__hybrid_time",
+                    {"coordinator-1",
+                     std::to_string(timestamp.physical /
+                                    hybrid_timestamp_chunk_base),
+                     std::to_string(timestamp.physical %
+                                    hybrid_timestamp_chunk_base),
+                     std::to_string(timestamp.logical),
+                     status}});
+        }
+        return rows;
+    }
+
+    std::vector<std::string> writeKeysForParsedCommand(
+        const Command& parsed) {
+        std::vector<std::string> keys;
+        if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+            if (!insert->values.empty()) {
+                keys.push_back(
+                    tableRowKey(insert->table, insert->values.front()));
+            }
+        } else if (const auto* update =
+                       std::get_if<UpdateRowsCommand>(&parsed)) {
+            keys.push_back(tableRowKey(update->table, update->where_value));
+        } else if (const auto* remove =
+                       std::get_if<DeleteRowsCommand>(&parsed)) {
+            keys.push_back(tableRowKey(remove->table, remove->value));
+        }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        return keys;
+    }
+
+    std::vector<InsertRowCommand> txnIntentRows(
+        const std::string& txn_id,
+        const std::vector<Command>& parsed,
+        const std::vector<TxnParticipant>& participants,
+        const HybridTimestamp& read_ts,
+        const HybridTimestamp& commit_ts,
+        const std::string& status) {
+        std::vector<InsertRowCommand> rows;
+        std::set<std::string> seen;
+        auto appendIntent =
+            [&](const std::string& range_id,
+                const std::string& replica_group_id,
+                const std::string& write_key) {
+                std::string identity =
+                    range_id + "\0" + replica_group_id + "\0" + write_key;
+                if (!seen.insert(identity).second) return;
+                rows.push_back(
+                    InsertRowCommand{
+                        "__txn_intents",
+                        {txn_id,
+                         range_id,
+                         replica_group_id,
+                         write_key,
+                         std::to_string(read_ts.physical /
+                                        hybrid_timestamp_chunk_base),
+                         std::to_string(read_ts.physical %
+                                        hybrid_timestamp_chunk_base),
+                         std::to_string(read_ts.logical),
+                         std::to_string(commit_ts.physical /
+                                        hybrid_timestamp_chunk_base),
+                         std::to_string(commit_ts.physical %
+                                        hybrid_timestamp_chunk_base),
+                         std::to_string(commit_ts.logical),
+                         status}});
+            };
+        for (const auto& participant : participants) {
+            appendIntent(participant.range_id,
+                         participant.replica_group_id,
+                         "range:" + participant.range_id + ":" + txn_id);
+        }
+        for (const auto& command : parsed) {
+            for (const auto& write_key : writeKeysForParsedCommand(command)) {
+                RangeDescriptor range = bestRangeForKey(write_key);
+                if (range.range_id.empty() || range.range_id == "-") {
+                    continue;
+                }
+                auto participant = std::find_if(
+                    participants.begin(),
+                    participants.end(),
+                    [&](const TxnParticipant& candidate) {
+                        return candidate.range_id == range.range_id &&
+                               candidate.replica_group_id ==
+                                   range.replica_group_id;
+                    });
+                if (participant == participants.end()) continue;
+                appendIntent(range.range_id,
+                             range.replica_group_id,
+                             write_key);
+            }
+        }
+        return rows;
+    }
+
+    std::vector<InsertRowCommand> txnIntentRowsForParticipant(
+        const std::string& txn_id,
+        const std::vector<Command>& parsed,
+        const std::string& participant_range_id,
+        const std::string& participant_replica_group_id,
+        const HybridTimestamp& read_ts,
+        const HybridTimestamp& commit_ts,
+        const std::string& status) {
+        std::vector<InsertRowCommand> rows;
+        std::set<std::string> seen;
+        auto appendIntent = [&](const std::string& write_key) {
+            if (!seen.insert(write_key).second) return;
+            rows.push_back(
+                InsertRowCommand{
+                    "__txn_intents",
+                    {txn_id,
+                     participant_range_id,
+                     participant_replica_group_id,
+                     write_key,
+                     std::to_string(read_ts.physical /
+                                    hybrid_timestamp_chunk_base),
+                     std::to_string(read_ts.physical %
+                                    hybrid_timestamp_chunk_base),
+                     std::to_string(read_ts.logical),
+                     std::to_string(commit_ts.physical /
+                                    hybrid_timestamp_chunk_base),
+                     std::to_string(commit_ts.physical %
+                                    hybrid_timestamp_chunk_base),
+                     std::to_string(commit_ts.logical),
+                     status}});
+        };
+        appendIntent("range:" + participant_range_id + ":" + txn_id);
+        for (const auto& command : parsed) {
+            for (const auto& write_key : writeKeysForParsedCommand(command)) {
+                RangeDescriptor range = bestRangeForKey(write_key);
+                if (range.range_id != participant_range_id ||
+                    range.replica_group_id != participant_replica_group_id) {
+                    continue;
+                }
+                appendIntent(write_key);
+            }
+        }
+        return rows;
+    }
+
     std::vector<InsertRowCommand> distributedTxnCatalogRows(
         const std::string& txn_id,
         const std::string& status,
         const std::vector<TxnParticipant>& participants,
-        size_t statement_count) {
+        size_t statement_count,
+        const HybridTimestamp& read_ts = HybridTimestamp{},
+        const HybridTimestamp& commit_ts = HybridTimestamp{}) {
         std::vector<InsertRowCommand> rows{
             InsertRowCommand{
                 "__distributed_txns",
@@ -14506,7 +15410,17 @@ private:
                  "coordinator-1",
                  std::to_string(statement_count),
                  std::to_string(participants.size()),
-                 status}}};
+                 status,
+                 std::to_string(read_ts.physical /
+                                hybrid_timestamp_chunk_base),
+                 std::to_string(read_ts.physical %
+                                hybrid_timestamp_chunk_base),
+                 std::to_string(read_ts.logical),
+                 std::to_string(commit_ts.physical /
+                                hybrid_timestamp_chunk_base),
+                 std::to_string(commit_ts.physical %
+                                hybrid_timestamp_chunk_base),
+                 std::to_string(commit_ts.logical)}}};
         for (size_t i = 0; i < participants.size(); ++i) {
             rows.push_back(
                 InsertRowCommand{
@@ -14563,11 +15477,15 @@ private:
         const std::string& txn_id,
         const std::vector<TxnParticipant>& participants,
         size_t statement_count,
-        const std::string& status) {
+        const std::string& status,
+        const HybridTimestamp& read_ts = HybridTimestamp{},
+        const HybridTimestamp& commit_ts = HybridTimestamp{}) {
         DistributedTxnResult result;
         result.txn_id = txn_id;
         result.statement_count = statement_count;
         result.status = status;
+        result.read_timestamp = encodeHybridTimestamp(read_ts);
+        result.commit_timestamp = encodeHybridTimestamp(commit_ts);
         for (const auto& participant : participants) {
             result.participant_range_ids.push_back(participant.range_id);
             result.participant_replica_group_ids.push_back(
@@ -14582,6 +15500,8 @@ private:
         size_t statement_count = 0;
         size_t participant_count = 0;
         std::string status;
+        HybridTimestamp read_ts;
+        HybridTimestamp commit_ts;
     };
 
     int distributedTxnStatusRank(const std::string& status) const {
@@ -14598,13 +15518,25 @@ private:
             selectSystemCatalogTable("__distributed_txns");
         std::map<std::string, DistributedTxnRecord> latest;
         for (const auto& row : rows.rows) {
-            if (row.size() < 5) continue;
+            if (row.size() < 11) continue;
+            uint64_t read_physical =
+                static_cast<uint64_t>(std::stoull(row[5])) *
+                    hybrid_timestamp_chunk_base +
+                static_cast<uint64_t>(std::stoull(row[6]));
+            uint64_t commit_physical =
+                static_cast<uint64_t>(std::stoull(row[8])) *
+                    hybrid_timestamp_chunk_base +
+                static_cast<uint64_t>(std::stoull(row[9]));
             DistributedTxnRecord record{
                 true,
                 row[0],
                 static_cast<size_t>(std::stoull(row[2])),
                 static_cast<size_t>(std::stoull(row[3])),
-                row[4]};
+                row[4],
+                HybridTimestamp{read_physical,
+                                static_cast<uint64_t>(std::stoull(row[7]))},
+                HybridTimestamp{commit_physical,
+                                static_cast<uint64_t>(std::stoull(row[10]))}};
             auto it = latest.find(record.txn_id);
             if (it == latest.end() ||
                 distributedTxnStatusRank(record.status) >=
@@ -14701,12 +15633,16 @@ private:
         const std::string& txn_id,
         const std::string& status,
         const std::vector<TxnParticipant>& participants,
-        size_t statement_count) {
+        size_t statement_count,
+        const HybridTimestamp& read_ts = HybridTimestamp{},
+        const HybridTimestamp& commit_ts = HybridTimestamp{}) {
         insertSystemCatalogRows(
             distributedTxnCatalogRows(txn_id,
                                       status,
                                       participants,
-                                      statement_count));
+                                      statement_count,
+                                      read_ts,
+                                      commit_ts));
     }
 
     struct DistributedTxnPlan {
@@ -15129,26 +16065,47 @@ private:
                 command.txn_id,
                 storedTxnParticipants(command.txn_id),
                 existing.statement_count,
-                existing.status == "ended" ? "committed" : existing.status);
+                existing.status == "ended" ? "committed" : existing.status,
+                existing.read_ts,
+                existing.commit_ts);
         }
 
         DistributedTxnPlan plan;
         Result planned = buildDistributedTxnPlan(command.statements, plan);
         if (transactionResultIsFailure(planned)) return planned;
+        auto [read_ts_value, commit_ts_value] =
+            allocateReadAndCommitTimestamps();
+        std::string read_ts = encodeHybridTimestamp(read_ts_value);
+        std::string commit_ts = encodeHybridTimestamp(commit_ts_value);
 
-        auto txn = db_->beginLoggedTxn("prepare-distributed-" +
-                                       command.txn_id);
+        auto txn = db_->beginLoggedTxnWithHybridTimestamps(
+            "prepare-distributed-" + command.txn_id,
+            read_ts,
+            commit_ts);
         try {
+            executeSystemCatalogRowsInTxn(
+                hybridTimestampRows({read_ts_value, commit_ts_value}),
+                txn);
             executeSystemCatalogRowsInTxn(
                 distributedTxnCatalogRows(command.txn_id,
                                           "prepared",
                                           plan.participants,
-                                          command.statements.size()),
+                                          command.statements.size(),
+                                          read_ts_value,
+                                          commit_ts_value),
                 txn);
             executeSystemCatalogRowsInTxn(
                 distributedTxnStatementRows(command.txn_id,
                                             command.statements,
                                             "prepared"),
+                txn);
+            executeSystemCatalogRowsInTxn(
+                txnIntentRows(command.txn_id,
+                              plan.parsed,
+                              plan.participants,
+                              read_ts_value,
+                              commit_ts_value,
+                              "prepared"),
                 txn);
             db_->commit(txn);
         } catch (const std::exception&) {
@@ -15159,7 +16116,9 @@ private:
         return distributedTxnResultFor(command.txn_id,
                                        plan.participants,
                                        command.statements.size(),
-                                       "prepared");
+                                       "prepared",
+                                       read_ts_value,
+                                       commit_ts_value);
     }
 
     Result executeOne(const ApplyParticipantTransactionCommand& command) {
@@ -15186,6 +16145,8 @@ private:
             result.txn_id = command.txn_id;
             result.statement_count = command.statements.size();
             result.status = "committed";
+            result.read_timestamp = encodeHybridTimestamp(existing.read_ts);
+            result.commit_timestamp = encodeHybridTimestamp(existing.commit_ts);
             result.participant_range_ids.push_back(command.participant_range_id);
             result.participant_replica_group_ids.push_back(
                 command.participant_replica_group_id);
@@ -15232,15 +16193,38 @@ private:
                 return lhs.range_id < rhs.range_id;
             });
 
-        auto txn = db_->beginLoggedTxn("distributed-" + command.txn_id +
-                                       "-" + command.participant_range_id);
+        auto read_ts_value =
+            decodeHybridLogicalTimestamp(command.read_timestamp);
+        auto commit_ts_value =
+            decodeHybridLogicalTimestamp(command.commit_timestamp);
+        if (!read_ts_value.has_value() || !commit_ts_value.has_value()) {
+            return RouteRejectedResult{};
+        }
+        std::string read_ts = encodeHybridTimestamp(*read_ts_value);
+        std::string commit_ts = encodeHybridTimestamp(*commit_ts_value);
+        auto txn = db_->beginLoggedTxnWithHybridTimestamps(
+            "distributed-" + command.txn_id + "-" +
+                command.participant_range_id,
+            read_ts,
+            commit_ts);
         std::set<std::string> touched_tables;
         try {
             executeSystemCatalogRowsInTxn(
                 distributedTxnCatalogRows(command.txn_id,
                                           "prepared",
                                           participants,
-                                          command.statements.size()),
+                                          command.statements.size(),
+                                          *read_ts_value,
+                                          *commit_ts_value),
+                txn);
+            executeSystemCatalogRowsInTxn(
+                txnIntentRowsForParticipant(command.txn_id,
+                                            parsed,
+                                            command.participant_range_id,
+                                            command.participant_replica_group_id,
+                                            *read_ts_value,
+                                            *commit_ts_value,
+                                            "prepared"),
                 txn);
             for (const auto& parsed_command : parsed) {
                 Result result = executeParticipantInTxn(
@@ -15260,7 +16244,18 @@ private:
                 distributedTxnCatalogRows(command.txn_id,
                                           "committed",
                                           participants,
-                                          command.statements.size()),
+                                          command.statements.size(),
+                                          *read_ts_value,
+                                          *commit_ts_value),
+                txn);
+            executeSystemCatalogRowsInTxn(
+                txnIntentRowsForParticipant(command.txn_id,
+                                            parsed,
+                                            command.participant_range_id,
+                                            command.participant_replica_group_id,
+                                            *read_ts_value,
+                                            *commit_ts_value,
+                                            "committed"),
                 txn);
             db_->commit(txn);
         } catch (const std::exception&) {
@@ -15279,6 +16274,8 @@ private:
         result.txn_id = command.txn_id;
         result.statement_count = command.statements.size();
         result.status = "committed";
+        result.read_timestamp = read_ts;
+        result.commit_timestamp = commit_ts;
         result.participant_range_ids.push_back(command.participant_range_id);
         result.participant_replica_group_ids.push_back(
             command.participant_replica_group_id);
@@ -15288,14 +16285,23 @@ private:
     Result applyPreparedDistributedTransaction(
         const std::string& txn_id,
         const std::vector<TxnParticipant>& participants,
-        const std::vector<std::string>& statements) {
-        auto txn = db_->beginLoggedTxn("finish-distributed-" + txn_id);
+        const std::vector<std::string>& statements,
+        const HybridTimestamp& read_ts,
+        const HybridTimestamp& commit_ts) {
+        std::string read_ts_string = encodeHybridTimestamp(read_ts);
+        std::string commit_ts_string = encodeHybridTimestamp(commit_ts);
+        auto txn = db_->beginLoggedTxnWithHybridTimestamps(
+            "finish-distributed-" + txn_id,
+            read_ts_string,
+            commit_ts_string);
         try {
             executeSystemCatalogRowsInTxn(
                 distributedTxnCatalogRows(txn_id,
                                           "ended",
                                           participants,
-                                          statements.size()),
+                                          statements.size(),
+                                          read_ts,
+                                          commit_ts),
                 txn);
             db_->commit(txn);
         } catch (const std::exception&) {
@@ -15305,7 +16311,9 @@ private:
         return distributedTxnResultFor(txn_id,
                                        participants,
                                        statements.size(),
-                                       "committed");
+                                       "committed",
+                                       read_ts,
+                                       commit_ts);
     }
 
 
@@ -15334,7 +16342,9 @@ private:
             return distributedTxnResultFor(command.txn_id,
                                            participants,
                                            statements.size(),
-                                           "committed");
+                                           "committed",
+                                           record.read_ts,
+                                           record.commit_ts);
         }
 
         if (record.status == "prepared") {
@@ -15344,7 +16354,9 @@ private:
             appendDistributedTxnPhase(command.txn_id,
                                       "committed",
                                       participants,
-                                      statements.size());
+                                      statements.size(),
+                                      record.read_ts,
+                                      record.commit_ts);
             record.status = "committed";
         }
 
@@ -15355,12 +16367,16 @@ private:
             return distributedTxnResultFor(command.txn_id,
                                            participants,
                                            statements.size(),
-                                           "committed");
+                                           "committed",
+                                           record.read_ts,
+                                           record.commit_ts);
         }
 
         return applyPreparedDistributedTransaction(command.txn_id,
                                                   participants,
-                                                  statements);
+                                                  statements,
+                                                  record.read_ts,
+                                                  record.commit_ts);
     }
 
     Result executeOne(
@@ -15379,24 +16395,23 @@ private:
             appendDistributedTxnPhase(command.txn_id,
                                       "aborted",
                                       participants,
-                                      record.statement_count);
+                                      record.statement_count,
+                                      record.read_ts,
+                                      record.commit_ts);
         }
         return distributedTxnResultFor(command.txn_id,
                                        participants,
                                        record.statement_count,
-                                       "aborted");
+                                       "aborted",
+                                       record.read_ts,
+                                       record.commit_ts);
     }
 
     Result executeOne(const RecoverDistributedTransactionsCommand&) {
         ensureSystemCatalogTables();
         for (const auto& record : latestDistributedTxnRecords()) {
             if (record.status == "committed") {
-                Result recovered = executeOne(
-                    CommitPreparedDistributedTransactionCommand{
-                        record.txn_id, true});
-                if (transactionResultIsFailure(recovered)) {
-                    return recovered;
-                }
+                return ConfigRejectedResult{};
             }
         }
         return StatementOkResult{};
@@ -15483,6 +16498,136 @@ private:
                                 const TxnPtr& txn = nullptr) {
         auto rows = db_->executeQuery(projectWhereQuery(table, column, value), txn, false);
         return queryResultToSelectAll(table, rows);
+    }
+
+    std::optional<size_t> columnIndex(
+        const std::vector<std::string>& columns,
+        const std::string& column) const {
+        auto it = std::find(columns.begin(), columns.end(), column);
+        if (it == columns.end()) return std::nullopt;
+        return static_cast<size_t>(std::distance(columns.begin(), it));
+    }
+
+    bool rowBelongsToRange(const std::string& table,
+                           const std::vector<std::string>& columns,
+                           const std::vector<std::string>& row,
+                           const std::string& range_id,
+                           const std::string& start_key,
+                           const std::string& end_key) const {
+        auto range_column = columnIndex(columns, "range_id");
+        if (range_column.has_value()) {
+            if (*range_column >= row.size() || row[*range_column] != range_id) {
+                return false;
+            }
+            auto status_column = columnIndex(columns, "status");
+            return !status_column.has_value() || *status_column >= row.size() ||
+                   row[*status_column] == "active";
+        }
+        if (row.empty()) return false;
+        std::string row_key = tableRowKey(table, row.front());
+        return row_key >= start_key && (end_key.empty() || row_key < end_key);
+    }
+
+    Result executeOne(const ExportRangeRowsCommand& command) {
+        if (!tableExists(command.table) || command.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        SelectAllResult all = queryResultToSelectAll(
+            command.table, db_->executeQuery("PROJECT * FROM " + command.table,
+                                             nullptr, false));
+        RangeRowsResult result{
+            command.table,
+            command.range_id,
+            command.start_key,
+            command.end_key,
+            all.columns,
+            {}};
+        for (const auto& row : all.rows) {
+            if (rowBelongsToRange(command.table,
+                                  all.columns,
+                                  row,
+                                  command.range_id,
+                                  command.start_key,
+                                  command.end_key)) {
+                result.rows.push_back(row);
+            }
+        }
+        return result;
+    }
+
+    Result executeOne(const DeleteRangeRowsCommand& command) {
+        if (!tableExists(command.table) || command.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        SelectAllResult all = queryResultToSelectAll(
+            command.table, db_->executeQuery("PROJECT * FROM " + command.table,
+                                             nullptr, false));
+        auto range_column = columnIndex(all.columns, "range_id");
+        if (range_column.has_value()) {
+            Result result =
+                executeOne(DeleteRowsCommand{command.table,
+                                             "range_id",
+                                             command.range_id});
+            if (const auto* count = std::get_if<DeleteRowsResult>(&result)) {
+                return *count;
+            }
+            return result;
+        }
+        auto primary_column = all.columns.empty()
+                                  ? std::optional<size_t>{}
+                                  : std::optional<size_t>{0};
+        if (!primary_column.has_value()) return SchemaMismatchResult{};
+        size_t deleted = 0;
+        for (const auto& row : all.rows) {
+            if (!rowBelongsToRange(command.table,
+                                   all.columns,
+                                   row,
+                                   command.range_id,
+                                   command.start_key,
+                                   command.end_key) ||
+                *primary_column >= row.size()) {
+                continue;
+            }
+            Result result = executeOne(
+                DeleteRowsCommand{command.table,
+                                  all.columns[*primary_column],
+                                  row[*primary_column]});
+            if (const auto* count = std::get_if<DeleteRowsResult>(&result)) {
+                deleted += count->count;
+            } else if (!std::holds_alternative<TableNotFoundResult>(result)) {
+                return result;
+            }
+        }
+        return DeleteRowsResult{deleted};
+    }
+
+    Result executeOne(const ImportRangeRowsCommand& command) {
+        if (!tableExists(command.table) || command.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        Result cleared = executeOne(
+            DeleteRangeRowsCommand{command.table,
+                                   command.range_id,
+                                   command.start_key,
+                                   command.end_key});
+        if (!std::holds_alternative<DeleteRowsResult>(cleared)) return cleared;
+
+        std::vector<std::string> columns = columnNames(command.table);
+        auto range_column = columnIndex(columns, "range_id");
+        auto group_column = columnIndex(columns, "replica_group_id");
+        size_t inserted = 0;
+        for (auto row : command.rows) {
+            if (range_column.has_value() && *range_column < row.size()) {
+                row[*range_column] = command.range_id;
+            }
+            if (group_column.has_value() && *group_column < row.size()) {
+                row[*group_column] = command.target_replica_group_id;
+            }
+            Result result = executeOne(InsertRowCommand{command.table, row});
+            if (!std::holds_alternative<InsertOkResult>(result)) return result;
+            ++inserted;
+        }
+        return CountRowsResult{inserted};
     }
 
     QueryRowsResult executeQueryRowCount(const std::string& sql) {
@@ -16138,10 +17283,9 @@ private:
         appendReplicaGroupConfig(config);
 
         groups.push_back(command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeTransferRequests(current, assignments, latest_config);
         return StatementOkResult{};
     }
 
@@ -16159,10 +17303,9 @@ private:
             return ConfigRejectedResult{};
         }
         groups = catalogListWithout(std::move(groups), command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeTransferRequests(current, assignments, latest_config);
         return StatementOkResult{};
     }
 
@@ -16176,27 +17319,13 @@ private:
         }
         std::vector<RangeOwnershipRecord> current =
             rangeOwnershipRecordsAtConfig(latest_config);
-        auto groups = activeReplicaGroups(current);
-        if (!catalogListContains(groups, command.target_replica_group_id)) {
+
+        if (!appendRangeTransferRequest(current,
+                                        command.range_id,
+                                        command.target_replica_group_id,
+                                        latest_config)) {
             return ConfigRejectedResult{};
         }
-
-        std::map<std::string, std::string> assignments;
-        bool found = false;
-        bool changed = false;
-        for (const auto& record : current) {
-            assignments[record.range_id] = record.replica_group_id;
-            if (record.range_id == command.range_id) {
-                found = true;
-                changed =
-                    record.replica_group_id != command.target_replica_group_id;
-                assignments[record.range_id] =
-                    command.target_replica_group_id;
-            }
-        }
-        if (!found || !changed) return ConfigRejectedResult{};
-
-        appendRangeConfigRows(latest_config + 1, current, assignments);
         return StatementOkResult{};
     }
 
@@ -16211,22 +17340,32 @@ private:
         }
 
         auto previous = latestRangeTransferRecord(command.range_id);
-        if (previous.has_value() &&
-            command.transfer_epoch <= previous->transfer_epoch) {
-            return ConfigRejectedResult{};
+        if (previous.has_value()) {
+            if (command.transfer_epoch < previous->transfer_epoch) {
+                return ConfigRejectedResult{};
+            }
+            if (command.transfer_epoch == previous->transfer_epoch) {
+                if (previous->status != "requested" ||
+                    previous->target_group_id !=
+                        command.target_replica_group_id) {
+                    return ConfigRejectedResult{};
+                }
+            } else if (rangeTransferInFlight(*previous)) {
+                return ConfigRejectedResult{};
+            }
         }
 
         std::vector<RangeOwnershipRecord> current =
             rangeOwnershipRecordsAtConfig(latest_config);
-        std::optional<RangeOwnershipRecord> source;
-        for (const auto& record : current) {
-            if (record.range_id == command.range_id) {
-                source = record;
-                break;
-            }
-        }
+        std::optional<RangeOwnershipRecord> source =
+            ownershipRecordForRange(current, command.range_id);
         if (!source.has_value() ||
             source->replica_group_id == command.target_replica_group_id) {
+            return ConfigRejectedResult{};
+        }
+        if (previous.has_value() &&
+            command.transfer_epoch == previous->transfer_epoch &&
+            previous->source_group_id != source->replica_group_id) {
             return ConfigRejectedResult{};
         }
 
@@ -16252,10 +17391,16 @@ private:
     Result executeOne(const CatchUpRangeTransferCommand& command) {
         ensureSystemCatalogTables();
         auto transfer = latestRangeTransferRecord(command.range_id);
+        int latest_config = latestRangeConfigNumber();
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
-            transfer->status != "prepared" ||
-            latestRangeConfigNumber() != transfer->prepared_config_num) {
+            transfer->status != "prepared") {
+            return ConfigRejectedResult{};
+        }
+        auto source = ownershipRecordForRange(
+            rangeOwnershipRecordsAtConfig(latest_config), command.range_id);
+        if (!source.has_value() ||
+            source->replica_group_id != transfer->source_group_id) {
             return ConfigRejectedResult{};
         }
         size_t current_keys = logicalKeyCountForRangeId(command.range_id);
@@ -16263,6 +17408,7 @@ private:
             current_keys > transfer->snapshot_key_count
                 ? current_keys - transfer->snapshot_key_count
                 : 0;
+        transfer->prepared_config_num = latest_config;
         transfer->status = "caught_up";
         appendRangeTransferRecord(*transfer);
         return StatementOkResult{};
@@ -16274,8 +17420,7 @@ private:
         int latest_config = latestRangeConfigNumber();
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
-            transfer->status != "caught_up" ||
-            latest_config != transfer->prepared_config_num) {
+            transfer->status != "caught_up") {
             return ConfigRejectedResult{};
         }
 
@@ -16301,6 +17446,7 @@ private:
         appendIndexEntryGroupRows(command.range_id,
                                   transfer->target_group_id,
                                   committed_config);
+        transfer->prepared_config_num = latest_config;
         transfer->status = "committed";
         appendRangeTransferRecord(*transfer);
         return StatementOkResult{};
@@ -16311,7 +17457,8 @@ private:
         auto transfer = latestRangeTransferRecord(command.range_id);
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
-            (transfer->status != "prepared" &&
+            (transfer->status != "requested" &&
+             transfer->status != "prepared" &&
              transfer->status != "caught_up")) {
             return ConfigRejectedResult{};
         }
@@ -16424,35 +17571,13 @@ private:
             return result;
         }
 
-        int transfer_epoch = 1;
-        auto previous =
-            latestRangeTransferRecord(selected->record.range_id);
-        if (previous.has_value()) {
-            transfer_epoch = previous->transfer_epoch + 1;
-        }
-
-        Result prepared = executeOne(
-            PrepareRangeTransferCommand{
-                selected->record.range_id,
-                lightest->first,
-                transfer_epoch});
-        if (!(prepared == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
-        Result caught_up = executeOne(
-            CatchUpRangeTransferCommand{
-                selected->record.range_id,
-                transfer_epoch});
-        if (!(caught_up == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
-        Result committed = executeOne(
-            CommitRangeTransferCommand{
-                selected->record.range_id,
-                transfer_epoch});
-        if (!(committed == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
+        auto request = buildRangeTransferRequest(
+            records,
+            selected->record.range_id,
+            lightest->first,
+            latest_config);
+        if (!request.has_value()) return result;
+        appendRangeTransferRecord(*request);
 
         result.moved = true;
         result.range_id = selected->record.range_id;
@@ -16463,7 +17588,7 @@ private:
         result.target_keys_before = lightest->second;
         result.source_keys_after = after_loads[heaviest->first];
         result.target_keys_after = after_loads[lightest->first];
-        result.config_num = latestRangeConfigNumber();
+        result.config_num = latest_config;
         return result;
     }
 
@@ -19145,6 +20270,9 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     };
 
     bootstrapGroup(catalog, true);
+    for (const auto& title : titles) {
+        commitCommand(catalog, parseSQL("INSERT " + title.first));
+    }
     commitCommand(catalog, createTitleYearIndex(index_replica_group));
 
     bootstrapGroup(table_owner, false);
@@ -19191,19 +20319,21 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     Result decision = commitCommand(
         catalog,
         CommitPreparedDistributedTransactionCommand{"trace-txn", false});
-    commitCommand(table_owner,
-                  ApplyParticipantTransactionCommand{
-                      "trace-txn",
-                      defaultRangeIdForTable("title"),
-                      "group-1",
-                      statements});
-    commitCommand(index_owner,
-                  ApplyParticipantTransactionCommand{
-                      "trace-txn",
-                      index_range,
-                      index_replica_group,
-                      statements});
-    commitCommand(catalog, RecoverDistributedTransactionsCommand{});
+    ControlPlaneRuntime txn_runtime{
+        [&](const Command& command) {
+            return commitCommand(catalog, command);
+        }};
+    txn_runtime.registerReplicaGroup(
+        "group-1",
+        [&](const Command& command) {
+            return commitCommand(table_owner, command);
+        });
+    txn_runtime.registerReplicaGroup(
+        index_replica_group,
+        [&](const Command& command) {
+            return commitCommand(index_owner, command);
+        });
+    txn_runtime.runUntilIdle();
 
     const auto* committed = std::get_if<DistributedTxnResult>(&decision);
     SelectAllResult txns = readSystemCatalog(catalog, "__distributed_txns");
@@ -19245,6 +20375,82 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     std::cout << "  catalog rows: __distributed_txns="
               << txns.rows.size()
               << ", __txn_participants=" << participants.rows.size()
+              << std::endl;
+
+    const std::string target_group_id = "group-index-target";
+    TraceGroup index_target = makeGroup(target_group_id, "index-target", 4);
+    auto registerTargetGroup = [&]() {
+        return RegisterReplicaGroupCommand{
+            target_group_id, {"target1", "target2", "target3"}, 1};
+    };
+    commitCommand(catalog, registerTargetGroup());
+    commitCommand(index_owner, registerTargetGroup());
+    commitCommand(index_target, bootstrapClusterACommand());
+    commitCommand(index_target, registerGroup1Command());
+    commitCommand(index_target, registerIndexGroup());
+    commitCommand(index_target, registerTargetGroup());
+    commitCommand(index_target, createTitleTableCommand());
+    commitCommand(index_target, createTitleYearIndex(target_group_id));
+
+    auto activeIndexEntries = [&](const TraceGroup& group) {
+        SelectAllResult rows = readSystemCatalog(group, "__index_entries");
+        auto range_col = catalogColumnIndex(rows, "range_id");
+        auto status_col = catalogColumnIndex(rows, "status");
+        SelectAllResult out{rows.columns, {}};
+        if (!range_col.has_value() || !status_col.has_value()) return out;
+        for (const auto& row : rows.rows) {
+            if (*range_col < row.size() && *status_col < row.size() &&
+                row[*range_col] == index_range && row[*status_col] == "active") {
+                out.rows.push_back(row);
+            }
+        }
+        return out;
+    };
+    auto routeIndexGroup = [&](const std::string& year) {
+        Result route_result =
+            leaderNode(catalog)->executeReadOnlyForTest(
+                ExplainIndexLookupCommand{title_year_index, year});
+        const auto* route = std::get_if<RouteResult>(&route_result);
+        if (route == nullptr || route->replica_group_ids.empty()) {
+            return std::string("?");
+        }
+        return route->replica_group_ids.front();
+    };
+    std::string route_before_transfer = routeIndexGroup(new_year);
+    commitCommand(catalog, MoveRangeCommand{index_range, target_group_id});
+    ControlPlaneRuntime runtime{
+        [&](const Command& command) { return commitCommand(catalog, command); }
+    };
+    runtime.registerReplicaGroup(
+        index_owner.group_id,
+        [&](const Command& command) { return commitCommand(index_owner, command); }
+    );
+    runtime.registerReplicaGroup(
+        index_target.group_id,
+        [&](const Command& command) { return commitCommand(index_target, command); }
+    );
+    if (!(runtime.tick().result == Result{StatementOkResult{}})) {
+        throw std::runtime_error("trace control plane runtime prepare failed");
+    }
+    size_t copied_entries = activeIndexEntries(index_target).rows.size();
+    std::string route_after_prepare = routeIndexGroup(new_year);
+    if (!(runtime.tick().result == Result{StatementOkResult{}}) ||
+        !(runtime.tick().result == Result{StatementOkResult{}})) {
+        throw std::runtime_error("trace control plane runtime commit failed");
+    }
+    std::string route_after_commit = routeIndexGroup(new_year);
+    IndexLookupResult moved_lookup = readIndex(index_target, new_year);
+
+    std::cout << "  range transfer: route_before=" << route_before_transfer
+              << ", route_after_prepare=" << route_after_prepare
+              << ", route_after_commit=" << route_after_commit
+              << ", copied_entries=" << copied_entries
+              << ", source_entries_after="
+              << activeIndexEntries(index_owner).rows.size()
+              << ", target_entries_after="
+              << activeIndexEntries(index_target).rows.size()
+              << ", target_primary_keys="
+              << moved_lookup.primary_keys.size()
               << std::endl;
     std::cout << std::endl;
 }
@@ -19557,14 +20763,18 @@ int main(int argc, char* argv[]) {
                                 const std::string& participant_range_id,
                                 const std::string& participant_replica_group_id,
                                 const std::string& txn_id,
-                                const std::vector<std::string>& statements) {
+                                const std::vector<std::string>& statements,
+                                const std::string& read_ts = "",
+                                const std::string& commit_ts = "") {
         Result result = commitCommand(
             group,
             ApplyParticipantTransactionCommand{
                 txn_id,
                 participant_range_id,
                 participant_replica_group_id,
-                statements});
+                statements,
+                read_ts,
+                commit_ts});
         const auto* applied = std::get_if<DistributedTxnResult>(&result);
         if (applied == nullptr) {
             throw std::runtime_error("participant transaction apply failed: " +
@@ -19585,6 +20795,26 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error("no physical participant group for " + group_id);
     };
 
+    auto controlPlaneRuntime = [&](IndexScenario& scenario,
+                                   bool leader = true) {
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            },
+            leader};
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        runtime.registerReplicaGroup(
+            scenario.index_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.index_owner, command);
+            });
+        return runtime;
+    };
+
     auto applyParticipants = [&](IndexScenario& scenario,
                                  const DistributedTxnResult& decision,
                                  const std::vector<std::string>& statements) {
@@ -19598,7 +20828,9 @@ int main(int argc, char* argv[]) {
                              range_id,
                              group_id,
                              decision.txn_id,
-                             statements);
+                             statements,
+                             decision.read_timestamp,
+                             decision.commit_timestamp);
         }
     };
 
@@ -19613,7 +20845,9 @@ int main(int argc, char* argv[]) {
                                         decision.participant_range_ids[i],
                                         group_id,
                                         decision.txn_id,
-                                        statements);
+                                        statements,
+                                        decision.read_timestamp,
+                                        decision.commit_timestamp);
             }
         }
         throw std::runtime_error("decision has no participant group " + group_id);
@@ -19716,6 +20950,338 @@ int main(int argc, char* argv[]) {
         }
         return *committed;
     };
+
+
+    struct RangeTransferView {
+        std::string range_id;
+        std::string source_group_id;
+        std::string target_group_id;
+        int transfer_epoch = 0;
+        size_t snapshot_key_count = 0;
+        size_t catchup_key_count = 0;
+        int prepared_config_num = 0;
+        std::string status;
+    };
+
+    auto latestTransferOn = [&](const ConsensusGroupHarness& group,
+                                const std::string& range_id)
+        -> std::optional<RangeTransferView> {
+        SelectAllResult transfers =
+            catalogTableOn(group, group.leader, "__range_transfers");
+        std::optional<RangeTransferView> latest;
+        for (const auto& row : transfers.rows) {
+            auto row_range = selectAllValue(transfers, row, "range_id");
+            auto source = selectAllValue(transfers, row, "source_group_id");
+            auto target = selectAllValue(transfers, row, "target_group_id");
+            auto epoch = selectAllValue(transfers, row, "transfer_epoch");
+            auto snapshot = selectAllValue(transfers, row, "snapshot_key_count");
+            auto catchup = selectAllValue(transfers, row, "catchup_key_count");
+            auto config = selectAllValue(transfers, row, "prepared_config_num");
+            auto status = selectAllValue(transfers, row, "status");
+            if (!row_range.has_value() || *row_range != range_id ||
+                !source.has_value() || !target.has_value() ||
+                !epoch.has_value() || !snapshot.has_value() ||
+                !catchup.has_value() || !config.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+            RangeTransferView view{
+                *row_range,
+                *source,
+                *target,
+                std::stoi(*epoch),
+                static_cast<size_t>(std::stoull(*snapshot)),
+                static_cast<size_t>(std::stoull(*catchup)),
+                std::stoi(*config),
+                *status};
+            if (!latest.has_value() ||
+                view.transfer_epoch >= latest->transfer_epoch) {
+                latest = view;
+            }
+        }
+        return latest;
+    };
+
+    auto physicalIndexEntryCount = [&](const ConsensusGroupHarness& group,
+                                       const std::string& range_id) {
+        SelectAllResult rows =
+            catalogTableOn(group, group.leader, "__index_entries");
+        auto range_column = catalogColumnIndex(rows, "range_id");
+        auto status_column = catalogColumnIndex(rows, "status");
+        if (!range_column.has_value() || !status_column.has_value()) {
+            return size_t{0};
+        }
+        size_t count = 0;
+        for (const auto& row : rows.rows) {
+            if (*range_column < row.size() &&
+                *status_column < row.size() &&
+                row[*range_column] == range_id &&
+                row[*status_column] == "active") {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    auto indexRouteGroupOnCatalog = [&](const ConsensusGroupHarness& catalog,
+                                        const std::string& year) {
+        Result route_result =
+            leaderNode(catalog)->executeReadOnlyForTest(
+                ExplainIndexLookupCommand{title_year_index, year});
+        const auto* route = std::get_if<RouteResult>(&route_result);
+        if (route == nullptr || route->replica_group_ids.empty()) {
+            throw std::runtime_error("missing index route for " + year);
+        }
+        return route->replica_group_ids.front();
+    };
+
+    struct IndexMovementScenario {
+        TitleIndexFixture fixture;
+        ConsensusGroupHarness catalog;
+        ConsensusGroupHarness source;
+        ConsensusGroupHarness target;
+    };
+
+    auto buildIndexMovementScenario = [&]() {
+        IndexMovementScenario scenario;
+        scenario.fixture = titleIndexFixture();
+        scenario.catalog =
+            makeConsensusGroup("movement-catalog", "move-catalog", 11);
+        scenario.source =
+            makeConsensusGroup("group-index-source", "index-source", 12);
+        scenario.target =
+            makeConsensusGroup("group-index-target", "index-target", 13);
+
+        auto registerSource = [&]() {
+            return RegisterReplicaGroupCommand{
+                scenario.source.group_id, {"source1", "source2", "source3"}, 1};
+        };
+        auto registerTarget = [&]() {
+            return RegisterReplicaGroupCommand{
+                scenario.target.group_id, {"target1", "target2", "target3"}, 1};
+        };
+        auto indexCommandFor = [&](const std::string& group_id) {
+            return CreateSecondaryIndexCommand{
+                title_year_index, "title", "production_year", group_id};
+        };
+        auto bootstrapMovementGroup = [&](ConsensusGroupHarness& group) {
+            tests.check(commitCommand(group, bootstrapClusterACommand()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should bootstrap");
+            tests.check(commitCommand(group, registerGroup1Command()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should register table group");
+            tests.check(commitCommand(group, registerSource()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should register source index group");
+            tests.check(commitCommand(group, registerTarget()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should register target index group");
+            tests.check(commitCommand(group, createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        group.group_id + " should create title schema");
+        };
+
+        bootstrapMovementGroup(scenario.catalog);
+        bootstrapMovementGroup(scenario.source);
+        bootstrapMovementGroup(scenario.target);
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(commitCommand(scenario.catalog,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "catalog should store title row for index metadata");
+            tests.check(commitCommand(scenario.source,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "source should store title row for physical index build");
+        }
+        tests.check(commitCommand(scenario.catalog,
+                                  indexCommandFor(scenario.source.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "catalog should route index range to source");
+        tests.check(commitCommand(scenario.source,
+                                  indexCommandFor(scenario.source.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "source should materialize index postings");
+        tests.check(commitCommand(scenario.target,
+                                  indexCommandFor(scenario.target.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "target should create empty physical index range");
+        return scenario;
+    };
+
+    tests.test("Hybrid MVCC policy uses HLC and first-writer-wins", [&] {
+        std::vector<std::string> log_lines;
+        HybridMVCCPolicy policy{
+            [&](const std::string& line) {
+                log_lines.push_back(line);
+            }};
+        ConcurrencyControlResource title_table{
+            "table:title",
+            "table title"};
+        policy.begin(1, "T1");
+        policy.begin(2, "T2");
+        tests.check(policy.readTimestamp(1).find('.') != std::string::npos &&
+                        policy.readTimestamp(2).find('.') != std::string::npos,
+                    "MVCC transactions should receive HLC read timestamps");
+        tests.check(policy.beforeAccess(
+                        ConcurrencyControlRequest{
+                            2,
+                            "T2",
+                            AccessType::Read,
+                            {title_table},
+                            "snapshot read"}).granted,
+                    "MVCC snapshot reads should not block on writers");
+        tests.check(policy.beforeAccess(
+                        ConcurrencyControlRequest{
+                            1,
+                            "T1",
+                            AccessType::Write,
+                            {title_table},
+                            "update title"}).granted,
+                    "first MVCC writer should install an intent");
+        auto conflict = policy.beforeAccess(
+            ConcurrencyControlRequest{
+                2,
+                "T2",
+                AccessType::Write,
+                {title_table},
+                "update title"});
+        tests.check(!conflict.granted &&
+                        conflict.reason.find("active MVCC writer") !=
+                            std::string::npos,
+                    "second overlapping writer should be rejected");
+        policy.assignHybridTimestamps(1, "10.1", "10.2");
+        policy.commit(1);
+        tests.check(policy.commitTimestamp(1) == "10.2",
+                    "externally assigned HLC commit timestamp should win");
+        tests.check(policy.beforeAccess(
+                        ConcurrencyControlRequest{
+                            2,
+                            "T2",
+                            AccessType::Write,
+                            {title_table},
+                            "retry update title"}).granted,
+                    "writer should proceed after conflicting writer commits");
+        policy.abort(2);
+    });
+
+    tests.test("BuzzDB local nodes default to Hybrid MVCC timestamps", [&] {
+        BuzzDB db;
+        tests.check(db.localConcurrencyPolicyName() == "Hybrid MVCC",
+                    "new local BuzzDB nodes should use Hybrid MVCC");
+        TxnPtr local = db.begin("local-hlc");
+        tests.check(db.txnReadTimestamp(local).find('.') != std::string::npos,
+                    "local transaction should expose an HLC read timestamp");
+        db.commit(local);
+        tests.check(db.txnCommitTimestamp(local).find('.') != std::string::npos,
+                    "committed local transaction should expose an HLC commit timestamp");
+
+        TxnPtr assigned =
+            db.beginWithHybridTimestamps("assigned-hlc", "123.4", "123.5");
+        tests.check(db.txnReadTimestamp(assigned) == "123.4",
+                    "assigned HLC read timestamp should be visible locally");
+        db.commit(assigned);
+        tests.check(db.txnCommitTimestamp(assigned) == "123.5",
+                    "assigned HLC commit timestamp should be preserved locally");
+    });
+
+    tests.test("Range transfer moves physical index entries before ownership switch", [&] {
+        auto scenario = buildIndexMovementScenario();
+        std::string range_id = defaultRangeIdForIndex(title_year_index);
+        std::string year = scenario.fixture.duplicate_year;
+        size_t source_before = physicalIndexEntryCount(scenario.source, range_id);
+        tests.check(source_before == scenario.fixture.initial_rows.size() &&
+                        physicalIndexEntryCount(scenario.target, range_id) == 0,
+                    "source should start with all physical postings and target empty");
+        tests.check(indexRouteGroupOnCatalog(scenario.catalog, year) ==
+                        scenario.source.group_id,
+                    "catalog should route index lookup to source before move");
+
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        MoveRangeCommand{range_id, scenario.target.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "move should create a transfer request without switching ownership");
+        auto requested = latestTransferOn(scenario.catalog, range_id);
+        tests.check(requested.has_value() &&
+                        requested->status == "requested" &&
+                        requested->snapshot_key_count == 0 &&
+                        requested->source_group_id == scenario.source.group_id &&
+                        requested->target_group_id == scenario.target.group_id,
+                    "move should record requested transfer metadata only");
+        tests.check(indexRouteGroupOnCatalog(scenario.catalog, year) ==
+                        scenario.source.group_id &&
+                        physicalIndexEntryCount(scenario.target, range_id) == 0,
+                    "requested transfer should not move route or target data");
+
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            }
+        };
+        runtime.registerReplicaGroup(
+            scenario.source.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.source, command);
+            }
+        );
+        runtime.registerReplicaGroup(
+            scenario.target.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.target, command);
+            }
+        );
+        auto prepared_step = runtime.tick();
+        tests.check(prepared_step.result == Result{StatementOkResult{}},
+                    "control plane runtime prepare should copy the source physical range");
+        auto prepared = latestTransferOn(scenario.catalog, range_id);
+        tests.check(prepared.has_value() &&
+                        prepared->status == "prepared" &&
+                        prepared->snapshot_key_count == source_before,
+                    "prepare should count the real source index postings");
+        size_t copied = physicalIndexEntryCount(scenario.target, range_id);
+        tests.check(copied == source_before &&
+                        physicalIndexEntryCount(scenario.target, range_id) ==
+                            source_before &&
+                        physicalIndexEntryCount(scenario.source, range_id) ==
+                            source_before,
+                    "copy phase should physically duplicate postings before switch");
+        tests.check(indexRouteGroupOnCatalog(scenario.catalog, year) ==
+                        scenario.source.group_id,
+                    "route should stay on source until commit");
+
+        auto caught_up_step = runtime.tick();
+        tests.check(caught_up_step.result == Result{StatementOkResult{}},
+                    "control plane runtime catch-up should complete before ownership switch");
+        tests.check(indexRouteGroupOnCatalog(scenario.catalog, year) ==
+                        scenario.source.group_id,
+                    "catch-up should still not switch catalog ownership");
+
+        auto committed_step = runtime.tick();
+        tests.check(committed_step.result == Result{StatementOkResult{}},
+                    "control plane runtime commit should switch catalog ownership after copy");
+        tests.check(indexRouteGroupOnCatalog(scenario.catalog, year) ==
+                        scenario.target.group_id,
+                    "committed transfer should route to target group");
+        tests.check(physicalIndexEntryCount(scenario.source, range_id) == 0 &&
+                        physicalIndexEntryCount(scenario.target, range_id) ==
+                            source_before,
+                    "cleanup should leave exactly one physical copy on target");
+        IndexLookupResult lookup =
+            readIndexOn(scenario.target, scenario.target.leader, year);
+        std::string expected_primary_key;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            if (row.values.size() >= 4 && row.values[3] == year) {
+                expected_primary_key = row.values[0];
+                break;
+            }
+        }
+        tests.check(!expected_primary_key.empty() &&
+                        containsText(lookup.primary_keys,
+                                     expected_primary_key),
+                    "target physical HashIndex should answer moved lookup");
+    });
 
     struct TwoPhaseHarness {
         Address coordinator;
@@ -20156,12 +21722,38 @@ int main(int argc, char* argv[]) {
         deliverDecisionTo(harness, prepared.txn_id, index_range, true);
         tests.check(allAcks(harness, prepared, "committed"),
                     "all participants should acknowledge commit");
-        applyParticipants(scenario, prepared, statements);
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitPrepared(scenario.catalog,
-                                       prepared.txn_id,
-                                       true)),
-                    "coordinator should apply after all commit acks");
+        ControlPlaneRuntime runtime = controlPlaneRuntime(scenario);
+        tests.check(runtime.runUntilIdle() == 1,
+                    "control plane runtime should finish the committed transaction");
+        SelectAllResult coordinator_txns =
+            catalogTableOn(scenario.catalog,
+                           scenario.catalog.leader,
+                           "__distributed_txns");
+        SelectAllResult coordinator_intents =
+            catalogTableOn(scenario.catalog,
+                           scenario.catalog.leader,
+                           "__txn_intents");
+        SelectAllResult index_intents =
+            catalogTableOn(scenario.index_owner,
+                           scenario.index_owner.leader,
+                           "__txn_intents");
+        bool catalogs_store_hlc_as_numbers =
+            catalogColumnIndex(coordinator_txns, "read_physical_hi").has_value() &&
+            catalogColumnIndex(coordinator_txns, "read_physical_lo").has_value() &&
+            catalogColumnIndex(coordinator_txns, "read_logical").has_value() &&
+            catalogColumnIndex(coordinator_txns, "commit_physical_hi").has_value() &&
+            catalogColumnIndex(coordinator_txns, "commit_physical_lo").has_value() &&
+            catalogColumnIndex(coordinator_txns, "commit_logical").has_value() &&
+            !catalogColumnIndex(coordinator_txns, "read_ts").has_value() &&
+            !catalogColumnIndex(coordinator_txns, "commit_ts").has_value() &&
+            catalogColumnIndex(coordinator_intents, "read_physical_hi").has_value() &&
+            catalogColumnIndex(coordinator_intents, "read_physical_lo").has_value() &&
+            catalogColumnIndex(coordinator_intents, "read_logical").has_value() &&
+            catalogColumnIndex(coordinator_intents, "commit_physical_hi").has_value() &&
+            catalogColumnIndex(coordinator_intents, "commit_physical_lo").has_value() &&
+            catalogColumnIndex(coordinator_intents, "commit_logical").has_value() &&
+            !catalogColumnIndex(coordinator_intents, "read_ts").has_value() &&
+            !catalogColumnIndex(coordinator_intents, "commit_ts").has_value();
         tests.check(txnHasStatus(scenario.catalog,
                                  prepared.txn_id,
                                  "ended") &&
@@ -20179,8 +21771,69 @@ int main(int argc, char* argv[]) {
                                         scenario.index_owner.leader,
                                         new_year).primary_keys,
                             row.values[0]) &&
+                        selectAllHasRow(coordinator_intents,
+                                        {{"txn_id", prepared.txn_id},
+                                         {"range_id", table_range},
+                                         {"status", "prepared"}}) &&
+                        selectAllHasRow(index_intents,
+                                        {{"txn_id", prepared.txn_id},
+                                         {"range_id", index_range},
+                                         {"status", "committed"}}) &&
+                        !prepared.read_timestamp.empty() &&
+                        !prepared.commit_timestamp.empty() &&
+                        catalogs_store_hlc_as_numbers &&
                         countRowsOn(scenario.index_owner, "title") == 0,
-                    "finished 2PC transaction should update table and index owners");
+                    "runtime-finished 2PC transaction should update table and index owners with durable intents");
+    });
+
+    tests.test("Control plane runtime is leader-gated for transaction recovery", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[5];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        DistributedTxnResult prepared =
+            runPrepare(scenario.catalog, "txn-runtime-leader", statements);
+        tests.check(std::holds_alternative<DistributedTxnResult>(
+                        commitPrepared(scenario.catalog,
+                                       prepared.txn_id,
+                                       false)),
+                    "coordinator should durably record the commit decision");
+        tests.check(commitCommand(scenario.catalog,
+                                  RecoverDistributedTransactionsCommand{}) ==
+                        Result{ConfigRejectedResult{}},
+                    "coordinator-only recovery should not finish participant work");
+
+        ControlPlaneRuntime follower_runtime =
+            controlPlaneRuntime(scenario, false);
+        tests.check(follower_runtime.runUntilIdle() == 0 &&
+                        !txnHasStatus(scenario.catalog,
+                                      prepared.txn_id,
+                                      "ended") &&
+                        firstRowValue(
+                            selectTitleById(scenario.table_owner,
+                                            row.values[0]),
+                            "production_year") == old_year,
+                    "non-leader control plane runtime should not schedule recovery");
+
+        ControlPlaneRuntime leader_runtime = controlPlaneRuntime(scenario);
+        tests.check(leader_runtime.runUntilIdle() == 1,
+                    "leader control plane runtime should recover the transaction");
+        tests.check(txnHasStatus(scenario.catalog,
+                                 prepared.txn_id,
+                                 "ended") &&
+                        firstRowValue(
+                            selectTitleById(scenario.table_owner,
+                                            row.values[0]),
+                            "production_year") == new_year &&
+                        containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        new_year).primary_keys,
+                            row.values[0]),
+                    "leader runtime should apply participants through their replica groups");
     });
 
     tests.test("Duplicate 2PC messages are participant-idempotent", [&] {
