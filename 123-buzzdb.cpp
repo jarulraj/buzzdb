@@ -16399,17 +16399,6 @@ Scenario oneClientBuzzDBScenario(Workload workload) {
         .build();
 }
 
-std::vector<Command> titleInsertCommandsFromImdb(
-    const std::string& data_file,
-    size_t row_count) {
-    std::vector<Command> commands{createTitleTableCommand()};
-    for (const auto& row : requireTupleLinesFromFile(
-             data_file, "title", row_count)) {
-        commands.push_back(parseSQL("INSERT " + row));
-    }
-    return commands;
-}
-
 std::string formatSelectAllResult(const SelectAllResult& result) {
     const auto& columns = result.columns;
     const auto& rows = result.rows;
@@ -16459,7 +16448,7 @@ std::string formatSelectAllResult(const SelectAllResult& result) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -16514,8 +16503,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v123-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -18571,7 +18560,7 @@ int main(int argc, char* argv[]) {
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
         printMembershipTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
@@ -18890,6 +18879,168 @@ int main(int argc, char* argv[]) {
                         replica.str() +
                             " should record the final two-voter config");
         }
+    });
+
+
+    struct PhysicalExportedTitleRow {
+        std::string primary_key;
+        std::string insert_sql;
+    };
+
+    auto physicalTitleRowsForMovement = [&]() {
+        std::vector<std::pair<std::string, std::vector<std::string>>> rows;
+        for (const auto& line :
+             requireTupleLinesFromFile(imdb_file, "title", 6)) {
+            rows.push_back({line, tupleValuesFromLine(line, "title")});
+        }
+        std::sort(
+            rows.begin(),
+            rows.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.second.front() < rhs.second.front();
+            });
+        return rows;
+    };
+
+    auto physicalRowInsertSQL = [](const std::vector<std::string>& values) {
+        std::ostringstream out;
+        out << "INSERT title";
+        for (const auto& value : values) out << "|" << value;
+        return out.str();
+    };
+
+    auto ensurePhysicalTitleTable = [&](BuzzDBCore& shard) {
+        Result existing = shard.execute(CountRowsCommand{"title"});
+        if (std::holds_alternative<TableNotFoundResult>(existing)) {
+            tests.check(shard.execute(createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        "physical shard should create a title table");
+        }
+    };
+
+    auto physicalTitleCount = [&](BuzzDBCore& shard) {
+        Result result = shard.execute(CountRowsCommand{"title"});
+        const auto* count = std::get_if<CountRowsResult>(&result);
+        return count == nullptr ? size_t{0} : count->count;
+    };
+
+    auto selectPhysicalTitle = [&](BuzzDBCore& shard,
+                                   const std::string& primary_key) {
+        Result result = shard.execute(
+            SelectWhereCommand{"title", "id", primary_key});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return SelectAllResult{};
+        return *rows;
+    };
+
+    auto loadPhysicalTitleRows = [&, physicalRowInsertSQL](
+                                     BuzzDBCore& shard,
+                                     const std::vector<std::pair<
+                                         std::string,
+                                         std::vector<std::string>>>& rows) {
+        ensurePhysicalTitleTable(shard);
+        for (const auto& row : rows) {
+            tests.check(shard.execute(parseSQL("INSERT " + row.first)) ==
+                            Result{InsertOkResult{}},
+                        "source shard should load real IMDB title row " +
+                            row.second.front());
+        }
+    };
+
+    auto exportPhysicalRows = [&, physicalRowInsertSQL](
+                                  BuzzDBCore& source,
+                                  const std::vector<std::pair<
+                                      std::string,
+                                      std::vector<std::string>>>& rows) {
+        std::vector<PhysicalExportedTitleRow> exported;
+        for (const auto& row : rows) {
+            const std::string& primary_key = row.second.front();
+            SelectAllResult selected = selectPhysicalTitle(source, primary_key);
+            tests.check(selected.rows.size() == 1,
+                        "source shard should physically contain " +
+                            primary_key + " before export");
+            if (!selected.rows.empty()) {
+                exported.push_back(
+                    PhysicalExportedTitleRow{
+                        primary_key,
+                        physicalRowInsertSQL(selected.rows.front())});
+            }
+        }
+        return exported;
+    };
+
+    auto importPhysicalRowsIfMissing = [&](BuzzDBCore& target,
+                                           const std::vector<
+                                               PhysicalExportedTitleRow>& rows) {
+        ensurePhysicalTitleTable(target);
+        for (const auto& row : rows) {
+            if (!selectPhysicalTitle(target, row.primary_key).rows.empty()) {
+                continue;
+            }
+            tests.check(target.execute(parseSQL(row.insert_sql)) ==
+                            Result{InsertOkResult{}},
+                        "target shard should import physical row " +
+                            row.primary_key);
+        }
+    };
+
+    auto deletePhysicalRows = [&](BuzzDBCore& source,
+                                  const std::vector<
+                                      PhysicalExportedTitleRow>& rows) {
+        for (const auto& row : rows) {
+            tests.check(source.execute(
+                            DeleteRowsCommand{"title", "id", row.primary_key}) ==
+                            Result{DeleteRowsResult{1}},
+                        "source shard should delete moved row " +
+                            row.primary_key);
+        }
+    };
+
+    tests.test("Physical shard split copies rows and removes source copies", [&] {
+        runWithSuppressedStdout([&] {
+        auto rows = physicalTitleRowsForMovement();
+        size_t split_index = rows.size() / 2;
+        std::vector<std::pair<std::string, std::vector<std::string>>> left_rows(
+            rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(split_index));
+        std::vector<std::pair<std::string, std::vector<std::string>>> right_rows(
+            rows.begin() + static_cast<std::ptrdiff_t>(split_index), rows.end());
+
+        BuzzDBCore source;
+        BuzzDBCore left;
+        BuzzDBCore right;
+        loadPhysicalTitleRows(source, rows);
+        tests.check(physicalTitleCount(source) == rows.size(),
+                    "source shard should begin with every title row");
+
+        std::vector<PhysicalExportedTitleRow> left_export =
+            exportPhysicalRows(source, left_rows);
+        std::vector<PhysicalExportedTitleRow> right_export =
+            exportPhysicalRows(source, right_rows);
+        importPhysicalRowsIfMissing(left, left_export);
+        importPhysicalRowsIfMissing(right, right_export);
+        importPhysicalRowsIfMissing(left, left_export);
+        deletePhysicalRows(source, left_export);
+        deletePhysicalRows(source, right_export);
+
+        tests.check(physicalTitleCount(left) == split_index,
+                    "left shard should contain copied lower-half rows");
+        tests.check(physicalTitleCount(right) == rows.size() - split_index,
+                    "right shard should contain copied upper-half rows");
+        tests.check(physicalTitleCount(source) == 0,
+                    "source shard should no longer contain moved rows");
+
+        for (const auto& row : rows) {
+            const std::string& primary_key = row.second.front();
+            size_t copies = 0;
+            copies += selectPhysicalTitle(source, primary_key).rows.size();
+            copies += selectPhysicalTitle(left, primary_key).rows.size();
+            copies += selectPhysicalTitle(right, primary_key).rows.size();
+            tests.check(copies == 1,
+                        "exactly one physical shard should contain " +
+                            primary_key);
+        }
+        return 0;
+        });
     });
 
     return tests.finish();

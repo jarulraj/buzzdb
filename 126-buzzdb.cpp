@@ -12531,20 +12531,12 @@ private:
         std::vector<InsertRowCommand> catalog_rows{
             InsertRowCommand{
                 "__ranges",
-                {source->range_id,
-                 source->start_key,
-                 source->end_key,
-                 source->replica_group_id,
-                 std::to_string(command.descriptor_version),
-                 "superseded"}},
-            InsertRowCommand{
-                "__ranges",
                 {command.left_range_id,
                  source->start_key,
                  split_key,
                  source->replica_group_id,
                  std::to_string(command.descriptor_version),
-                 "active"}},
+                 "planned"}},
             InsertRowCommand{
                 "__ranges",
                 {command.right_range_id,
@@ -12552,7 +12544,7 @@ private:
                  source->end_key,
                  source->replica_group_id,
                  std::to_string(command.descriptor_version),
-                 "active"}}
+                 "planned"}}
         };
 
         for (const auto& record : records) {
@@ -14729,6 +14721,168 @@ private:
     std::vector<RangeDescriptor> cached_ranges_;
 };
 
+class SplitPlanningCluster {
+public:
+    SplitPlanningCluster(std::string table,
+                         CreateTableCommand create_table,
+                         std::string source_range_id,
+                         std::string left_range_id,
+                         std::string right_range_id,
+                         std::string source_group_id = "group-1")
+        : table_(std::move(table)),
+          create_table_(std::move(create_table)),
+          source_range_id_(std::move(source_range_id)),
+          left_range_id_(std::move(left_range_id)),
+          right_range_id_(std::move(right_range_id)),
+          source_group_id_(std::move(source_group_id)) {}
+
+    void loadSourceRows(
+        const std::vector<std::pair<std::string,
+                                    std::vector<std::string>>>& rows) {
+        ensureTable(catalog_);
+        ensureTable(source_);
+        loaded_rows_ = rows;
+        for (const auto& row : loaded_rows_) {
+            requireResultType<InsertOkResult>(
+                source_.execute(parseSQL("INSERT " + row.first)),
+                "source range should load " + primaryKey(row));
+            recordCatalogKey(primaryKey(row),
+                             source_range_id_,
+                             source_group_id_,
+                             1);
+        }
+    }
+
+    Result splitTable(const SplitTableCommand& command) {
+        return catalog_.execute(command);
+    }
+
+    RouteResult routePoint(const std::string& primary_key) {
+        Result result = catalog_.execute(
+            ExplainRouteCommand{table_, primary_key, false});
+        const auto* route = std::get_if<RouteResult>(&result);
+        if (route == nullptr) {
+            throw std::runtime_error("expected route result");
+        }
+        return *route;
+    }
+
+    size_t sourceRowCount() { return rowCount(source_); }
+    size_t leftRowCount() { return rowCount(left_); }
+    size_t rightRowCount() { return rowCount(right_); }
+
+    size_t plannedKeyCount(const std::string& range_id) {
+        Result result = catalog_.execute(SelectAllCommand{"__global_keys"});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return 0;
+
+        struct LatestKeyOwner {
+            std::string range_id;
+            int descriptor_version = 0;
+        };
+        std::map<std::string, LatestKeyOwner> latest;
+        for (const auto& row : rows->rows) {
+            if (row.size() < 6 || row[0] != table_) continue;
+            int version = std::stoi(row[5]);
+            std::string key = row[0] + std::string(1, '\0') + row[1] +
+                              std::string(1, '\0') + row[2];
+            auto it = latest.find(key);
+            if (it == latest.end() ||
+                version >= it->second.descriptor_version) {
+                latest[key] = LatestKeyOwner{row[3], version};
+            }
+        }
+
+        size_t count = 0;
+        for (const auto& [key, owner] : latest) {
+            (void)key;
+            if (owner.range_id == range_id) ++count;
+        }
+        return count;
+    }
+
+    size_t physicalCopies(const std::string& primary_key) {
+        return selectRows(source_, primary_key).rows.size() +
+               selectRows(left_, primary_key).rows.size() +
+               selectRows(right_, primary_key).rows.size();
+    }
+
+    BuzzDBCore& catalogStore() { return catalog_; }
+    BuzzDBCore& sourceStore() { return source_; }
+    BuzzDBCore& leftStore() { return left_; }
+    BuzzDBCore& rightStore() { return right_; }
+
+private:
+    template <typename ResultType>
+    static void requireResultType(const Result& actual,
+                                  const std::string& message) {
+        if (!std::holds_alternative<ResultType>(actual)) {
+            throw std::runtime_error(
+                message + ": got " + describeResult(actual));
+        }
+    }
+
+    static std::string primaryKey(
+        const std::pair<std::string, std::vector<std::string>>& row) {
+        if (row.second.empty()) {
+            throw std::runtime_error("row is missing a primary key");
+        }
+        return row.second.front();
+    }
+
+    void ensureTable(BuzzDBCore& store) {
+        Result count = store.execute(CountRowsCommand{table_});
+        if (std::holds_alternative<TableNotFoundResult>(count)) {
+            requireResultType<CreateTableOkResult>(
+                store.execute(create_table_),
+                "range store should create " + table_);
+        }
+    }
+
+    void recordCatalogKey(const std::string& primary_key,
+                          const std::string& range_id,
+                          const std::string& replica_group_id,
+                          int descriptor_version) {
+        requireResultType<InsertOkResult>(
+            catalog_.execute(InsertRowCommand{
+                "__global_keys",
+                {table_,
+                 primary_key,
+                 tableRowKey(table_, primary_key),
+                 range_id,
+                 replica_group_id,
+                 std::to_string(descriptor_version)}}),
+            "catalog should record ownership for " + primary_key);
+    }
+
+    SelectAllResult selectRows(BuzzDBCore& store,
+                               const std::string& primary_key) {
+        Result result = store.execute(
+            SelectWhereCommand{table_, "id", primary_key});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return SelectAllResult{};
+        return *rows;
+    }
+
+    size_t rowCount(BuzzDBCore& store) {
+        Result result = store.execute(SelectAllCommand{table_});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        return rows == nullptr ? size_t{0} : rows->rows.size();
+    }
+
+    std::string table_;
+    CreateTableCommand create_table_;
+    std::string source_range_id_;
+    std::string left_range_id_;
+    std::string right_range_id_;
+    std::string source_group_id_;
+    BuzzDBCore catalog_;
+    BuzzDBCore source_;
+    BuzzDBCore left_;
+    BuzzDBCore right_;
+    std::vector<std::pair<std::string, std::vector<std::string>>> loaded_rows_;
+};
+
 Command bootstrapClusterACommand() {
     return BootstrapClusterCommand{
         "cluster-A", "server1", {"server1", "server2", "server3"}, 1};
@@ -14761,7 +14915,7 @@ SearchState buildInitialReplicaGroupState(
 }
 
 void printPartitionedSQLTrace(const std::string& data_file) {
-    std::cout << "Trace: range splits and routing" << std::endl;
+    std::cout << "Trace: split metadata planning" << std::endl;
     std::vector<Address> replicas = quorumReplicaAddresses(3);
     Address leader = replicas[0];
     Address client = ScenarioAddress::client1();
@@ -14828,7 +14982,7 @@ void printPartitionedSQLTrace(const std::string& data_file) {
               << ", split_key=" << split_key
               << ", primary_key=" << primary_key << std::endl;
     if (route != nullptr && !route->range_ids.empty()) {
-        std::cout << "  row key=" << route->start_key
+        std::cout << "  active route row key=" << route->start_key
                   << " -> range=" << route->range_ids.front()
                   << ", replica_group="
                   << route->replica_group_ids.front()
@@ -14844,6 +14998,30 @@ void printPartitionedSQLTrace(const std::string& data_file) {
               << ", current_right_keys="
               << currentGlobalKeyCountOn(leader_node, right_range)
               << std::endl;
+
+    SplitPlanningCluster planner(
+        "title",
+        createTitleTableCommand(),
+        defaultRangeIdForTable("title"),
+        left_range,
+        right_range);
+    Result planned_split = runWithSuppressedStdout([&] {
+        planner.loadSourceRows(titles);
+        return planner.splitTable(
+            SplitTableCommand{"title",
+                              defaultRangeIdForTable("title"),
+                              left_range,
+                              right_range,
+                              2});
+    });
+    std::cout << "  planned split -> " << describeResult(planned_split)
+              << ", source_rows=" << planner.sourceRowCount()
+              << ", planned_left_keys="
+              << planner.plannedKeyCount(left_range)
+              << ", planned_right_keys="
+              << planner.plannedKeyCount(right_range)
+              << ", physical_copies(" << primary_key << ")="
+              << planner.physicalCopies(primary_key) << std::endl;
     for (const auto& replica : replicas) {
         const auto* node = state.nodeAs<ConsensusReplica>(replica);
         std::cout << "  " << replica << " has split children="
@@ -14865,14 +15043,14 @@ int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
         std::cerr << "--measure-restart is not available in v126; "
                   << "this version focuses on the first partitioned-SQL "
-                  << "range split boundary."
+                  << "range split-planning boundary."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v126: range splits and routing" << std::endl;
+    std::cout << "BuzzDB v126: split metadata planning" << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
@@ -15011,7 +15189,7 @@ int main(int argc, char* argv[]) {
         return std::optional<Result>{};
     };
 
-    tests.test("Split table records parent history and active children", [&] {
+    tests.test("Split table records parent history and planned children", [&] {
         TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         SearchState state = buildTitleSplitState(505);
@@ -15029,29 +15207,22 @@ int main(int argc, char* argv[]) {
                             " should keep the original descriptor history");
             tests.check(catalogHasRowOn(
                             node, "__ranges",
-                            {{"range_id", defaultRangeIdForTable("title")},
-                             {"descriptor_version", "2"},
-                             {"status", "superseded"}}),
-                        replica.str() +
-                            " should supersede the parent descriptor");
-            tests.check(catalogHasRowOn(
-                            node, "__ranges",
                             {{"range_id", titleLeftRangeId()},
                              {"start_key", tableRowPrefix("title")},
                              {"end_key", fixture.split_key},
                              {"descriptor_version", "2"},
-                             {"status", "active"}}),
+                             {"status", "planned"}}),
                         replica.str() +
-                            " should have the active left child range");
+                            " should have the planned left child range");
             tests.check(catalogHasRowOn(
                             node, "__ranges",
                             {{"range_id", titleRightRangeId()},
                              {"start_key", fixture.split_key},
                              {"end_key", tableRowPrefixEnd("title")},
                              {"descriptor_version", "2"},
-                             {"status", "active"}}),
+                             {"status", "planned"}}),
                         replica.str() +
-                            " should have the active right child range");
+                            " should have the planned right child range");
         }
         auto split_reply = clientReplyResult(
             state, 505, static_cast<int>(fixture.rows.size()) + 4);
@@ -15060,7 +15231,7 @@ int main(int argc, char* argv[]) {
                     "split command should commit with StatementOk");
     });
 
-    tests.test("Point lookups route to the correct split child", [&] {
+    tests.test("Planned split keeps point lookups on the active parent", [&] {
         TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
@@ -15072,23 +15243,25 @@ int main(int argc, char* argv[]) {
             ExplainRouteCommand{
                 "title", fixture.left_values.front(), false});
         tests.check(left.range_ids.size() == 1 &&
-                        left.range_ids.front() == titleLeftRangeId(),
-                    "key below split should route to left child");
-        tests.check(left.descriptor_versions.front() == 2,
-                    "left child should use split descriptor version");
+                        left.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "key below planned split should still route to parent");
+        tests.check(left.descriptor_versions.front() == 1,
+                    "parent should remain the active serving descriptor");
 
         RouteResult right = routeFor(
             leader_node,
             ExplainRouteCommand{
                 "title", fixture.right_values.front(), false});
         tests.check(right.range_ids.size() == 1 &&
-                        right.range_ids.front() == titleRightRangeId(),
-                    "key at split should route to right child");
-        tests.check(right.descriptor_versions.front() == 2,
-                    "right child should use split descriptor version");
+                        right.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "key at planned split should still route to parent");
+        tests.check(right.descriptor_versions.front() == 1,
+                    "parent should remain active until movement commits");
     });
 
-    tests.test("Full scan routes across both split ranges", [&] {
+    tests.test("Full scan stays on parent before split movement", [&] {
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         SearchState state = buildTitleSplitState(507);
@@ -15096,14 +15269,13 @@ int main(int argc, char* argv[]) {
         RouteResult route = routeFor(
             leader_node, ExplainRouteCommand{"title", "", true});
 
-        tests.check(route.range_ids.size() == 2,
-                    "split table scan should route both children");
-        tests.check(route.range_ids[0] == titleLeftRangeId() &&
-                        route.range_ids[1] == titleRightRangeId(),
-                    "split scan should preserve key order");
-        tests.check(route.replica_group_ids[0] == "group-1" &&
-                        route.replica_group_ids[1] == "group-1",
-                    "split children should stay in the source group");
+        tests.check(route.range_ids.size() == 1 &&
+                        route.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "scan should remain on parent before movement");
+        tests.check(route.replica_group_ids.size() == 1 &&
+                        route.replica_group_ids.front() == "group-1",
+                    "active parent should stay in the source group");
     });
 
     tests.test("Invalid split does not change active routing", [&] {
@@ -15138,7 +15310,7 @@ int main(int argc, char* argv[]) {
                     "invalid split should leave the parent active");
     });
 
-    tests.test("Stale parent descriptor is ignored after split", [&] {
+    tests.test("Planned children do not override active parent route", [&] {
         TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
@@ -15161,10 +15333,11 @@ int main(int argc, char* argv[]) {
             ExplainRouteCommand{
                 "title", fixture.right_values.front(), false});
         tests.check(route.range_ids.size() == 1 &&
-                        route.range_ids.front() == titleRightRangeId(),
-                    "lower-version parent descriptor should be ignored");
-        tests.check(route.descriptor_versions.front() == 2,
-                    "split child should remain the latest active route");
+                        route.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "planned child should not become the serving route");
+        tests.check(route.descriptor_versions.front() == 1,
+                    "active parent version should continue serving");
     });
 
     tests.test("Router cache refreshes after split", [&] {
@@ -15198,11 +15371,88 @@ int main(int argc, char* argv[]) {
         RouteResult refreshed = router.routePoint(
             "title", fixture.right_values.front());
         tests.check(refreshed.range_ids.size() == 1 &&
-                        refreshed.range_ids.front() == titleRightRangeId(),
-                    "router refresh should load split metadata");
+                        refreshed.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "router refresh should not serve planned children yet");
     });
 
-    tests.test("Full title table is assigned across split ranges", [&] {
+    tests.test("Split planned ownership is derived from every title row", [&] {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<Address> replicas = quorumReplicaAddresses(3);
+        Address leader = replicas[0];
+        SearchState state = buildTitleSplitState(512);
+        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
+
+        tests.check(fixture.split_index > 0 &&
+                        fixture.split_index < fixture.rows.size(),
+                    "split point should be an interior key from the loaded table");
+        tests.check(fixture.split_key ==
+                        tableRowKey("title",
+                                    fixture.rows[fixture.split_index]
+                                        .second.front()),
+                    "split key should be the median title row key");
+        for (size_t i = 0; i < fixture.rows.size(); ++i) {
+            const std::string& primary_key = fixture.rows[i].second.front();
+            const std::string expected_range =
+                i < fixture.split_index ? titleLeftRangeId()
+                                        : titleRightRangeId();
+            tests.check(catalogHasRowOn(
+                            leader_node,
+                            "__global_keys",
+                            {{"table_name", "title"},
+                             {"primary_key", primary_key},
+                             {"row_key", tableRowKey("title", primary_key)},
+                             {"range_id", expected_range},
+                             {"descriptor_version", "2"}}),
+                        "title " + primary_key +
+                            " should be assigned to its planned child");
+        }
+    });
+
+    tests.test("Split planning records ownership without moving rows", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            SplitPlanningCluster cluster(
+                "title",
+                createTitleTableCommand(),
+                defaultRangeIdForTable("title"),
+                titleLeftRangeId(),
+                titleRightRangeId());
+            cluster.loadSourceRows(fixture.rows);
+            tests.check(cluster.sourceRowCount() == fixture.rows.size(),
+                        "source range should initially contain every title row");
+
+            Result split = cluster.splitTable(splitTitleCommand());
+            tests.check(split == Result{StatementOkResult{}},
+                        "split planning should commit");
+            tests.check(cluster.sourceRowCount() == fixture.rows.size(),
+                        "split planning should not move source rows");
+            tests.check(cluster.leftRowCount() == 0 &&
+                            cluster.rightRowCount() == 0,
+                        "child physical stores should remain empty in v126");
+            tests.check(cluster.plannedKeyCount(titleLeftRangeId()) ==
+                            fixture.leftCount(),
+                        "left child should receive lower-half planned ownership");
+            tests.check(cluster.plannedKeyCount(titleRightRangeId()) ==
+                            fixture.rightCount(),
+                        "right child should receive upper-half planned ownership");
+
+            for (const auto& row : fixture.rows) {
+                const std::string& primary_key = row.second.front();
+                tests.check(cluster.physicalCopies(primary_key) == 1,
+                            "planned split should leave source as the only physical copy for " +
+                                primary_key);
+                RouteResult route = cluster.routePoint(primary_key);
+                tests.check(route.range_ids.size() == 1 &&
+                                route.range_ids.front() ==
+                                    defaultRangeIdForTable("title"),
+                            "planned split should leave active route on source");
+            }
+            return 0;
+        });
+    });
+
+    tests.test("Full title table remains on source while planned ownership is recorded", [&] {
         TitleSplitFixture fixture = titleSplitFixture();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
@@ -15226,14 +15476,15 @@ int main(int argc, char* argv[]) {
             ExplainRouteCommand{
                 "title", fixture.right_values.front(), false});
         tests.check(route.range_ids.size() == 1 &&
-                        route.range_ids.front() == titleRightRangeId(),
-                    "the inserted row should route to the right child");
+                        route.range_ids.front() ==
+                            defaultRangeIdForTable("title"),
+                    "the inserted row should route to the active source range");
         tests.check(currentGlobalKeyCountOn(leader_node, titleLeftRangeId()) ==
                         fixture.leftCount(),
-                    "left child should own the lower half of title row keys");
+                    "left child should have planned lower-half ownership");
         tests.check(currentGlobalKeyCountOn(leader_node, titleRightRangeId()) ==
                         fixture.rightCount(),
-                    "right child should own the upper half of title row keys");
+                    "right child should have planned upper-half ownership");
     });
 
     return tests.finish();

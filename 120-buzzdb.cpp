@@ -15577,6 +15577,37 @@ Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
+std::vector<Command> createTitleWriteCommands(const std::string& data_file) {
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 2);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<std::string> second_title =
+        tupleValuesFromLine(title_rows[1], "title");
+    if (first_title.size() < 4 || second_title.size() < 4) {
+        throw std::runtime_error("title rows must include production_year");
+    }
+
+    std::vector<Command> commands{createTitleTableCommand()};
+    commands.push_back(parseSQL("INSERT " + title_rows[0]));
+    commands.push_back(parseSQL("INSERT " + title_rows[1]));
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(first_title[3]),
+        "id", first_title[0]});
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(second_title[3]),
+        "id", second_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", first_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", second_title[0]});
+    commands.push_back(CountRowsCommand{"title"});
+    return commands;
+}
+
+Workload createTitleWriteWorkload(const std::string& data_file) {
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    return Workload(commands, buzzDBOracleResults(commands));
+}
+
 class BuzzDBClientWorkload final : public SearchTestWorkload {
 public:
     BuzzDBClientWorkload(Address server,
@@ -15622,17 +15653,6 @@ Scenario oneClientBuzzDBScenario(Workload workload) {
         .addServer(server, std::make_unique<BuzzDBApplication>())
         .addClient(client, server, 1, std::move(workload))
         .build();
-}
-
-std::vector<Command> titleInsertCommandsFromImdb(
-    const std::string& data_file,
-    size_t row_count) {
-    std::vector<Command> commands{createTitleTableCommand()};
-    for (const auto& row : requireTupleLinesFromFile(
-             data_file, "title", row_count)) {
-        commands.push_back(parseSQL("INSERT " + row));
-    }
-    return commands;
 }
 
 std::string formatSelectAllResult(const SelectAllResult& result) {
@@ -15684,7 +15704,7 @@ std::string formatSelectAllResult(const SelectAllResult& result) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -15739,8 +15759,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v120-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -17605,25 +17625,19 @@ void printLogRepairTrace(const std::string& data_file) {
               << ", votes=" << (leader_node ? leader_node->voteCount() : 0)
               << std::endl;
 
-    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        1,
-        commands[0],
-        {replicas[1], replicas[2]});
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        2,
-        commands[1],
-        {replicas[1], replicas[2]});
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    constexpr size_t write_prefix = 3;
+    for (size_t i = 0; i < write_prefix; ++i) {
+        state = deliverConsensusCommandToQuorum(
+            state,
+            majority_partition,
+            leader,
+            client,
+            1,
+            static_cast<int>(i + 1),
+            commands[i],
+            {replicas[1], replicas[2]});
+    }
     leader_node = state.nodeAs<ConsensusReplica>(leader);
     std::cout << "  committed through index="
               << (leader_node ? leader_node->commitIndex() : 0)
@@ -17633,11 +17647,14 @@ void printLogRepairTrace(const std::string& data_file) {
                                           CountRowsCommand{"title"})
                                     : Result{TableNotFoundResult{}})
               << std::endl;
-    state = requestConsensusCompaction(state, majority_partition, leader, 2);
+    state = requestConsensusCompaction(
+        state, majority_partition, leader, static_cast<int>(write_prefix));
     state = deliverCompactionHeartbeat(state, majority_partition,
-                                       leader, replicas[1], 2);
+                                       leader, replicas[1],
+                                       static_cast<int>(write_prefix));
     state = deliverCompactionHeartbeat(state, majority_partition,
-                                       leader, replicas[2], 2);
+                                       leader, replicas[2],
+                                       static_cast<int>(write_prefix));
     leader_node = state.nodeAs<ConsensusReplica>(leader);
     std::cout << "  compacted prefix through index="
               << (leader_node ? leader_node->lastIncludedIndex() : 0)
@@ -17682,7 +17699,7 @@ int main(int argc, char* argv[]) {
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
         printLogRepairTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
@@ -17696,13 +17713,13 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, settings, leader,
                                      {up_to_date, lagging});
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 81, 1, commands[0],
-            {up_to_date});
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 81, 2, commands[1],
-            {up_to_date});
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        constexpr size_t write_prefix = 3;
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state, settings, leader, client, 81,
+                static_cast<int>(i + 1), commands[i], {up_to_date});
+        }
 
         const auto* lagging_node = state.nodeAs<ConsensusReplica>(lagging);
         tests.check(lagging_node != nullptr &&
@@ -17712,14 +17729,18 @@ int main(int argc, char* argv[]) {
         uint64_t before_retry = lastMessageId(state);
         state = fireConsensusAppendRetry(state, settings, leader);
         state = deliverRepairAppendAfter(state, settings, leader, lagging,
-                                         before_retry, 2, 2);
+                                         before_retry,
+                                         static_cast<int>(write_prefix),
+                                         static_cast<int>(write_prefix));
         lagging_node = state.nodeAs<ConsensusReplica>(lagging);
         tests.check(lagging_node != nullptr &&
-                        lagging_node->commitIndex() == 2 &&
-                        lagging_node->appliedIndex() == 2 &&
+                        lagging_node->commitIndex() ==
+                            static_cast<int>(write_prefix) &&
+                        lagging_node->appliedIndex() ==
+                            static_cast<int>(write_prefix) &&
                         lagging_node->executeReadOnlyForTest(
                             CountRowsCommand{"title"}) ==
-                            Result{CountRowsResult{1}},
+                            Result{CountRowsResult{2}},
                     "append retry should repair the missing suffix");
     });
 
@@ -17733,6 +17754,9 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, normal, old_leader,
                                      {new_leader, replicas[2]});
+        std::vector<CreateTableCommand> real_tables =
+            createFullJobTableCommands();
+        CreateTableCommand stale_command = real_tables[1];
 
         SearchSettings isolated;
         isolated.partition({
@@ -17742,7 +17766,7 @@ int main(int argc, char* argv[]) {
         state.send(client1, old_leader, ClientRequest{
             82,
             1,
-            CreateTableCommand{"stale_table", {"id:int"}}
+            stale_command
         });
         state = stepRequired(
             state,
@@ -17782,7 +17806,7 @@ int main(int argc, char* argv[]) {
                             CountRowsCommand{"title"}) ==
                             Result{CountRowsResult{0}} &&
                         old_node->executeReadOnlyForTest(
-                            CountRowsCommand{"stale_table"}) ==
+                            CountRowsCommand{stale_command.table}) ==
                             Result{TableNotFoundResult{}},
                     "new leader should overwrite the stale uncommitted suffix");
     });
@@ -17876,36 +17900,43 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, settings, leader,
                                      {replicas[1], replicas[2]});
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 86, 1, commands[0],
-            {replicas[1], replicas[2]});
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 86, 2, commands[1],
-            {replicas[1], replicas[2]});
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        constexpr size_t write_prefix = 3;
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state, settings, leader, client, 86,
+                static_cast<int>(i + 1), commands[i],
+                {replicas[1], replicas[2]});
+        }
 
-        state = requestConsensusCompaction(state, settings, leader, 2);
+        state = requestConsensusCompaction(
+            state, settings, leader, static_cast<int>(write_prefix));
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
         tests.check(leader_node != nullptr &&
-                        leader_node->firstNonCleared() == 3 &&
-                        leader_node->lastIncludedIndex() == 2 &&
+                        leader_node->firstNonCleared() == 4 &&
+                        leader_node->lastIncludedIndex() ==
+                            static_cast<int>(write_prefix) &&
                         leader_node->slotStatus(1) ==
                             ConsensusSlotStatus::Cleared &&
                         leader_node->slotStatus(2) ==
                             ConsensusSlotStatus::Cleared &&
                         leader_node->slotStatus(3) ==
+                            ConsensusSlotStatus::Cleared &&
+                        leader_node->slotStatus(4) ==
                             ConsensusSlotStatus::Empty &&
                         leader_node->logEntryCount() == 0,
                     "leader should compact the applied prefix");
 
         state = deliverCompactionHeartbeat(state, settings, leader,
-                                           replicas[1], 2);
+                                           replicas[1],
+                                           static_cast<int>(write_prefix));
         state = deliverCompactionHeartbeat(state, settings, leader,
-                                           replicas[2], 2);
+                                           replicas[2],
+                                           static_cast<int>(write_prefix));
         for (const auto& replica : replicas) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
             tests.check(node != nullptr &&
-                            node->firstNonCleared() == 3 &&
+                            node->firstNonCleared() == 4 &&
                             node->slotStatus(1) ==
                                 ConsensusSlotStatus::Cleared,
                         replica.str() + " should learn the compacted prefix");
@@ -17924,29 +17955,34 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, settings, leader,
                                      {current, lagging});
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 87, 1, commands[0],
-            {current});
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 87, 2, commands[1],
-            {current});
-        state = requestConsensusCompaction(state, settings, leader, 2);
-        state = deliverConsensusSnapshot(state, settings, leader, lagging, 2);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        constexpr size_t write_prefix = 3;
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state, settings, leader, client, 87,
+                static_cast<int>(i + 1), commands[i], {current});
+        }
+        state = requestConsensusCompaction(
+            state, settings, leader, static_cast<int>(write_prefix));
+        state = deliverConsensusSnapshot(state, settings, leader, lagging,
+                                         static_cast<int>(write_prefix));
 
         const auto* lagging_node = state.nodeAs<ConsensusReplica>(lagging);
         tests.check(lagging_node != nullptr &&
-                        lagging_node->firstNonCleared() == 3 &&
-                        lagging_node->lastIncludedIndex() == 2 &&
+                        lagging_node->firstNonCleared() == 4 &&
+                        lagging_node->lastIncludedIndex() ==
+                            static_cast<int>(write_prefix) &&
                         lagging_node->executeReadOnlyForTest(
                             CountRowsCommand{"title"}) ==
-                            Result{CountRowsResult{1}} &&
-                        lagging_node->executionCount(87, 2) == 1,
+                            Result{CountRowsResult{2}} &&
+                        lagging_node->executionCount(
+                            87, static_cast<int>(write_prefix)) == 1,
                     "snapshot should carry BuzzDB and AMO execution state");
 
         state = electConsensusLeader(state, settings, lagging,
                                      {leader, current});
-        state.send(client, lagging, ClientRequest{87, 2, commands[1]});
+        state.send(client, lagging, ClientRequest{
+            87, static_cast<int>(write_prefix), commands[write_prefix - 1]});
         state = stepRequired(
             state,
             requireMessageEvent(
@@ -17957,16 +17993,20 @@ int main(int argc, char* argv[]) {
                         std::get_if<ClientRequest>(&envelope.message);
                     return request != nullptr &&
                            request->client_id == 87 &&
-                           request->request_id == 2 &&
+                           request->request_id ==
+                               static_cast<int>(write_prefix) &&
                            envelope.to.rootAddress() == lagging;
                 },
                 "duplicate request to snapshot leader"),
             settings);
         lagging_node = state.nodeAs<ConsensusReplica>(lagging);
         tests.check(lagging_node != nullptr &&
-                        lagging_node->lastNonEmpty() == 2 &&
-                        lagging_node->executionCount(87, 2) == 1 &&
-                        clientReplyInNetworkFor(state, 87, 2),
+                        lagging_node->lastNonEmpty() ==
+                            static_cast<int>(write_prefix) &&
+                        lagging_node->executionCount(
+                            87, static_cast<int>(write_prefix)) == 1 &&
+                        clientReplyInNetworkFor(
+                            state, 87, static_cast<int>(write_prefix)),
                     "duplicate after snapshot should return cached result "
                     "without a new log slot");
     });
@@ -17981,28 +18021,34 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, settings, leader,
                                      {up_to_date, lagging});
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 88, 1, commands[0],
-            {up_to_date});
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 88, 2, commands[1],
-            {up_to_date});
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        constexpr size_t write_prefix = 3;
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state, settings, leader, client, 88,
+                static_cast<int>(i + 1), commands[i], {up_to_date});
+        }
 
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
         tests.check(leader_node != nullptr &&
-                        leader_node->commitIndex() == 2,
-                    "leader should have a committed two-slot prefix");
+                        leader_node->commitIndex() ==
+                            static_cast<int>(write_prefix),
+                    "leader should have a committed real title-write prefix");
         int term = leader_node == nullptr ? 1 : leader_node->currentTerm();
 
         state.send(leader, lagging, AppendEntries{
             term,
             leader,
-            1,
+            2,
             term,
             std::vector<ConsensusLogEntryMessage>{
-                ConsensusLogEntryMessage{2, term, 88, 2, commands[1]}},
-            2,
+                ConsensusLogEntryMessage{
+                    static_cast<int>(write_prefix),
+                    term,
+                    88,
+                    static_cast<int>(write_prefix),
+                    commands[write_prefix - 1]}},
+            static_cast<int>(write_prefix),
             0});
         state = stepRequired(
             state,
@@ -18013,15 +18059,16 @@ int main(int argc, char* argv[]) {
                     const auto* append =
                         std::get_if<AppendEntries>(&envelope.message);
                     return append != nullptr &&
-                           append->prev_log_index == 1 &&
+                           append->prev_log_index == 2 &&
                            append->entries.size() == 1 &&
-                           append->entries.front().index == 2 &&
+                           append->entries.front().index ==
+                               static_cast<int>(write_prefix) &&
                            envelope.from.rootAddress() ==
                                leader.rootAddress() &&
                            envelope.to.rootAddress() ==
                                lagging.rootAddress();
                 },
-                "hole append containing slot 2 without slot 1"),
+                "hole append containing slot 3 without slots 1 and 2"),
             settings);
 
         const auto* lagging_node = state.nodeAs<ConsensusReplica>(lagging);
@@ -18029,6 +18076,8 @@ int main(int argc, char* argv[]) {
                         lagging_node->slotStatus(1) ==
                             ConsensusSlotStatus::Empty &&
                         lagging_node->slotStatus(2) ==
+                            ConsensusSlotStatus::Empty &&
+                        lagging_node->slotStatus(3) ==
                             ConsensusSlotStatus::Empty,
                     "follower should reject an append with a missing prefix");
 
@@ -18051,18 +18100,23 @@ int main(int argc, char* argv[]) {
         state = stepRequired(state, rejection_event, settings);
 
         state = deliverRepairAppendAfter(
-            state, settings, leader, lagging, rejection_id, 2, 2);
+            state, settings, leader, lagging, rejection_id,
+            static_cast<int>(write_prefix), static_cast<int>(write_prefix));
         lagging_node = state.nodeAs<ConsensusReplica>(lagging);
         tests.check(lagging_node != nullptr &&
-                        lagging_node->commitIndex() == 2 &&
-                        lagging_node->appliedIndex() == 2 &&
+                        lagging_node->commitIndex() ==
+                            static_cast<int>(write_prefix) &&
+                        lagging_node->appliedIndex() ==
+                            static_cast<int>(write_prefix) &&
                         lagging_node->slotStatus(1) ==
                             ConsensusSlotStatus::Chosen &&
                         lagging_node->slotStatus(2) ==
                             ConsensusSlotStatus::Chosen &&
+                        lagging_node->slotStatus(3) ==
+                            ConsensusSlotStatus::Chosen &&
                         lagging_node->executeReadOnlyForTest(
                             CountRowsCommand{"title"}) ==
-                            Result{CountRowsResult{1}},
+                            Result{CountRowsResult{2}},
                     "backtracking append should fill the missing prefix");
         CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
         tests.check(logs.ok, logs.message);

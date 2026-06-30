@@ -15534,6 +15534,37 @@ Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
+std::vector<Command> createTitleWriteCommands(const std::string& data_file) {
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 2);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<std::string> second_title =
+        tupleValuesFromLine(title_rows[1], "title");
+    if (first_title.size() < 4 || second_title.size() < 4) {
+        throw std::runtime_error("title rows must include production_year");
+    }
+
+    std::vector<Command> commands{createTitleTableCommand()};
+    commands.push_back(parseSQL("INSERT " + title_rows[0]));
+    commands.push_back(parseSQL("INSERT " + title_rows[1]));
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(first_title[3]),
+        "id", first_title[0]});
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(second_title[3]),
+        "id", second_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", first_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", second_title[0]});
+    commands.push_back(CountRowsCommand{"title"});
+    return commands;
+}
+
+Workload createTitleWriteWorkload(const std::string& data_file) {
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    return Workload(commands, buzzDBOracleResults(commands));
+}
+
 class BuzzDBClientWorkload final : public SearchTestWorkload {
 public:
     BuzzDBClientWorkload(Address server,
@@ -15579,17 +15610,6 @@ Scenario oneClientBuzzDBScenario(Workload workload) {
         .addServer(server, std::make_unique<BuzzDBApplication>())
         .addClient(client, server, 1, std::move(workload))
         .build();
-}
-
-std::vector<Command> titleInsertCommandsFromImdb(
-    const std::string& data_file,
-    size_t row_count) {
-    std::vector<Command> commands{createTitleTableCommand()};
-    for (const auto& row : requireTupleLinesFromFile(
-             data_file, "title", row_count)) {
-        commands.push_back(parseSQL("INSERT " + row));
-    }
-    return commands;
 }
 
 std::string formatSelectAllResult(const SelectAllResult& result) {
@@ -15641,7 +15661,7 @@ std::string formatSelectAllResult(const SelectAllResult& result) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -15696,8 +15716,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v119-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -17198,25 +17218,19 @@ void printLeaderChangeTrace(const std::string& data_file) {
               << ", votes=" << (leader_node ? leader_node->voteCount() : 0)
               << std::endl;
 
-    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        1,
-        commands[0],
-        {replicas[1], replicas[2]});
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        2,
-        commands[1],
-        {replicas[1], replicas[2]});
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    constexpr size_t write_prefix = 5;
+    for (size_t i = 0; i < write_prefix; ++i) {
+        state = deliverConsensusCommandToQuorum(
+            state,
+            majority_partition,
+            leader,
+            client,
+            1,
+            static_cast<int>(i + 1),
+            commands[i],
+            {replicas[1], replicas[2]});
+    }
     leader_node = state.nodeAs<ConsensusReplica>(leader);
     std::cout << "  committed through index="
               << (leader_node ? leader_node->commitIndex() : 0)
@@ -17262,7 +17276,7 @@ int main(int argc, char* argv[]) {
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
         printLeaderChangeTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
@@ -17481,7 +17495,8 @@ int main(int argc, char* argv[]) {
         Address new_leader = replicas[2];
         Address client1 = ScenarioAddress::client1();
         Address client2 = ScenarioAddress::client2();
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        constexpr size_t write_prefix = 5;
 
         SearchSettings first_partition;
         first_partition.partition({
@@ -17491,12 +17506,12 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, first_partition, old_leader,
                                      {replicas[1], new_leader});
-        state = deliverConsensusCommandToQuorum(
-            state, first_partition, old_leader, client1, 51, 1,
-            commands[0], {replicas[1], new_leader});
-        state = deliverConsensusCommandToQuorum(
-            state, first_partition, old_leader, client1, 51, 2,
-            commands[1], {replicas[1], new_leader});
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state, first_partition, old_leader, client1, 51,
+                static_cast<int>(i + 1), commands[i],
+                {replicas[1], new_leader});
+        }
 
         SearchSettings second_partition;
         second_partition.partition({
@@ -17505,10 +17520,12 @@ int main(int argc, char* argv[]) {
         });
         state = electConsensusLeader(state, second_partition, new_leader,
                                      {replicas[3], replicas[4]});
-        state = catchUpConsensusFollowerThrough(state, second_partition,
-                                                new_leader, replicas[3], 2);
-        state = catchUpConsensusFollowerThrough(state, second_partition,
-                                                new_leader, replicas[4], 2);
+        state = catchUpConsensusFollowerThrough(
+            state, second_partition, new_leader, replicas[3],
+            static_cast<int>(write_prefix));
+        state = catchUpConsensusFollowerThrough(
+            state, second_partition, new_leader, replicas[4],
+            static_cast<int>(write_prefix));
         state = deliverConsensusCommandToQuorum(
             state, second_partition, new_leader, client2, 52, 1,
             CountRowsCommand{"title"}, {replicas[3], replicas[4]});
@@ -17525,7 +17542,8 @@ int main(int argc, char* argv[]) {
                         std::get_if<AppendEntries>(&envelope.message);
                     if (append == nullptr ||
                         !(append->leader == new_leader.rootAddress()) ||
-                        append->leader_commit < 3 ||
+                        append->leader_commit <
+                            static_cast<int>(write_prefix + 1) ||
                         !(envelope.from.rootAddress() ==
                           new_leader.rootAddress()) ||
                         !(envelope.to.rootAddress() ==
@@ -17536,10 +17554,11 @@ int main(int argc, char* argv[]) {
                         append->entries.begin(),
                         append->entries.end(),
                         [](const ConsensusLogEntryMessage& entry) {
-                            return entry.index == 3;
+                            return entry.index ==
+                                   static_cast<int>(write_prefix + 1);
                         });
                 },
-                "slot-3 retry append to old leader"),
+                "post-switch retry append to old leader"),
             healed);
         state = stepRequired(
             state,
@@ -17551,13 +17570,14 @@ int main(int argc, char* argv[]) {
                         std::get_if<AppendReply>(&envelope.message);
                     return reply != nullptr &&
                            reply->success &&
-                           reply->match_index >= 3 &&
+                           reply->match_index >=
+                               static_cast<int>(write_prefix + 1) &&
                            envelope.from.rootAddress() ==
                                old_leader.rootAddress() &&
                            envelope.to.rootAddress() ==
                                new_leader.rootAddress();
                 },
-                "slot-3 retry reply from old leader"),
+                "post-switch retry reply from old leader"),
             healed);
 
         const auto* old_node = state.nodeAs<ConsensusReplica>(old_leader);
@@ -17566,11 +17586,13 @@ int main(int argc, char* argv[]) {
                         old_node->currentTerm() == 2,
                     "old leader should rejoin as a follower in the new term");
         tests.check(old_node != nullptr &&
-                        old_node->commitIndex() == 3 &&
-                        old_node->appliedIndex() == 3 &&
+                        old_node->commitIndex() ==
+                            static_cast<int>(write_prefix + 1) &&
+                        old_node->appliedIndex() ==
+                            static_cast<int>(write_prefix + 1) &&
                         old_node->executeReadOnlyForTest(
                             CountRowsCommand{"title"}) ==
-                            Result{CountRowsResult{1}},
+                            Result{CountRowsResult{2}},
                     std::string("old leader should catch up to the "
                                 "committed prefix: ") +
                         (old_node == nullptr ? "missing" : old_node->digest()));
@@ -17585,7 +17607,7 @@ int main(int argc, char* argv[]) {
         Address client1 = ScenarioAddress::client1();
         Address client2 = ScenarioAddress::client2();
         Address client3("client3");
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
 
         SearchSettings first_partition;
         first_partition.partition({
@@ -17622,8 +17644,8 @@ int main(int argc, char* argv[]) {
             std::vector<Address>{new_leader, replicas[3], replicas[4]},
             63,
             Workload(
-                std::vector<Command>{CountRowsCommand{"title"}},
-                std::vector<Result>{Result{CountRowsResult{1}}})));
+                std::vector<Command>{commands[2]},
+                std::vector<Result>{Result{InsertOkResult{}}})));
 
         for (const auto& item :
              std::vector<std::pair<Address, int>>{
@@ -17677,7 +17699,7 @@ int main(int argc, char* argv[]) {
         tests.check(consensusClientDone(state, client2).ok,
                     "insert client should finish after repartition");
         tests.check(consensusClientDone(state, client3).ok,
-                    "count client should observe the inserted row");
+                    "second insert client should finish after repartition");
         for (const auto& replica :
              std::vector<Address>{new_leader, replicas[3], replicas[4]}) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
@@ -17685,9 +17707,9 @@ int main(int argc, char* argv[]) {
                             node->commitIndex() == 3 &&
                             node->executeReadOnlyForTest(
                                 CountRowsCommand{"title"}) ==
-                                Result{CountRowsResult{1}},
+                                Result{CountRowsResult{2}},
                         replica.str() +
-                            " should apply create, insert, and count in order");
+                            " should apply create and both real title inserts");
         }
         CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
         tests.check(logs.ok, logs.message);
@@ -17817,23 +17839,21 @@ int main(int argc, char* argv[]) {
         Address client1 = ScenarioAddress::client1();
         Address client2 = ScenarioAddress::client2();
         SearchState state = consensusClusterState(replicas);
+        std::vector<CreateTableCommand> real_tables =
+            createFullJobTableCommands();
         state.addNode(std::make_unique<ConsensusClientWorker>(
             client1,
             replicas,
             91,
             Workload(
-                std::vector<Command>{
-                    CreateTableCommand{"rs_a", {"id:int", "value:string"}}
-                },
+                std::vector<Command>{real_tables[0]},
                 std::vector<Result>{Result{CreateTableOkResult{}}})));
         state.addNode(std::make_unique<ConsensusClientWorker>(
             client2,
             replicas,
             92,
             Workload(
-                std::vector<Command>{
-                    CreateTableCommand{"rs_b", {"id:int", "value:string"}}
-                },
+                std::vector<Command>{real_tables[1]},
                 std::vector<Result>{Result{CreateTableOkResult{}}})));
 
         SearchSettings search;

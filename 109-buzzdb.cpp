@@ -14994,6 +14994,37 @@ Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
+std::vector<Command> createTitleWriteCommands(const std::string& data_file) {
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 2);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<std::string> second_title =
+        tupleValuesFromLine(title_rows[1], "title");
+    if (first_title.size() < 4 || second_title.size() < 4) {
+        throw std::runtime_error("title rows must include production_year");
+    }
+
+    std::vector<Command> commands{createTitleTableCommand()};
+    commands.push_back(parseSQL("INSERT " + title_rows[0]));
+    commands.push_back(parseSQL("INSERT " + title_rows[1]));
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(first_title[3]),
+        "id", first_title[0]});
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(second_title[3]),
+        "id", second_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", first_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", second_title[0]});
+    commands.push_back(CountRowsCommand{"title"});
+    return commands;
+}
+
+Workload createTitleWriteWorkload(const std::string& data_file) {
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    return Workload(commands, buzzDBOracleResults(commands));
+}
+
 class BuzzDBClientWorkload final : public SearchTestWorkload {
 public:
     BuzzDBClientWorkload(Address server,
@@ -15170,7 +15201,7 @@ void printDistributedServiceTrace(const std::string& data_file) {
     Address server = ScenarioAddress::server1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientBuzzDBScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientBuzzDBScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings = scenario.settings;
     SearchState state = scenario.state;
 
@@ -15562,7 +15593,7 @@ int main(int argc, char* argv[]) {
 
     tests.test("Simulator server calls BuzzDBApplication once per client request", [&] {
         Scenario scenario =
-            oneClientBuzzDBScenario(createExplicitJobJoinWorkload(imdb_file));
+            oneClientBuzzDBScenario(createTitleWriteWorkload(imdb_file));
         SearchState state = scenario.state;
         auto first = state.stepEvent(state.events().front());
         tests.check(first.has_value(), "client request should be deliverable");
@@ -15576,7 +15607,7 @@ int main(int argc, char* argv[]) {
         Address client = ScenarioAddress::client1();
         SearchSettings settings;
         SearchState state = oneClientBuzzDBScenario(
-            createExplicitJobJoinWorkload(imdb_file)).state;
+            createTitleWriteWorkload(imdb_file)).state;
 
         EventRef initial_request = requireMessageEvent(
             state,

@@ -17592,6 +17592,37 @@ Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
+std::vector<Command> createTitleWriteCommands(const std::string& data_file) {
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 2);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<std::string> second_title =
+        tupleValuesFromLine(title_rows[1], "title");
+    if (first_title.size() < 4 || second_title.size() < 4) {
+        throw std::runtime_error("title rows must include production_year");
+    }
+
+    std::vector<Command> commands{createTitleTableCommand()};
+    commands.push_back(parseSQL("INSERT " + title_rows[0]));
+    commands.push_back(parseSQL("INSERT " + title_rows[1]));
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(first_title[3]),
+        "id", first_title[0]});
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(second_title[3]),
+        "id", second_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", first_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", second_title[0]});
+    commands.push_back(CountRowsCommand{"title"});
+    return commands;
+}
+
+Workload createTitleWriteWorkload(const std::string& data_file) {
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    return Workload(commands, buzzDBOracleResults(commands));
+}
+
 class BuzzDBClientWorkload final : public SearchTestWorkload {
 public:
     BuzzDBClientWorkload(Address server,
@@ -17846,7 +17877,7 @@ void printDistributedServiceTrace(const std::string& data_file) {
     Address server = ScenarioAddress::server1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientBuzzDBScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientBuzzDBScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings = scenario.settings;
     SearchState state = scenario.state;
 
@@ -18102,7 +18133,7 @@ void printActualPrimaryBackupSearchStates(size_t count,
     Address backup = ScenarioAddress::backup1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientPrimaryBackupScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientPrimaryBackupScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings;
     settings.max_depth = 5;
     settings.max_states = 1000;
@@ -18887,7 +18918,7 @@ void printRestartRecoveryMeasurement(const std::string& data_file) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -18940,8 +18971,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v117-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -19103,17 +19134,6 @@ void seedViewServerForPrimaryBackup(ViewServer& view_server,
     view_server.pingServer(backup, 0);
     view_server.pingServer(primary, 2);
     view_server.pingServer(backup, 2);
-}
-
-std::vector<Command> titleInsertCommandsFromImdb(
-    const std::string& data_file,
-    size_t row_count) {
-    std::vector<Command> commands{createTitleTableCommand()};
-    for (const auto& row : requireTupleLinesFromFile(
-             data_file, "title", row_count)) {
-        commands.push_back(parseSQL("INSERT " + row));
-    }
-    return commands;
 }
 
 SearchState viewAwarePrimaryBackupState(std::vector<Command> commands) {
@@ -19895,7 +19915,7 @@ void printPrimaryBackupCeilingTrace(const std::string& data_file) {
     Address client = ScenarioAddress::client1();
 
     SearchState view_state = viewAwarePrimaryBackupState(
-        titleInsertCommandsFromImdb(data_file, 1));
+        createTitleWriteCommands(data_file));
     SearchSettings control_plane_partition;
     control_plane_partition.partition({{client, primary, backup}, {view_server}});
     bool view_request_deliverable = false;
@@ -19911,7 +19931,7 @@ void printPrimaryBackupCeilingTrace(const std::string& data_file) {
     std::cout << "  control plane partition: view request deliverable="
               << (view_request_deliverable ? "yes" : "no") << std::endl;
 
-    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
     SearchState write_state = oneClientPrimaryBackupScenario(
         Workload(commands, buzzDBOracleResults(commands))).state;
     SearchSettings normal;
@@ -20396,25 +20416,19 @@ void printQuorumLeadershipTrace(const std::string& data_file) {
               << ", votes=" << (leader_node ? leader_node->voteCount() : 0)
               << std::endl;
 
-    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        1,
-        commands[0],
-        {replicas[1], replicas[2]});
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        2,
-        commands[1],
-        {replicas[1], replicas[2]});
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    const size_t write_prefix = 5;
+    for (size_t i = 0; i < write_prefix; ++i) {
+        state = deliverConsensusCommandToQuorum(
+            state,
+            majority_partition,
+            leader,
+            client,
+            1,
+            static_cast<int>(i + 1),
+            commands[i],
+            {replicas[1], replicas[2]});
+    }
     leader_node = state.nodeAs<ConsensusReplica>(leader);
     std::cout << "  committed through index="
               << (leader_node ? leader_node->commitIndex() : 0)
@@ -20428,10 +20442,10 @@ void printQuorumLeadershipTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        const std::string imdb_file =
-            argc > 2 ? argv[2] : defaultImdbInputFile();
-        printRestartRecoveryMeasurement(imdb_file);
-        return 0;
+        std::cerr << "--measure-restart is not available in v117; "
+                  << "this version focuses on consensus log replication."
+                  << std::endl;
+        return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
@@ -20441,9 +20455,8 @@ int main(int argc, char* argv[]) {
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
-        printPrimaryBackupCeilingTrace(imdb_file);
         printQuorumLeadershipTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
@@ -20456,34 +20469,45 @@ int main(int argc, char* argv[]) {
         state = electConsensusLeader(state, settings, leader,
                                      {replicas[1], replicas[2]});
 
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 1, 1, commands[0],
-            {replicas[1], replicas[2]});
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client, 1, 2, commands[1],
-            {replicas[1], replicas[2]});
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        const size_t write_prefix = 5;
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state,
+                settings,
+                leader,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                commands[i],
+                {replicas[1], replicas[2]});
+        }
 
         for (const auto& replica : replicas) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
             tests.check(node != nullptr &&
-                            node->commitIndex() == 2 &&
-                            node->appliedIndex() == 2,
-                        replica.str() + " should commit and apply both slots");
-            tests.check(node != nullptr &&
-                            node->slotStatus(1) == ConsensusSlotStatus::Chosen &&
-                            node->slotStatus(2) == ConsensusSlotStatus::Chosen,
-                        replica.str() + " should mark both slots chosen");
+                            node->commitIndex() ==
+                                static_cast<int>(write_prefix) &&
+                            node->appliedIndex() ==
+                                static_cast<int>(write_prefix),
+                        replica.str() +
+                            " should commit and apply the write prefix");
+            for (size_t i = 0; i < write_prefix; ++i) {
+                tests.check(node != nullptr &&
+                                node->slotStatus(static_cast<int>(i + 1)) ==
+                                    ConsensusSlotStatus::Chosen,
+                            replica.str() + " should mark the slot chosen");
+            }
             tests.check(node != nullptr &&
                             node->executeReadOnlyForTest(
                                 CountRowsCommand{"title"}) ==
-                                Result{CountRowsResult{1}},
-                        replica.str() + " should have the IMDB title row");
+                                Result{CountRowsResult{2}},
+                        replica.str() + " should have both IMDB title rows");
         }
-        tests.check(clientReplyInNetworkFor(state, 1, 1),
-                    "client should receive create-table result");
-        tests.check(clientReplyInNetworkFor(state, 1, 2),
-                    "client should receive insert result");
+        for (size_t i = 0; i < write_prefix; ++i) {
+            tests.check(clientReplyInNetworkFor(state, 1, static_cast<int>(i + 1)),
+                        "client should receive each write-prefix result");
+        }
         CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
         tests.check(logs.ok, logs.message);
     });
@@ -20497,26 +20521,39 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, settings, leader,
                                      {replicas[1], replicas[2]});
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        const size_t write_prefix = 5;
 
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client1, 1, 1, commands[0],
-            {replicas[1], replicas[2]});
-        state = deliverConsensusCommandToQuorum(
-            state, settings, leader, client1, 1, 2, commands[1],
-            {replicas[1], replicas[2]});
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state,
+                settings,
+                leader,
+                client1,
+                1,
+                static_cast<int>(i + 1),
+                commands[i],
+                {replicas[1], replicas[2]});
+        }
         state = deliverConsensusCommandToQuorum(
             state, settings, leader, client2, 2, 1,
             CountRowsCommand{"title"}, {replicas[1], replicas[2]});
 
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
         tests.check(leader_node != nullptr &&
-                        leader_node->commitIndex() == 3 &&
-                        leader_node->appliedIndex() == 3,
-                    "leader should commit three ordered log slots");
+                        leader_node->commitIndex() ==
+                            static_cast<int>(write_prefix + 1) &&
+                        leader_node->appliedIndex() ==
+                            static_cast<int>(write_prefix + 1),
+                    "leader should commit the ordered write prefix and read");
         tests.check(leader_node != nullptr &&
                         leader_node->executionCount(2, 1) == 1,
                     "read command should execute once through the log");
+        tests.check(leader_node != nullptr &&
+                        leader_node->executeReadOnlyForTest(
+                            CountRowsCommand{"title"}) ==
+                            Result{CountRowsResult{2}},
+                    "read should observe both committed title rows");
         tests.check(clientReplyInNetworkFor(state, 2, 1),
                     "second client should receive the count result");
         CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
@@ -20535,18 +20572,31 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, majority_partition, leader,
                                      {replicas[1], replicas[2]});
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        state = deliverConsensusCommandToQuorum(
-            state, majority_partition, leader, client, 1, 1, commands[0],
-            {replicas[1], replicas[2]});
-        state = deliverConsensusCommandToQuorum(
-            state, majority_partition, leader, client, 1, 2, commands[1],
-            {replicas[1], replicas[2]});
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        const size_t write_prefix = 5;
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state,
+                majority_partition,
+                leader,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                commands[i],
+                {replicas[1], replicas[2]});
+        }
 
         for (const auto& replica : std::vector<Address>{replicas[0], replicas[1], replicas[2]}) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(node != nullptr && node->commitIndex() == 2,
+            tests.check(node != nullptr &&
+                            node->commitIndex() ==
+                                static_cast<int>(write_prefix),
                         replica.str() + " should commit in the majority");
+            tests.check(node != nullptr &&
+                            node->executeReadOnlyForTest(
+                                CountRowsCommand{"title"}) ==
+                                Result{CountRowsResult{2}},
+                        replica.str() + " should apply both real title rows");
         }
         for (const auto& replica : std::vector<Address>{replicas[3], replicas[4]}) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
@@ -20603,7 +20653,8 @@ int main(int argc, char* argv[]) {
         Address second_leader = replicas[2];
         Address client1 = ScenarioAddress::client1();
         Address client2 = ScenarioAddress::client2();
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        const size_t write_prefix = 5;
 
         SearchSettings first_partition;
         first_partition.partition({
@@ -20613,12 +20664,17 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, first_partition, first_leader,
                                      {replicas[1], replicas[2]});
-        state = deliverConsensusCommandToQuorum(
-            state, first_partition, first_leader, client1, 1, 1, commands[0],
-            {replicas[1], replicas[2]});
-        state = deliverConsensusCommandToQuorum(
-            state, first_partition, first_leader, client1, 1, 2, commands[1],
-            {replicas[1], replicas[2]});
+        for (size_t i = 0; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state,
+                first_partition,
+                first_leader,
+                client1,
+                1,
+                static_cast<int>(i + 1),
+                commands[i],
+                {replicas[1], replicas[2]});
+        }
 
         SearchSettings second_partition;
         second_partition.partition({
@@ -20636,20 +20692,23 @@ int main(int argc, char* argv[]) {
             CountRowsCommand{"title"}, {replicas[3], replicas[4]});
 
         const auto* second_node = state.nodeAs<ConsensusReplica>(second_leader);
-        tests.check(second_node != nullptr && second_node->commitIndex() == 3,
+        tests.check(second_node != nullptr &&
+                        second_node->commitIndex() ==
+                            static_cast<int>(write_prefix + 1),
                     "new majority should commit after preserving old prefix");
         tests.check(second_node != nullptr &&
                         second_node->executeReadOnlyForTest(
                             CountRowsCommand{"title"}) ==
-                            Result{CountRowsResult{1}},
-                    "new leader should preserve the row from old majority");
+                            Result{CountRowsResult{2}},
+                    "new leader should preserve both rows from old majority");
         for (const auto& replica : std::vector<Address>{replicas[2], replicas[3], replicas[4]}) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(node != nullptr &&
-                            node->slotStatus(1) == ConsensusSlotStatus::Chosen &&
-                            node->slotStatus(2) == ConsensusSlotStatus::Chosen &&
-                            node->slotStatus(3) == ConsensusSlotStatus::Chosen,
-                        replica.str() + " should have a chosen three-slot log");
+            for (size_t i = 0; i <= write_prefix; ++i) {
+                tests.check(node != nullptr &&
+                                node->slotStatus(static_cast<int>(i + 1)) ==
+                                    ConsensusSlotStatus::Chosen,
+                            replica.str() + " should have a chosen log slot");
+            }
         }
         CheckResult logs = consensusLogsConsistentAllSlots(state, replicas);
         tests.check(logs.ok, logs.message);

@@ -11437,7 +11437,7 @@ struct SplitRangeCommand {
     int descriptor_version = 1;
 };
 
-struct SplitTableCommand {
+struct CommitSplitOwnershipCommand {
     std::string table;
     std::string source_range_id;
     std::string left_range_id;
@@ -11534,7 +11534,7 @@ using Command = std::variant<
     RegisterReplicaGroupCommand,
     RegisterRangeCommand,
     SplitRangeCommand,
-    SplitTableCommand,
+    CommitSplitOwnershipCommand,
     BootstrapClusterCommand,
     DiscoverClusterNodeCommand,
     AddLearnerToGroupCommand,
@@ -11620,8 +11620,8 @@ bool operator==(const SplitRangeCommand& lhs,
            lhs.right_range_id == rhs.right_range_id &&
            lhs.descriptor_version == rhs.descriptor_version;
 }
-bool operator==(const SplitTableCommand& lhs,
-                const SplitTableCommand& rhs) {
+bool operator==(const CommitSplitOwnershipCommand& lhs,
+                const CommitSplitOwnershipCommand& rhs) {
     return lhs.table == rhs.table &&
            lhs.source_range_id == rhs.source_range_id &&
            lhs.left_range_id == rhs.left_range_id &&
@@ -11900,8 +11900,8 @@ std::string describeCommand(const Command& command) {
                     << " -> " << value.left_range_id
                     << ", " << value.right_range_id
                     << ", version=" << value.descriptor_version << ")";
-            } else if constexpr (std::is_same_v<T, SplitTableCommand>) {
-                out << "SplitTable(" << value.table
+            } else if constexpr (std::is_same_v<T, CommitSplitOwnershipCommand>) {
+                out << "CommitSplitOwnership(" << value.table
                     << ", source=" << value.source_range_id
                     << " -> " << value.left_range_id
                     << "@" << (value.left_replica_group_id.empty()
@@ -12235,6 +12235,7 @@ const std::vector<std::string>& systemCatalogTableNames() {
         "__tables",
         "__ranges",
         "__range_ownership",
+        "__range_movements",
         "__global_keys",
         "__schema_versions"
     };
@@ -12672,6 +12673,12 @@ private:
              "replica_group_id:string", "owner_version:int",
              "status:string"});
         createSystemCatalogTableIfMissing(
+            "__range_movements",
+            {"movement_id:string", "table_name:string",
+             "source_range_id:string", "target_range_id:string",
+             "target_replica_group_id:string", "start_key:string",
+             "end_key:string", "phase:string", "sequence:int"});
+        createSystemCatalogTableIfMissing(
             "__global_keys",
             {"table_name:string", "primary_key:string", "row_key:string",
              "range_id:string", "replica_group_id:string",
@@ -13018,6 +13025,56 @@ private:
             groups.push_back(record.replica_group_id);
         }
         return canonicalCatalogList(std::move(groups));
+    }
+
+    int nextRangeMovementSequence() {
+        SelectAllResult rows = selectSystemCatalogTable("__range_movements");
+        int latest = 0;
+        for (const auto& row : rows.rows) {
+            if (row.size() >= 9) {
+                latest = std::max(latest, std::stoi(row[8]));
+            }
+        }
+        return latest + 1;
+    }
+
+    InsertRowCommand rangeMovementRequestRow(
+        const RangeOwnershipRecord& record,
+        const std::string& target_group_id,
+        int sequence) {
+        return InsertRowCommand{
+            "__range_movements",
+            {record.range_id + "->" + target_group_id + "#" +
+                 std::to_string(sequence),
+             record.table_name,
+             record.range_id,
+             record.range_id,
+             target_group_id,
+             record.start_key,
+             record.end_key,
+             "requested",
+             std::to_string(sequence)}};
+    }
+
+    bool appendRangeMovementRequests(
+        const std::vector<RangeOwnershipRecord>& records,
+        const std::map<std::string, std::string>& assignments) {
+        std::vector<InsertRowCommand> rows;
+        int sequence = nextRangeMovementSequence();
+        for (const auto& record : records) {
+            auto assignment = assignments.find(record.range_id);
+            if (assignment == assignments.end()) {
+                throw std::runtime_error("missing range assignment");
+            }
+            if (assignment->second == record.replica_group_id) {
+                continue;
+            }
+            rows.push_back(
+                rangeMovementRequestRow(record, assignment->second, sequence++));
+        }
+        if (rows.empty()) return false;
+        insertSystemCatalogRows(rows);
+        return true;
     }
 
     std::map<std::string, std::string> balancedRangeAssignments(
@@ -13922,8 +13979,40 @@ private:
         });
         return StatementOkResult{};
     }
+    std::string movementIdForCommit(
+        const CommitSplitOwnershipCommand& command) const {
+        return command.source_range_id + "->" + command.left_range_id + "+" +
+               command.right_range_id;
+    }
 
-    Result executeOne(const SplitTableCommand& command) {
+    bool copiedMovementRecorded(
+        const CommitSplitOwnershipCommand& command,
+        const RangeDescriptor& source,
+        const std::string& left_group,
+        const std::string& right_group) {
+        SelectAllResult rows = selectSystemCatalogTable("__range_movements");
+        const std::string movement_id = movementIdForCommit(command);
+        const std::string target_ranges =
+            catalogJoin({command.left_range_id, command.right_range_id});
+        const std::string target_groups =
+            catalogJoin({left_group, right_group});
+        for (const auto& row : rows.rows) {
+            if (row.size() < 9) continue;
+            if (row[0] == movement_id &&
+                row[1] == command.table &&
+                row[2] == command.source_range_id &&
+                row[3] == target_ranges &&
+                row[4] == target_groups &&
+                row[5] == source.start_key &&
+                row[6] == source.end_key &&
+                row[7] == "copied") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Result executeOne(const CommitSplitOwnershipCommand& command) {
         ensureSystemCatalogTables();
         if (!tableExists(command.table)) return TableNotFoundResult{};
         if (command.table.empty() ||
@@ -13976,6 +14065,9 @@ private:
             if (!group.exists || group.phase != "stable") {
                 return ConfigRejectedResult{};
             }
+        }
+        if (!copiedMovementRecorded(command, *source, left_group, right_group)) {
+            return ConfigRejectedResult{};
         }
 
         size_t split_index = records.size() / 2;
@@ -14151,10 +14243,9 @@ private:
         appendReplicaGroupConfig(config);
 
         groups.push_back(command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeMovementRequests(current, assignments);
         return StatementOkResult{};
     }
 
@@ -14172,10 +14263,9 @@ private:
             return ConfigRejectedResult{};
         }
         groups = catalogListWithout(std::move(groups), command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeMovementRequests(current, assignments);
         return StatementOkResult{};
     }
 
@@ -14189,8 +14279,8 @@ private:
         }
         std::vector<RangeOwnershipRecord> current =
             rangeOwnershipRecordsAtConfig(latest_config);
-        auto groups = activeReplicaGroups(current);
-        if (!catalogListContains(groups, command.target_replica_group_id)) {
+        auto target = latestReplicaGroupConfig(command.target_replica_group_id);
+        if (!target.exists || target.phase != "stable") {
             return ConfigRejectedResult{};
         }
 
@@ -14209,7 +14299,7 @@ private:
         }
         if (!found || !changed) return ConfigRejectedResult{};
 
-        appendRangeConfigRows(latest_config + 1, current, assignments);
+        appendRangeMovementRequests(current, assignments);
         return StatementOkResult{};
     }
 
@@ -14357,7 +14447,11 @@ struct AppendRetryTimer {
     int generation = 0;
 };
 
-using Timer = std::variant<ElectionTimer, AppendRetryTimer>;
+struct RangeTransferTimer {
+    int generation = 0;
+};
+
+using Timer = std::variant<ElectionTimer, AppendRetryTimer, RangeTransferTimer>;
 
 std::string requestKey(int client_id, int request_id) {
     return std::to_string(client_id) + ":" + std::to_string(request_id);
@@ -14444,6 +14538,8 @@ std::string describeTimer(const Timer& timer) {
                 out << "ElectionTimer(gen=" << value.generation << ")";
             } else if constexpr (std::is_same_v<T, AppendRetryTimer>) {
                 out << "AppendRetryTimer(gen=" << value.generation << ")";
+            } else if constexpr (std::is_same_v<T, RangeTransferTimer>) {
+                out << "RangeTransferTimer(gen=" << value.generation << ")";
             }
             return out.str();
         },
@@ -14920,6 +15016,367 @@ std::vector<std::string> realTitleSchemaColumns() {
 CreateTableCommand createTitleTableCommand() {
     return CreateTableCommand{"title", realTitleSchemaColumns()};
 }
+
+class RangeTransferCoordinator : public Node {
+public:
+    RangeTransferCoordinator(Address address,
+                             Address catalog_leader,
+                             Address parent_group_leader,
+                             Address left_child_group_leader,
+                             Address right_child_group_leader,
+                             std::string parent_range_id,
+                             std::string left_child_range_id,
+                             std::string right_child_range_id,
+                             std::string left_child_group_id,
+                             std::string right_child_group_id,
+                             std::string split_key,
+                             int descriptor_version,
+                             int client_id)
+        : Node(std::move(address)),
+          catalog_leader_(std::move(catalog_leader)),
+          parent_group_leader_(std::move(parent_group_leader)),
+          left_child_group_leader_(std::move(left_child_group_leader)),
+          right_child_group_leader_(std::move(right_child_group_leader)),
+          parent_range_id_(std::move(parent_range_id)),
+          left_child_range_id_(std::move(left_child_range_id)),
+          right_child_range_id_(std::move(right_child_range_id)),
+          left_child_group_id_(std::move(left_child_group_id)),
+          right_child_group_id_(std::move(right_child_group_id)),
+          split_key_(std::move(split_key)),
+          descriptor_version_(descriptor_version),
+          client_id_(client_id) {}
+
+    void init(NodeContext& ctx) override {
+        ctx.setTimer(RangeTransferTimer{++timer_generation_}, 1);
+    }
+
+    void onMessage(NodeContext& ctx,
+                   const Address& from,
+                   const Message& message) override {
+        (void)from;
+        const auto* reply = std::get_if<ClientReply>(&message);
+        if (reply == nullptr || reply->client_id != client_id_ ||
+            !pending_request_id_.has_value() ||
+            reply->request_id != *pending_request_id_) {
+            return;
+        }
+        handleReply(ctx, *reply);
+    }
+
+    void onTimer(NodeContext& ctx, const Timer& timer) override {
+        const auto* transfer = std::get_if<RangeTransferTimer>(&timer);
+        if (transfer == nullptr || transfer->generation != timer_generation_ ||
+            phase_ != Phase::Idle) {
+            return;
+        }
+        sendMovementRecord(ctx, Pending::RecordStarted, "started");
+    }
+
+    std::unique_ptr<Node> clone() const override {
+        return std::make_unique<RangeTransferCoordinator>(*this);
+    }
+
+    std::string digest() const override {
+        std::ostringstream out;
+        out << phaseName() << ":req=" << request_seq_
+            << ":left_child=" << left_child_rows_.size()
+            << ":right_child=" << right_child_rows_.size();
+        return out.str();
+    }
+
+    std::string describe() const override {
+        return "RangeTransferCoordinator{" + digest() + "}";
+    }
+
+    bool done() const { return phase_ == Phase::Done; }
+    bool failed() const { return phase_ == Phase::Failed; }
+    int clientId() const { return client_id_; }
+    std::string phaseName() const {
+        switch (phase_) {
+            case Phase::Idle: return "IDLE";
+            case Phase::Exporting: return "EXPORTING";
+            case Phase::CreatingLeftChild: return "CREATING_LEFT_CHILD";
+            case Phase::CreatingRightChild: return "CREATING_RIGHT_CHILD";
+            case Phase::ImportingLeftChild: return "IMPORTING_LEFT_CHILD";
+            case Phase::ImportingRightChild: return "IMPORTING_RIGHT_CHILD";
+            case Phase::RecordingStarted: return "RECORDING_STARTED";
+            case Phase::RecordingCopied: return "RECORDING_COPIED";
+            case Phase::SwitchingCatalog: return "SWITCHING_CATALOG";
+            case Phase::RecordingSwitched: return "RECORDING_SWITCHED";
+            case Phase::DeletingParent: return "DELETING_PARENT";
+            case Phase::RecordingDone: return "RECORDING_DONE";
+            case Phase::Done: return "DONE";
+            case Phase::Failed: return "FAILED";
+        }
+        return "UNKNOWN";
+    }
+
+private:
+    enum class Phase {
+        Idle,
+        Exporting,
+        CreatingLeftChild,
+        CreatingRightChild,
+        ImportingLeftChild,
+        ImportingRightChild,
+        RecordingStarted,
+        RecordingCopied,
+        SwitchingCatalog,
+        RecordingSwitched,
+        DeletingParent,
+        RecordingDone,
+        Done,
+        Failed
+    };
+
+    enum class Pending {
+        None,
+        ExportParent,
+        CreateLeftChild,
+        CreateRightChild,
+        ImportLeftChild,
+        ImportRightChild,
+        RecordStarted,
+        RecordCopied,
+        SwitchCatalog,
+        RecordSwitched,
+        DeleteParent,
+        RecordDone
+    };
+
+    static std::string primaryKeyForRow(const SelectAllResult& rows,
+                                        const std::vector<std::string>& row) {
+        auto id_it = std::find(rows.columns.begin(), rows.columns.end(), "id");
+        if (id_it == rows.columns.end()) {
+            throw std::runtime_error("title export is missing id column");
+        }
+        size_t id_col = static_cast<size_t>(
+            std::distance(rows.columns.begin(), id_it));
+        if (id_col >= row.size()) {
+            throw std::runtime_error("title export row is missing id value");
+        }
+        return row[id_col];
+    }
+
+    static bool okCreate(const Result& result) {
+        return std::holds_alternative<CreateTableOkResult>(result) ||
+               std::holds_alternative<TableAlreadyExistsResult>(result);
+    }
+
+    static bool okInsert(const Result& result) {
+        return std::holds_alternative<InsertOkResult>(result);
+    }
+
+    static bool okStatement(const Result& result) {
+        return std::holds_alternative<StatementOkResult>(result);
+    }
+
+    static bool okDelete(const Result& result) {
+        const auto* deleted = std::get_if<DeleteRowsResult>(&result);
+        return deleted != nullptr && deleted->count <= 1;
+    }
+
+    void sendCommand(NodeContext& ctx,
+                     const Address& leader,
+                     Pending pending,
+                     Command command) {
+        pending_request_id_ = ++request_seq_;
+        pending_ = pending;
+        ctx.send(leader, ClientRequest{client_id_, *pending_request_id_, command});
+    }
+
+    std::string movementId() const {
+        return parent_range_id_ + "->" + left_child_range_id_ + "+" +
+               right_child_range_id_;
+    }
+
+    void sendMovementRecord(NodeContext& ctx,
+                            Pending pending,
+                            const std::string& phase) {
+        ++movement_sequence_;
+        sendCommand(ctx,
+                    catalog_leader_,
+                    pending,
+                    InsertRowCommand{
+                        "__range_movements",
+                        {movementId(),
+                         "title",
+                         parent_range_id_,
+                         catalogJoin({left_child_range_id_,
+                                      right_child_range_id_}),
+                         catalogJoin({left_child_group_id_,
+                                      right_child_group_id_}),
+                         tableRowPrefix("title"),
+                         tableRowPrefixEnd("title"),
+                         phase,
+                         std::to_string(movement_sequence_)}});
+    }
+
+    void fail() {
+        phase_ = Phase::Failed;
+        pending_ = Pending::None;
+        pending_request_id_.reset();
+    }
+
+    void clearPending() {
+        pending_ = Pending::None;
+        pending_request_id_.reset();
+    }
+
+    void sendNextImport(NodeContext& ctx) {
+        if (phase_ == Phase::ImportingLeftChild) {
+            if (left_child_index_ >= left_child_rows_.size()) {
+                phase_ = Phase::ImportingRightChild;
+                sendNextImport(ctx);
+                return;
+            }
+            sendCommand(ctx, left_child_group_leader_, Pending::ImportLeftChild,
+                        InsertRowCommand{"title", left_child_rows_[left_child_index_]});
+            return;
+        }
+        if (right_child_index_ >= right_child_rows_.size()) {
+            phase_ = Phase::RecordingCopied;
+            sendMovementRecord(ctx, Pending::RecordCopied, "copied");
+            return;
+        }
+        sendCommand(ctx, right_child_group_leader_, Pending::ImportRightChild,
+                    InsertRowCommand{"title", right_child_rows_[right_child_index_]});
+    }
+
+    void sendCatalogSwitch(NodeContext& ctx) {
+        phase_ = Phase::SwitchingCatalog;
+        sendCommand(ctx, catalog_leader_, Pending::SwitchCatalog,
+                    CommitSplitOwnershipCommand{"title",
+                                          parent_range_id_,
+                                          left_child_range_id_,
+                                          right_child_range_id_,
+                                          descriptor_version_,
+                                          left_child_group_id_,
+                                          right_child_group_id_});
+    }
+
+    void sendNextDelete(NodeContext& ctx) {
+        if (delete_index_ >= delete_keys_.size()) {
+            phase_ = Phase::RecordingDone;
+            sendMovementRecord(ctx, Pending::RecordDone, "done");
+            return;
+        }
+        sendCommand(ctx, parent_group_leader_, Pending::DeleteParent,
+                    DeleteRowsCommand{"title", "id", delete_keys_[delete_index_]});
+    }
+
+    void handleReply(NodeContext& ctx, const ClientReply& reply) {
+        Pending completed = pending_;
+        clearPending();
+        switch (completed) {
+            case Pending::RecordStarted:
+                if (!okInsert(reply.result)) { fail(); return; }
+                phase_ = Phase::Exporting;
+                sendCommand(ctx, parent_group_leader_, Pending::ExportParent,
+                            SelectAllCommand{"title"});
+                return;
+            case Pending::ExportParent: {
+                const auto* rows = std::get_if<SelectAllResult>(&reply.result);
+                if (rows == nullptr) {
+                    fail();
+                    return;
+                }
+                left_child_rows_.clear();
+                right_child_rows_.clear();
+                delete_keys_.clear();
+                for (const auto& row : rows->rows) {
+                    std::string primary_key = primaryKeyForRow(*rows, row);
+                    delete_keys_.push_back(primary_key);
+                    if (tableRowKey("title", primary_key) < split_key_) {
+                        left_child_rows_.push_back(row);
+                    } else {
+                        right_child_rows_.push_back(row);
+                    }
+                }
+                phase_ = Phase::CreatingLeftChild;
+                sendCommand(ctx, left_child_group_leader_, Pending::CreateLeftChild,
+                            createTitleTableCommand());
+                return;
+            }
+            case Pending::CreateLeftChild:
+                if (!okCreate(reply.result)) { fail(); return; }
+                phase_ = Phase::CreatingRightChild;
+                sendCommand(ctx, right_child_group_leader_, Pending::CreateRightChild,
+                            createTitleTableCommand());
+                return;
+            case Pending::CreateRightChild:
+                if (!okCreate(reply.result)) { fail(); return; }
+                phase_ = Phase::ImportingLeftChild;
+                left_child_index_ = 0;
+                right_child_index_ = 0;
+                sendNextImport(ctx);
+                return;
+            case Pending::ImportLeftChild:
+                if (!okInsert(reply.result)) { fail(); return; }
+                ++left_child_index_;
+                sendNextImport(ctx);
+                return;
+            case Pending::ImportRightChild:
+                if (!okInsert(reply.result)) { fail(); return; }
+                ++right_child_index_;
+                sendNextImport(ctx);
+                return;
+            case Pending::RecordCopied:
+                if (!okInsert(reply.result)) { fail(); return; }
+                sendCatalogSwitch(ctx);
+                return;
+            case Pending::SwitchCatalog:
+                if (!okStatement(reply.result)) { fail(); return; }
+                phase_ = Phase::RecordingSwitched;
+                sendMovementRecord(ctx, Pending::RecordSwitched,
+                                   "ownership_switched");
+                return;
+            case Pending::RecordSwitched:
+                if (!okInsert(reply.result)) { fail(); return; }
+                phase_ = Phase::DeletingParent;
+                delete_index_ = 0;
+                sendNextDelete(ctx);
+                return;
+            case Pending::DeleteParent:
+                if (!okDelete(reply.result)) { fail(); return; }
+                ++delete_index_;
+                sendNextDelete(ctx);
+                return;
+            case Pending::RecordDone:
+                if (!okInsert(reply.result)) { fail(); return; }
+                phase_ = Phase::Done;
+                clearPending();
+                return;
+            case Pending::None:
+                return;
+        }
+    }
+
+    Address catalog_leader_;
+    Address parent_group_leader_;
+    Address left_child_group_leader_;
+    Address right_child_group_leader_;
+    std::string parent_range_id_;
+    std::string left_child_range_id_;
+    std::string right_child_range_id_;
+    std::string left_child_group_id_;
+    std::string right_child_group_id_;
+    std::string split_key_;
+    int descriptor_version_ = 1;
+    int client_id_ = 0;
+    int timer_generation_ = 0;
+    int request_seq_ = 0;
+    int movement_sequence_ = 0;
+    Phase phase_ = Phase::Idle;
+    Pending pending_ = Pending::None;
+    std::optional<int> pending_request_id_;
+    std::vector<std::vector<std::string>> left_child_rows_;
+    std::vector<std::vector<std::string>> right_child_rows_;
+    std::vector<std::string> delete_keys_;
+    size_t left_child_index_ = 0;
+    size_t right_child_index_ = 0;
+    size_t delete_index_ = 0;
+};
 
 std::vector<std::string> requireTupleLinesFromFile(
     const std::string& data_file,
@@ -16358,7 +16815,7 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     }
     state = deliverConsensusCommandToQuorum(
         state, leader, client, 1, request_id++,
-        SplitTableCommand{"title",
+        CommitSplitOwnershipCommand{"title",
                           defaultRangeIdForTable("title"),
                           left_range,
                           right_range,
@@ -16367,7 +16824,7 @@ void printPartitionedSQLTrace(const std::string& data_file) {
     state = deliverConsensusCommandToQuorum(
         state, leader, client, 1, request_id++,
         JoinReplicaGroupCommand{
-            joined_group, {"right1", "right2", "right3"}},
+            joined_group, {"title-right-replica-1", "title-right-replica-2", "title-right-replica-3"}},
         {replicas[1], replicas[2]});
 
     const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
@@ -16470,6 +16927,13 @@ int main(int argc, char* argv[]) {
 
     struct TitleSplitFixture {
         std::vector<std::pair<std::string, std::vector<std::string>>> rows;
+        std::vector<std::string> left_values;
+        std::vector<std::string> right_values;
+        std::string split_key;
+        size_t split_index = 0;
+
+        size_t leftCount() const { return split_index; }
+        size_t rightCount() const { return rows.size() - split_index; }
     };
 
     auto titleLeftRangeId = []() {
@@ -16510,17 +16974,23 @@ int main(int argc, char* argv[]) {
         if (split_index == 0 || split_index >= titles.size()) {
             throw std::runtime_error("Invalid title split index.");
         }
-        return TitleSplitFixture{titles};
+        return TitleSplitFixture{
+            titles,
+            titles[0].second,
+            titles[split_index].second,
+            tableRowKey("title", titles[split_index].second.front()),
+            split_index
+        };
     };
 
     auto titleSplitFixture = [&]() {
         return makeTitleSplitFixture(readTitleRows());
     };
 
-    auto splitTitleCommand = [&](int version = 2,
+    auto commitSplitOwnershipCommand = [&](int version = 2,
                                  const std::string& left_group = "",
                                  const std::string& right_group = "") {
-        return SplitTableCommand{
+        return CommitSplitOwnershipCommand{
             "title",
             defaultRangeIdForTable("title"),
             titleLeftRangeId(),
@@ -16528,6 +16998,15 @@ int main(int argc, char* argv[]) {
             version,
             left_group,
             right_group};
+    };
+
+    auto addressNames = [](const std::vector<Address>& addresses) {
+        std::vector<std::string> names;
+        names.reserve(addresses.size());
+        for (const auto& address : addresses) {
+            names.push_back(address.str());
+        }
+        return names;
     };
 
     auto prefixedReplicas = [](const std::string& prefix) {
@@ -16543,7 +17022,6 @@ int main(int argc, char* argv[]) {
         std::vector<Address> replicas;
         Address leader;
         Address client;
-        SearchState state;
         int client_id = 0;
         int next_request_id = 1;
     };
@@ -16557,9 +17035,33 @@ int main(int argc, char* argv[]) {
         group.replicas = prefixedReplicas(prefix);
         group.leader = group.replicas.front();
         group.client = Address("client-" + group_id);
-        group.state = electedConsensusState(group.replicas, group.leader);
         group.client_id = client_id;
         return group;
+    };
+
+    struct IntegratedRangeReplicaScenario {
+        TitleSplitFixture fixture;
+        SearchState state;
+        ConsensusGroupHarness catalog;
+        ConsensusGroupHarness parent_group;
+        ConsensusGroupHarness left_child_group;
+        ConsensusGroupHarness right_child_group;
+        Address transfer;
+        int transfer_client_id = 9000;
+    };
+
+    auto addConsensusGroupNodes = [&](SearchState& state,
+                                      const ConsensusGroupHarness& group) {
+        for (const auto& replica : group.replicas) {
+            state.addNode(std::make_unique<ConsensusReplica>(replica,
+                                                             group.replicas));
+        }
+    };
+
+    auto electGroup = [&](IntegratedRangeReplicaScenario& scenario,
+                          const ConsensusGroupHarness& group) {
+        scenario.state = electConsensusLeader(
+            scenario.state, group.leader, {group.replicas[1], group.replicas[2]});
     };
 
     auto clientReplyFor = [](const SearchState& state,
@@ -16577,19 +17079,21 @@ int main(int argc, char* argv[]) {
         return std::nullopt;
     };
 
-    auto commitCommand = [&](ConsensusGroupHarness& group,
+    auto commitCommand = [&](IntegratedRangeReplicaScenario& scenario,
+                             ConsensusGroupHarness& group,
                              const Command& command) {
         int request_id = group.next_request_id++;
-        group.state = deliverConsensusCommandToQuorum(
-            group.state,
+        scenario.state = deliverConsensusCommandToQuorum(
+            scenario.state,
             group.leader,
             group.client,
             group.client_id,
             request_id,
             command,
             {group.replicas[1], group.replicas[2]});
-        auto reply =
-            clientReplyFor(group.state, group.client_id, request_id);
+        auto reply = clientReplyFor(scenario.state,
+                                    group.client_id,
+                                    request_id);
         if (!reply.has_value()) {
             throw std::runtime_error(
                 "missing client reply for " + describeCommand(command));
@@ -16597,49 +17101,474 @@ int main(int argc, char* argv[]) {
         return *reply;
     };
 
-    struct ConfigScenario {
-        TitleSplitFixture fixture;
-        ConsensusGroupHarness catalog;
+    auto groupLeader = [&](const IntegratedRangeReplicaScenario& scenario,
+                           const ConsensusGroupHarness& group) {
+        const auto* node =
+            scenario.state.nodeAs<ConsensusReplica>(group.leader);
+        if (node == nullptr) {
+            throw std::runtime_error("missing consensus leader");
+        }
+        return node;
     };
 
-    auto buildConfigScenario = [&]() {
-        ConfigScenario scenario;
-        scenario.fixture = titleSplitFixture();
-        scenario.catalog =
-            makeConsensusGroup("group-catalog", "server", 1);
+    auto selectTitleInGroup = [&](const IntegratedRangeReplicaScenario& scenario,
+                                  const ConsensusGroupHarness& group,
+                                  const std::string& primary_key) {
+        Result result = groupLeader(scenario, group)->executeReadOnlyForTest(
+            SelectWhereCommand{"title", "id", primary_key});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return SelectAllResult{};
+        return *rows;
+    };
 
-        tests.check(commitCommand(scenario.catalog,
+    auto countTitlesInGroup = [&](const IntegratedRangeReplicaScenario& scenario,
+                                  const ConsensusGroupHarness& group) {
+        Result result = groupLeader(scenario, group)->executeReadOnlyForTest(
+            SelectAllCommand{"title"});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        return rows == nullptr ? size_t{0} : rows->rows.size();
+    };
+
+    auto ensureTitleTableInGroup = [&](IntegratedRangeReplicaScenario& scenario,
+                                       ConsensusGroupHarness& group) {
+        Result count = groupLeader(scenario, group)->executeReadOnlyForTest(
+            CountRowsCommand{"title"});
+        if (std::holds_alternative<TableNotFoundResult>(count)) {
+            tests.check(commitCommand(scenario, group, createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        group.group_id + " should create a physical title table");
+        }
+    };
+
+    auto loadParentRangeGroup = [&](IntegratedRangeReplicaScenario& scenario,
+                                    ConsensusGroupHarness& group,
+                                    const std::vector<
+                                        std::pair<std::string,
+                                                  std::vector<std::string>>>& rows) {
+        ensureTitleTableInGroup(scenario, group);
+        for (const auto& row : rows) {
+            tests.check(commitCommand(scenario,
+                                      group,
+                                      parseSQL("INSERT " + row.first)) ==
+                            Result{InsertOkResult{}},
+                        "parent range group should load real IMDB title row " +
+                            row.second.front());
+        }
+    };
+
+    auto recordParentKeyOwnership = [&](IntegratedRangeReplicaScenario& scenario,
+                                        const ConsensusGroupHarness& parent_group,
+                                        const std::vector<
+                                            std::pair<std::string,
+                                                      std::vector<std::string>>>& rows) {
+        for (const auto& row : rows) {
+            const std::string& primary_key = row.second.front();
+            tests.check(
+                commitCommand(
+                    scenario,
+                    scenario.catalog,
+                    InsertRowCommand{
+                        "__global_keys",
+                        {"title",
+                         primary_key,
+                         tableRowKey("title", primary_key),
+                         defaultRangeIdForTable("title"),
+                         parent_group.group_id,
+                         "1",
+                         "active"}}) == Result{InsertOkResult{}},
+                "catalog should record parent range ownership for " + primary_key);
+        }
+    };
+
+    auto catalogLeader = [&](const IntegratedRangeReplicaScenario& scenario) {
+        return groupLeader(scenario, scenario.catalog);
+    };
+
+    auto catalogRowsForGroup = [&](const IntegratedRangeReplicaScenario& scenario,
+                                   const std::string& table) {
+        Result storage = TableNotFoundResult{};
+        const auto* rows =
+            catalogRowsOn(catalogLeader(scenario), table, &storage);
+        if (rows == nullptr) {
+            throw std::runtime_error("missing catalog rows for " + table);
+        }
+        return *rows;
+    };
+
+    auto routeOnCatalog = [&](const IntegratedRangeReplicaScenario& scenario,
+                              const std::string& primary_key,
+                              bool full_scan = false) {
+        Result result = catalogLeader(scenario)->executeReadOnlyForTest(
+            ExplainRouteCommand{"title", primary_key, full_scan});
+        const auto* route = std::get_if<RouteResult>(&result);
+        if (route == nullptr) {
+            throw std::runtime_error("route lookup did not return a route");
+        }
+        return *route;
+    };
+
+    auto groupForRoute = [](IntegratedRangeReplicaScenario& scenario,
+                            const RouteResult& route)
+        -> ConsensusGroupHarness& {
+        if (route.replica_group_ids.empty()) {
+            throw std::runtime_error("route did not name a replica group");
+        }
+        const std::string& group_id = route.replica_group_ids.front();
+        if (group_id == scenario.left_child_group.group_id) return scenario.left_child_group;
+        if (group_id == scenario.right_child_group.group_id) return scenario.right_child_group;
+        throw std::runtime_error("unknown routed replica group " + group_id);
+    };
+
+    auto commitPointCommandThroughCatalog =
+        [&](IntegratedRangeReplicaScenario& scenario,
+            const std::string& primary_key,
+            const Command& command) {
+        RouteResult route = routeOnCatalog(scenario, primary_key, false);
+        tests.check(route.range_ids.size() == 1 &&
+                        route.replica_group_ids.size() == 1,
+                    "point command should route to one range group");
+        ConsensusGroupHarness& owner = groupForRoute(scenario, route);
+        return commitCommand(scenario, owner, command);
+    };
+
+    auto selectTitle = [&](const IntegratedRangeReplicaScenario& scenario,
+                           const ConsensusGroupHarness& group,
+                           const std::string& primary_key) {
+        return selectTitleInGroup(scenario, group, primary_key);
+    };
+
+    auto titleYear = [&](const IntegratedRangeReplicaScenario& scenario,
+                         const ConsensusGroupHarness& group,
+                         const std::string& primary_key) {
+        SelectAllResult rows = selectTitle(scenario, group, primary_key);
+        if (rows.rows.empty()) return std::optional<std::string>{};
+        auto year = catalogColumnIndex(rows, "production_year");
+        if (!year.has_value() || *year >= rows.rows.front().size()) {
+            return std::optional<std::string>{};
+        }
+        return std::optional<std::string>{rows.rows.front()[*year]};
+    };
+
+    auto coordinatorNode = [&](const IntegratedRangeReplicaScenario& scenario) {
+        const auto* node = scenario.state.nodeAs<RangeTransferCoordinator>(
+            scenario.transfer);
+        if (node == nullptr) {
+            throw std::runtime_error("missing range transfer coordinator");
+        }
+        return node;
+    };
+
+    auto groupForLeader = [](IntegratedRangeReplicaScenario& scenario,
+                             const Address& leader)
+        -> ConsensusGroupHarness& {
+        Address root = leader.rootAddress();
+        if (root == scenario.catalog.leader.rootAddress()) return scenario.catalog;
+        if (root == scenario.parent_group.leader.rootAddress()) return scenario.parent_group;
+        if (root == scenario.left_child_group.leader.rootAddress()) return scenario.left_child_group;
+        if (root == scenario.right_child_group.leader.rootAddress()) return scenario.right_child_group;
+        throw std::runtime_error("unknown consensus group leader " + leader.str());
+    };
+
+    auto addAutonomousTransferCoordinator =
+        [&](IntegratedRangeReplicaScenario& scenario) {
+            scenario.transfer = Address("range-transfer");
+            scenario.state.addNode(std::make_unique<RangeTransferCoordinator>(
+                scenario.transfer,
+                scenario.catalog.leader,
+                scenario.parent_group.leader,
+                scenario.left_child_group.leader,
+                scenario.right_child_group.leader,
+                defaultRangeIdForTable("title"),
+                titleLeftRangeId(),
+                titleRightRangeId(),
+                scenario.left_child_group.group_id,
+                scenario.right_child_group.group_id,
+                scenario.fixture.split_key,
+                2,
+                scenario.transfer_client_id));
+        };
+
+    struct CoordinatorRequestEvent {
+        EventRef event;
+        uint64_t message_id = 0;
+        Address leader;
+        int client_id = 0;
+        int request_id = 0;
+        Command command = CreateTableCommand{"", {}};
+    };
+
+    auto findCoordinatorRequest = [&]
+        (const IntegratedRangeReplicaScenario& scenario,
+         const std::set<uint64_t>& delivered,
+         const std::function<bool(const MessageEnvelope&, const ClientRequest&)>& predicate,
+         const SearchSettings& settings = SearchSettings{})
+            -> std::optional<CoordinatorRequestEvent> {
+        for (const auto& event : scenario.state.events(settings)) {
+            const auto* envelope = messageForEvent(scenario.state, event);
+            if (envelope == nullptr || delivered.count(envelope->id) != 0 ||
+                !(envelope->from.rootAddress() == scenario.transfer.rootAddress())) {
+                continue;
+            }
+            const auto* request = std::get_if<ClientRequest>(&envelope->message);
+            if (request == nullptr ||
+                request->client_id != scenario.transfer_client_id ||
+                !predicate(*envelope, *request)) {
+                continue;
+            }
+            return CoordinatorRequestEvent{
+                event,
+                envelope->id,
+                envelope->to.rootAddress(),
+                request->client_id,
+                request->request_id,
+                request->command};
+        }
+        return std::nullopt;
+    };
+
+    auto requireCoordinatorRequest = [&]
+        (const IntegratedRangeReplicaScenario& scenario,
+         const std::set<uint64_t>& delivered,
+         const std::function<bool(const MessageEnvelope&, const ClientRequest&)>& predicate,
+         const std::string& label,
+         const SearchSettings& settings = SearchSettings{}) {
+        auto found = findCoordinatorRequest(scenario, delivered, predicate, settings);
+        if (!found.has_value()) {
+            throw std::runtime_error("missing coordinator request: " + label);
+        }
+        return *found;
+    };
+
+    auto deliverCoordinatorReplication = [&]
+        (IntegratedRangeReplicaScenario& scenario,
+         ConsensusGroupHarness& group,
+         int client_id,
+         int request_id,
+         std::set<uint64_t>& delivered,
+         const SearchSettings& settings = SearchSettings{}) {
+        int slot = 0;
+        for (const auto& acceptor : {group.replicas[1], group.replicas[2]}) {
+            EventRef accept_event = requireMessageEvent(
+                scenario.state,
+                [&](const MessageEnvelope& envelope) {
+                    if (delivered.count(envelope.id) != 0) return false;
+                    const auto* append =
+                        std::get_if<AppendEntries>(&envelope.message);
+                    return append != nullptr &&
+                           !append->entries.empty() &&
+                           append->entries.back().client_id == client_id &&
+                           append->entries.back().request_id == request_id &&
+                           envelope.from.rootAddress() ==
+                               group.leader.rootAddress() &&
+                           envelope.to.rootAddress() ==
+                               acceptor.rootAddress();
+                },
+                "coordinator append entry",
+                settings);
+            const auto* envelope = messageForEvent(scenario.state, accept_event);
+            const auto* append = std::get_if<AppendEntries>(&envelope->message);
+            slot = append->entries.back().index;
+            delivered.insert(envelope->id);
+            scenario.state = stepRequired(scenario.state, accept_event, settings);
+        }
+
+        for (const auto& acceptor : {group.replicas[1], group.replicas[2]}) {
+            EventRef reply_event = requireMessageEvent(
+                scenario.state,
+                [&](const MessageEnvelope& envelope) {
+                    if (delivered.count(envelope.id) != 0) return false;
+                    const auto* reply = std::get_if<AppendReply>(&envelope.message);
+                    return reply != nullptr &&
+                           reply->success &&
+                           reply->match_index == slot &&
+                           reply->replica == acceptor.rootAddress() &&
+                           envelope.from.rootAddress() ==
+                               acceptor.rootAddress() &&
+                           envelope.to.rootAddress() == group.leader.rootAddress();
+                },
+                "coordinator append reply",
+                settings);
+            const auto* envelope = messageForEvent(scenario.state, reply_event);
+            delivered.insert(envelope->id);
+            scenario.state = stepRequired(scenario.state, reply_event, settings);
+        }
+
+        for (const auto& acceptor : {group.replicas[1], group.replicas[2]}) {
+            EventRef commit_event = requireMessageEvent(
+                scenario.state,
+                [&](const MessageEnvelope& envelope) {
+                    if (delivered.count(envelope.id) != 0) return false;
+                    const auto* append =
+                        std::get_if<AppendEntries>(&envelope.message);
+                    return append != nullptr &&
+                           append->leader == group.leader.rootAddress() &&
+                           append->leader_commit >= slot &&
+                           envelope.from.rootAddress() ==
+                               group.leader.rootAddress() &&
+                           envelope.to.rootAddress() ==
+                               acceptor.rootAddress();
+                },
+                "coordinator commit append",
+                settings);
+            const auto* envelope = messageForEvent(scenario.state, commit_event);
+            delivered.insert(envelope->id);
+            scenario.state = stepRequired(scenario.state, commit_event, settings);
+        }
+
+        EventRef client_reply_event = requireMessageEvent(
+            scenario.state,
+            [&](const MessageEnvelope& envelope) {
+                if (delivered.count(envelope.id) != 0) return false;
+                const auto* reply = std::get_if<ClientReply>(&envelope.message);
+                return reply != nullptr &&
+                       reply->client_id == client_id &&
+                       reply->request_id == request_id &&
+                       envelope.to.rootAddress() ==
+                           scenario.transfer.rootAddress();
+            },
+            "coordinator client reply",
+            settings);
+        const auto* envelope = messageForEvent(scenario.state, client_reply_event);
+        delivered.insert(envelope->id);
+        scenario.state = stepRequired(scenario.state, client_reply_event, settings);
+    };
+
+    auto deliverCoordinatorRequestThroughQuorum = [&]
+        (IntegratedRangeReplicaScenario& scenario,
+         std::set<uint64_t>& delivered,
+         const SearchSettings& settings = SearchSettings{}) {
+        CoordinatorRequestEvent request = requireCoordinatorRequest(
+            scenario,
+            delivered,
+            [](const MessageEnvelope&, const ClientRequest&) { return true; },
+            "next autonomous transfer command",
+            settings);
+        ConsensusGroupHarness& group = groupForLeader(scenario, request.leader);
+        delivered.insert(request.message_id);
+        scenario.state = stepRequired(scenario.state, request.event, settings);
+        deliverCoordinatorReplication(scenario,
+                                      group,
+                                      request.client_id,
+                                      request.request_id,
+                                      delivered,
+                                      settings);
+        return request;
+    };
+
+    auto startAutonomousTransfer = [&](IntegratedRangeReplicaScenario& scenario) {
+        EventRef start = requireTimerEvent(
+            scenario.state,
+            [&](const TimerEnvelope& timer) {
+                return timer.to.rootAddress() == scenario.transfer.rootAddress() &&
+                       std::get_if<RangeTransferTimer>(&timer.timer) != nullptr;
+            },
+            "range transfer coordinator start");
+        scenario.state = stepRequired(scenario.state, start);
+    };
+
+    auto runAutonomousTransferToCompletion = [&]
+        (IntegratedRangeReplicaScenario& scenario,
+         std::set<uint64_t>& delivered) {
+        if (coordinatorNode(scenario)->phaseName() == "IDLE") {
+            startAutonomousTransfer(scenario);
+        }
+        for (int step = 0; step < 200; ++step) {
+            const auto* coordinator = coordinatorNode(scenario);
+            if (coordinator->done()) return;
+            if (coordinator->failed()) {
+                throw std::runtime_error("range transfer coordinator failed");
+            }
+            deliverCoordinatorRequestThroughQuorum(scenario, delivered);
+        }
+        throw std::runtime_error("range transfer coordinator did not finish");
+    };
+
+    auto buildIntegratedRangeReplicaScenarioBeforeTransfer = [&]() {
+        IntegratedRangeReplicaScenario scenario;
+        scenario.fixture = titleSplitFixture();
+        scenario.catalog = makeConsensusGroup("group-catalog", "catalog-replica-", 1);
+        scenario.parent_group = makeConsensusGroup("group-1", "title-parent-replica-", 2);
+        scenario.left_child_group = makeConsensusGroup("rg-title-left", "title-left-replica-", 3);
+        scenario.right_child_group = makeConsensusGroup("rg-title-right", "title-right-replica-", 4);
+
+        addConsensusGroupNodes(scenario.state, scenario.catalog);
+        addConsensusGroupNodes(scenario.state, scenario.parent_group);
+        addConsensusGroupNodes(scenario.state, scenario.left_child_group);
+        addConsensusGroupNodes(scenario.state, scenario.right_child_group);
+        electGroup(scenario, scenario.catalog);
+        electGroup(scenario, scenario.parent_group);
+        electGroup(scenario, scenario.left_child_group);
+        electGroup(scenario, scenario.right_child_group);
+
+        tests.check(commitCommand(scenario,
+                                  scenario.catalog,
                                   bootstrapClusterACommand()) ==
                         Result{StatementOkResult{}},
                     "catalog group should bootstrap the cluster");
-        tests.check(commitCommand(scenario.catalog,
-                                  registerGroup1Command()) ==
-                        Result{StatementOkResult{}},
-                    "catalog group should register the initial group");
-        tests.check(commitCommand(scenario.catalog,
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        RegisterReplicaGroupCommand{
+                            scenario.parent_group.group_id,
+                            addressNames(scenario.parent_group.replicas),
+                            1}) == Result{StatementOkResult{}},
+                    "catalog should register the parent range group");
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        RegisterReplicaGroupCommand{
+                            scenario.left_child_group.group_id,
+                            addressNames(scenario.left_child_group.replicas),
+                            1}) == Result{StatementOkResult{}},
+                    "catalog should register the left child range group");
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        RegisterReplicaGroupCommand{
+                            scenario.right_child_group.group_id,
+                            addressNames(scenario.right_child_group.replicas),
+                            1}) == Result{StatementOkResult{}},
+                    "catalog should register the right child range group");
+        tests.check(commitCommand(scenario,
+                                  scenario.catalog,
                                   createTitleTableCommand()) ==
                         Result{CreateTableOkResult{}},
-                    "catalog should create the title table metadata");
-        for (const auto& row : scenario.fixture.rows) {
-            tests.check(
-                commitCommand(scenario.catalog,
-                              parseSQL("INSERT " + row.first)) ==
-                    Result{InsertOkResult{}},
-                "catalog should record a real IMDB title key");
-        }
-        tests.check(
-            commitCommand(
-                scenario.catalog,
-                splitTitleCommand(2)) ==
-                Result{StatementOkResult{}},
-            "catalog should create two title ranges in one group");
+                    "catalog should create only title metadata");
+
+        loadParentRangeGroup(scenario, scenario.parent_group, scenario.fixture.rows);
+        recordParentKeyOwnership(scenario, scenario.parent_group, scenario.fixture.rows);
+
+        tests.check(countTitlesInGroup(scenario, scenario.left_child_group) == 0 &&
+                        countTitlesInGroup(scenario, scenario.right_child_group) == 0,
+                    "child groups should start empty before transfer commands");
         return scenario;
     };
 
-    auto queryConfigOn = [&](const ConsensusGroupHarness& group,
+    auto buildIntegratedRangeReplicaScenario = [&]() {
+        IntegratedRangeReplicaScenario scenario =
+            buildIntegratedRangeReplicaScenarioBeforeTransfer();
+        addAutonomousTransferCoordinator(scenario);
+        std::set<uint64_t> delivered;
+        runAutonomousTransferToCompletion(scenario, delivered);
+        tests.check(coordinatorNode(scenario)->done(),
+                    "autonomous range transfer should finish");
+        SelectAllResult movements =
+            catalogRowsForGroup(scenario, "__range_movements");
+        tests.check(selectAllHasRow(
+                        movements,
+                        {{"movement_id",
+                          defaultRangeIdForTable("title") + "->" +
+                              titleLeftRangeId() + "+" + titleRightRangeId()},
+                         {"phase", "done"},
+                         {"sequence", "4"}}),
+                    "catalog should record completed autonomous movement");
+        return scenario;
+    };
+
+    auto queryConfigOn = [&](const IntegratedRangeReplicaScenario& scenario,
                              const Address& replica,
                              int config_num) -> Result {
-        const auto* node = group.state.nodeAs<ConsensusReplica>(replica);
+        const auto* node = scenario.state.nodeAs<ConsensusReplica>(replica);
         if (node == nullptr) {
             throw std::runtime_error("missing config replica");
         }
@@ -16647,9 +17576,11 @@ int main(int argc, char* argv[]) {
             QueryRangeConfigCommand{config_num});
     };
 
-    auto configOn = [&](const ConsensusGroupHarness& group,
+    auto configOn = [&](const IntegratedRangeReplicaScenario& scenario,
                         int config_num = -1) {
-        Result result = queryConfigOn(group, group.leader, config_num);
+        Result result = queryConfigOn(scenario,
+                                      scenario.catalog.leader,
+                                      config_num);
         const auto* config = std::get_if<RangeConfigResult>(&result);
         if (config == nullptr) {
             throw std::runtime_error("config query failed");
@@ -16657,141 +17588,153 @@ int main(int argc, char* argv[]) {
         return *config;
     };
 
-    auto groupForRange = [](const RangeConfigResult& config,
-                            const std::string& range_id) {
-        size_t limit = std::min(config.range_ids.size(),
-                                config.replica_group_ids.size());
-        for (size_t i = 0; i < limit; ++i) {
-            if (config.range_ids[i] == range_id) {
-                return config.replica_group_ids[i];
-            }
-        }
-        return std::string{};
-    };
-
-    auto changedAssignments = [](const RangeConfigResult& lhs,
-                                 const RangeConfigResult& rhs) {
-        size_t changed = 0;
-        for (size_t i = 0; i < lhs.range_ids.size(); ++i) {
-            for (size_t j = 0; j < rhs.range_ids.size(); ++j) {
-                if (lhs.range_ids[i] == rhs.range_ids[j] &&
-                    lhs.replica_group_ids[i] != rhs.replica_group_ids[j]) {
-                    ++changed;
-                }
-            }
-        }
-        return changed;
-    };
-
-    auto configLooksSane = [](const RangeConfigResult& config) {
-        if (config.range_ids.empty() ||
-            config.range_ids.size() != config.replica_group_ids.size()) {
-            return false;
-        }
-        for (size_t i = 0; i < config.range_ids.size(); ++i) {
-            if (config.range_ids[i].empty() ||
-                config.replica_group_ids[i].empty()) {
-                return false;
-            }
-            if (std::find(config.range_ids.begin() + i + 1,
-                          config.range_ids.end(),
-                          config.range_ids[i]) != config.range_ids.end()) {
-                return false;
-            }
-        }
-        return true;
+    auto movementRows = [&](const IntegratedRangeReplicaScenario& scenario) {
+        return catalogRowsForGroup(scenario, "__range_movements");
     };
 
     tests.test("Initial config query returns no config", [&] {
-        ConsensusGroupHarness catalog =
-            makeConsensusGroup("group-catalog", "server", 1);
-        tests.check(queryConfigOn(catalog, catalog.leader, -1) ==
+        IntegratedRangeReplicaScenario scenario;
+        scenario.catalog = makeConsensusGroup("group-catalog",
+                                              "catalog-replica-",
+                                              1);
+        addConsensusGroupNodes(scenario.state, scenario.catalog);
+        electGroup(scenario, scenario.catalog);
+        tests.check(commitCommand(scenario,
+                                  scenario.catalog,
+                                  bootstrapClusterACommand()) ==
+                        Result{StatementOkResult{}},
+                    "catalog group should bootstrap the cluster");
+        tests.check(queryConfigOn(scenario, scenario.catalog.leader, -1) ==
                         Result{ConfigRejectedResult{}},
                     "query before any range config should return error");
     });
 
-    tests.test("Join and leave create historical configs", [&] {
-        auto scenario = buildConfigScenario();
-        RangeConfigResult initial = configOn(scenario.catalog);
-        tests.check(initial.config_num == 2 &&
-                        initial.range_ids ==
-                            std::vector<std::string>{
-                                titleLeftRangeId(), titleRightRangeId()} &&
-                        initial.replica_group_ids ==
-                            std::vector<std::string>{"group-1", "group-1"},
-                    "split setup should produce config 2 in group-1");
-
-        tests.check(
-            commitCommand(
-                scenario.catalog,
-                JoinReplicaGroupCommand{
-                    "group-2", {"g2s1", "g2s2", "g2s3"}}) ==
-                Result{StatementOkResult{}},
-            "join should return OK");
-        RangeConfigResult joined = configOn(scenario.catalog);
-        tests.check(joined.config_num == 3 &&
-                        joined.replica_group_ids ==
-                            std::vector<std::string>{"group-1", "group-2"},
-                    "join should rebalance two ranges over two groups");
-
-        tests.check(commitCommand(scenario.catalog,
-                                  LeaveReplicaGroupCommand{"group-1"}) ==
-                        Result{StatementOkResult{}},
-                    "leave should return OK");
-        RangeConfigResult left = configOn(scenario.catalog);
-        tests.check(left.config_num == 4 &&
-                        left.replica_group_ids ==
-                            std::vector<std::string>{"group-2", "group-2"},
-                    "leave should move all ranges to remaining group");
-        tests.check(configOn(scenario.catalog, 2) == initial,
-                    "historical query should preserve the split config");
-        tests.check(configOn(scenario.catalog, 3) == joined,
-                    "historical query should preserve the joined config");
-        tests.check(configOn(scenario.catalog, 99) == left,
-                    "query past the latest config should return latest");
-    });
-
-    tests.test("Move changes exactly one range", [&] {
-        auto scenario = buildConfigScenario();
-        tests.check(
-            commitCommand(
-                scenario.catalog,
-                JoinReplicaGroupCommand{
-                    "group-2", {"g2s1", "g2s2", "g2s3"}}) ==
-                Result{StatementOkResult{}},
-            "join should prepare a target group");
-        RangeConfigResult before = configOn(scenario.catalog);
+    tests.test("Ownership commit is rejected before copied movement", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenarioBeforeTransfer();
+        RangeConfigResult before = configOn(scenario);
         tests.check(commitCommand(
+                        scenario,
                         scenario.catalog,
-                        MoveRangeCommand{titleRightRangeId(), "group-1"}) ==
-                        Result{StatementOkResult{}},
-                    "move should return OK");
-        RangeConfigResult after = configOn(scenario.catalog);
-        tests.check(after.config_num == before.config_num + 1,
-                    "move should create a new config");
-        tests.check(changedAssignments(before, after) == 1,
-                    "move should change exactly one range assignment");
-        tests.check(groupForRange(after, titleLeftRangeId()) == "group-1" &&
-                        groupForRange(after, titleRightRangeId()) == "group-1",
-                    "move should put only the requested range on target group");
-        tests.check(configOn(scenario.catalog, before.config_num) == before,
-                    "move should not mutate the previous config");
+                        commitSplitOwnershipCommand(
+                            2,
+                            scenario.left_child_group.group_id,
+                            scenario.right_child_group.group_id)) ==
+                        Result{ConfigRejectedResult{}},
+                    "catalog should not publish child ownership before copy proof");
+        tests.check(configOn(scenario) == before,
+                    "rejected ownership commit should leave active config unchanged");
+        tests.check(movementRows(scenario).rows.empty(),
+                    "rejected ownership commit should not invent movement records");
+        tests.check(countTitlesInGroup(scenario, scenario.parent_group) ==
+                        scenario.fixture.rows.size(),
+                    "source group should still hold all title rows");
+        tests.check(countTitlesInGroup(scenario, scenario.left_child_group) == 0 &&
+                        countTitlesInGroup(scenario, scenario.right_child_group) == 0,
+                    "child groups should remain physically empty");
     });
 
-    tests.test("Bad config commands return errors", [&] {
-        auto scenario = buildConfigScenario();
-        RangeConfigResult unchanged = configOn(scenario.catalog);
+    tests.test("Move can target a stable empty replica group", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenario();
+        RangeConfigResult before = configOn(scenario);
+        SelectAllResult before_movements = movementRows(scenario);
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        RegisterReplicaGroupCommand{
+                            "group-empty-target",
+                            {"empty-1", "empty-2", "empty-3"},
+                            1}) == Result{StatementOkResult{}},
+                    "catalog should register a stable target group with no ranges");
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        MoveRangeCommand{titleRightRangeId(),
+                                         "group-empty-target"}) ==
+                        Result{StatementOkResult{}},
+                    "move should plan transfer to a stable empty group");
+        tests.check(configOn(scenario) == before,
+                    "move planning should not publish active ownership");
+        SelectAllResult movements = movementRows(scenario);
+        tests.check(movements.rows.size() == before_movements.rows.size() + 1,
+                    "move to empty target should append one movement request");
+        tests.check(selectAllHasRow(
+                        movements,
+                        {{"source_range_id", titleRightRangeId()},
+                         {"target_range_id", titleRightRangeId()},
+                         {"target_replica_group_id", "group-empty-target"},
+                         {"phase", "requested"}}),
+                    "movement request should name the stable empty target group");
+    });
+
+    tests.test("Move creates transfer request without changing active config", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenario();
+        RangeConfigResult before = configOn(scenario);
+        SelectAllResult before_movements = movementRows(scenario);
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        MoveRangeCommand{titleRightRangeId(),
+                                         scenario.left_child_group.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "move should create a transfer request");
+        RangeConfigResult after = configOn(scenario);
+        tests.check(after == before,
+                    "move request should not rewrite active ownership");
+        SelectAllResult movements = movementRows(scenario);
+        tests.check(movements.rows.size() == before_movements.rows.size() + 1,
+                    "move should append exactly one movement request");
+        tests.check(selectAllHasRow(
+                        movements,
+                        {{"source_range_id", titleRightRangeId()},
+                         {"target_range_id", titleRightRangeId()},
+                         {"target_replica_group_id",
+                          scenario.left_child_group.group_id},
+                         {"phase", "requested"}}),
+                    "movement request should name the range and target group");
+    });
+
+    tests.test("Join plans movement requests without changing active config", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenario();
+        RangeConfigResult before = configOn(scenario);
+        SelectAllResult before_movements = movementRows(scenario);
+        tests.check(
+            commitCommand(
+                scenario,
+                scenario.catalog,
+                JoinReplicaGroupCommand{
+                    "group-2", {"g2s1", "g2s2", "g2s3"}}) ==
+                Result{StatementOkResult{}},
+            "join should register the new group and plan movement");
+        tests.check(configOn(scenario) == before,
+                    "join request should not directly rewrite active owners");
+        SelectAllResult movements = movementRows(scenario);
+        tests.check(movements.rows.size() > before_movements.rows.size(),
+                    "join should append at least one movement request");
+        tests.check(selectAllHasRow(
+                        movements,
+                        {{"target_replica_group_id", "group-2"},
+                         {"phase", "requested"}}),
+                    "join should request transfer into the new group");
+    });
+
+    tests.test("Bad config commands do not create requests", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenario();
+        RangeConfigResult unchanged = configOn(scenario);
+        size_t before_count = movementRows(scenario).rows.size();
         auto expectRejectedWithoutChange =
             [&](const Command& command, const std::string& label) {
-            tests.check(commitCommand(scenario.catalog, command) ==
+            tests.check(commitCommand(scenario, scenario.catalog, command) ==
                             Result{ConfigRejectedResult{}},
                         label + " should fail");
-            tests.check(configOn(scenario.catalog) == unchanged,
-                        label + " should not mutate the config");
+            tests.check(configOn(scenario) == unchanged,
+                        label + " should not mutate active config");
+            tests.check(movementRows(scenario).rows.size() == before_count,
+                        label + " should not append movement requests");
         };
 
         expectRejectedWithoutChange(
-            JoinReplicaGroupCommand{"group-1", {"server1", "server2"}},
+            JoinReplicaGroupCommand{scenario.left_child_group.group_id,
+                                    {"server1", "server2"}},
             "joining an active group");
         expectRejectedWithoutChange(
             JoinReplicaGroupCommand{"group-empty", {}},
@@ -16800,104 +17743,44 @@ int main(int argc, char* argv[]) {
             LeaveReplicaGroupCommand{"missing-group"},
             "leaving an unknown group");
         expectRejectedWithoutChange(
-            MoveRangeCommand{"missing-range", "group-1"},
+            MoveRangeCommand{"missing-range", scenario.left_child_group.group_id},
             "moving an unknown range");
         expectRejectedWithoutChange(
             MoveRangeCommand{titleLeftRangeId(), "missing-group"},
             "moving to an unknown group");
         expectRejectedWithoutChange(
-            MoveRangeCommand{titleLeftRangeId(), "group-1"},
+            MoveRangeCommand{titleLeftRangeId(), scenario.left_child_group.group_id},
             "moving a range to its current group");
     });
 
-    tests.test("Config service is deterministic and replicated", [&] {
-        auto first = buildConfigScenario();
-        auto second = buildConfigScenario();
+    tests.test("Config requests are deterministic and replicated", [&] {
+        auto first = buildIntegratedRangeReplicaScenario();
+        auto second = buildIntegratedRangeReplicaScenario();
         tests.check(commitCommand(
+                        first,
                         first.catalog,
                         JoinReplicaGroupCommand{
                             "group-2", {"g2s1", "g2s2", "g2s3"}}) ==
                         Result{StatementOkResult{}},
-                    "first join should succeed");
+                    "first join should plan movement");
         tests.check(commitCommand(
+                        second,
                         second.catalog,
                         JoinReplicaGroupCommand{
                             "group-2", {"g2s1", "g2s2", "g2s3"}}) ==
                         Result{StatementOkResult{}},
-                    "second join should succeed");
-        tests.check(commitCommand(
-                        first.catalog,
-                        MoveRangeCommand{titleRightRangeId(), "group-1"}) ==
-                        Result{StatementOkResult{}},
-                    "first move should succeed");
-        tests.check(commitCommand(
-                        second.catalog,
-                        MoveRangeCommand{titleRightRangeId(), "group-1"}) ==
-                        Result{StatementOkResult{}},
-                    "second move should succeed");
-        RangeConfigResult expected = configOn(first.catalog);
-        tests.check(configOn(second.catalog) == expected,
-                    "same config commands should produce same config");
+                    "second join should plan movement");
+        tests.check(movementRows(first) == movementRows(second),
+                    "same config command should produce same movement requests");
+        RangeConfigResult expected = configOn(first);
         for (const auto& replica : first.catalog.replicas) {
-            Result result = queryConfigOn(first.catalog, replica, -1);
+            Result result = queryConfigOn(first, replica, -1);
             const auto* replica_config =
                 std::get_if<RangeConfigResult>(&result);
             tests.check(replica_config != nullptr &&
                             *replica_config == expected,
                         "catalog follower should expose the same config");
         }
-    });
-
-    tests.test("Repeated config churn is deterministic with stable history", [&] {
-        auto first = buildConfigScenario();
-        auto second = buildConfigScenario();
-
-        auto runChurn = [&](ConfigScenario& scenario) {
-            std::vector<RangeConfigResult> history;
-            history.push_back(configOn(scenario.catalog));
-
-            auto apply = [&](const Command& command,
-                             const std::string& label) {
-                tests.check(commitCommand(scenario.catalog, command) ==
-                                Result{StatementOkResult{}},
-                            label + " should commit through consensus");
-                RangeConfigResult current = configOn(scenario.catalog);
-                tests.check(configLooksSane(current),
-                            label + " should keep a valid config");
-                history.push_back(current);
-            };
-
-            apply(JoinReplicaGroupCommand{
-                      "group-2", {"g2s1", "g2s2", "g2s3"}},
-                  "joining group-2");
-
-            RangeConfigResult joined = configOn(scenario.catalog);
-            std::string right_group =
-                groupForRange(joined, titleRightRangeId());
-            std::string move_target =
-                right_group == "group-1" ? "group-2" : "group-1";
-            apply(MoveRangeCommand{titleRightRangeId(), move_target},
-                  "moving the right title range");
-
-            apply(JoinReplicaGroupCommand{
-                      "group-3", {"g3s1", "g3s2", "g3s3"}},
-                  "joining group-3");
-            apply(LeaveReplicaGroupCommand{"group-3"}, "leaving group-3");
-
-            return history;
-        };
-
-        std::vector<RangeConfigResult> first_history = runChurn(first);
-        std::vector<RangeConfigResult> second_history = runChurn(second);
-        tests.check(first_history == second_history,
-                    "same churn sequence should produce identical configs");
-        for (const auto& config : first_history) {
-            tests.check(configOn(first.catalog, config.config_num) == config,
-                        "historical config should remain queryable");
-        }
-        tests.check(configOn(first.catalog) == first_history.back() &&
-                        configOn(second.catalog) == second_history.back(),
-                    "latest config should be the final churn config");
     });
 
     return tests.finish();

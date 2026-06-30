@@ -15853,17 +15853,6 @@ Scenario oneClientBuzzDBScenario(Workload workload) {
         .build();
 }
 
-std::vector<Command> titleInsertCommandsFromImdb(
-    const std::string& data_file,
-    size_t row_count) {
-    std::vector<Command> commands{createTitleTableCommand()};
-    for (const auto& row : requireTupleLinesFromFile(
-             data_file, "title", row_count)) {
-        commands.push_back(parseSQL("INSERT " + row));
-    }
-    return commands;
-}
-
 std::string formatSelectAllResult(const SelectAllResult& result) {
     const auto& columns = result.columns;
     const auto& rows = result.rows;
@@ -15913,7 +15902,7 @@ std::string formatSelectAllResult(const SelectAllResult& result) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -15968,8 +15957,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v121-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -17962,7 +17951,7 @@ int main(int argc, char* argv[]) {
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
         printReplicatedCatalogTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
@@ -18183,11 +18172,12 @@ int main(int argc, char* argv[]) {
         SearchState state = consensusClusterState(replicas);
         state = electConsensusLeader(state, settings, leader,
                                      {replicas[1], replicas[2]});
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        Command create = commands[0];
+        std::vector<std::string> title_rows =
+            requireTupleLinesFromFile(imdb_file, "title", 1);
+        Command create = createTitleTableCommand();
         Command range = RegisterRangeCommand{
             "range-title", "/table/title", "/table/title0", "group-1", 1};
-        Command insert = commands[1];
+        Command insert = parseSQL("INSERT " + title_rows.front());
 
         state = deliverConsensusCommandToQuorum(
             state, settings, leader, client, 126, 1, create,

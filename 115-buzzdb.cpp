@@ -17502,6 +17502,37 @@ Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
+std::vector<Command> createTitleWriteCommands(const std::string& data_file) {
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 2);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<std::string> second_title =
+        tupleValuesFromLine(title_rows[1], "title");
+    if (first_title.size() < 4 || second_title.size() < 4) {
+        throw std::runtime_error("title rows must include production_year");
+    }
+
+    std::vector<Command> commands{createTitleTableCommand()};
+    commands.push_back(parseSQL("INSERT " + title_rows[0]));
+    commands.push_back(parseSQL("INSERT " + title_rows[1]));
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(first_title[3]),
+        "id", first_title[0]});
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(second_title[3]),
+        "id", second_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", first_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", second_title[0]});
+    commands.push_back(CountRowsCommand{"title"});
+    return commands;
+}
+
+Workload createTitleWriteWorkload(const std::string& data_file) {
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    return Workload(commands, buzzDBOracleResults(commands));
+}
+
 class BuzzDBClientWorkload final : public SearchTestWorkload {
 public:
     BuzzDBClientWorkload(Address server,
@@ -17756,7 +17787,7 @@ void printDistributedServiceTrace(const std::string& data_file) {
     Address server = ScenarioAddress::server1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientBuzzDBScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientBuzzDBScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings = scenario.settings;
     SearchState state = scenario.state;
 
@@ -18012,7 +18043,7 @@ void printActualPrimaryBackupSearchStates(size_t count,
     Address backup = ScenarioAddress::backup1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientPrimaryBackupScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientPrimaryBackupScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings;
     settings.max_depth = 5;
     settings.max_states = 1000;
@@ -18189,7 +18220,7 @@ void printPrimaryBackupTrace(const std::string& data_file) {
     Address primary = ScenarioAddress::server1();
     Address backup = ScenarioAddress::backup1();
     Address client = ScenarioAddress::client1();
-    std::vector<Command> commands = createExplicitJobJoinCommands(data_file);
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
     Scenario scenario =
         oneClientPrimaryBackupScenario(
             Workload(commands, buzzDBOracleResults(commands)));
@@ -18797,7 +18828,7 @@ void printRestartRecoveryMeasurement(const std::string& data_file) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -18850,8 +18881,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v115-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -19015,17 +19046,6 @@ void seedViewServerForPrimaryBackup(ViewServer& view_server,
     view_server.pingServer(backup, 2);
 }
 
-std::vector<Command> titleInsertCommandsFromImdb(
-    const std::string& data_file,
-    size_t row_count) {
-    std::vector<Command> commands{createTitleTableCommand()};
-    for (const auto& row : requireTupleLinesFromFile(
-             data_file, "title", row_count)) {
-        commands.push_back(parseSQL("INSERT " + row));
-    }
-    return commands;
-}
-
 SearchState viewAwarePrimaryBackupState(std::vector<Command> commands) {
     Address view_server = ScenarioAddress::viewserver1();
     Address primary = ScenarioAddress::server1();
@@ -19116,7 +19136,7 @@ void printPrimaryBackupCeilingTrace(const std::string& data_file) {
     Address client = ScenarioAddress::client1();
 
     SearchState view_state = viewAwarePrimaryBackupState(
-        titleInsertCommandsFromImdb(data_file, 1));
+        createTitleWriteCommands(data_file));
     SearchSettings control_plane_partition;
     control_plane_partition.partition({{client, primary, backup}, {view_server}});
     bool view_request_deliverable = false;
@@ -19132,7 +19152,7 @@ void printPrimaryBackupCeilingTrace(const std::string& data_file) {
     std::cout << "  control plane partition: view request deliverable="
               << (view_request_deliverable ? "yes" : "no") << std::endl;
 
-    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
     SearchState write_state = oneClientPrimaryBackupScenario(
         Workload(commands, buzzDBOracleResults(commands))).state;
     SearchSettings normal;
@@ -19193,7 +19213,7 @@ int main(int argc, char* argv[]) {
         printPrimaryBackupTrace(imdb_file);
         printReadIndexPartitionTrace(imdb_file);
         printPrimaryBackupCeilingTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
@@ -19204,7 +19224,7 @@ int main(int argc, char* argv[]) {
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
         SearchState state = viewAwarePrimaryBackupState(
-            titleInsertCommandsFromImdb(imdb_file, 1));
+            createTitleWriteCommands(imdb_file));
 
         SearchSettings partitioned;
         partitioned.partition({{client, primary, backup}, {view_server}});
@@ -19262,7 +19282,7 @@ int main(int argc, char* argv[]) {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
         SearchState state = oneClientPrimaryBackupScenario(
             Workload(commands, buzzDBOracleResults(commands))).state;
         SearchSettings normal;
@@ -19324,8 +19344,12 @@ int main(int argc, char* argv[]) {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
-        commands.push_back(CountRowsCommand{"title"});
+        std::vector<Command> title_commands =
+            createTitleWriteCommands(imdb_file);
+        std::vector<Command> commands{
+            title_commands[0],
+            title_commands[1],
+            CountRowsCommand{"title"}};
         Scenario scenario = oneClientPrimaryBackupScenario(
             Workload(commands, buzzDBOracleResults(commands)));
         SearchSettings settings = scenario.settings;
@@ -19400,10 +19424,10 @@ int main(int argc, char* argv[]) {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
-        std::vector<Command> prefix = titleInsertCommandsFromImdb(imdb_file, 1);
-        std::vector<std::string> title_rows =
-            requireTupleLinesFromFile(imdb_file, "title", 2);
-        Command suffix = parseSQL("INSERT " + title_rows[1]);
+        std::vector<Command> title_commands =
+            createTitleWriteCommands(imdb_file);
+        std::vector<Command> prefix{title_commands[0], title_commands[1]};
+        Command suffix = title_commands[2];
         SearchState source_state = oneClientPrimaryBackupScenario(
             Workload(prefix, buzzDBOracleResults(prefix))).state;
         SearchSettings settings;

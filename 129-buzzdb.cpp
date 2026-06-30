@@ -12140,6 +12140,7 @@ const std::vector<std::string>& systemCatalogTableNames() {
         "__tables",
         "__ranges",
         "__global_keys",
+        "__range_movements",
         "__schema_versions"
     };
     return names;
@@ -12574,6 +12575,12 @@ private:
             {"table_name:string", "primary_key:string", "row_key:string",
              "range_id:string", "replica_group_id:string",
              "descriptor_version:int", "status:string"});
+        createSystemCatalogTableIfMissing(
+            "__range_movements",
+            {"movement_id:string", "table_name:string",
+             "source_range_id:string", "target_range_id:string",
+             "target_replica_group_id:string", "start_key:string",
+             "end_key:string", "phase:string", "sequence:int"});
         createSystemCatalogTableIfMissing(
             "__schema_versions",
             {"table_name:string", "schema_version:int"});
@@ -16121,6 +16128,409 @@ int main(int argc, char* argv[]) {
         });
     };
 
+    struct DurableRangeMovementProtocol {
+        std::string movement_id;
+        std::string catalog_file;
+        std::string source_file;
+        std::string target_file;
+        std::string table = "title";
+        std::string source_range_id = defaultRangeIdForTable("title");
+        std::string target_range_id;
+        std::string target_group_id;
+        std::string start_key;
+        std::string end_key;
+        SplitTableCommand split_command;
+        std::vector<std::pair<std::string, std::vector<std::string>>> rows;
+
+        DurableRangeMovementProtocol(
+            std::string movement,
+            std::string catalog,
+            std::string source,
+            std::string target,
+            std::string target_range,
+            std::string target_group,
+            std::string start,
+            std::string end,
+            SplitTableCommand split,
+            std::vector<std::pair<std::string,
+                                  std::vector<std::string>>> moved_rows)
+            : movement_id(std::move(movement)),
+              catalog_file(std::move(catalog)),
+              source_file(std::move(source)),
+              target_file(std::move(target)),
+              target_range_id(std::move(target_range)),
+              target_group_id(std::move(target_group)),
+              start_key(std::move(start)),
+              end_key(std::move(end)),
+              split_command(std::move(split)),
+              rows(std::move(moved_rows)) {}
+
+        static void requireInsertOk(const Result& actual,
+                                    const std::string& message) {
+            if (!std::holds_alternative<InsertOkResult>(actual)) {
+                throw std::runtime_error(
+                    message + ": got " + describeResult(actual));
+            }
+        }
+
+        static void requireCreateOkOrExists(const Result& actual,
+                                            const std::string& message) {
+            if (!std::holds_alternative<CreateTableOkResult>(actual) &&
+                !std::holds_alternative<TableAlreadyExistsResult>(actual)) {
+                throw std::runtime_error(
+                    message + ": got " + describeResult(actual));
+            }
+        }
+
+        static std::string primaryKey(
+            const std::pair<std::string, std::vector<std::string>>& row) {
+            if (row.second.empty()) {
+                throw std::runtime_error("row is missing a primary key");
+            }
+            return row.second.front();
+        }
+
+        static SelectAllResult selectTitle(BuzzDBCore& db,
+                                           const std::string& primary_key) {
+            Result result = db.execute(
+                SelectWhereCommand{"title", "id", primary_key});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            return rows == nullptr ? SelectAllResult{} : *rows;
+        }
+
+        static size_t countTitles(BuzzDBCore& db) {
+            Result result = db.execute(SelectAllCommand{"title"});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            return rows == nullptr ? size_t{0} : rows->rows.size();
+        }
+
+        void recoverBundle(BuzzDBCore& db) const {
+            db.recover();
+        }
+
+        BuzzDBCore openCatalog() const {
+            BuzzDBCore db(catalog_file);
+            recoverBundle(db);
+            return db;
+        }
+
+        BuzzDBCore openSource() const {
+            BuzzDBCore db(source_file);
+            recoverBundle(db);
+            return db;
+        }
+
+        BuzzDBCore openTarget() const {
+            BuzzDBCore db(target_file);
+            recoverBundle(db);
+            return db;
+        }
+
+        void ensureMovementCatalog(BuzzDBCore& catalog) const {
+            Result rows = catalog.execute(
+                ReadSystemCatalogCommand{"__range_movements"});
+            if (!std::holds_alternative<SelectAllResult>(rows)) {
+                throw std::runtime_error("missing movement catalog");
+            }
+        }
+
+        int nextSequence(BuzzDBCore& catalog) const {
+            ensureMovementCatalog(catalog);
+            Result result = catalog.execute(
+                ReadSystemCatalogCommand{"__range_movements"});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            int sequence = 0;
+            if (rows == nullptr) return 1;
+            auto id_col = catalogColumnIndex(*rows, "movement_id");
+            auto sequence_col = catalogColumnIndex(*rows, "sequence");
+            if (!id_col.has_value() || !sequence_col.has_value()) return 1;
+            for (const auto& row : rows->rows) {
+                if (*id_col < row.size() && row[*id_col] == movement_id &&
+                    *sequence_col < row.size()) {
+                    sequence = std::max(sequence, std::stoi(row[*sequence_col]));
+                }
+            }
+            return sequence + 1;
+        }
+
+        std::string latestPhase(BuzzDBCore& catalog) const {
+            ensureMovementCatalog(catalog);
+            Result result = catalog.execute(
+                ReadSystemCatalogCommand{"__range_movements"});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            if (rows == nullptr) return "";
+            auto id_col = catalogColumnIndex(*rows, "movement_id");
+            auto phase_col = catalogColumnIndex(*rows, "phase");
+            auto sequence_col = catalogColumnIndex(*rows, "sequence");
+            if (!id_col.has_value() || !phase_col.has_value() ||
+                !sequence_col.has_value()) {
+                return "";
+            }
+            int best = -1;
+            std::string phase;
+            for (const auto& row : rows->rows) {
+                if (*id_col >= row.size() || row[*id_col] != movement_id ||
+                    *phase_col >= row.size() || *sequence_col >= row.size()) {
+                    continue;
+                }
+                int sequence = std::stoi(row[*sequence_col]);
+                if (sequence > best) {
+                    best = sequence;
+                    phase = row[*phase_col];
+                }
+            }
+            return phase;
+        }
+
+        std::string latestPhase() const {
+            BuzzDBCore catalog = openCatalog();
+            return latestPhase(catalog);
+        }
+
+        void appendPhase(BuzzDBCore& catalog, const std::string& phase) const {
+            ensureMovementCatalog(catalog);
+            requireInsertOk(
+                catalog.execute(InsertRowCommand{
+                    "__range_movements",
+                    {movement_id,
+                     table,
+                     source_range_id,
+                     target_range_id,
+                     target_group_id,
+                     start_key,
+                     end_key,
+                     phase,
+                     std::to_string(nextSequence(catalog))}}),
+                "movement should append phase " + phase);
+        }
+
+        Result prepare() const {
+            BuzzDBCore catalog = openCatalog();
+            std::string phase = latestPhase(catalog);
+            if (phase.empty()) appendPhase(catalog, "PREPARING");
+            return StatementOkResult{};
+        }
+
+        void ensureTitleTable(BuzzDBCore& db) const {
+            Result result = db.execute(createTitleTableCommand());
+            requireCreateOkOrExists(result,
+                                    "range store should have title table");
+        }
+
+        void copyRowsWithPhase(const std::string& phase) const {
+            {
+                BuzzDBCore catalog = openCatalog();
+                appendPhase(catalog, phase);
+            }
+            BuzzDBCore target = openTarget();
+            ensureTitleTable(target);
+            for (const auto& row : rows) {
+                std::string key = primaryKey(row);
+                if (!selectTitle(target, key).rows.empty()) continue;
+                requireInsertOk(
+                    target.execute(parseSQL("INSERT " + row.first)),
+                    "target should import moved title " + key);
+            }
+            target.execute(CheckpointCommand{});
+        }
+
+        Result copy() const {
+            copyRowsWithPhase("COPYING");
+            return StatementOkResult{};
+        }
+
+        Result catchUp() const {
+            copyRowsWithPhase("CATCHING_UP");
+            return StatementOkResult{};
+        }
+
+        bool targetHasAllRows() const {
+            BuzzDBCore target = openTarget();
+            for (const auto& row : rows) {
+                if (selectTitle(target, primaryKey(row)).rows.empty()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        Result commitReady() const {
+            if (!targetHasAllRows()) return ConfigRejectedResult{};
+            BuzzDBCore catalog = openCatalog();
+            appendPhase(catalog, "COMMIT_READY");
+            return StatementOkResult{};
+        }
+
+        bool catalogSwitched(BuzzDBCore& catalog) const {
+            for (const auto& row : rows) {
+                Result result = catalog.execute(
+                    ExplainRouteCommand{table, primaryKey(row), false});
+                const auto* route = std::get_if<RouteResult>(&result);
+                if (route == nullptr || route->range_ids.size() != 1 ||
+                    route->range_ids.front() != target_range_id) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        Result switchOwnership() const {
+            BuzzDBCore catalog = openCatalog();
+            std::string phase = latestPhase(catalog);
+            if (phase != "COMMIT_READY") return ConfigRejectedResult{};
+            Result split = catalog.execute(split_command);
+            if (!std::holds_alternative<StatementOkResult>(split) &&
+                !catalogSwitched(catalog)) {
+                return split;
+            }
+            appendPhase(catalog, "OWNERSHIP_SWITCHED");
+            return StatementOkResult{};
+        }
+
+        Result gcSource() const {
+            BuzzDBCore catalog = openCatalog();
+            std::string phase = latestPhase(catalog);
+            if (phase == "GC_SOURCE") return StatementOkResult{};
+            if (phase != "OWNERSHIP_SWITCHED") return ConfigRejectedResult{};
+            BuzzDBCore source = openSource();
+            for (const auto& row : rows) {
+                std::string key = primaryKey(row);
+                if (selectTitle(source, key).rows.empty()) continue;
+                Result deleted = source.execute(
+                    DeleteRowsCommand{table, "id", key});
+                const auto* delete_rows = std::get_if<DeleteRowsResult>(&deleted);
+                if (delete_rows == nullptr || delete_rows->count > 1) {
+                    throw std::runtime_error(
+                        "source cleanup returned " + describeResult(deleted));
+                }
+            }
+            source.execute(CheckpointCommand{});
+            appendPhase(catalog, "GC_SOURCE");
+            return StatementOkResult{};
+        }
+
+        Result resumeToComplete() const {
+            for (int step = 0; step < 8; ++step) {
+                std::string phase = latestPhase();
+                if (phase.empty()) return prepare();
+                if (phase == "PREPARING") return copy();
+                if (phase == "COPYING") return catchUp();
+                if (phase == "CATCHING_UP") return commitReady();
+                if (phase == "COMMIT_READY") return switchOwnership();
+                if (phase == "OWNERSHIP_SWITCHED") return gcSource();
+                if (phase == "GC_SOURCE") return StatementOkResult{};
+            }
+            return ConfigRejectedResult{};
+        }
+
+        Result runToCompletion() const {
+            for (int step = 0; step < 8; ++step) {
+                Result result = resumeToComplete();
+                if (!std::holds_alternative<StatementOkResult>(result)) {
+                    return result;
+                }
+                if (latestPhase() == "GC_SOURCE") return StatementOkResult{};
+            }
+            return ConfigRejectedResult{};
+        }
+
+        size_t sourceRowCount() const {
+            BuzzDBCore source = openSource();
+            return countTitles(source);
+        }
+
+        size_t targetRowCount() const {
+            BuzzDBCore target = openTarget();
+            return countTitles(target);
+        }
+
+        size_t physicalCopies(const std::string& primary_key) const {
+            BuzzDBCore source = openSource();
+            BuzzDBCore target = openTarget();
+            return selectTitle(source, primary_key).rows.size() +
+                   selectTitle(target, primary_key).rows.size();
+        }
+    };
+
+    struct DurableMovementCase {
+        TitleSplitFixture fixture;
+        std::vector<std::pair<std::string, std::vector<std::string>>> moved_rows;
+        std::string catalog_file;
+        std::string source_file;
+        std::string target_file;
+        SplitTableCommand split_command;
+        DurableRangeMovementProtocol protocol;
+    };
+
+    auto makeDurableMovementCase = [&]() {
+        TitleSplitFixture fixture = titleSplitFixture();
+        std::vector<std::pair<std::string, std::vector<std::string>>>
+            moved_rows(
+                fixture.rows.begin() +
+                    static_cast<std::ptrdiff_t>(fixture.split_index),
+                fixture.rows.end());
+        std::string catalog_file = makeScratchBuzzDBFile();
+        std::string source_file = makeScratchBuzzDBFile();
+        std::string target_file = makeScratchBuzzDBFile();
+        SplitTableCommand split = splitTitleCommand();
+        {
+            BuzzDBCore catalog(catalog_file);
+            BuzzDBCore source(source_file);
+            tests.check(catalog.execute(createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        "catalog should create title metadata");
+            tests.check(source.execute(createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        "source should create title table");
+            for (const auto& row : fixture.rows) {
+                std::string key = row.second.front();
+                tests.check(source.execute(parseSQL("INSERT " + row.first)) ==
+                                Result{InsertOkResult{}},
+                            "source should load title " + key);
+                tests.check(catalog.execute(InsertRowCommand{
+                                "__global_keys",
+                                {"title",
+                                 key,
+                                 tableRowKey("title", key),
+                                 defaultRangeIdForTable("title"),
+                                 "group-1",
+                                 "1",
+                                 "active"}}) == Result{InsertOkResult{}},
+                            "catalog should record source ownership for " + key);
+            }
+            Result movement_catalog = catalog.execute(
+                ReadSystemCatalogCommand{"__range_movements"});
+            tests.check(std::holds_alternative<SelectAllResult>(movement_catalog),
+                        "movement catalog should exist");
+            catalog.execute(CheckpointCommand{});
+            source.execute(CheckpointCommand{});
+        }
+        return DurableMovementCase{
+            fixture,
+            moved_rows,
+            catalog_file,
+            source_file,
+            target_file,
+            split,
+            DurableRangeMovementProtocol{
+                "move-title-right",
+                catalog_file,
+                source_file,
+                target_file,
+                titleRightRangeId(),
+                "group-1",
+                fixture.split_key,
+                tableRowPrefixEnd("title"),
+                split,
+                moved_rows}};
+    };
+
+    auto removeDurableMovementCase = [&](const DurableMovementCase& c) {
+        removeScratchDatabase(c.catalog_file);
+        removeScratchDatabase(c.source_file);
+        removeScratchDatabase(c.target_file);
+    };
+
     tests.test("No table has no range config", [&] {
         BuzzDBCore db;
         Result route = db.execute(
@@ -16400,6 +16810,106 @@ int main(int argc, char* argv[]) {
                                 titleLeftRangeId(),
                                 titleRightRangeId()},
                     "full table scan should see two adjacent children");
+    });
+
+    tests.test("Range movement refuses ownership switch before target proof", [&] {
+        DurableMovementCase movement = makeDurableMovementCase();
+        try {
+            tests.check(movement.protocol.prepare() ==
+                            Result{StatementOkResult{}},
+                        "movement should enter PREPARING");
+            tests.check(movement.protocol.commitReady() ==
+                            Result{ConfigRejectedResult{}},
+                        "target proof should be required before COMMIT_READY");
+            tests.check(movement.protocol.latestPhase() == "PREPARING",
+                        "failed proof should not advance movement state");
+            tests.check(movement.protocol.switchOwnership() ==
+                            Result{ConfigRejectedResult{}},
+                        "ownership switch should require COMMIT_READY");
+        } catch (...) {
+            removeDurableMovementCase(movement);
+            throw;
+        }
+        removeDurableMovementCase(movement);
+    });
+
+    tests.test("Range movement resumes from durable COPYING state", [&] {
+        DurableMovementCase movement = makeDurableMovementCase();
+        try {
+            tests.check(movement.protocol.prepare() ==
+                            Result{StatementOkResult{}},
+                        "movement should prepare durably");
+            tests.check(movement.protocol.copy() ==
+                            Result{StatementOkResult{}},
+                        "movement should copy rows to target");
+            tests.check(movement.protocol.latestPhase() == "COPYING",
+                        "copy phase should be durable before restart");
+
+            DurableRangeMovementProtocol restarted = movement.protocol;
+            tests.check(restarted.runToCompletion() ==
+                            Result{StatementOkResult{}},
+                        "restart should resume through switch and cleanup");
+            tests.check(restarted.latestPhase() == "GC_SOURCE",
+                        "completed movement should end in GC_SOURCE");
+            tests.check(restarted.targetRowCount() ==
+                            movement.fixture.rightCount(),
+                        "target should hold moved title rows after resume");
+            tests.check(restarted.sourceRowCount() ==
+                            movement.fixture.leftCount(),
+                        "source should keep only unmoved rows after cleanup");
+            for (const auto& row : movement.moved_rows) {
+                tests.check(restarted.physicalCopies(row.second.front()) == 1,
+                            "moved title should have one physical copy after resume");
+            }
+        } catch (...) {
+            removeDurableMovementCase(movement);
+            throw;
+        }
+        removeDurableMovementCase(movement);
+    });
+
+    tests.test("Range movement copy and cleanup retries are idempotent", [&] {
+        DurableMovementCase movement = makeDurableMovementCase();
+        try {
+            tests.check(movement.protocol.prepare() ==
+                            Result{StatementOkResult{}},
+                        "movement should prepare");
+            tests.check(movement.protocol.copy() ==
+                            Result{StatementOkResult{}},
+                        "first copy should succeed");
+            tests.check(movement.protocol.copy() ==
+                            Result{StatementOkResult{}},
+                        "copy retry should be accepted");
+            tests.check(movement.protocol.targetRowCount() ==
+                            movement.fixture.rightCount(),
+                        "copy retry should not duplicate target rows");
+            tests.check(movement.protocol.catchUp() ==
+                            Result{StatementOkResult{}},
+                        "catch-up should retry copy idempotently");
+            tests.check(movement.protocol.commitReady() ==
+                            Result{StatementOkResult{}},
+                        "target proof should allow commit-ready");
+            tests.check(movement.protocol.switchOwnership() ==
+                            Result{StatementOkResult{}},
+                        "catalog ownership switch should succeed");
+            tests.check(movement.protocol.gcSource() ==
+                            Result{StatementOkResult{}},
+                        "source cleanup should succeed");
+            tests.check(movement.protocol.gcSource() ==
+                            Result{StatementOkResult{}},
+                        "source cleanup retry should be a no-op");
+            tests.check(movement.protocol.sourceRowCount() ==
+                            movement.fixture.leftCount(),
+                        "cleanup retry should not remove unmoved rows");
+            for (const auto& row : movement.moved_rows) {
+                tests.check(movement.protocol.physicalCopies(row.second.front()) == 1,
+                            "retry-safe movement should leave one physical copy");
+            }
+        } catch (...) {
+            removeDurableMovementCase(movement);
+            throw;
+        }
+        removeDurableMovementCase(movement);
     });
 
     tests.test("Restart undo removes stolen loser insert", [&] {

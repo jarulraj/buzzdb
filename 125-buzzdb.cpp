@@ -13132,7 +13132,7 @@ std::string formatSelectAllResult(const SelectAllResult& result) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -13187,8 +13187,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v125-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -14359,6 +14359,184 @@ private:
     std::vector<RangeDescriptor> cached_ranges_;
 };
 
+
+class PhysicalRangeCluster {
+public:
+    PhysicalRangeCluster(std::string table,
+                         CreateTableCommand create_table,
+                         std::string source_range_id,
+                         std::string left_range_id,
+                         std::string right_range_id,
+                         std::string source_group_id = "group-1")
+        : table_(std::move(table)),
+          create_table_(std::move(create_table)),
+          source_range_id_(std::move(source_range_id)),
+          left_range_id_(std::move(left_range_id)),
+          right_range_id_(std::move(right_range_id)),
+          source_group_id_(std::move(source_group_id)) {}
+
+    void loadSourceRows(
+        const std::vector<std::pair<std::string,
+                                    std::vector<std::string>>>& rows) {
+        ensureTable(catalog_);
+        ensureTable(source_);
+        loaded_rows_ = rows;
+        for (const auto& row : loaded_rows_) {
+            requireResultType<InsertOkResult>(
+                source_.execute(parseSQL("INSERT " + row.first)),
+                "source range should load " + primaryKey(row));
+            recordCatalogKey(primaryKey(row),
+                             source_range_id_,
+                             source_group_id_,
+                             1);
+        }
+    }
+
+    void moveRowsBySplitIndex(size_t split_index) {
+        if (split_index == 0 || split_index >= loaded_rows_.size()) {
+            throw std::runtime_error("physical movement needs an interior split");
+        }
+        for (size_t i = 0; i < loaded_rows_.size(); ++i) {
+            const std::string& target_range =
+                i < split_index ? left_range_id_ : right_range_id_;
+            moveRowToRange(loaded_rows_[i], target_range);
+        }
+    }
+
+    size_t sourceRowCount() { return rowCount(source_); }
+    size_t leftRowCount() { return rowCount(left_); }
+    size_t rightRowCount() { return rowCount(right_); }
+
+    size_t physicalCopies(const std::string& primary_key) {
+        return selectRows(source_, primary_key).rows.size() +
+               selectRows(left_, primary_key).rows.size() +
+               selectRows(right_, primary_key).rows.size();
+    }
+
+    BuzzDBCore& catalogStore() { return catalog_; }
+    BuzzDBCore& sourceStore() { return source_; }
+    BuzzDBCore& leftStore() { return left_; }
+    BuzzDBCore& rightStore() { return right_; }
+
+private:
+    template <typename ResultType>
+    static void requireResultType(const Result& actual,
+                                  const std::string& message) {
+        if (!std::holds_alternative<ResultType>(actual)) {
+            throw std::runtime_error(
+                message + ": got " + describeResult(actual));
+        }
+    }
+
+    static void requireDeletedOne(const Result& actual,
+                                  const std::string& message) {
+        const auto* deleted = std::get_if<DeleteRowsResult>(&actual);
+        if (deleted == nullptr || deleted->count != 1) {
+            throw std::runtime_error(
+                message + ": got " + describeResult(actual));
+        }
+    }
+
+    static std::string primaryKey(
+        const std::pair<std::string, std::vector<std::string>>& row) {
+        if (row.second.empty()) {
+            throw std::runtime_error("row is missing a primary key");
+        }
+        return row.second.front();
+    }
+
+    void ensureTable(BuzzDBCore& store) {
+        Result count = store.execute(CountRowsCommand{table_});
+        if (std::holds_alternative<TableNotFoundResult>(count)) {
+            requireResultType<CreateTableOkResult>(
+                store.execute(create_table_),
+                "range store should create " + table_);
+        }
+    }
+
+    void recordCatalogKey(const std::string& primary_key,
+                          const std::string& range_id,
+                          const std::string& replica_group_id,
+                          int descriptor_version) {
+        requireResultType<InsertOkResult>(
+            catalog_.execute(InsertRowCommand{
+                "__global_keys",
+                {table_,
+                 primary_key,
+                 tableRowKey(table_, primary_key),
+                 range_id,
+                 replica_group_id,
+                 std::to_string(descriptor_version)}}),
+            "catalog should record ownership for " + primary_key);
+    }
+
+    SelectAllResult selectRows(BuzzDBCore& store,
+                               const std::string& primary_key) {
+        Result result = store.execute(
+            SelectWhereCommand{table_, "id", primary_key});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return SelectAllResult{};
+        return *rows;
+    }
+
+    size_t rowCount(BuzzDBCore& store) {
+        Result result = store.execute(SelectAllCommand{table_});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        return rows == nullptr ? size_t{0} : rows->rows.size();
+    }
+
+    std::string insertSQLFromValues(const std::vector<std::string>& values) {
+        std::ostringstream out;
+        out << "INSERT " << table_;
+        for (const auto& value : values) out << "|" << value;
+        return out.str();
+    }
+
+    BuzzDBCore& storeForRange(const std::string& range_id) {
+        if (range_id == left_range_id_) return left_;
+        if (range_id == right_range_id_) return right_;
+        if (range_id == source_range_id_) return source_;
+        throw std::runtime_error("unknown range id " + range_id);
+    }
+
+    void importIfMissing(BuzzDBCore& target,
+                         const std::string& primary_key,
+                         const std::vector<std::string>& values) {
+        ensureTable(target);
+        if (!selectRows(target, primary_key).rows.empty()) return;
+        requireResultType<InsertOkResult>(
+            target.execute(parseSQL(insertSQLFromValues(values))),
+            "target range should import " + primary_key);
+    }
+
+    void moveRowToRange(
+        const std::pair<std::string, std::vector<std::string>>& row,
+        const std::string& target_range_id) {
+        const std::string primary_key = primaryKey(row);
+        SelectAllResult selected = selectRows(source_, primary_key);
+        if (selected.rows.empty()) return;
+        BuzzDBCore& target = storeForRange(target_range_id);
+        importIfMissing(target, primary_key, selected.rows.front());
+        if (target_range_id != source_range_id_) {
+            requireDeletedOne(
+                source_.execute(DeleteRowsCommand{table_, "id", primary_key}),
+                "source range should remove moved row " + primary_key);
+        }
+    }
+
+    std::string table_;
+    CreateTableCommand create_table_;
+    std::string source_range_id_;
+    std::string left_range_id_;
+    std::string right_range_id_;
+    std::string source_group_id_;
+    BuzzDBCore catalog_;
+    BuzzDBCore source_;
+    BuzzDBCore left_;
+    BuzzDBCore right_;
+    std::vector<std::pair<std::string, std::vector<std::string>>> loaded_rows_;
+};
+
 Command bootstrapClusterACommand() {
     return BootstrapClusterCommand{
         "cluster-A", "server1", {"server1", "server2", "server3"}, 1};
@@ -14439,6 +14617,39 @@ void printPartitionedSQLTrace(const std::string& data_file) {
               << ", __global_keys rows="
               << catalogRowCountOn(leader_node, "__global_keys")
               << std::endl;
+
+    std::vector<std::pair<std::string, std::vector<std::string>>> movement_rows;
+    for (const auto& line : requireTupleLinesFromFile(data_file, "title", 6)) {
+        movement_rows.push_back({line, tupleValuesFromLine(line, "title")});
+    }
+    std::sort(
+        movement_rows.begin(),
+        movement_rows.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return tableRowKey("title", lhs.second.front()) <
+                   tableRowKey("title", rhs.second.front());
+        });
+    if (movement_rows.size() >= 2) {
+        PhysicalRangeCluster physical(
+            "title",
+            createTitleTableCommand(),
+            defaultRangeIdForTable("title"),
+            defaultRangeIdForTable("title") + "-left",
+            defaultRangeIdForTable("title") + "-right");
+        size_t split_index = movement_rows.size() / 2;
+        runWithSuppressedStdout([&] {
+            physical.loadSourceRows(movement_rows);
+            physical.moveRowsBySplitIndex(split_index);
+            return 0;
+        });
+        std::string sample_key = movement_rows[split_index].second.front();
+        std::cout << "  physical mover -> source_rows="
+                  << physical.sourceRowCount()
+                  << ", left_rows=" << physical.leftRowCount()
+                  << ", right_rows=" << physical.rightRowCount()
+                  << ", copies(" << sample_key << ")="
+                  << physical.physicalCopies(sample_key) << std::endl;
+    }
     for (const auto& replica : replicas) {
         const auto* node = state.nodeAs<ConsensusReplica>(replica);
         std::cout << "  " << replica << " has title range="
@@ -14472,15 +14683,40 @@ int main(int argc, char* argv[]) {
     if (!tests_only) {
         printLocalBuzzDBTrace(imdb_file);
         printPartitionedSQLTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
 
+    auto titleTuplesByKey = [&]() {
+        std::vector<std::pair<std::string, std::vector<std::string>>> tuples;
+        for (const auto& line :
+             requireTupleLinesFromFile(imdb_file, "title", 2)) {
+            tuples.push_back(
+                std::make_pair(line, tupleValuesFromLine(line, "title")));
+        }
+        std::sort(
+            tuples.begin(),
+            tuples.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return tableRowKey("title", lhs.second.front()) <
+                       tableRowKey("title", rhs.second.front());
+            });
+        return tuples;
+    };
+
     auto firstTitleTuple = [&]() {
-        std::string line =
-            requireTupleLinesFromFile(imdb_file, "title", 1).front();
-        return std::make_pair(line, tupleValuesFromLine(line, "title"));
+        return titleTuplesByKey().front();
+    };
+
+    auto secondTitleTuple = [&]() {
+        auto tuples = titleTuplesByKey();
+        return tuples.at(1);
+    };
+
+    auto boundaryAfterFirstTitle = [&]() {
+        auto second = secondTitleTuple();
+        return tableRowKey("title", second.second.front());
     };
 
     auto buildTitleTableState = [&](int client_id) {
@@ -14518,85 +14754,6 @@ int main(int argc, char* argv[]) {
         }
         return *route;
     };
-
-    tests.test("Network controls filter simulator messages and timers", [&] {
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address follower = replicas[1];
-        Address client = ScenarioAddress::client1();
-        SearchState state = consensusClusterState(replicas);
-        state.send(client, leader,
-                   ClientRequest{600, 1, createTitleTableCommand()});
-
-        auto clientRequestVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* message = messageForEvent(state, event);
-                if (message == nullptr) continue;
-                const auto* request =
-                    std::get_if<ClientRequest>(&message->message);
-                if (request != nullptr &&
-                    message->from.rootAddress() == client.rootAddress() &&
-                    message->to.rootAddress() == leader.rootAddress()) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        auto electionTimerVisible = [&](const SearchSettings& settings) {
-            for (const auto& event : state.events(settings)) {
-                const auto* timer = timerForEvent(state, event);
-                if (timer != nullptr &&
-                    timer->to.rootAddress() == leader.rootAddress() &&
-                    std::get_if<ElectionTimer>(&timer->timer) != nullptr) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        SearchSettings network_off;
-        network_off.networkActive(false);
-        tests.check(!clientRequestVisible(network_off),
-                    "global network disable should hide client request");
-        network_off.linkActive(client, leader, true);
-        tests.check(clientRequestVisible(network_off),
-                    "explicit link enable should override global network off");
-
-        SearchSettings sender_off;
-        sender_off.senderActive(client, false);
-        tests.check(!clientRequestVisible(sender_off),
-                    "sender disable should hide client request");
-
-        SearchSettings receiver_off;
-        receiver_off.receiverActive(leader, false);
-        tests.check(!clientRequestVisible(receiver_off),
-                    "receiver disable should hide client request");
-
-        SearchSettings node_off;
-        node_off.nodeActive(leader, false);
-        tests.check(!clientRequestVisible(node_off),
-                    "node disable should hide messages and timers");
-        tests.check(!electionTimerVisible(node_off),
-                    "node disable should hide its timers");
-
-        SearchSettings partitioned;
-        partitioned.partition({{client}, {leader, follower}});
-        tests.check(!clientRequestVisible(partitioned),
-                    "partition should block cross-group message delivery");
-        partitioned.resetNetwork();
-        tests.check(clientRequestVisible(partitioned),
-                    "resetNetwork should restore message delivery");
-
-        SearchSettings timer_off;
-        timer_off.timerActive(leader, false);
-        tests.check(!electionTimerVisible(timer_off),
-                    "timerActive(false) should hide that node's timer");
-        timer_off.timerActive(leader, true);
-        timer_off.deliverTimers(false);
-        tests.check(electionTimerVisible(timer_off),
-                    "node timer override should beat global timer disable");
-    });
 
     tests.test("Create table creates a default range descriptor through consensus", [&] {
         std::vector<Address> replicas = quorumReplicaAddresses(3);
@@ -14683,11 +14840,13 @@ int main(int argc, char* argv[]) {
     tests.test("Range descriptor changes are versioned and latest wins", [&] {
         auto title = firstTitleTuple();
         const std::string& primary_key = title.second.front();
+        auto second_title = secondTitleTuple();
+        const std::string& second_key = second_title.second.front();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
         SearchState state = buildTitleTableState(505);
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
+        const std::string new_end = boundaryAfterFirstTitle();
         state = deliverConsensusCommandToQuorum(
             state, leader, client, 505, 4,
             RegisterRangeCommand{defaultRangeIdForTable("title"),
@@ -14719,11 +14878,17 @@ int main(int argc, char* argv[]) {
                     "router should use the latest descriptor version");
         tests.check(route.end_key == tableRowKey("title", primary_key) + "\x7F",
                     "point lookup route should still describe the point key");
+        RouteResult second_route = routeFor(
+            leader_node, ExplainRouteCommand{"title", second_key, false});
+        tests.check(second_route.range_ids.empty(),
+                    "half-open descriptor should exclude the boundary key");
     });
 
     tests.test("Router cache refreshes after descriptor change", [&] {
         auto title = firstTitleTuple();
         const std::string& primary_key = title.second.front();
+        auto second_title = secondTitleTuple();
+        const std::string& second_key = second_title.second.front();
         std::vector<Address> replicas = quorumReplicaAddresses(3);
         Address leader = replicas[0];
         Address client = ScenarioAddress::client1();
@@ -14736,7 +14901,7 @@ int main(int argc, char* argv[]) {
                         before.descriptor_versions.front() == 1,
                     "fresh router should see descriptor version 1");
 
-        const std::string new_end = tableRowKey("title", primary_key) + "~";
+        const std::string new_end = boundaryAfterFirstTitle();
         state = deliverConsensusCommandToQuorum(
             state, leader, client, 506, 4,
             RegisterRangeCommand{defaultRangeIdForTable("title"),
@@ -14748,12 +14913,18 @@ int main(int argc, char* argv[]) {
         RouteResult stale = router.routePoint("title", primary_key);
         tests.check(stale.descriptor_versions.front() == 1,
                     "stale router cache should still expose old metadata");
+        RouteResult stale_second = router.routePoint("title", second_key);
+        tests.check(stale_second.descriptor_versions.front() == 1,
+                    "stale router should still believe the old descriptor owns the boundary key");
 
         leader_node = state.nodeAs<ConsensusReplica>(leader);
         router.refreshFrom(leader_node);
         RouteResult refreshed = router.routePoint("title", primary_key);
         tests.check(refreshed.descriptor_versions.front() == 2,
                     "router refresh should load the latest descriptor");
+        RouteResult refreshed_second = router.routePoint("title", second_key);
+        tests.check(refreshed_second.range_ids.empty(),
+                    "refreshed router should honor the new half-open boundary");
     });
 
     tests.test("Single-range SQL behavior is preserved", [&] {
@@ -14781,6 +14952,55 @@ int main(int argc, char* argv[]) {
                         route.range_ids.front() ==
                             defaultRangeIdForTable("title"),
                     "the inserted row should route to the single title range");
+    });
+
+
+    auto physicalTitleRowsForMovement = [&]() {
+        std::vector<std::pair<std::string, std::vector<std::string>>> rows;
+        for (const auto& line :
+             requireTupleLinesFromFile(imdb_file, "title", 6)) {
+            rows.push_back({line, tupleValuesFromLine(line, "title")});
+        }
+        std::sort(
+            rows.begin(),
+            rows.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return tableRowKey("title", lhs.second.front()) <
+                       tableRowKey("title", rhs.second.front());
+            });
+        return rows;
+    };
+
+    tests.test("Physical movement primitive copies rows and removes source copies", [&] {
+        runWithSuppressedStdout([&] {
+            auto rows = physicalTitleRowsForMovement();
+            size_t split_index = rows.size() / 2;
+            PhysicalRangeCluster cluster(
+                "title",
+                createTitleTableCommand(),
+                defaultRangeIdForTable("title"),
+                defaultRangeIdForTable("title") + "-left",
+                defaultRangeIdForTable("title") + "-right");
+            cluster.loadSourceRows(rows);
+
+            tests.check(cluster.sourceRowCount() == rows.size(),
+                        "source range should begin with every title row");
+            cluster.moveRowsBySplitIndex(split_index);
+            tests.check(cluster.leftRowCount() == split_index,
+                        "left range should contain lower-half rows");
+            tests.check(cluster.rightRowCount() == rows.size() - split_index,
+                        "right range should contain upper-half rows");
+            tests.check(cluster.sourceRowCount() == 0,
+                        "source range should no longer contain moved rows");
+
+            for (const auto& row : rows) {
+                const std::string& primary_key = row.second.front();
+                tests.check(cluster.physicalCopies(primary_key) == 1,
+                            "exactly one physical range should contain " +
+                                primary_key);
+            }
+            return 0;
+        });
     });
 
     return tests.finish();

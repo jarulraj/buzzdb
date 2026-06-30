@@ -14756,6 +14756,279 @@ size_t currentGlobalKeyCountOn(const ConsensusReplica* node,
     return count;
 }
 
+class RoutedSQLCluster {
+public:
+    RoutedSQLCluster(std::string table,
+                         CreateTableCommand create_table,
+                         std::string source_range_id,
+                         std::string left_range_id,
+                         std::string right_range_id,
+                         std::string source_group_id = "group-1")
+        : table_(std::move(table)),
+          create_table_(std::move(create_table)),
+          source_range_id_(std::move(source_range_id)),
+          left_range_id_(std::move(left_range_id)),
+          right_range_id_(std::move(right_range_id)),
+          source_group_id_(std::move(source_group_id)) {}
+
+    void loadSourceRows(
+        const std::vector<std::pair<std::string,
+                                    std::vector<std::string>>>& rows) {
+        ensureTable(catalog_);
+        ensureTable(source_);
+        loaded_rows_ = rows;
+        for (const auto& row : loaded_rows_) {
+            requireResultType<InsertOkResult>(
+                source_.execute(parseSQL("INSERT " + row.first)),
+                "source range should load " + primaryKey(row));
+            recordCatalogKey(primaryKey(row),
+                             source_range_id_,
+                             source_group_id_,
+                             1);
+        }
+    }
+
+    Result splitTable(const SplitTableCommand& command) {
+        Result result = catalog_.execute(command);
+        if (!std::holds_alternative<StatementOkResult>(result)) return result;
+        moveRowsToCommittedOwners();
+        return result;
+    }
+
+    Result execute(const RoutedSQLCommand& command) {
+        try {
+            return executeRoutedParsedCommand(parseSQL(command.sql));
+        } catch (const std::exception&) {
+            return RouteRejectedResult{};
+        }
+    }
+
+    RouteResult routePoint(const std::string& primary_key) {
+        return route(ExplainRouteCommand{table_, primary_key, false});
+    }
+
+    SelectAllResult rowsInRange(const std::string& range_id,
+                                const std::string& primary_key) {
+        return selectRows(storeForRange(range_id), primary_key);
+    }
+
+    size_t sourceRowCount() { return rowCount(source_); }
+    size_t leftRowCount() { return rowCount(left_); }
+    size_t rightRowCount() { return rowCount(right_); }
+
+    size_t physicalCopies(const std::string& primary_key) {
+        return selectRows(source_, primary_key).rows.size() +
+               selectRows(left_, primary_key).rows.size() +
+               selectRows(right_, primary_key).rows.size();
+    }
+
+    BuzzDBCore& catalogStore() { return catalog_; }
+    BuzzDBCore& sourceStore() { return source_; }
+    BuzzDBCore& leftStore() { return left_; }
+    BuzzDBCore& rightStore() { return right_; }
+
+private:
+    template <typename ResultType>
+    static void requireResultType(const Result& actual,
+                                  const std::string& message) {
+        if (!std::holds_alternative<ResultType>(actual)) {
+            throw std::runtime_error(
+                message + ": got " + describeResult(actual));
+        }
+    }
+
+    static void requireDeletedOne(const Result& actual,
+                                  const std::string& message) {
+        const auto* deleted = std::get_if<DeleteRowsResult>(&actual);
+        if (deleted == nullptr || deleted->count != 1) {
+            throw std::runtime_error(
+                message + ": got " + describeResult(actual));
+        }
+    }
+
+    static std::string primaryKey(
+        const std::pair<std::string, std::vector<std::string>>& row) {
+        if (row.second.empty()) {
+            throw std::runtime_error("row is missing a primary key");
+        }
+        return row.second.front();
+    }
+
+    void ensureTable(BuzzDBCore& store) {
+        Result count = store.execute(CountRowsCommand{table_});
+        if (std::holds_alternative<TableNotFoundResult>(count)) {
+            requireResultType<CreateTableOkResult>(
+                store.execute(create_table_),
+                "range store should create " + table_);
+        }
+    }
+
+    void recordCatalogKey(const std::string& primary_key,
+                          const std::string& range_id,
+                          const std::string& replica_group_id,
+                          int descriptor_version) {
+        requireResultType<InsertOkResult>(
+            catalog_.execute(InsertRowCommand{
+                "__global_keys",
+                {table_,
+                 primary_key,
+                 tableRowKey(table_, primary_key),
+                 range_id,
+                 replica_group_id,
+                 std::to_string(descriptor_version)}}),
+            "catalog should record ownership for " + primary_key);
+    }
+
+    SelectAllResult selectRows(BuzzDBCore& store,
+                               const std::string& primary_key) {
+        Result result = store.execute(
+            SelectWhereCommand{table_, "id", primary_key});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return SelectAllResult{};
+        return *rows;
+    }
+
+    size_t rowCount(BuzzDBCore& store) {
+        Result result = store.execute(SelectAllCommand{table_});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        return rows == nullptr ? size_t{0} : rows->rows.size();
+    }
+
+    std::string insertSQLFromValues(const std::vector<std::string>& values) {
+        std::ostringstream out;
+        out << "INSERT " << table_;
+        for (const auto& value : values) out << "|" << value;
+        return out.str();
+    }
+
+    RouteResult route(const ExplainRouteCommand& command) {
+        Result result = catalog_.execute(command);
+        const auto* route_result = std::get_if<RouteResult>(&result);
+        if (route_result == nullptr) {
+            throw std::runtime_error("expected route result");
+        }
+        return *route_result;
+    }
+
+    bool oneRange(const RouteResult& route_result) const {
+        return route_result.range_ids.size() == 1 &&
+               route_result.replica_group_ids.size() == 1 &&
+               route_result.descriptor_versions.size() == 1;
+    }
+
+    BuzzDBCore& storeForRange(const std::string& range_id) {
+        if (range_id == left_range_id_) return left_;
+        if (range_id == right_range_id_) return right_;
+        if (range_id == source_range_id_) return source_;
+        throw std::runtime_error("unknown range id " + range_id);
+    }
+
+    void importIfMissing(BuzzDBCore& target,
+                         const std::string& primary_key,
+                         const std::vector<std::string>& values) {
+        ensureTable(target);
+        if (!selectRows(target, primary_key).rows.empty()) return;
+        requireResultType<InsertOkResult>(
+            target.execute(parseSQL(insertSQLFromValues(values))),
+            "target range should import " + primary_key);
+    }
+
+    void moveRowsToCommittedOwners() {
+        for (const auto& row : loaded_rows_) {
+            const std::string primary_key = primaryKey(row);
+            SelectAllResult selected = selectRows(source_, primary_key);
+            if (selected.rows.empty()) continue;
+            RouteResult route_result = routePoint(primary_key);
+            if (!oneRange(route_result)) {
+                throw std::runtime_error(
+                    "split route should name one owner for " + primary_key);
+            }
+            BuzzDBCore& target = storeForRange(route_result.range_ids.front());
+            importIfMissing(target, primary_key, selected.rows.front());
+            if (route_result.range_ids.front() != source_range_id_) {
+                requireDeletedOne(
+                    source_.execute(DeleteRowsCommand{table_, "id", primary_key}),
+                    "source range should remove moved row " + primary_key);
+            }
+        }
+    }
+
+    Result executeOnRoute(const RouteResult& route_result,
+                          const Command& parsed) {
+        if (!oneRange(route_result)) return RouteRejectedResult{};
+        return storeForRange(route_result.range_ids.front()).execute(parsed);
+    }
+
+    Result executeRoutedParsedCommand(const Command& parsed) {
+        if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+            if (insert->table != table_ || insert->values.empty()) {
+                return RouteRejectedResult{};
+            }
+            RouteResult route_result = route(
+                ExplainRouteCommand{insert->table, insert->values.front(), false});
+            if (!oneRange(route_result)) return RouteRejectedResult{};
+            Result result = storeForRange(route_result.range_ids.front())
+                                .execute(*insert);
+            if (std::holds_alternative<InsertOkResult>(result)) {
+                recordCatalogKey(insert->values.front(),
+                                 route_result.range_ids.front(),
+                                 route_result.replica_group_ids.front(),
+                                 route_result.descriptor_versions.front());
+            }
+            return result;
+        }
+
+        if (const auto* select = std::get_if<SelectWhereCommand>(&parsed)) {
+            if (select->table != table_ || select->column != "id") {
+                return RouteRejectedResult{};
+            }
+            return executeOnRoute(
+                route(ExplainRouteCommand{select->table, select->value, false}),
+                *select);
+        }
+
+        if (const auto* update = std::get_if<UpdateRowsCommand>(&parsed)) {
+            if (update->table != table_ || update->where_column != "id") {
+                return RouteRejectedResult{};
+            }
+            return executeOnRoute(
+                route(ExplainRouteCommand{update->table,
+                                          update->where_value,
+                                          false}),
+                *update);
+        }
+
+        if (const auto* remove = std::get_if<DeleteRowsCommand>(&parsed)) {
+            if (remove->table != table_ || remove->column != "id") {
+                return RouteRejectedResult{};
+            }
+            return executeOnRoute(
+                route(ExplainRouteCommand{remove->table, remove->value, false}),
+                *remove);
+        }
+
+        if (const auto* scan = std::get_if<SelectAllCommand>(&parsed)) {
+            if (scan->table != table_) return RouteRejectedResult{};
+            return executeOnRoute(
+                route(ExplainRouteCommand{scan->table, "", true}), *scan);
+        }
+
+        return RouteRejectedResult{};
+    }
+
+    std::string table_;
+    CreateTableCommand create_table_;
+    std::string source_range_id_;
+    std::string left_range_id_;
+    std::string right_range_id_;
+    std::string source_group_id_;
+    BuzzDBCore catalog_;
+    BuzzDBCore source_;
+    BuzzDBCore left_;
+    BuzzDBCore right_;
+    std::vector<std::pair<std::string, std::vector<std::string>>> loaded_rows_;
+};
+
 Command bootstrapClusterACommand() {
     return BootstrapClusterCommand{
         "cluster-A", "server1", {"server1", "server2", "server3"}, 1};
@@ -14847,14 +15120,6 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         leader_node->executeReadOnlyForTest(
             ExplainRouteCommand{"title", primary_key, false});
     const auto* route = std::get_if<RouteResult>(&route_result);
-    Result point_select =
-        leader_node->executeReadOnlyForTest(
-            RoutedSQLCommand{
-                "PROJECT * FROM title WHERE id=" + primary_key});
-    Result full_scan =
-        leader_node->executeReadOnlyForTest(
-            RoutedSQLCommand{"PROJECT * FROM title"});
-
     std::cout << "  leader=" << leader
               << ", commit_index=" << leader_node->commitIndex()
               << ", table=title"
@@ -14878,10 +15143,37 @@ void printPartitionedSQLTrace(const std::string& data_file) {
               << ", current_right_keys="
               << currentGlobalKeyCountOn(leader_node, right_range)
               << std::endl;
-    std::cout << "  routed point select -> "
-              << describeResult(point_select) << std::endl;
-    std::cout << "  routed full scan -> "
-              << describeResult(full_scan) << std::endl;
+    RoutedSQLCluster routed(
+        "title",
+        createTitleTableCommand(),
+        defaultRangeIdForTable("title"),
+        left_range,
+        right_range);
+    Result physical_update = runWithSuppressedStdout([&] {
+        routed.loadSourceRows(titles);
+        Result split = routed.splitTable(
+            SplitTableCommand{"title",
+                              defaultRangeIdForTable("title"),
+                              left_range,
+                              right_range,
+                              2});
+        if (!std::holds_alternative<StatementOkResult>(split)) return split;
+        return routed.execute(RoutedSQLCommand{
+            "UPDATE title SET production_year=2096 WHERE id=" +
+            primary_key});
+    });
+    RouteResult physical_route = routed.routePoint(primary_key);
+    std::cout << "  physical routed command -> "
+              << describeResult(physical_update)
+              << ", owner="
+              << (physical_route.range_ids.empty()
+                      ? std::string("-")
+                      : physical_route.range_ids.front())
+              << ", source_rows=" << routed.sourceRowCount()
+              << ", left_rows=" << routed.leftRowCount()
+              << ", right_rows=" << routed.rightRowCount()
+              << ", copies(" << primary_key << ")="
+              << routed.physicalCopies(primary_key) << std::endl;
     for (const auto& replica : replicas) {
         const auto* node = state.nodeAs<ConsensusReplica>(replica);
         std::cout << "  " << replica << " has split children="
@@ -15088,182 +15380,166 @@ int main(int argc, char* argv[]) {
         return std::optional<Result>{};
     };
 
-    tests.test("Routed point select executes on one split child", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(506);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 506, request_id,
-            RoutedSQLCommand{
-                "PROJECT * FROM title WHERE id=" +
-                fixture.right_values.front()},
-            {replicas[1], replicas[2]});
+    auto makeRoutedCluster = [&](const TitleSplitFixture& fixture) {
+        auto cluster = std::make_unique<RoutedSQLCluster>(
+            "title",
+            createTitleTableCommand(),
+            defaultRangeIdForTable("title"),
+            titleLeftRangeId(),
+            titleRightRangeId());
+        cluster->loadSourceRows(fixture.rows);
+        Result split = cluster->splitTable(splitTitleCommand());
+        tests.check(std::holds_alternative<StatementOkResult>(split),
+                    "routed SQL cluster should install split ownership");
+        return cluster;
+    };
 
-        auto reply = clientReplyResult(state, 506, request_id);
-        const auto* selected = reply.has_value()
-                                   ? std::get_if<SelectAllResult>(&*reply)
-                                   : nullptr;
-        tests.check(selected != nullptr && selected->rows.size() == 1,
-                    "routed primary-key select should return one row");
+    tests.test("Routed point select executes on physical owner group", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makeRoutedCluster(fixture);
+            std::string id = fixture.right_values.front();
+            Result result = cluster->execute(
+                RoutedSQLCommand{"PROJECT * FROM title WHERE id=" + id});
+            const auto* selected = std::get_if<SelectAllResult>(&result);
+            tests.check(selected != nullptr && selected->rows.size() == 1,
+                        "routed primary-key select should return one row");
 
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        RouteResult right = routeFor(
-            leader_node,
-            ExplainRouteCommand{
-                "title", fixture.right_values.front(), false});
-        tests.check(right.range_ids.size() == 1 &&
-                        right.range_ids.front() == titleRightRangeId(),
-                    "selected key should route to the right child");
-        tests.check(right.descriptor_versions.front() == 2,
-                    "routed select should use the split descriptor version");
+            RouteResult route = cluster->routePoint(id);
+            tests.check(route.range_ids.size() == 1 &&
+                            route.range_ids.front() == titleRightRangeId(),
+                        "selected key should route to the right child");
+            tests.check(!cluster->rowsInRange(titleRightRangeId(), id).rows.empty(),
+                        "owner group should contain selected row");
+            tests.check(cluster->rowsInRange(titleLeftRangeId(), id).rows.empty(),
+                        "non-owner group should not contain selected row");
+            tests.check(cluster->physicalCopies(id) == 1,
+                        "routed select should observe one physical copy");
+            return 0;
+        });
     });
 
-    tests.test("Routed update by primary key changes one row", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(507);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 507, request_id,
-            RoutedSQLCommand{
-                "UPDATE title SET production_year=1998 WHERE id=" +
-                fixture.right_values.front()},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 507, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{UpdateRowsResult{1}},
-                    "routed update should affect one row");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id",
-                               fixture.right_values.front()});
-        const auto* rows = std::get_if<SelectAllResult>(&selected);
-        tests.check(rows != nullptr &&
-                        !rows->rows.empty() &&
-                        selectAllValue(*rows, rows->rows.front(),
-                                       "production_year") == "1998",
-                    "updated row should be visible after routed write");
+    tests.test("Routed update mutates only physical owner group", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makeRoutedCluster(fixture);
+            std::string id = fixture.right_values.front();
+            Result result = cluster->execute(
+                RoutedSQLCommand{
+                    "UPDATE title SET production_year=1998 WHERE id=" + id});
+            tests.check(result == Result{UpdateRowsResult{1}},
+                        "routed update should affect one owner row");
+            SelectAllResult owner_rows =
+                cluster->rowsInRange(titleRightRangeId(), id);
+            tests.check(!owner_rows.rows.empty() &&
+                            selectAllValue(owner_rows,
+                                           owner_rows.rows.front(),
+                                           "production_year") == "1998",
+                        "owner group should contain updated value");
+            tests.check(cluster->rowsInRange(titleLeftRangeId(), id).rows.empty(),
+                        "non-owner group should remain untouched");
+            tests.check(cluster->physicalCopies(id) == 1,
+                        "routed update should preserve one physical copy");
+            return 0;
+        });
     });
 
-    tests.test("Routed delete by primary key removes one row", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(508);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 508, request_id,
-            RoutedSQLCommand{
-                "DELETE FROM title WHERE id=" +
-                fixture.left_values.front()},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 508, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{DeleteRowsResult{1}},
-                    "routed delete should affect one row");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", fixture.left_values.front()});
-        const auto* rows = std::get_if<SelectAllResult>(&selected);
-        tests.check(rows != nullptr && rows->rows.empty(),
-                    "deleted row should no longer be visible");
+    tests.test("Routed delete removes only the physical owner copy", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makeRoutedCluster(fixture);
+            std::string id = fixture.left_values.front();
+            Result result = cluster->execute(
+                RoutedSQLCommand{"DELETE FROM title WHERE id=" + id});
+            tests.check(result == Result{DeleteRowsResult{1}},
+                        "routed delete should affect one owner row");
+            tests.check(cluster->rowsInRange(titleLeftRangeId(), id).rows.empty(),
+                        "owner group should remove deleted row");
+            tests.check(cluster->rowsInRange(titleRightRangeId(), id).rows.empty(),
+                        "non-owner group should not contain deleted row");
+            tests.check(cluster->physicalCopies(id) == 0,
+                        "deleted row should have no physical copy");
+            return 0;
+        });
     });
 
-    tests.test("Routed insert after split records child ownership", [&] {
-        TitleInsertFixture insert_fixture = titleInsertFixture();
-        const auto& fixture = insert_fixture.split_fixture;
-        const auto& held_out = insert_fixture.held_out_row;
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitStateFor(509, fixture);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 509, request_id,
-            RoutedSQLCommand{"INSERT " + held_out.first},
-            {replicas[1], replicas[2]});
+    tests.test("Routed insert after split writes the physical owner group", [&] {
+        runWithSuppressedStdout([&] {
+            TitleInsertFixture insert_fixture = titleInsertFixture();
+            const auto& fixture = insert_fixture.split_fixture;
+            const auto& held_out = insert_fixture.held_out_row;
+            auto cluster = makeRoutedCluster(fixture);
+            std::string id = held_out.second.front();
 
-        auto reply = clientReplyResult(state, 509, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{InsertOkResult{}},
-                    "routed insert should succeed");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        tests.check(catalogHasRowOn(
-                        leader_node, "__global_keys",
-                        {{"table_name", "title"},
-                         {"primary_key", held_out.second.front()},
-                         {"range_id", titleRightRangeId()},
-                         {"descriptor_version", "2"}}),
-                    "inserted held-out IMDB row should land in right child");
-        tests.check(currentGlobalKeyCountOn(leader_node,
-                                            titleRightRangeId()) ==
-                        fixture.rightCount() + 1,
-                    "right child should own the inserted row key");
+            Result result = cluster->execute(
+                RoutedSQLCommand{"INSERT " + held_out.first});
+            tests.check(result == Result{InsertOkResult{}},
+                        "routed insert should succeed");
+            RouteResult route = cluster->routePoint(id);
+            tests.check(route.range_ids.size() == 1,
+                        "inserted row should have one catalog owner");
+            std::string owner = route.range_ids.front();
+            tests.check(!cluster->rowsInRange(owner, id).rows.empty(),
+                        "owner group should contain inserted row");
+            std::string other = owner == titleLeftRangeId()
+                ? titleRightRangeId()
+                : titleLeftRangeId();
+            tests.check(cluster->rowsInRange(other, id).rows.empty(),
+                        "non-owner group should not contain inserted row");
+            tests.check(cluster->physicalCopies(id) == 1,
+                        "routed insert should create one physical copy");
+            return 0;
+        });
     });
 
-    tests.test("Routed full scan before split still executes", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildLoadedTitleTableState(510, fixture);
-        int request_id = static_cast<int>(fixture.rows.size()) + 4;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 510, request_id,
-            RoutedSQLCommand{"PROJECT * FROM title"},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 510, request_id);
-        const auto* rows = reply.has_value()
-                               ? std::get_if<SelectAllResult>(&*reply)
-                               : nullptr;
-        tests.check(rows != nullptr && rows->rows.size() == fixture.rows.size(),
-                    "single-range routed scan should still execute");
+    tests.test("Routed full scan before split still executes on source group", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            RoutedSQLCluster cluster(
+                "title",
+                createTitleTableCommand(),
+                defaultRangeIdForTable("title"),
+                titleLeftRangeId(),
+                titleRightRangeId());
+            cluster.loadSourceRows(fixture.rows);
+            Result result = cluster.execute(
+                RoutedSQLCommand{"PROJECT * FROM title"});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            tests.check(rows != nullptr && rows->rows.size() == fixture.rows.size(),
+                        "single-range routed scan should execute on source");
+            tests.check(cluster.sourceRowCount() == fixture.rows.size() &&
+                            cluster.leftRowCount() == 0 &&
+                            cluster.rightRowCount() == 0,
+                        "pre-split scan should not move physical rows");
+            return 0;
+        });
     });
 
     tests.test("Routed full scan after split is rejected", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(511);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 511, request_id,
-            RoutedSQLCommand{"PROJECT * FROM title"},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 511, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{RouteRejectedResult{}},
-                    "multi-range routed scan should be rejected in v127");
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makeRoutedCluster(fixture);
+            Result result = cluster->execute(
+                RoutedSQLCommand{"PROJECT * FROM title"});
+            tests.check(result == Result{RouteRejectedResult{}},
+                        "multi-range routed scan should be rejected in v127");
+            return 0;
+        });
     });
 
     tests.test("Routed non-primary-key predicate is rejected", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(512);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 512, request_id,
-            RoutedSQLCommand{"PROJECT * FROM title WHERE production_year=2011"},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 512, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{RouteRejectedResult{}},
-                    "non-primary-key predicate needs a later planner");
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makeRoutedCluster(fixture);
+            Result result = cluster->execute(
+                RoutedSQLCommand{
+                    "PROJECT * FROM title WHERE production_year=2011"});
+            tests.check(result == Result{RouteRejectedResult{}},
+                        "non-primary-key predicate needs a later planner");
+            return 0;
+        });
     });
+
 
     return tests.finish();
 }

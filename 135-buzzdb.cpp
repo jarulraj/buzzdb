@@ -13943,6 +13943,92 @@ private:
         });
     }
 
+    bool rangeTransferInFlight(const RangeTransferRecord& record) {
+        return record.status == "requested" ||
+               record.status == "prepared" ||
+               record.status == "caught_up";
+    }
+
+    int nextRangeTransferEpoch(const std::string& range_id) {
+        auto previous = latestRangeTransferRecord(range_id);
+        return previous.has_value() ? previous->transfer_epoch + 1 : 1;
+    }
+
+    std::optional<RangeOwnershipRecord> ownershipRecordForRange(
+        const std::vector<RangeOwnershipRecord>& records,
+        const std::string& range_id) {
+        for (const auto& record : records) {
+            if (record.range_id == range_id) return record;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<RangeTransferRecord> buildRangeTransferRequest(
+        const std::vector<RangeOwnershipRecord>& current,
+        const std::string& range_id,
+        const std::string& target_group_id,
+        int config_num) {
+        auto source = ownershipRecordForRange(current, range_id);
+        if (!source.has_value() ||
+            source->replica_group_id == target_group_id) {
+            return std::nullopt;
+        }
+        auto target = latestReplicaGroupConfig(target_group_id);
+        if (!target.exists || target.phase != "stable") {
+            return std::nullopt;
+        }
+        auto previous = latestRangeTransferRecord(range_id);
+        if (previous.has_value() && rangeTransferInFlight(*previous)) {
+            return std::nullopt;
+        }
+        return RangeTransferRecord{
+            range_id,
+            source->replica_group_id,
+            target_group_id,
+            nextRangeTransferEpoch(range_id),
+            0,
+            0,
+            config_num,
+            "requested"};
+    }
+
+    bool appendRangeTransferRequest(
+        const std::vector<RangeOwnershipRecord>& current,
+        const std::string& range_id,
+        const std::string& target_group_id,
+        int config_num) {
+        auto request = buildRangeTransferRequest(
+            current, range_id, target_group_id, config_num);
+        if (!request.has_value()) return false;
+        appendRangeTransferRecord(*request);
+        return true;
+    }
+
+    bool appendRangeTransferRequests(
+        const std::vector<RangeOwnershipRecord>& records,
+        const std::map<std::string, std::string>& assignments,
+        int config_num) {
+        std::vector<RangeTransferRecord> requests;
+        for (const auto& record : records) {
+            auto assignment = assignments.find(record.range_id);
+            if (assignment == assignments.end()) {
+                throw std::runtime_error("missing range assignment");
+            }
+            if (assignment->second == record.replica_group_id) {
+                continue;
+            }
+            auto request = buildRangeTransferRequest(
+                records, record.range_id, assignment->second, config_num);
+            if (!request.has_value()) return false;
+            requests.push_back(*request);
+        }
+        if (requests.empty()) return false;
+        for (const auto& request : requests) {
+            appendRangeTransferRecord(request);
+        }
+        return true;
+    }
+
     std::vector<RangeDescriptor> matchingPointRanges(
         const std::string& key) {
         std::vector<RangeDescriptor> matches;
@@ -15013,10 +15099,9 @@ private:
         appendReplicaGroupConfig(config);
 
         groups.push_back(command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeTransferRequests(current, assignments, latest_config);
         return StatementOkResult{};
     }
 
@@ -15034,10 +15119,9 @@ private:
             return ConfigRejectedResult{};
         }
         groups = catalogListWithout(std::move(groups), command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeTransferRequests(current, assignments, latest_config);
         return StatementOkResult{};
     }
 
@@ -15051,27 +15135,13 @@ private:
         }
         std::vector<RangeOwnershipRecord> current =
             rangeOwnershipRecordsAtConfig(latest_config);
-        auto groups = activeReplicaGroups(current);
-        if (!catalogListContains(groups, command.target_replica_group_id)) {
+
+        if (!appendRangeTransferRequest(current,
+                                        command.range_id,
+                                        command.target_replica_group_id,
+                                        latest_config)) {
             return ConfigRejectedResult{};
         }
-
-        std::map<std::string, std::string> assignments;
-        bool found = false;
-        bool changed = false;
-        for (const auto& record : current) {
-            assignments[record.range_id] = record.replica_group_id;
-            if (record.range_id == command.range_id) {
-                found = true;
-                changed =
-                    record.replica_group_id != command.target_replica_group_id;
-                assignments[record.range_id] =
-                    command.target_replica_group_id;
-            }
-        }
-        if (!found || !changed) return ConfigRejectedResult{};
-
-        appendRangeConfigRows(latest_config + 1, current, assignments);
         return StatementOkResult{};
     }
 
@@ -15086,22 +15156,33 @@ private:
         }
 
         auto previous = latestRangeTransferRecord(command.range_id);
-        if (previous.has_value() &&
-            command.transfer_epoch <= previous->transfer_epoch) {
-            return ConfigRejectedResult{};
+        if (previous.has_value()) {
+            if (command.transfer_epoch < previous->transfer_epoch) {
+                return ConfigRejectedResult{};
+            }
+            if (command.transfer_epoch == previous->transfer_epoch) {
+                if (previous->status != "requested" ||
+                    previous->target_group_id !=
+                        command.target_replica_group_id ||
+                    previous->prepared_config_num != latest_config) {
+                    return ConfigRejectedResult{};
+                }
+            } else if (rangeTransferInFlight(*previous)) {
+                return ConfigRejectedResult{};
+            }
         }
 
         std::vector<RangeOwnershipRecord> current =
             rangeOwnershipRecordsAtConfig(latest_config);
-        std::optional<RangeOwnershipRecord> source;
-        for (const auto& record : current) {
-            if (record.range_id == command.range_id) {
-                source = record;
-                break;
-            }
-        }
+        std::optional<RangeOwnershipRecord> source =
+            ownershipRecordForRange(current, command.range_id);
         if (!source.has_value() ||
             source->replica_group_id == command.target_replica_group_id) {
+            return ConfigRejectedResult{};
+        }
+        if (previous.has_value() &&
+            command.transfer_epoch == previous->transfer_epoch &&
+            previous->source_group_id != source->replica_group_id) {
             return ConfigRejectedResult{};
         }
 
@@ -15186,7 +15267,8 @@ private:
         auto transfer = latestRangeTransferRecord(command.range_id);
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
-            (transfer->status != "prepared" &&
+            (transfer->status != "requested" &&
+             transfer->status != "prepared" &&
              transfer->status != "caught_up")) {
             return ConfigRejectedResult{};
         }
@@ -15299,35 +15381,13 @@ private:
             return result;
         }
 
-        int transfer_epoch = 1;
-        auto previous =
-            latestRangeTransferRecord(selected->record.range_id);
-        if (previous.has_value()) {
-            transfer_epoch = previous->transfer_epoch + 1;
-        }
-
-        Result prepared = executeOne(
-            PrepareRangeTransferCommand{
-                selected->record.range_id,
-                lightest->first,
-                transfer_epoch});
-        if (!(prepared == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
-        Result caught_up = executeOne(
-            CatchUpRangeTransferCommand{
-                selected->record.range_id,
-                transfer_epoch});
-        if (!(caught_up == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
-        Result committed = executeOne(
-            CommitRangeTransferCommand{
-                selected->record.range_id,
-                transfer_epoch});
-        if (!(committed == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
+        auto request = buildRangeTransferRequest(
+            records,
+            selected->record.range_id,
+            lightest->first,
+            latest_config);
+        if (!request.has_value()) return result;
+        appendRangeTransferRecord(*request);
 
         result.moved = true;
         result.range_id = selected->record.range_id;
@@ -15338,7 +15398,7 @@ private:
         result.target_keys_before = lightest->second;
         result.source_keys_after = after_loads[heaviest->first];
         result.target_keys_after = after_loads[lightest->first];
-        result.config_num = latestRangeConfigNumber();
+        result.config_num = latest_config;
         return result;
     }
 
@@ -17569,138 +17629,172 @@ SearchState buildInitialReplicaGroupState(
 }
 
 void printPartitionedSQLTrace(const std::string& data_file) {
-    std::cout << "Trace: secondary index as a range" << std::endl;
-    std::vector<Address> replicas = quorumReplicaAddresses(3);
-    Address leader = replicas[0];
-    Address client = ScenarioAddress::client1();
+    std::cout << "Trace: physical secondary index range" << std::endl;
 
-    std::vector<std::string> title_rows =
-        requireTupleLinesFromFile(data_file, "title", 8);
-    std::vector<std::pair<std::string, std::vector<std::string>>> titles;
-    for (const auto& row : title_rows) {
-        titles.push_back({row, tupleValuesFromLine(row, "title")});
-    }
-    if (titles.size() < 8) {
-        throw std::runtime_error(
-            "Need enough title rows for secondary index trace.");
-    }
+    struct TraceGroup {
+        std::string group_id;
+        std::vector<Address> replicas;
+        Address leader;
+        Address client;
+        SearchState state;
+        int client_id = 0;
+        int next_request_id = 1;
+    };
 
-    std::map<std::string, std::vector<std::string>> primary_keys_by_year;
-    for (const auto& title : titles) {
-        if (title.second.size() >= 4) {
-            primary_keys_by_year[title.second[3]].push_back(title.second[0]);
+    auto makeReplicas = [](const std::string& prefix) {
+        std::vector<Address> replicas;
+        for (size_t i = 1; i <= 3; ++i) replicas.emplace_back(prefix + std::to_string(i));
+        return replicas;
+    };
+    auto makeGroup = [&](const std::string& group_id,
+                         const std::string& prefix,
+                         int client_id) {
+        TraceGroup group;
+        group.group_id = group_id;
+        group.replicas = makeReplicas(prefix);
+        group.leader = group.replicas.front();
+        group.client = Address("client-" + group_id);
+        group.state = electedConsensusState(group.replicas, group.leader);
+        group.client_id = client_id;
+        return group;
+    };
+    auto replyFor = [](const SearchState& state,
+                       int client_id,
+                       int request_id) -> std::optional<Result> {
+        for (auto it = state.network().rbegin(); it != state.network().rend(); ++it) {
+            const auto* reply = std::get_if<ClientReply>(&it->message);
+            if (reply != nullptr && reply->client_id == client_id &&
+                reply->request_id == request_id) {
+                return reply->result;
+            }
         }
-    }
+        return std::nullopt;
+    };
+    auto commit = [&](TraceGroup& group, const Command& command) {
+        int request_id = group.next_request_id++;
+        group.state = deliverConsensusCommandToQuorum(
+            group.state, group.leader, group.client, group.client_id,
+            request_id, command, {group.replicas[1], group.replicas[2]});
+        auto reply = replyFor(group.state, group.client_id, request_id);
+        if (!reply.has_value()) {
+            throw std::runtime_error("missing trace reply for " + describeCommand(command));
+        }
+        return *reply;
+    };
+    auto leaderNode = [](const TraceGroup& group) {
+        const auto* node = group.state.nodeAs<ConsensusReplica>(group.leader);
+        if (node == nullptr) throw std::runtime_error("missing trace leader");
+        return node;
+    };
+
+    std::vector<std::string> title_rows = requireTupleLinesFromFile(data_file, "title", 9);
+    std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+    for (const auto& row : title_rows) titles.push_back({row, tupleValuesFromLine(row, "title")});
+    std::string index_name = "idx_title_year";
+    std::string index_range = defaultRangeIdForIndex(index_name);
     std::string lookup_year = titles.front().second[3];
-    for (const auto& [year, primary_keys] : primary_keys_by_year) {
-        if (primary_keys.size() >= 2) {
-            lookup_year = year;
+    for (const auto& title : titles) {
+        size_t same_year = 0;
+        for (const auto& other : titles) {
+            if (other.second.size() >= 4 && other.second[3] == title.second[3]) ++same_year;
+        }
+        if (same_year >= 2) {
+            lookup_year = title.second[3];
             break;
         }
     }
 
-    SearchState state = buildInitialReplicaGroupState(
-        replicas, leader, client, 1);
-    int request_id = 3;
-    state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, request_id++,
-        createTitleTableCommand(),
-        {replicas[1], replicas[2]});
+    TraceGroup catalog = makeGroup("group-catalog", "catalog", 1);
+    TraceGroup source = makeGroup("group-1", "index-source", 2);
+    TraceGroup target = makeGroup("group-2", "index-target", 3);
+    auto indexCommand = [&](const std::string& group_id) {
+        return CreateSecondaryIndexCommand{index_name, "title", "production_year", group_id};
+    };
+    auto bootstrap = [&](TraceGroup& group) {
+        commit(group, bootstrapClusterACommand());
+        commit(group, registerGroup1Command());
+        commit(group, RegisterReplicaGroupCommand{target.group_id, {"target1", "target2", "target3"}, 1});
+        commit(group, createTitleTableCommand());
+    };
+    bootstrap(catalog);
+    bootstrap(source);
+    bootstrap(target);
     for (const auto& title : titles) {
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 1, request_id++,
-            parseSQL("INSERT " + title.first),
-            {replicas[1], replicas[2]});
+        commit(catalog, parseSQL("INSERT " + title.first));
+        commit(source, parseSQL("INSERT " + title.first));
     }
-    state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, request_id++,
-        CreateSecondaryIndexCommand{
-            "idx_title_year", "title", "production_year", "group-1"},
-        {replicas[1], replicas[2]});
+    commit(catalog, indexCommand(source.group_id));
+    commit(source, indexCommand(source.group_id));
+    commit(target, indexCommand(target.group_id));
 
-    const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-    if (leader_node == nullptr) {
-        throw std::runtime_error("missing consensus leader in index trace");
-    }
-
-    Result table_route_result =
-        leader_node->executeReadOnlyForTest(
-            ExplainRouteCommand{"title", titles.front().second[0], false});
-    const auto* table_route = std::get_if<RouteResult>(&table_route_result);
-    Result index_route_result =
-        leader_node->executeReadOnlyForTest(
-            ExplainIndexLookupCommand{"idx_title_year", lookup_year});
-    const auto* index_route = std::get_if<RouteResult>(&index_route_result);
-    Result lookup_result =
-        leader_node->executeReadOnlyForTest(
-            ReadSecondaryIndexCommand{"idx_title_year", lookup_year});
-    const auto* lookup = std::get_if<IndexLookupResult>(&lookup_result);
-    Result ownership_result =
-        leader_node->executeReadOnlyForTest(
-            ReadRangeOwnershipCommand{"title", true});
-    const auto* ownership = std::get_if<SelectAllResult>(&ownership_result);
-    Result config_result =
-        leader_node->executeReadOnlyForTest(QueryRangeConfigCommand{-1});
-    const auto* config = std::get_if<RangeConfigResult>(&config_result);
-
-    std::cout << "  leader=" << leader
-              << ", commit_index=" << leader_node->commitIndex()
-              << ", table=title"
-              << ", rows=" << titles.size()
-              << ", index=idx_title_year(production_year)"
-              << ", lookup_year=" << lookup_year << std::endl;
-    if (config != nullptr) {
-        std::cout << "  config=" << config->config_num
-                  << ", ranges=" << config->range_ids.size()
-                  << ", groups=[";
-        for (size_t i = 0; i < config->replica_group_ids.size(); ++i) {
-            if (i != 0) std::cout << ", ";
-            std::cout << config->replica_group_ids[i];
+    auto tableRows = [&](const TraceGroup& group, const std::string& table) {
+        Result result = leaderNode(group)->executeReadOnlyForTest(ReadSystemCatalogCommand{table});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return SelectAllResult{};
+        return *rows;
+    };
+    auto activeEntries = [&](const TraceGroup& group) {
+        SelectAllResult rows = tableRows(group, "__index_entries");
+        auto range_col = catalogColumnIndex(rows, "range_id");
+        auto status_col = catalogColumnIndex(rows, "status");
+        if (!range_col.has_value() || !status_col.has_value()) return SelectAllResult{rows.columns, {}};
+        SelectAllResult out{rows.columns, {}};
+        for (const auto& row : rows.rows) {
+            if (*range_col < row.size() && *status_col < row.size() &&
+                row[*range_col] == index_range && row[*status_col] == "active") {
+                out.rows.push_back(row);
+            }
         }
-        std::cout << "]" << std::endl;
-    }
-    if (table_route != nullptr && !table_route->range_ids.empty()) {
-        std::cout << "  table row key=" << table_route->start_key
-                  << " -> range=" << table_route->range_ids.front()
-                  << ", replica_group="
-                  << table_route->replica_group_ids.front() << std::endl;
-    }
-    if (index_route != nullptr && !index_route->range_ids.empty()) {
-        std::cout << "  index lookup key=" << index_route->start_key
-                  << " -> range=" << index_route->range_ids.front()
-                  << ", replica_group="
-                  << index_route->replica_group_ids.front() << std::endl;
+        return out;
+    };
+    auto copyEntries = [&]() {
+        SelectAllResult rows = activeEntries(source);
+        auto group_col = catalogColumnIndex(rows, "replica_group_id");
+        commit(target, DeleteRowsCommand{"__index_entries", "range_id", index_range});
+        for (auto row : rows.rows) {
+            if (group_col.has_value() && *group_col < row.size()) row[*group_col] = target.group_id;
+            commit(target, InsertRowCommand{"__index_entries", row});
+        }
+        return rows.rows.size();
+    };
+
+    commit(catalog, MoveRangeCommand{index_range, target.group_id});
+    commit(catalog, PrepareRangeTransferCommand{index_range, target.group_id, 1});
+    size_t copied = copyEntries();
+    commit(catalog, CatchUpRangeTransferCommand{index_range, 1});
+    copyEntries();
+    commit(catalog, CommitRangeTransferCommand{index_range, 1});
+    commit(source, DeleteRowsCommand{"__index_entries", "range_id", index_range});
+
+    Result lookup_result = leaderNode(target)->executeReadOnlyForTest(
+        ReadSecondaryIndexCommand{index_name, lookup_year});
+    const auto* lookup = std::get_if<IndexLookupResult>(&lookup_result);
+    Result route_result = leaderNode(catalog)->executeReadOnlyForTest(
+        ExplainIndexLookupCommand{index_name, lookup_year});
+    const auto* route = std::get_if<RouteResult>(&route_result);
+
+    std::cout << "  catalog_leader=" << catalog.leader
+              << ", source_index_leader=" << source.leader
+              << ", target_index_leader=" << target.leader
+              << ", index=" << index_name
+              << ", lookup_year=" << lookup_year << std::endl;
+    if (route != nullptr && !route->replica_group_ids.empty()) {
+        std::cout << "  index route -> range=" << route->range_ids.front()
+                  << ", replica_group=" << route->replica_group_ids.front()
+                  << std::endl;
     }
     if (lookup != nullptr) {
         std::cout << "  HashIndex slot=" << lookup->hash_slot
-                  << ", distinct_keys=" << lookup->hash_distinct_keys
                   << ", entries=" << lookup->hash_entry_count
-                  << ", primary_keys=[";
-        for (size_t i = 0; i < lookup->primary_keys.size(); ++i) {
-            if (i != 0) std::cout << ", ";
-            std::cout << lookup->primary_keys[i];
-        }
-        std::cout << "]" << std::endl;
-    }
-    std::cout << "  __indexes rows="
-              << catalogRowCountOn(leader_node, "__indexes")
-              << ", __index_entries rows="
-              << catalogRowCountOn(leader_node, "__index_entries")
-              << ", active_ownership_rows="
-              << (ownership == nullptr ? 0 : ownership->rows.size())
-              << std::endl;
-    for (const auto& replica : replicas) {
-        const auto* node = state.nodeAs<ConsensusReplica>(replica);
-        std::cout << "  " << replica << " has index metadata="
-                  << (catalogHasRowOn(
-                          node, "__indexes",
-                          {{"index_name", "idx_title_year"},
-                           {"table_name", "title"},
-                           {"status", "active"}})
-                          ? "yes" : "no")
+                  << ", primary_keys=" << lookup->primary_keys.size()
                   << std::endl;
     }
-    std::cout << std::endl;
+    std::cout << "  copied_entries=" << copied
+              << ", source_entries_after=" << activeEntries(source).rows.size()
+              << ", target_entries_after=" << activeEntries(target).rows.size()
+              << ", catalog_transfer_rows="
+              << catalogRowCountOn(leaderNode(catalog), "__range_transfers")
+              << std::endl << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -17875,39 +17969,8 @@ int main(int argc, char* argv[]) {
     struct IndexScenario {
         TitleIndexFixture fixture;
         ConsensusGroupHarness catalog;
-    };
-
-    auto buildIndexScenario = [&]() {
-        IndexScenario scenario;
-        scenario.fixture = titleIndexFixture();
-        scenario.catalog =
-            makeConsensusGroup("group-catalog", "server", 1);
-
-        tests.check(commitCommand(scenario.catalog,
-                                  bootstrapClusterACommand()) ==
-                        Result{StatementOkResult{}},
-                    "catalog group should bootstrap the cluster");
-        tests.check(commitCommand(scenario.catalog,
-                                  registerGroup1Command()) ==
-                        Result{StatementOkResult{}},
-                    "catalog group should register the initial group");
-        tests.check(commitCommand(scenario.catalog,
-                                  createTitleTableCommand()) ==
-                        Result{CreateTableOkResult{}},
-                    "catalog should create the title table metadata");
-        for (const auto& row : scenario.fixture.initial_rows) {
-            tests.check(
-                commitCommand(scenario.catalog,
-                              parseSQL("INSERT " + row.line)) ==
-                    Result{InsertOkResult{}},
-                "catalog should record a real IMDB title key");
-        }
-        tests.check(
-            commitCommand(scenario.catalog,
-                          createTitleYearIndexCommand()) ==
-                Result{StatementOkResult{}},
-            "catalog should build the secondary index through Raft");
-        return scenario;
+        ConsensusGroupHarness index_source_group;
+        ConsensusGroupHarness index_target_group;
     };
 
     auto catalogTableOn = [&](const ConsensusGroupHarness& group,
@@ -17972,17 +18035,22 @@ int main(int argc, char* argv[]) {
         const auto* node =
             group.state.nodeAs<ConsensusReplica>(group.leader);
         if (node == nullptr) {
-            throw std::runtime_error("missing catalog leader");
+            throw std::runtime_error("missing consensus leader");
         }
         return node;
     };
 
-    auto readIndexOn = [&](const ConsensusGroupHarness& group,
-                           const Address& replica,
-                           const std::string& year) {
+    auto indexCommandForGroup = [&](const std::string& group_id) {
+        return CreateSecondaryIndexCommand{
+            title_year_index, "title", "production_year", group_id};
+    };
+
+    auto readIndexLocal = [&](const ConsensusGroupHarness& group,
+                              const Address& replica,
+                              const std::string& year) {
         const auto* node = group.state.nodeAs<ConsensusReplica>(replica);
         if (node == nullptr) {
-            throw std::runtime_error("missing catalog replica");
+            throw std::runtime_error("missing index replica");
         }
         Result result =
             node->executeReadOnlyForTest(
@@ -17992,6 +18060,37 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("index lookup failed");
         }
         return *lookup;
+    };
+
+    auto indexOwnerGroupForYear = [&](IndexScenario& scenario,
+                                      const std::string& year)
+        -> ConsensusGroupHarness& {
+        Result route_result = leaderNode(scenario.catalog)->executeReadOnlyForTest(
+            ExplainIndexLookupCommand{title_year_index, year});
+        const auto* route = std::get_if<RouteResult>(&route_result);
+        if (route == nullptr || route->replica_group_ids.empty()) {
+            throw std::runtime_error("missing index route for year " + year);
+        }
+        const std::string& group_id = route->replica_group_ids.front();
+        if (group_id == scenario.index_source_group.group_id) {
+            return scenario.index_source_group;
+        }
+        if (group_id == scenario.index_target_group.group_id) {
+            return scenario.index_target_group;
+        }
+        throw std::runtime_error("unknown index owner " + group_id);
+    };
+
+    auto readIndexOn = [&](IndexScenario& scenario,
+                           const std::string& year) {
+        ConsensusGroupHarness& group = indexOwnerGroupForYear(scenario, year);
+        return readIndexLocal(group, group.leader, year);
+    };
+
+    auto readIndexOnReplica = [&](const ConsensusGroupHarness& group,
+                                  const Address& replica,
+                                  const std::string& year) {
+        return readIndexLocal(group, replica, year);
     };
 
     auto activeIndexEntryCount = [&](const SelectAllResult& rows,
@@ -18020,6 +18119,185 @@ int main(int argc, char* argv[]) {
                          primary_key) != lookup.primary_keys.end();
     };
 
+    auto physicalIndexEntryCount = [&](const ConsensusGroupHarness& group,
+                                       const std::string& range_id) {
+        SelectAllResult rows = catalogTableOn(group, group.leader,
+                                              "__index_entries");
+        auto range_column = catalogColumnIndex(rows, "range_id");
+        auto status_column = catalogColumnIndex(rows, "status");
+        if (!range_column.has_value() || !status_column.has_value()) return size_t{0};
+        size_t count = 0;
+        for (const auto& row : rows.rows) {
+            if (*range_column < row.size() && *status_column < row.size() &&
+                row[*range_column] == range_id && row[*status_column] == "active") {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    auto copyIndexEntries = [&](ConsensusGroupHarness& source,
+                                ConsensusGroupHarness& target,
+                                const std::string& range_id,
+                                const std::string& target_group_id) {
+        SelectAllResult rows = catalogTableOn(source, source.leader,
+                                              "__index_entries");
+        auto range_column = catalogColumnIndex(rows, "range_id");
+        auto group_column = catalogColumnIndex(rows, "replica_group_id");
+        auto status_column = catalogColumnIndex(rows, "status");
+        if (!range_column.has_value() ||
+            !group_column.has_value() ||
+            !status_column.has_value()) {
+            throw std::runtime_error("malformed __index_entries table");
+        }
+        commitCommand(target, DeleteRowsCommand{"__index_entries", "range_id", range_id});
+        size_t copied = 0;
+        for (auto row : rows.rows) {
+            if (*range_column >= row.size() ||
+                *group_column >= row.size() ||
+                *status_column >= row.size() ||
+                row[*range_column] != range_id ||
+                row[*status_column] != "active") {
+                continue;
+            }
+            row[*group_column] = target_group_id;
+            tests.check(commitCommand(target,
+                                      InsertRowCommand{"__index_entries", row}) ==
+                            Result{InsertOkResult{}},
+                        "target index group should store copied posting");
+            ++copied;
+        }
+        return copied;
+    };
+
+    auto deleteIndexEntries = [&](ConsensusGroupHarness& group,
+                                  const std::string& range_id) {
+        Result result = commitCommand(
+            group, DeleteRowsCommand{"__index_entries", "range_id", range_id});
+        tests.check(std::holds_alternative<DeleteRowsResult>(result),
+                    "source index group should delete moved postings");
+    };
+
+    auto groupForIndexReplicaGroup = [](IndexScenario& scenario,
+                                        const std::string& group_id)
+        -> ConsensusGroupHarness& {
+        if (group_id == scenario.index_source_group.group_id) {
+            return scenario.index_source_group;
+        }
+        if (group_id == scenario.index_target_group.group_id) {
+            return scenario.index_target_group;
+        }
+        throw std::runtime_error("unknown index group " + group_id);
+    };
+
+    auto moveIndexRangeThroughTransferProtocol =
+        [&](IndexScenario& scenario,
+            const std::string& range_id,
+            const std::string& target_group_id) {
+            tests.check(commitCommand(
+                            scenario.catalog,
+                            MoveRangeCommand{range_id, target_group_id}) ==
+                            Result{StatementOkResult{}},
+                        "move should create a transfer request");
+            auto requested = latestTransferOn(scenario.catalog, range_id);
+            tests.check(requested.has_value() &&
+                            requested->target_group_id == target_group_id &&
+                            requested->snapshot_key_count == 0 &&
+                            requested->status == "requested",
+                        "move should not snapshot or switch ownership early");
+            if (!requested.has_value()) return 0;
+            int epoch = requested->transfer_epoch;
+            ConsensusGroupHarness& source = groupForIndexReplicaGroup(
+                scenario, requested->source_group_id);
+            ConsensusGroupHarness& target = groupForIndexReplicaGroup(
+                scenario, target_group_id);
+            tests.check(commitCommand(
+                            scenario.catalog,
+                            PrepareRangeTransferCommand{
+                                range_id, target_group_id, epoch}) ==
+                            Result{StatementOkResult{}},
+                        "range transfer should prepare");
+            size_t copied = copyIndexEntries(source, target, range_id,
+                                             target_group_id);
+            tests.check(commitCommand(
+                            scenario.catalog,
+                            CatchUpRangeTransferCommand{range_id, epoch}) ==
+                            Result{StatementOkResult{}},
+                        "range transfer should catch up");
+            copyIndexEntries(source, target, range_id, target_group_id);
+            tests.check(commitCommand(
+                            scenario.catalog,
+                            CommitRangeTransferCommand{range_id, epoch}) ==
+                            Result{StatementOkResult{}},
+                        "range transfer should commit");
+            deleteIndexEntries(source, range_id);
+            tests.check(copied > 0 &&
+                            physicalIndexEntryCount(target, range_id) == copied &&
+                            physicalIndexEntryCount(source, range_id) == 0,
+                        "index transfer should leave postings only on target");
+            return epoch;
+        };
+
+    auto buildIndexScenario = [&]() {
+        IndexScenario scenario;
+        scenario.fixture = titleIndexFixture();
+        scenario.catalog =
+            makeConsensusGroup("group-catalog", "catalog", 1);
+        scenario.index_source_group =
+            makeConsensusGroup("group-1", "index-source", 2);
+        scenario.index_target_group =
+            makeConsensusGroup("group-2", "index-target", 3);
+
+        auto bootstrapIndexGroup = [&](ConsensusGroupHarness& group) {
+            tests.check(commitCommand(group, bootstrapClusterACommand()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should bootstrap");
+            tests.check(commitCommand(group, registerGroup1Command()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should register group-1");
+            tests.check(commitCommand(
+                            group,
+                            RegisterReplicaGroupCommand{
+                                scenario.index_target_group.group_id,
+                                {"target1", "target2", "target3"}, 1}) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should know target group");
+            tests.check(commitCommand(group, createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        group.group_id + " should create title table");
+        };
+
+        bootstrapIndexGroup(scenario.catalog);
+        bootstrapIndexGroup(scenario.index_source_group);
+        bootstrapIndexGroup(scenario.index_target_group);
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(commitCommand(scenario.catalog,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "catalog should record title row for metadata build");
+            tests.check(commitCommand(scenario.index_source_group,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "index source should store title row for physical index build");
+        }
+        tests.check(commitCommand(scenario.catalog,
+                                  indexCommandForGroup(
+                                      scenario.index_source_group.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "catalog should build index metadata through Raft");
+        tests.check(commitCommand(scenario.index_source_group,
+                                  indexCommandForGroup(
+                                      scenario.index_source_group.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "source group should materialize physical index postings");
+        tests.check(commitCommand(scenario.index_target_group,
+                                  indexCommandForGroup(
+                                      scenario.index_target_group.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "target group should create empty physical index range");
+        return scenario;
+    };
+
     tests.test("HashIndex stores duplicate secondary-key postings", [&] {
         HashIndex index;
         tests.check(index.insert(2008, 10) &&
@@ -18035,13 +18313,14 @@ int main(int argc, char* argv[]) {
                     "rangeQuery should still expose values for comparison");
     });
 
-    tests.test("Create secondary index materializes real title rows", [&] {
+    tests.test("Create secondary index materializes physical postings", [&] {
         auto scenario = buildIndexScenario();
         SelectAllResult indexes =
             catalogTableOn(scenario.catalog, scenario.catalog.leader,
                            "__indexes");
         SelectAllResult entries =
-            catalogTableOn(scenario.catalog, scenario.catalog.leader,
+            catalogTableOn(scenario.index_source_group,
+                           scenario.index_source_group.leader,
                            "__index_entries");
         SelectAllResult ownership =
             catalogTableOn(scenario.catalog, scenario.catalog.leader,
@@ -18056,22 +18335,25 @@ int main(int argc, char* argv[]) {
                     "index catalog should describe the real title index");
         tests.check(activeIndexEntryCount(entries, title_year_index) ==
                         scenario.fixture.initial_rows.size(),
-                    "index entries should be materialized from real title rows");
+                    "source index group should materialize real title postings");
+        tests.check(physicalIndexEntryCount(
+                        scenario.index_target_group,
+                        defaultRangeIdForIndex(title_year_index)) == 0,
+                    "target index group should start physically empty");
         tests.check(selectAllHasRow(
                         ownership,
                         {{"table_name", "title"},
                          {"index_name", title_year_index},
                          {"range_id", defaultRangeIdForIndex(title_year_index)},
-                         {"replica_group_id", "group-1"},
+                         {"replica_group_id", scenario.index_source_group.group_id},
                          {"status", "active"}}),
-                    "index should own an independent range");
+                    "catalog should route index range to source group");
     });
 
-    tests.test("Secondary index lookup uses HashIndex and range routing", [&] {
+    tests.test("Secondary index lookup uses routed physical HashIndex", [&] {
         auto scenario = buildIndexScenario();
         std::string year = scenario.fixture.duplicate_year;
-        IndexLookupResult lookup =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, year);
+        IndexLookupResult lookup = readIndexOn(scenario, year);
         tests.check(lookup.primary_keys ==
                         expectedPrimaryKeysFor(
                             scenario.fixture.initial_rows, year),
@@ -18082,15 +18364,16 @@ int main(int argc, char* argv[]) {
                             scenario.fixture.initial_rows.size() &&
                         lookup.hash_distinct_keys ==
                             distinctYearCount(scenario.fixture.initial_rows),
-                    "lookup should expose the populated HashIndex state");
+                    "lookup should expose the physical HashIndex state");
         tests.check(lookup.range_ids.size() == 1 &&
                         lookup.range_ids.front() ==
                             defaultRangeIdForIndex(title_year_index) &&
-                        lookup.replica_group_ids.front() == "group-1",
-                    "lookup should route through the index range");
+                        lookup.replica_group_ids.front() ==
+                            scenario.index_source_group.group_id,
+                    "lookup should route through the source index range");
     });
 
-    tests.test("Insert update and delete maintain secondary index entries", [&] {
+    tests.test("Insert update and delete maintain physical index entries", [&] {
         auto scenario = buildIndexScenario();
         const auto& extra = scenario.fixture.extra_row;
         std::string old_year = extra.values[3];
@@ -18099,52 +18382,33 @@ int main(int argc, char* argv[]) {
                 ? replacementProductionYear(old_year)
                 : scenario.fixture.duplicate_year;
 
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        parseSQL("INSERT " + extra.line)) ==
+        ConsensusGroupHarness& owner = indexOwnerGroupForYear(scenario, old_year);
+        tests.check(commitCommand(owner, parseSQL("INSERT " + extra.line)) ==
                         Result{InsertOkResult{}},
-                    "insert should succeed through consensus");
-        IndexLookupResult after_insert =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, old_year);
-        tests.check(std::find(after_insert.primary_keys.begin(),
-                              after_insert.primary_keys.end(),
-                              extra.values[0]) !=
-                        after_insert.primary_keys.end(),
+                    "insert should update physical index owner");
+        IndexLookupResult after_insert = readIndexOn(scenario, old_year);
+        tests.check(primaryKeysContain(after_insert, extra.values[0]),
                     "insert should add an index posting");
 
         tests.check(commitCommand(
-                        scenario.catalog,
+                        owner,
                         parseSQL("UPDATE title SET production_year=" +
-                                 new_year + " WHERE id=" +
-                                 extra.values[0])) ==
+                                 new_year + " WHERE id=" + extra.values[0])) ==
                         Result{UpdateRowsResult{1}},
-                    "update should succeed through consensus");
-        IndexLookupResult old_lookup =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, old_year);
-        IndexLookupResult new_lookup =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, new_year);
-        tests.check(std::find(old_lookup.primary_keys.begin(),
-                              old_lookup.primary_keys.end(),
-                              extra.values[0]) ==
-                        old_lookup.primary_keys.end() &&
-                        std::find(new_lookup.primary_keys.begin(),
-                                  new_lookup.primary_keys.end(),
-                                  extra.values[0]) !=
-                            new_lookup.primary_keys.end(),
+                    "update should change physical index owner");
+        IndexLookupResult old_lookup = readIndexOn(scenario, old_year);
+        IndexLookupResult new_lookup = readIndexOn(scenario, new_year);
+        tests.check(!primaryKeysContain(old_lookup, extra.values[0]) &&
+                        primaryKeysContain(new_lookup, extra.values[0]),
                     "update should move the posting to the new index key");
 
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        parseSQL("DELETE FROM title WHERE id=" +
-                                 extra.values[0])) ==
+        tests.check(commitCommand(owner,
+                                  parseSQL("DELETE FROM title WHERE id=" +
+                                           extra.values[0])) ==
                         Result{DeleteRowsResult{1}},
-                    "delete should succeed through consensus");
-        IndexLookupResult after_delete =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, new_year);
-        tests.check(std::find(after_delete.primary_keys.begin(),
-                              after_delete.primary_keys.end(),
-                              extra.values[0]) ==
-                        after_delete.primary_keys.end(),
+                    "delete should update physical index owner");
+        IndexLookupResult after_delete = readIndexOn(scenario, new_year);
+        tests.check(!primaryKeysContain(after_delete, extra.values[0]),
                     "delete should remove the active index posting");
     });
 
@@ -18152,67 +18416,56 @@ int main(int argc, char* argv[]) {
         auto scenario = buildIndexScenario();
         std::string year = scenario.fixture.duplicate_year;
         IndexLookupResult expected =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, year);
+            readIndexOnReplica(scenario.index_source_group,
+                               scenario.index_source_group.leader,
+                               year);
         SelectAllResult expected_indexes =
             catalogTableOn(scenario.catalog, scenario.catalog.leader,
                            "__indexes");
         SelectAllResult expected_entries =
-            catalogTableOn(scenario.catalog, scenario.catalog.leader,
+            catalogTableOn(scenario.index_source_group,
+                           scenario.index_source_group.leader,
                            "__index_entries");
+        for (const auto& replica : scenario.index_source_group.replicas) {
+            tests.check(readIndexOnReplica(scenario.index_source_group,
+                                           replica, year) == expected,
+                        "index follower should rebuild the same HashIndex lookup");
+            tests.check(catalogTableOn(scenario.index_source_group,
+                                       replica,
+                                       "__index_entries") == expected_entries,
+                        "index follower should expose materialized index entries");
+        }
         for (const auto& replica : scenario.catalog.replicas) {
-            tests.check(readIndexOn(scenario.catalog, replica, year) ==
-                            expected,
-                        "follower should rebuild the same HashIndex lookup");
             tests.check(catalogTableOn(scenario.catalog, replica,
-                                       "__indexes") ==
-                            expected_indexes,
-                        "follower should expose index metadata");
-            tests.check(catalogTableOn(scenario.catalog, replica,
-                                       "__index_entries") ==
-                            expected_entries,
-                        "follower should expose materialized index entries");
+                                       "__indexes") == expected_indexes,
+                        "catalog follower should expose index metadata");
         }
     });
 
     tests.test("Index range transfers independently from table range", [&] {
         auto scenario = buildIndexScenario();
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        RegisterReplicaGroupCommand{
-                            "group-2", {"g2s1", "g2s2", "g2s3"}, 1}) ==
-                        Result{StatementOkResult{}},
-                    "target replica group should be registered");
         std::string index_range = defaultRangeIdForIndex(title_year_index);
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        PrepareRangeTransferCommand{
-                            index_range, "group-2", 1}) ==
-                        Result{StatementOkResult{}},
-                    "index range transfer should prepare");
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        CatchUpRangeTransferCommand{index_range, 1}) ==
-                        Result{StatementOkResult{}},
-                    "index range transfer should catch up");
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        CommitRangeTransferCommand{index_range, 1}) ==
-                        Result{StatementOkResult{}},
-                    "index range transfer should commit");
+        IndexLookupResult before_move =
+            readIndexOn(scenario, scenario.fixture.duplicate_year);
+        tests.check(before_move.replica_group_ids.front() ==
+                        scenario.index_source_group.group_id,
+                    "index lookup should route to source before movement");
+        int transfer_epoch = moveIndexRangeThroughTransferProtocol(
+            scenario, index_range, scenario.index_target_group.group_id);
         auto transfer = latestTransferOn(scenario.catalog, index_range);
         tests.check(transfer.has_value() &&
                         transfer->snapshot_key_count ==
                             scenario.fixture.initial_rows.size() &&
-                        transfer->target_group_id == "group-2" &&
+                        transfer->target_group_id == scenario.index_target_group.group_id &&
+                        transfer->transfer_epoch == transfer_epoch &&
                         transfer->status == "committed",
                     "transfer manifest should count real index entries");
         IndexLookupResult lookup =
-            readIndexOn(scenario.catalog,
-                        scenario.catalog.leader,
-                        scenario.fixture.duplicate_year);
+            readIndexOn(scenario, scenario.fixture.duplicate_year);
         tests.check(lookup.replica_group_ids.size() == 1 &&
-                        lookup.replica_group_ids.front() == "group-2",
-                    "index lookup should route to the moved index range");
+                        lookup.replica_group_ids.front() ==
+                            scenario.index_target_group.group_id,
+                    "index lookup should route to the moved physical index range");
         Result table_route_result =
             leaderNode(scenario.catalog)->executeReadOnlyForTest(
                 ExplainRouteCommand{
@@ -18223,80 +18476,56 @@ int main(int argc, char* argv[]) {
             std::get_if<RouteResult>(&table_route_result);
         tests.check(table_route != nullptr &&
                         table_route->replica_group_ids.size() == 1 &&
-                        table_route->replica_group_ids.front() == "group-1",
-	                    "primary table range should stay on its original group");
+                        table_route->replica_group_ids.front() ==
+                            scenario.index_source_group.group_id,
+                    "primary table range should stay on its original group");
     });
 
     tests.test("Moved index range tracks later table changes", [&] {
         auto scenario = buildIndexScenario();
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        RegisterReplicaGroupCommand{
-                            "group-2", {"g2s1", "g2s2", "g2s3"}, 1}) ==
-                        Result{StatementOkResult{}},
-                    "target replica group should be registered");
         std::string index_range = defaultRangeIdForIndex(title_year_index);
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        PrepareRangeTransferCommand{
-                            index_range, "group-2", 1}) ==
-                        Result{StatementOkResult{}},
-                    "index range transfer should prepare");
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        CatchUpRangeTransferCommand{index_range, 1}) ==
-                        Result{StatementOkResult{}},
-                    "index range transfer should catch up");
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        CommitRangeTransferCommand{index_range, 1}) ==
-                        Result{StatementOkResult{}},
-                    "index range transfer should commit");
+        moveIndexRangeThroughTransferProtocol(
+            scenario, index_range, scenario.index_target_group.group_id);
 
         const auto& extra = scenario.fixture.extra_row;
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        parseSQL("INSERT " + extra.line)) ==
+        ConsensusGroupHarness& moved_owner = indexOwnerGroupForYear(
+            scenario, extra.values[3]);
+        tests.check(commitCommand(moved_owner,
+                                  parseSQL("INSERT " + extra.line)) ==
                         Result{InsertOkResult{}},
-                    "insert after index move should succeed");
-        IndexLookupResult inserted =
-            readIndexOn(scenario.catalog,
-                        scenario.catalog.leader,
-                        extra.values[3]);
-        tests.check(inserted.replica_group_ids.front() == "group-2" &&
+                    "insert after index move should update target index owner");
+        IndexLookupResult inserted = readIndexOn(scenario, extra.values[3]);
+        tests.check(inserted.replica_group_ids.front() ==
+                        scenario.index_target_group.group_id &&
                         primaryKeysContain(inserted, extra.values[0]),
                     "moved index range should include post-move insert");
 
-        const auto& row = scenario.fixture.initial_rows[1];
-        std::string old_year = row.values[3];
+        std::string old_year = extra.values[3];
         std::string new_year = replacementProductionYear(old_year);
         tests.check(commitCommand(
-                        scenario.catalog,
+                        moved_owner,
                         parseSQL("UPDATE title SET production_year=" +
-                                 new_year + " WHERE id=" + row.values[0])) ==
+                                 new_year + " WHERE id=" + extra.values[0])) ==
                         Result{UpdateRowsResult{1}},
-                    "update after index move should succeed");
-        IndexLookupResult old_lookup =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, old_year);
-        IndexLookupResult new_lookup =
-            readIndexOn(scenario.catalog, scenario.catalog.leader, new_year);
-        tests.check(old_lookup.replica_group_ids.front() == "group-2" &&
-                        new_lookup.replica_group_ids.front() == "group-2" &&
-                        !primaryKeysContain(old_lookup, row.values[0]) &&
-                        primaryKeysContain(new_lookup, row.values[0]),
+                    "update after index move should update target index owner");
+        IndexLookupResult old_lookup = readIndexOn(scenario, old_year);
+        IndexLookupResult new_lookup = readIndexOn(scenario, new_year);
+        tests.check(old_lookup.replica_group_ids.front() ==
+                        scenario.index_target_group.group_id &&
+                        new_lookup.replica_group_ids.front() ==
+                            scenario.index_target_group.group_id &&
+                        !primaryKeysContain(old_lookup, extra.values[0]) &&
+                        primaryKeysContain(new_lookup, extra.values[0]),
                     "moved index range should move updated posting");
 
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        parseSQL("DELETE FROM title WHERE id=" +
-                                 extra.values[0])) ==
+        tests.check(commitCommand(moved_owner,
+                                  parseSQL("DELETE FROM title WHERE id=" +
+                                           extra.values[0])) ==
                         Result{DeleteRowsResult{1}},
-                    "delete after index move should succeed");
-        IndexLookupResult after_delete =
-            readIndexOn(scenario.catalog,
-                        scenario.catalog.leader,
-                        extra.values[3]);
-        tests.check(after_delete.replica_group_ids.front() == "group-2" &&
+                    "delete after index move should update target index owner");
+        IndexLookupResult after_delete = readIndexOn(scenario, new_year);
+        tests.check(after_delete.replica_group_ids.front() ==
+                        scenario.index_target_group.group_id &&
                         !primaryKeysContain(after_delete, extra.values[0]),
                     "moved index range should remove deleted posting");
     });

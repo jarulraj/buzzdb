@@ -17578,6 +17578,37 @@ Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
+std::vector<Command> createTitleWriteCommands(const std::string& data_file) {
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 2);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<std::string> second_title =
+        tupleValuesFromLine(title_rows[1], "title");
+    if (first_title.size() < 4 || second_title.size() < 4) {
+        throw std::runtime_error("title rows must include production_year");
+    }
+
+    std::vector<Command> commands{createTitleTableCommand()};
+    commands.push_back(parseSQL("INSERT " + title_rows[0]));
+    commands.push_back(parseSQL("INSERT " + title_rows[1]));
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(first_title[3]),
+        "id", first_title[0]});
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(second_title[3]),
+        "id", second_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", first_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", second_title[0]});
+    commands.push_back(CountRowsCommand{"title"});
+    return commands;
+}
+
+Workload createTitleWriteWorkload(const std::string& data_file) {
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    return Workload(commands, buzzDBOracleResults(commands));
+}
+
 class BuzzDBClientWorkload final : public SearchTestWorkload {
 public:
     BuzzDBClientWorkload(Address server,
@@ -17832,7 +17863,7 @@ void printDistributedServiceTrace(const std::string& data_file) {
     Address server = ScenarioAddress::server1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientBuzzDBScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientBuzzDBScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings = scenario.settings;
     SearchState state = scenario.state;
 
@@ -18088,7 +18119,7 @@ void printActualPrimaryBackupSearchStates(size_t count,
     Address backup = ScenarioAddress::backup1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientPrimaryBackupScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientPrimaryBackupScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings;
     settings.max_depth = 5;
     settings.max_states = 1000;
@@ -18265,7 +18296,7 @@ void printPrimaryBackupTrace(const std::string& data_file) {
     Address primary = ScenarioAddress::server1();
     Address backup = ScenarioAddress::backup1();
     Address client = ScenarioAddress::client1();
-    std::vector<Command> commands = createExplicitJobJoinCommands(data_file);
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
     Scenario scenario =
         oneClientPrimaryBackupScenario(
             Workload(commands, buzzDBOracleResults(commands)));
@@ -18873,7 +18904,7 @@ void printRestartRecoveryMeasurement(const std::string& data_file) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -18926,8 +18957,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v116-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -19089,17 +19120,6 @@ void seedViewServerForPrimaryBackup(ViewServer& view_server,
     view_server.pingServer(backup, 0);
     view_server.pingServer(primary, 2);
     view_server.pingServer(backup, 2);
-}
-
-std::vector<Command> titleInsertCommandsFromImdb(
-    const std::string& data_file,
-    size_t row_count) {
-    std::vector<Command> commands{createTitleTableCommand()};
-    for (const auto& row : requireTupleLinesFromFile(
-             data_file, "title", row_count)) {
-        commands.push_back(parseSQL("INSERT " + row));
-    }
-    return commands;
 }
 
 SearchState viewAwarePrimaryBackupState(std::vector<Command> commands) {
@@ -19646,7 +19666,7 @@ void printPrimaryBackupCeilingTrace(const std::string& data_file) {
     Address client = ScenarioAddress::client1();
 
     SearchState view_state = viewAwarePrimaryBackupState(
-        titleInsertCommandsFromImdb(data_file, 1));
+        createTitleWriteCommands(data_file));
     SearchSettings control_plane_partition;
     control_plane_partition.partition({{client, primary, backup}, {view_server}});
     bool view_request_deliverable = false;
@@ -19662,7 +19682,7 @@ void printPrimaryBackupCeilingTrace(const std::string& data_file) {
     std::cout << "  control plane partition: view request deliverable="
               << (view_request_deliverable ? "yes" : "no") << std::endl;
 
-    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
     SearchState write_state = oneClientPrimaryBackupScenario(
         Workload(commands, buzzDBOracleResults(commands))).state;
     SearchSettings normal;
@@ -19952,25 +19972,19 @@ void printQuorumLeadershipTrace(const std::string& data_file) {
               << ", votes=" << (leader_node ? leader_node->voteCount() : 0)
               << std::endl;
 
-    std::vector<Command> commands = titleInsertCommandsFromImdb(data_file, 1);
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        1,
-        commands[0],
-        {replicas[1], replicas[2]});
-    state = deliverConsensusCommandToQuorum(
-        state,
-        majority_partition,
-        leader,
-        client,
-        1,
-        2,
-        commands[1],
-        {replicas[1], replicas[2]});
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
+    const size_t write_prefix = 5;
+    for (size_t i = 0; i < write_prefix; ++i) {
+        state = deliverConsensusCommandToQuorum(
+            state,
+            majority_partition,
+            leader,
+            client,
+            1,
+            static_cast<int>(i + 1),
+            commands[i],
+            {replicas[1], replicas[2]});
+    }
     leader_node = state.nodeAs<ConsensusReplica>(leader);
     std::cout << "  committed through index="
               << (leader_node ? leader_node->commitIndex() : 0)
@@ -19999,7 +20013,7 @@ int main(int argc, char* argv[]) {
         printLocalBuzzDBTrace(imdb_file);
         printPrimaryBackupCeilingTrace(imdb_file);
         printQuorumLeadershipTrace(imdb_file);
-        printV104BootstrapTrace(imdb_file);
+        printBuzzDBBootstrapTrace(imdb_file);
     }
 
     TestRunner tests;
@@ -20252,7 +20266,8 @@ int main(int argc, char* argv[]) {
             leader,
             {replicas[1], replicas[2]});
 
-        std::vector<Command> commands = titleInsertCommandsFromImdb(imdb_file, 1);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
+        const size_t write_prefix = 5;
         state = deliverConsensusCommandToQuorum(
             state,
             majority_partition,
@@ -20264,52 +20279,63 @@ int main(int argc, char* argv[]) {
             {replicas[1], replicas[2]});
         tests.check(newClientReplyFor(state, 1, 1),
                     "majority should complete the create-table command");
-        state = deliverConsensusCommandToQuorum(
-            state,
-            majority_partition,
-            leader,
-            client,
-            1,
-            2,
-            commands[1],
-            {replicas[1], replicas[2]});
+        for (size_t i = 1; i < write_prefix; ++i) {
+            state = deliverConsensusCommandToQuorum(
+                state,
+                majority_partition,
+                leader,
+                client,
+                1,
+                static_cast<int>(i + 1),
+                commands[i],
+                {replicas[1], replicas[2]});
+        }
 
         const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
         tests.check(leader_node != nullptr &&
-                        leader_node->commitIndex() == 2 &&
-                        leader_node->appliedIndex() == 2,
-                    "leader should commit and apply two quorum-backed entries");
-        tests.check(leader_node != nullptr &&
-                        leader_node->executionCount(1, 1) == 1 &&
-                        leader_node->executionCount(1, 2) == 1,
-                    "leader should execute each completed request once");
+                        leader_node->commitIndex() ==
+                            static_cast<int>(write_prefix) &&
+                        leader_node->appliedIndex() ==
+                            static_cast<int>(write_prefix),
+                    "leader should commit and apply the quorum-backed write prefix");
+        for (size_t i = 0; i < write_prefix; ++i) {
+            tests.check(leader_node != nullptr &&
+                            leader_node->executionCount(
+                                1, static_cast<int>(i + 1)) == 1,
+                        "leader should execute each completed request once");
+        }
         for (const auto& replica :
              std::vector<Address>{leader, replicas[1], replicas[2]}) {
             const auto* node = state.nodeAs<ConsensusReplica>(replica);
-            tests.check(node != nullptr &&
-                            node->acceptedEntryMatches(
-                                1, 1, 1, 1, commands[0]) &&
-                            node->acceptedEntryMatches(
-                                2, 1, 1, 2, commands[1]),
-                        replica.str() +
-                            " should store the accepted BuzzDB commands");
+            for (size_t i = 0; i < write_prefix; ++i) {
+                tests.check(node != nullptr &&
+                                node->acceptedEntryMatches(
+                                    static_cast<int>(i + 1),
+                                    1,
+                                    1,
+                                    static_cast<int>(i + 1),
+                                    commands[i]),
+                            replica.str() +
+                                " should store the accepted BuzzDB command");
+            }
         }
         for (const auto& isolated :
              std::vector<Address>{replicas[3], replicas[4]}) {
             const auto* node = state.nodeAs<ConsensusReplica>(isolated);
-            tests.check(node != nullptr &&
-                            !node->hasAccepted(1) &&
-                            !node->hasAccepted(2),
-                        isolated.str() +
-                            " should not accept entries across the partition");
+            for (size_t i = 0; i < write_prefix; ++i) {
+                tests.check(node != nullptr &&
+                                !node->hasAccepted(static_cast<int>(i + 1)),
+                            isolated.str() +
+                                " should not accept entries across the partition");
+            }
         }
         tests.check(leader_node != nullptr &&
                         leader_node->executeReadOnlyForTest(
                             CountRowsCommand{"title"}) ==
-                            Result{CountRowsResult{1}},
-                    "real IMDB title tuple should be visible on the leader");
-        tests.check(newClientReplyFor(state, 1, 2),
-                    "majority should reply to the inserted row command");
+                            Result{CountRowsResult{2}},
+                    "both real IMDB title rows should be visible on the leader");
+        tests.check(newClientReplyFor(state, 1, static_cast<int>(write_prefix)),
+                    "majority should reply to the final update command");
     });
 
     tests.test("Client can contact follower and reach leader", [&] {

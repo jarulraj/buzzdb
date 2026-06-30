@@ -13366,6 +13366,92 @@ private:
         });
     }
 
+    bool rangeTransferInFlight(const RangeTransferRecord& record) {
+        return record.status == "requested" ||
+               record.status == "prepared" ||
+               record.status == "caught_up";
+    }
+
+    int nextRangeTransferEpoch(const std::string& range_id) {
+        auto previous = latestRangeTransferRecord(range_id);
+        return previous.has_value() ? previous->transfer_epoch + 1 : 1;
+    }
+
+    std::optional<RangeOwnershipRecord> ownershipRecordForRange(
+        const std::vector<RangeOwnershipRecord>& records,
+        const std::string& range_id) {
+        for (const auto& record : records) {
+            if (record.range_id == range_id) return record;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<RangeTransferRecord> buildRangeTransferRequest(
+        const std::vector<RangeOwnershipRecord>& current,
+        const std::string& range_id,
+        const std::string& target_group_id,
+        int config_num) {
+        auto source = ownershipRecordForRange(current, range_id);
+        if (!source.has_value() ||
+            source->replica_group_id == target_group_id) {
+            return std::nullopt;
+        }
+        auto target = latestReplicaGroupConfig(target_group_id);
+        if (!target.exists || target.phase != "stable") {
+            return std::nullopt;
+        }
+        auto previous = latestRangeTransferRecord(range_id);
+        if (previous.has_value() && rangeTransferInFlight(*previous)) {
+            return std::nullopt;
+        }
+        return RangeTransferRecord{
+            range_id,
+            source->replica_group_id,
+            target_group_id,
+            nextRangeTransferEpoch(range_id),
+            0,
+            0,
+            config_num,
+            "requested"};
+    }
+
+    bool appendRangeTransferRequest(
+        const std::vector<RangeOwnershipRecord>& current,
+        const std::string& range_id,
+        const std::string& target_group_id,
+        int config_num) {
+        auto request = buildRangeTransferRequest(
+            current, range_id, target_group_id, config_num);
+        if (!request.has_value()) return false;
+        appendRangeTransferRecord(*request);
+        return true;
+    }
+
+    bool appendRangeTransferRequests(
+        const std::vector<RangeOwnershipRecord>& records,
+        const std::map<std::string, std::string>& assignments,
+        int config_num) {
+        std::vector<RangeTransferRecord> requests;
+        for (const auto& record : records) {
+            auto assignment = assignments.find(record.range_id);
+            if (assignment == assignments.end()) {
+                throw std::runtime_error("missing range assignment");
+            }
+            if (assignment->second == record.replica_group_id) {
+                continue;
+            }
+            auto request = buildRangeTransferRequest(
+                records, record.range_id, assignment->second, config_num);
+            if (!request.has_value()) return false;
+            requests.push_back(*request);
+        }
+        if (requests.empty()) return false;
+        for (const auto& request : requests) {
+            appendRangeTransferRecord(request);
+        }
+        return true;
+    }
+
     std::vector<RangeDescriptor> matchingPointRanges(
         const std::string& key) {
         std::vector<RangeDescriptor> matches;
@@ -14384,10 +14470,9 @@ private:
         appendReplicaGroupConfig(config);
 
         groups.push_back(command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeTransferRequests(current, assignments, latest_config);
         return StatementOkResult{};
     }
 
@@ -14405,10 +14490,9 @@ private:
             return ConfigRejectedResult{};
         }
         groups = catalogListWithout(std::move(groups), command.group_id);
-        appendRangeConfigRows(
-            latest_config + 1,
-            current,
-            balancedRangeAssignments(current, std::move(groups)));
+        std::map<std::string, std::string> assignments =
+            balancedRangeAssignments(current, std::move(groups));
+        appendRangeTransferRequests(current, assignments, latest_config);
         return StatementOkResult{};
     }
 
@@ -14422,27 +14506,13 @@ private:
         }
         std::vector<RangeOwnershipRecord> current =
             rangeOwnershipRecordsAtConfig(latest_config);
-        auto groups = activeReplicaGroups(current);
-        if (!catalogListContains(groups, command.target_replica_group_id)) {
+
+        if (!appendRangeTransferRequest(current,
+                                        command.range_id,
+                                        command.target_replica_group_id,
+                                        latest_config)) {
             return ConfigRejectedResult{};
         }
-
-        std::map<std::string, std::string> assignments;
-        bool found = false;
-        bool changed = false;
-        for (const auto& record : current) {
-            assignments[record.range_id] = record.replica_group_id;
-            if (record.range_id == command.range_id) {
-                found = true;
-                changed =
-                    record.replica_group_id != command.target_replica_group_id;
-                assignments[record.range_id] =
-                    command.target_replica_group_id;
-            }
-        }
-        if (!found || !changed) return ConfigRejectedResult{};
-
-        appendRangeConfigRows(latest_config + 1, current, assignments);
         return StatementOkResult{};
     }
 
@@ -14457,22 +14527,33 @@ private:
         }
 
         auto previous = latestRangeTransferRecord(command.range_id);
-        if (previous.has_value() &&
-            command.transfer_epoch <= previous->transfer_epoch) {
-            return ConfigRejectedResult{};
+        if (previous.has_value()) {
+            if (command.transfer_epoch < previous->transfer_epoch) {
+                return ConfigRejectedResult{};
+            }
+            if (command.transfer_epoch == previous->transfer_epoch) {
+                if (previous->status != "requested" ||
+                    previous->target_group_id !=
+                        command.target_replica_group_id ||
+                    previous->prepared_config_num != latest_config) {
+                    return ConfigRejectedResult{};
+                }
+            } else if (rangeTransferInFlight(*previous)) {
+                return ConfigRejectedResult{};
+            }
         }
 
         std::vector<RangeOwnershipRecord> current =
             rangeOwnershipRecordsAtConfig(latest_config);
-        std::optional<RangeOwnershipRecord> source;
-        for (const auto& record : current) {
-            if (record.range_id == command.range_id) {
-                source = record;
-                break;
-            }
-        }
+        std::optional<RangeOwnershipRecord> source =
+            ownershipRecordForRange(current, command.range_id);
         if (!source.has_value() ||
             source->replica_group_id == command.target_replica_group_id) {
+            return ConfigRejectedResult{};
+        }
+        if (previous.has_value() &&
+            command.transfer_epoch == previous->transfer_epoch &&
+            previous->source_group_id != source->replica_group_id) {
             return ConfigRejectedResult{};
         }
 
@@ -14555,7 +14636,8 @@ private:
         auto transfer = latestRangeTransferRecord(command.range_id);
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
-            (transfer->status != "prepared" &&
+            (transfer->status != "requested" &&
+             transfer->status != "prepared" &&
              transfer->status != "caught_up")) {
             return ConfigRejectedResult{};
         }
@@ -14604,8 +14686,7 @@ private:
             load_by_group[group] = 0;
         }
         for (const auto& record : records) {
-            size_t keys =
-                latestGlobalKeyRecordsForRangeId(record.range_id).size();
+            size_t keys = latestGlobalKeyRecordsForRangeId(record.range_id).size();
             load_by_group[record.replica_group_id] += keys;
             if (catalogListContains(groups, record.replica_group_id)) {
                 candidates.push_back(RebalanceCandidate{record, keys});
@@ -14669,35 +14750,13 @@ private:
             return result;
         }
 
-        int transfer_epoch = 1;
-        auto previous =
-            latestRangeTransferRecord(selected->record.range_id);
-        if (previous.has_value()) {
-            transfer_epoch = previous->transfer_epoch + 1;
-        }
-
-        Result prepared = executeOne(
-            PrepareRangeTransferCommand{
-                selected->record.range_id,
-                lightest->first,
-                transfer_epoch});
-        if (!(prepared == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
-        Result caught_up = executeOne(
-            CatchUpRangeTransferCommand{
-                selected->record.range_id,
-                transfer_epoch});
-        if (!(caught_up == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
-        Result committed = executeOne(
-            CommitRangeTransferCommand{
-                selected->record.range_id,
-                transfer_epoch});
-        if (!(committed == Result{StatementOkResult{}})) {
-            return ConfigRejectedResult{};
-        }
+        auto request = buildRangeTransferRequest(
+            records,
+            selected->record.range_id,
+            lightest->first,
+            latest_config);
+        if (!request.has_value()) return result;
+        appendRangeTransferRecord(*request);
 
         result.moved = true;
         result.range_id = selected->record.range_id;
@@ -14708,7 +14767,7 @@ private:
         result.target_keys_before = lightest->second;
         result.source_keys_after = after_loads[heaviest->first];
         result.target_keys_after = after_loads[lightest->first];
-        result.config_num = latestRangeConfigNumber();
+        result.config_num = latest_config;
         return result;
     }
 
@@ -16812,147 +16871,191 @@ SearchState buildInitialReplicaGroupState(
 }
 
 void printPartitionedSQLTrace(const std::string& data_file) {
-    std::cout << "Trace: range rebalancer" << std::endl;
-    std::vector<Address> replicas = quorumReplicaAddresses(3);
-    Address leader = replicas[0];
-    Address client = ScenarioAddress::client1();
+    std::cout << "Trace: physical range rebalancer" << std::endl;
 
-    std::vector<std::string> title_rows =
-        requireTupleLinesFromFile(data_file, "title", 8);
-    std::vector<std::pair<std::string, std::vector<std::string>>> all_titles;
-    for (const auto& row : title_rows) {
-        all_titles.push_back({row, tupleValuesFromLine(row, "title")});
-    }
-    if (all_titles.size() < 8) {
-        throw std::runtime_error(
-            "Need enough title rows for range rebalancer trace.");
-    }
-    std::vector<std::pair<std::string, std::vector<std::string>>> titles(
-        all_titles.begin(), all_titles.begin() + 8);
-    std::vector<std::pair<std::string, std::vector<std::string>>>
-        sorted_titles = titles;
-    std::sort(
-        sorted_titles.begin(),
-        sorted_titles.end(),
-        [](const auto& lhs, const auto& rhs) {
-            return tableRowKey("title", lhs.second.front()) <
-                   tableRowKey("title", rhs.second.front());
-        });
-    size_t split_index = sorted_titles.size() / 2;
+    struct TraceGroup {
+        std::string group_id;
+        std::vector<Address> replicas;
+        Address leader;
+        Address client;
+        SearchState state;
+        int client_id = 0;
+        int next_request_id = 1;
+    };
+
+    auto makeReplicas = [](const std::string& prefix) {
+        std::vector<Address> replicas;
+        for (size_t i = 1; i <= 3; ++i) replicas.emplace_back(prefix + std::to_string(i));
+        return replicas;
+    };
+    auto makeGroup = [&](const std::string& group_id,
+                         const std::string& prefix,
+                         int client_id) {
+        TraceGroup group;
+        group.group_id = group_id;
+        group.replicas = makeReplicas(prefix);
+        group.leader = group.replicas.front();
+        group.client = Address("client-" + group_id);
+        group.state = electedConsensusState(group.replicas, group.leader);
+        group.client_id = client_id;
+        return group;
+    };
+    auto replyFor = [](const SearchState& state,
+                       int client_id,
+                       int request_id) -> std::optional<Result> {
+        for (auto it = state.network().rbegin(); it != state.network().rend(); ++it) {
+            const auto* reply = std::get_if<ClientReply>(&it->message);
+            if (reply != nullptr && reply->client_id == client_id &&
+                reply->request_id == request_id) {
+                return reply->result;
+            }
+        }
+        return std::nullopt;
+    };
+    auto commit = [&](TraceGroup& group, const Command& command) {
+        int request_id = group.next_request_id++;
+        group.state = deliverConsensusCommandToQuorum(
+            group.state, group.leader, group.client, group.client_id,
+            request_id, command, {group.replicas[1], group.replicas[2]});
+        auto reply = replyFor(group.state, group.client_id, request_id);
+        if (!reply.has_value()) {
+            throw std::runtime_error("missing trace reply for " + describeCommand(command));
+        }
+        return *reply;
+    };
+    auto leaderNode = [](const TraceGroup& group) {
+        const auto* node = group.state.nodeAs<ConsensusReplica>(group.leader);
+        if (node == nullptr) throw std::runtime_error("missing trace leader");
+        return node;
+    };
+
+    std::vector<std::string> title_rows = requireTupleLinesFromFile(data_file, "title", 8);
+    std::vector<std::pair<std::string, std::vector<std::string>>> titles;
+    for (const auto& row : title_rows) titles.push_back({row, tupleValuesFromLine(row, "title")});
+    std::vector<std::pair<std::string, std::vector<std::string>>> sorted = titles;
+    std::sort(sorted.begin(), sorted.end(), [](const auto& lhs, const auto& rhs) {
+        return tableRowKey("title", lhs.second.front()) <
+               tableRowKey("title", rhs.second.front());
+    });
+    size_t split_index = sorted.size() / 2;
     std::string left_range = defaultRangeIdForTable("title") + "-left";
     std::string right_range = defaultRangeIdForTable("title") + "-right";
-    std::string target_group = "group-title-cold";
-    std::string split_key =
-        tableRowKey("title", sorted_titles[split_index].second.front());
-    std::string primary_key = sorted_titles.front().second.front();
+    std::string split_key = tableRowKey("title", sorted[split_index].second.front());
 
-    SearchState state = buildInitialReplicaGroupState(
-        replicas, leader, client, 1);
-    int request_id = 3;
-    state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, request_id++,
-        createTitleTableCommand(),
-        {replicas[1], replicas[2]});
+    TraceGroup catalog = makeGroup("group-catalog", "catalog", 1);
+    TraceGroup source = makeGroup("group-1", "source", 2);
+    TraceGroup target = makeGroup("group-2", "target", 3);
+
+    auto routeFor = [&](const std::string& key) {
+        Result result = leaderNode(catalog)->executeReadOnlyForTest(
+            ExplainRouteCommand{"title", key, false});
+        const auto* route = std::get_if<RouteResult>(&result);
+        if (route == nullptr || route->range_ids.empty()) {
+            throw std::runtime_error("missing trace route");
+        }
+        return *route;
+    };
+    auto recordKey = [&](const std::vector<std::string>& row) {
+        const std::string& key = row.front();
+        RouteResult route = routeFor(key);
+        Result recorded = commit(
+            catalog,
+            InsertRowCommand{
+                "__global_keys",
+                {"title", key, tableRowKey("title", key), route.range_ids.front(),
+                 route.replica_group_ids.front(),
+                 std::to_string(route.descriptor_versions.front()), "active"}});
+        if (!(recorded == Result{InsertOkResult{}})) {
+            throw std::runtime_error("unable to record trace key");
+        }
+    };
+    auto selectAllTitles = [&](const TraceGroup& group) {
+        Result result = leaderNode(group)->executeReadOnlyForTest(SelectAllCommand{"title"});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        return rows == nullptr ? SelectAllResult{} : *rows;
+    };
+    auto rowsInRange = [&](const TraceGroup& group, const std::string& range_id) {
+        SelectAllResult all = selectAllTitles(group);
+        SelectAllResult filtered{all.columns, {}};
+        for (const auto& row : all.rows) {
+            auto id = selectAllValue(all, row, "id");
+            if (!id.has_value()) continue;
+            bool left = tableRowKey("title", *id) < split_key;
+            if ((range_id == left_range && left) || (range_id == right_range && !left)) {
+                filtered.rows.push_back(row);
+            }
+        }
+        return filtered;
+    };
+    auto upsertTarget = [&](const std::vector<std::string>& row) {
+        commit(target, DeleteRowsCommand{"title", "id", row.front()});
+        Result inserted = commit(target, InsertRowCommand{"title", row});
+        if (!(inserted == Result{InsertOkResult{}})) {
+            throw std::runtime_error("unable to copy trace row");
+        }
+    };
+    auto copyRange = [&](const std::string& range_id) {
+        SelectAllResult rows = rowsInRange(source, range_id);
+        for (const auto& row : rows.rows) upsertTarget(row);
+        return rows.rows.size();
+    };
+    auto deleteRange = [&](const std::string& range_id) {
+        SelectAllResult rows = rowsInRange(source, range_id);
+        for (const auto& row : rows.rows) {
+            auto id = selectAllValue(rows, row, "id");
+            if (id.has_value()) commit(source, DeleteRowsCommand{"title", "id", *id});
+        }
+    };
+
+    commit(catalog, bootstrapClusterACommand());
+    commit(catalog, registerGroup1Command());
+    commit(catalog, RegisterReplicaGroupCommand{target.group_id, {"target1", "target2", "target3"}, 1});
+    commit(catalog, createTitleTableCommand());
+    commit(source, createTitleTableCommand());
+    commit(target, createTitleTableCommand());
     for (const auto& title : titles) {
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 1, request_id++,
-            parseSQL("INSERT " + title.first),
-            {replicas[1], replicas[2]});
+        commit(source, parseSQL("INSERT " + title.first));
+        recordKey(title.second);
     }
-    state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, request_id++,
-        SplitTableCommand{"title",
-                          defaultRangeIdForTable("title"),
-                          left_range,
-                          right_range,
-                          2},
-        {replicas[1], replicas[2]});
-    state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, request_id++,
-        RegisterReplicaGroupCommand{
-            target_group, {"cold1", "cold2", "cold3"}, 1},
-        {replicas[1], replicas[2]});
-    state = deliverConsensusCommandToQuorum(
-        state, leader, client, 1, request_id++,
-        RebalanceRangesCommand{"title", 1},
-        {replicas[1], replicas[2]});
-
-    const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-    if (leader_node == nullptr) {
-        throw std::runtime_error("missing consensus leader in route trace");
+    commit(catalog, SplitTableCommand{"title", defaultRangeIdForTable("title"),
+                                      left_range, right_range, 2});
+    Result rebalance_result = commit(catalog, RebalanceRangesCommand{"title", 1});
+    const auto* rebalance = std::get_if<RebalanceResult>(&rebalance_result);
+    if (rebalance == nullptr || !rebalance->moved) {
+        throw std::runtime_error("trace rebalance did not move a range");
     }
-    Result route_result =
-        leader_node->executeReadOnlyForTest(
-            ExplainRouteCommand{"title", primary_key, false});
-    const auto* route = std::get_if<RouteResult>(&route_result);
-    Result full_scan =
-        leader_node->executeReadOnlyForTest(
-            RoutedSQLCommand{"PROJECT * FROM title"});
-    Result ownership_result =
-        leader_node->executeReadOnlyForTest(
-            ReadRangeOwnershipCommand{"title", true});
-    const auto* ownership =
-        std::get_if<SelectAllResult>(&ownership_result);
-    Result config_result =
-        leader_node->executeReadOnlyForTest(QueryRangeConfigCommand{-1});
-    const auto* config =
-        std::get_if<RangeConfigResult>(&config_result);
+    auto requested = leaderNode(catalog)->executeReadOnlyForTest(
+        ReadSystemCatalogCommand{"__range_transfers"});
+    (void)requested;
+    commit(catalog, PrepareRangeTransferCommand{rebalance->range_id,
+                                                rebalance->target_group_id, 1});
+    size_t copied = copyRange(rebalance->range_id);
+    commit(catalog, CatchUpRangeTransferCommand{rebalance->range_id, 1});
+    copyRange(rebalance->range_id);
+    commit(catalog, CommitRangeTransferCommand{rebalance->range_id, 1});
+    deleteRange(rebalance->range_id);
 
-    std::cout << "  leader=" << leader
-              << ", commit_index=" << leader_node->commitIndex()
-              << ", table=title"
-              << ", rows=" << titles.size()
-              << ", split_key=" << split_key
-              << ", primary_key=" << primary_key << std::endl;
+    Result config_result = leaderNode(catalog)->executeReadOnlyForTest(QueryRangeConfigCommand{-1});
+    const auto* config = std::get_if<RangeConfigResult>(&config_result);
+    std::cout << "  catalog_leader=" << catalog.leader
+              << ", source_leader=" << source.leader
+              << ", target_leader=" << target.leader
+              << ", moved_range=" << rebalance->range_id
+              << ", moved_keys=" << rebalance->moved_key_count << std::endl;
     if (config != nullptr) {
-        std::cout << "  config=" << config->config_num
-                  << ", ranges=" << config->range_ids.size()
-                  << ", groups=[";
+        std::cout << "  config=" << config->config_num << ", groups=[";
         for (size_t i = 0; i < config->replica_group_ids.size(); ++i) {
             if (i != 0) std::cout << ", ";
             std::cout << config->replica_group_ids[i];
         }
         std::cout << "]" << std::endl;
     }
-    if (route != nullptr && !route->range_ids.empty()) {
-        std::cout << "  row key=" << route->start_key
-                  << " -> range=" << route->range_ids.front()
-                  << ", replica_group="
-                  << route->replica_group_ids.front()
-                  << ", descriptor_version="
-                  << route->descriptor_versions.front() << std::endl;
-    }
-    std::cout << "  __ranges rows="
-              << catalogRowCountOn(leader_node, "__ranges")
-              << ", __global_key_versions="
-              << catalogRowCountOn(leader_node, "__global_keys")
+    std::cout << "  copied_rows=" << copied
+              << ", source_after=" << rowsInRange(source, rebalance->range_id).rows.size()
+              << ", target_after=" << rowsInRange(target, rebalance->range_id).rows.size()
               << ", __range_transfers="
-              << catalogRowCountOn(leader_node, "__range_transfers")
-              << ", active_ownership_rows="
-              << (ownership == nullptr ? 0 : ownership->rows.size())
-              << ", current_left_keys="
-              << currentGlobalKeyCountOn(leader_node, left_range)
-              << ", current_right_keys="
-              << currentGlobalKeyCountOn(leader_node, right_range)
-              << std::endl;
-    std::cout << "  single-group full scan -> "
-              << describeResult(full_scan)
-              << " (multi-range scatter is introduced later)" << std::endl;
-    for (const auto& replica : replicas) {
-        const auto* node = state.nodeAs<ConsensusReplica>(replica);
-        std::cout << "  " << replica << " has split children="
-                  << (catalogHasRowOn(
-                          node, "__ranges",
-                          {{"range_id", left_range},
-                           {"status", "active"}}) &&
-                      catalogHasRowOn(
-                          node, "__ranges",
-                          {{"range_id", right_range},
-                           {"status", "active"}})
-                          ? "yes" : "no")
-                  << std::endl;
-    }
-    std::cout << std::endl;
+              << catalogRowCountOn(leaderNode(catalog), "__range_transfers")
+              << std::endl << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -17121,47 +17224,17 @@ int main(int argc, char* argv[]) {
     struct RebalanceScenario {
         TitleRebalanceFixture fixture;
         ConsensusGroupHarness catalog;
+        ConsensusGroupHarness source_group;
+        ConsensusGroupHarness target_group;
     };
 
-    auto buildRebalanceScenario = [&]() {
-        RebalanceScenario scenario;
-        scenario.fixture = titleRebalanceFixture();
-        scenario.catalog =
-            makeConsensusGroup("group-catalog", "server", 1);
-
-        tests.check(commitCommand(scenario.catalog,
-                                  bootstrapClusterACommand()) ==
-                        Result{StatementOkResult{}},
-                    "catalog group should bootstrap the cluster");
-        tests.check(commitCommand(scenario.catalog,
-                                  registerGroup1Command()) ==
-                        Result{StatementOkResult{}},
-                    "catalog group should register the initial group");
-        tests.check(commitCommand(scenario.catalog,
-                                  createTitleTableCommand()) ==
-                        Result{CreateTableOkResult{}},
-                    "catalog should create the title table metadata");
-        for (const auto& row : scenario.fixture.initial_rows) {
-            tests.check(
-                commitCommand(scenario.catalog,
-                              parseSQL("INSERT " + row.line)) ==
-                    Result{InsertOkResult{}},
-                "catalog should record a real IMDB title key");
+    auto groupLeaderNode = [&](const ConsensusGroupHarness& group) {
+        const auto* node = group.state.nodeAs<ConsensusReplica>(group.leader);
+        if (node == nullptr) {
+            throw std::runtime_error("missing consensus leader for " +
+                                     group.group_id);
         }
-        tests.check(
-            commitCommand(
-                scenario.catalog,
-                splitTitleCommand(2)) ==
-                Result{StatementOkResult{}},
-            "catalog should create two title ranges in one group");
-        tests.check(
-            commitCommand(
-                scenario.catalog,
-                RegisterReplicaGroupCommand{
-                    "group-2", {"g2s1", "g2s2", "g2s3"}, 1}) ==
-                Result{StatementOkResult{}},
-            "catalog should create an empty target group");
-        return scenario;
+        return node;
     };
 
     auto queryConfigOn = [&](const ConsensusGroupHarness& group,
@@ -17271,12 +17344,7 @@ int main(int argc, char* argv[]) {
 
     auto currentGlobalKeyCount = [&](const ConsensusGroupHarness& group,
                                      const std::string& range_id) {
-        const auto* node =
-            group.state.nodeAs<ConsensusReplica>(group.leader);
-        if (node == nullptr) {
-            throw std::runtime_error("missing catalog leader");
-        }
-        return currentGlobalKeyCountOn(node, range_id);
+        return currentGlobalKeyCountOn(groupLeaderNode(group), range_id);
     };
 
     auto latestGlobalKeyGroupCount =
@@ -17345,44 +17413,164 @@ int main(int argc, char* argv[]) {
         return count;
     };
 
-    auto routeGroupFor = [&](const ConsensusGroupHarness& group,
-                             const std::string& primary_key) {
-        const auto* node =
-            group.state.nodeAs<ConsensusReplica>(group.leader);
-        if (node == nullptr) {
-            throw std::runtime_error("missing catalog leader");
-        }
-        Result result = node->executeReadOnlyForTest(
+    auto routeForKey = [&](const RebalanceScenario& scenario,
+                           const std::string& primary_key) {
+        Result result = groupLeaderNode(scenario.catalog)->executeReadOnlyForTest(
             ExplainRouteCommand{"title", primary_key, false});
         const auto* route = std::get_if<RouteResult>(&result);
-        if (route == nullptr || route->replica_group_ids.empty()) {
-            return std::string{};
+        if (route == nullptr ||
+            route->range_ids.empty() ||
+            route->replica_group_ids.empty()) {
+            throw std::runtime_error("missing route for title id " + primary_key);
         }
-        return route->replica_group_ids.front();
+        return *route;
     };
 
-    auto selectTitleById = [&](ConsensusGroupHarness& group,
-                               const std::string& primary_key) {
-        Result result = commitCommand(
-            group,
-            RoutedSQLCommand{
-                "PROJECT * FROM title WHERE id=" + primary_key});
+    auto routeGroupFor = [&](const RebalanceScenario& scenario,
+                             const std::string& primary_key) {
+        RouteResult route = routeForKey(scenario, primary_key);
+        return route.replica_group_ids.front();
+    };
+
+    auto groupForReplicaGroup = [](RebalanceScenario& scenario,
+                                   const std::string& group_id)
+        -> ConsensusGroupHarness& {
+        if (group_id == scenario.source_group.group_id) return scenario.source_group;
+        if (group_id == scenario.target_group.group_id) return scenario.target_group;
+        throw std::runtime_error("unknown physical range group " + group_id);
+    };
+
+    auto recordCatalogKeyForRow = [&](RebalanceScenario& scenario,
+                                      const TitleRowFixture& row) {
+        const std::string& primary_key = row.values.front();
+        RouteResult route = routeForKey(scenario, primary_key);
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        InsertRowCommand{
+                            "__global_keys",
+                            {"title",
+                             primary_key,
+                             tableRowKey("title", primary_key),
+                             route.range_ids.front(),
+                             route.replica_group_ids.front(),
+                             std::to_string(route.descriptor_versions.front()),
+                             "active"}}) == Result{InsertOkResult{}},
+                    "catalog should record key ownership for title " +
+                        primary_key);
+    };
+
+    auto titleRowMatchesRange = [&](const TitleRebalanceFixture& fixture,
+                                    const std::string& primary_key,
+                                    const std::string& range_id) {
+        bool left = tableRowKey("title", primary_key) < fixture.split_key;
+        if (range_id == titleLeftRangeId()) return left;
+        if (range_id == titleRightRangeId()) return !left;
+        return false;
+    };
+
+    auto selectAllTitles = [&](const ConsensusGroupHarness& group) {
+        Result result = groupLeaderNode(group)->executeReadOnlyForTest(
+            SelectAllCommand{"title"});
         const auto* rows = std::get_if<SelectAllResult>(&result);
-        if (rows == nullptr) {
-            throw std::runtime_error(
-                "expected routed title lookup for id " + primary_key);
-        }
+        if (rows == nullptr) return SelectAllResult{};
         return *rows;
+    };
+
+    auto physicalRowsInRange = [&](const RebalanceScenario& scenario,
+                                   const ConsensusGroupHarness& group,
+                                   const std::string& range_id) {
+        SelectAllResult all = selectAllTitles(group);
+        SelectAllResult filtered{all.columns, {}};
+        for (const auto& row : all.rows) {
+            auto id = selectAllValue(all, row, "id");
+            if (id.has_value() &&
+                titleRowMatchesRange(scenario.fixture, *id, range_id)) {
+                filtered.rows.push_back(row);
+            }
+        }
+        return filtered;
+    };
+
+    auto physicalRowCountInRange = [&](const RebalanceScenario& scenario,
+                                       const ConsensusGroupHarness& group,
+                                       const std::string& range_id) {
+        return physicalRowsInRange(scenario, group, range_id).rows.size();
+    };
+
+    auto selectTitleInGroup = [&](const ConsensusGroupHarness& group,
+                                  const std::string& primary_key) {
+        Result result = groupLeaderNode(group)->executeReadOnlyForTest(
+            SelectWhereCommand{"title", "id", primary_key});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) return SelectAllResult{};
+        return *rows;
+    };
+
+    auto selectRoutedTitleById = [&](RebalanceScenario& scenario,
+                                     const std::string& primary_key) {
+        ConsensusGroupHarness& group = groupForReplicaGroup(
+            scenario, routeGroupFor(scenario, primary_key));
+        return selectTitleInGroup(group, primary_key);
+    };
+
+    auto upsertPhysicalTitleRow = [&](ConsensusGroupHarness& group,
+                                      const std::vector<std::string>& row) {
+        if (row.empty()) {
+            throw std::runtime_error("cannot upsert title row without id");
+        }
+        Result removed = commitCommand(
+            group, DeleteRowsCommand{"title", "id", row.front()});
+        tests.check(std::holds_alternative<DeleteRowsResult>(removed),
+                    group.group_id + " should accept idempotent title delete");
+        tests.check(commitCommand(group, InsertRowCommand{"title", row}) ==
+                        Result{InsertOkResult{}},
+                    group.group_id + " should store copied title row " +
+                        row.front());
+    };
+
+    auto copyRangeRows = [&](RebalanceScenario& scenario,
+                             ConsensusGroupHarness& source,
+                             ConsensusGroupHarness& target,
+                             const std::string& range_id) {
+        SelectAllResult rows = physicalRowsInRange(scenario, source, range_id);
+        for (const auto& row : rows.rows) {
+            upsertPhysicalTitleRow(target, row);
+        }
+        return rows.rows.size();
+    };
+
+    auto deleteRangeRows = [&](RebalanceScenario& scenario,
+                               ConsensusGroupHarness& group,
+                               const std::string& range_id) {
+        SelectAllResult rows = physicalRowsInRange(scenario, group, range_id);
+        for (const auto& row : rows.rows) {
+            auto id = selectAllValue(rows, row, "id");
+            if (!id.has_value()) continue;
+            tests.check(commitCommand(
+                            group,
+                            DeleteRowsCommand{"title", "id", *id}) ==
+                            Result{DeleteRowsResult{1}},
+                        group.group_id + " should delete moved title row " +
+                            *id);
+        }
+    };
+
+    auto updateRoutedTitleYear = [&](RebalanceScenario& scenario,
+                                     const std::string& primary_key,
+                                     const std::string& year) {
+        ConsensusGroupHarness& group = groupForReplicaGroup(
+            scenario, routeGroupFor(scenario, primary_key));
+        return commitCommand(
+            group,
+            UpdateRowsCommand{"title", "production_year", year,
+                              "id", primary_key});
     };
 
     auto titleRowInRange = [&](const TitleRebalanceFixture& fixture,
                                const std::string& range_id) {
         for (const auto& row : fixture.initial_rows) {
             if (row.values.empty()) continue;
-            bool left =
-                tableRowKey("title", row.values.front()) < fixture.split_key;
-            if ((range_id == titleLeftRangeId() && left) ||
-                (range_id == titleRightRangeId() && !left)) {
+            if (titleRowMatchesRange(fixture, row.values.front(), range_id)) {
                 return row;
             }
         }
@@ -17400,53 +17588,180 @@ int main(int argc, char* argv[]) {
         return *rebalance_result;
     };
 
-    tests.test("Rebalancer moves one real size-imbalanced range", [&] {
+    auto moveRangePhysically = [&](RebalanceScenario& scenario,
+                                   const std::string& range_id,
+                                   const std::string& target_group_id,
+                                   int epoch) {
+        std::string source_group_id = groupForRange(configOn(scenario.catalog),
+                                                    range_id);
+        ConsensusGroupHarness& source = groupForReplicaGroup(scenario,
+                                                             source_group_id);
+        ConsensusGroupHarness& target = groupForReplicaGroup(scenario,
+                                                             target_group_id);
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        PrepareRangeTransferCommand{
+                            range_id, target_group_id, epoch}) ==
+                        Result{StatementOkResult{}},
+                    "range transfer should prepare in catalog");
+        copyRangeRows(scenario, source, target, range_id);
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        CatchUpRangeTransferCommand{range_id, epoch}) ==
+                        Result{StatementOkResult{}},
+                    "range transfer should catch up in catalog");
+        copyRangeRows(scenario, source, target, range_id);
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        CommitRangeTransferCommand{range_id, epoch}) ==
+                        Result{StatementOkResult{}},
+                    "range transfer should commit in catalog");
+        deleteRangeRows(scenario, source, range_id);
+    };
+
+    auto completeTransfer = [&](RebalanceScenario& scenario,
+                                const RebalanceResult& result) {
+        auto requested = latestTransferOn(scenario.catalog, result.range_id);
+        tests.check(requested.has_value() &&
+                        requested->source_group_id == result.source_group_id &&
+                        requested->target_group_id == result.target_group_id &&
+                        requested->snapshot_key_count == 0 &&
+                        requested->status == "requested",
+                    "rebalance should leave a planned transfer request");
+        if (!requested.has_value()) return;
+        moveRangePhysically(scenario,
+                            result.range_id,
+                            result.target_group_id,
+                            requested->transfer_epoch);
+    };
+
+    auto buildRebalanceScenario = [&]() {
+        RebalanceScenario scenario;
+        scenario.fixture = titleRebalanceFixture();
+        scenario.catalog =
+            makeConsensusGroup("group-catalog", "catalog", 1);
+        scenario.source_group =
+            makeConsensusGroup("group-1", "source", 2);
+        scenario.target_group =
+            makeConsensusGroup("group-2", "target", 3);
+
+        tests.check(commitCommand(scenario.catalog,
+                                  bootstrapClusterACommand()) ==
+                        Result{StatementOkResult{}},
+                    "catalog group should bootstrap the cluster");
+        tests.check(commitCommand(scenario.catalog,
+                                  registerGroup1Command()) ==
+                        Result{StatementOkResult{}},
+                    "catalog group should register the source group");
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        RegisterReplicaGroupCommand{
+                            scenario.target_group.group_id,
+                            {"target1", "target2", "target3"}, 1}) ==
+                        Result{StatementOkResult{}},
+                    "catalog should create an empty target group");
+        tests.check(commitCommand(scenario.catalog,
+                                  createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "catalog should create only title metadata");
+        tests.check(commitCommand(scenario.source_group,
+                                  createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "source group should create physical title storage");
+        tests.check(commitCommand(scenario.target_group,
+                                  createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "target group should create physical title storage");
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(commitCommand(scenario.source_group,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "source group should load real IMDB title row " +
+                            row.values.front());
+            recordCatalogKeyForRow(scenario, row);
+        }
+        tests.check(
+            commitCommand(
+                scenario.catalog,
+                splitTitleCommand(2)) ==
+                Result{StatementOkResult{}},
+            "catalog should split title metadata while source keeps rows");
+        tests.check(physicalRowCountInRange(
+                        scenario, scenario.source_group, titleLeftRangeId()) > 0 &&
+                        physicalRowCountInRange(
+                            scenario, scenario.target_group,
+                            titleLeftRangeId()) == 0,
+                    "setup should have source-owned physical rows and empty target");
+        return scenario;
+    };
+
+    tests.test("Rebalancer requests one real size-imbalanced range", [&] {
         auto scenario = buildRebalanceScenario();
         RangeConfigResult before = configOn(scenario.catalog);
         size_t left_keys =
             currentGlobalKeyCount(scenario.catalog, titleLeftRangeId());
         size_t right_keys =
             currentGlobalKeyCount(scenario.catalog, titleRightRangeId());
-        tests.check(groupForRange(before, titleLeftRangeId()) == "group-1" &&
+        tests.check(groupForRange(before, titleLeftRangeId()) ==
+                        scenario.source_group.group_id &&
                         groupForRange(before, titleRightRangeId()) ==
-                            "group-1",
-                    "setup should place both split ranges on group-1");
+                            scenario.source_group.group_id,
+                    "setup should place both split ranges on source group");
 
         RebalanceResult result = rebalance(scenario.catalog);
         tests.check(result.moved &&
-                        result.source_group_id == "group-1" &&
-                        result.target_group_id == "group-2" &&
+                        result.source_group_id == scenario.source_group.group_id &&
+                        result.target_group_id == scenario.target_group.group_id &&
                         result.source_keys_before == left_keys + right_keys &&
                         result.target_keys_before == 0 &&
                         result.moved_key_count ==
                             std::max(left_keys, right_keys) &&
                         result.source_keys_after ==
-                            result.source_keys_before -
-                                result.moved_key_count &&
+                            result.source_keys_before - result.moved_key_count &&
                         result.target_keys_after == result.moved_key_count,
                     "rebalance should choose one real range from the loaded group");
 
+        RangeConfigResult requested_config = configOn(scenario.catalog);
+        tests.check(requested_config == before,
+                    "rebalance request should not rewrite active ownership");
+        auto transfer = latestTransferOn(scenario.catalog, result.range_id);
+        tests.check(transfer.has_value() &&
+                        transfer->source_group_id == scenario.source_group.group_id &&
+                        transfer->target_group_id == scenario.target_group.group_id &&
+                        transfer->snapshot_key_count == 0 &&
+                        transfer->prepared_config_num == before.config_num &&
+                        transfer->status == "requested",
+                    "rebalance should use the transfer manifest protocol");
+        tests.check(latestGlobalKeyGroupCount(
+                        scenario.catalog, result.range_id,
+                        scenario.target_group.group_id) == 0,
+                    "request should not retarget key metadata early");
+        tests.check(physicalRowCountInRange(
+                        scenario, scenario.target_group, result.range_id) == 0,
+                    "request should not copy physical rows early");
+
+        completeTransfer(scenario, result);
         RangeConfigResult after = configOn(scenario.catalog);
         tests.check(after.config_num == before.config_num + 1 &&
                         changedAssignments(before, after) == 1 &&
-                        groupForRange(after, result.range_id) == "group-2",
-                    "rebalance should commit one ownership change");
-        auto transfer =
-            latestTransferOn(scenario.catalog, result.range_id);
-        tests.check(transfer.has_value() &&
-                        transfer->source_group_id == "group-1" &&
-                        transfer->target_group_id == "group-2" &&
-                        transfer->snapshot_key_count ==
-                            result.moved_key_count &&
-                        transfer->status == "committed",
-                    "rebalance should use the transfer manifest protocol");
+                        groupForRange(after, result.range_id) ==
+                            scenario.target_group.group_id,
+                    "transfer commit should switch only the moved range");
         tests.check(latestGlobalKeyGroupCount(
-                        scenario.catalog, result.range_id, "group-2") ==
+                        scenario.catalog, result.range_id,
+                        scenario.target_group.group_id) ==
                         result.moved_key_count &&
                         latestGlobalKeyGroupCount(
-                            scenario.catalog, result.range_id, "group-1") ==
-                            0,
-                    "rebalance should retarget moved range key metadata");
+                            scenario.catalog, result.range_id,
+                            scenario.source_group.group_id) == 0,
+                    "commit should retarget moved range key metadata");
+        tests.check(physicalRowCountInRange(
+                        scenario, scenario.target_group, result.range_id) ==
+                        result.moved_key_count &&
+                        physicalRowCountInRange(
+                            scenario, scenario.source_group,
+                            result.range_id) == 0,
+                    "commit should leave physical rows on the target group only");
     });
 
     tests.test("Live routed writes remain visible across rebalance", [&] {
@@ -17465,17 +17780,14 @@ int main(int argc, char* argv[]) {
         const std::string second_year =
             replacementProductionYear(first_year);
 
-        tests.check(routeGroupFor(scenario.catalog, moved_id) == "group-1",
+        tests.check(routeGroupFor(scenario, moved_id) ==
+                        scenario.source_group.group_id,
                     "setup should route the chosen row to the loaded group");
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        RoutedSQLCommand{
-                            "UPDATE title SET production_year=" +
-                            first_year + " WHERE id=" + moved_id}) ==
+        tests.check(updateRoutedTitleYear(scenario, moved_id, first_year) ==
                         Result{UpdateRowsResult{1}},
-                    "pre-rebalance routed update should succeed");
+                    "pre-rebalance routed update should succeed on physical source");
         SelectAllResult before_rebalance =
-            selectTitleById(scenario.catalog, moved_id);
+            selectRoutedTitleById(scenario, moved_id);
         tests.check(before_rebalance.rows.size() == 1 &&
                         selectAllValue(before_rebalance,
                                        before_rebalance.rows.front(),
@@ -17485,29 +17797,28 @@ int main(int argc, char* argv[]) {
         RebalanceResult result = rebalance(scenario.catalog);
         tests.check(result.moved &&
                         result.range_id == expected_moved_range &&
-                        result.source_group_id == "group-1" &&
-                        result.target_group_id == "group-2",
-                    "rebalance should move the expected loaded range");
-        tests.check(routeGroupFor(scenario.catalog, moved_id) ==
-                        result.target_group_id,
-                    "moved row should route to the target group");
+                        result.source_group_id == scenario.source_group.group_id &&
+                        result.target_group_id == scenario.target_group.group_id,
+                    "rebalance should plan the expected loaded range");
+        tests.check(routeGroupFor(scenario, moved_id) == result.source_group_id,
+                    "planned rebalance should keep live routing on source");
+
+        completeTransfer(scenario, result);
+        tests.check(routeGroupFor(scenario, moved_id) == result.target_group_id,
+                    "committed transfer should route the row to the target group");
         SelectAllResult after_rebalance =
-            selectTitleById(scenario.catalog, moved_id);
+            selectRoutedTitleById(scenario, moved_id);
         tests.check(after_rebalance.rows.size() == 1 &&
                         selectAllValue(after_rebalance,
                                        after_rebalance.rows.front(),
                                        "production_year") == first_year,
                     "rebalance should preserve the pre-move update");
 
-        tests.check(commitCommand(
-                        scenario.catalog,
-                        RoutedSQLCommand{
-                            "UPDATE title SET production_year=" +
-                            second_year + " WHERE id=" + moved_id}) ==
+        tests.check(updateRoutedTitleYear(scenario, moved_id, second_year) ==
                         Result{UpdateRowsResult{1}},
-                    "post-rebalance routed update should use new ownership");
+                    "post-rebalance routed update should use new physical owner");
         SelectAllResult after_second_update =
-            selectTitleById(scenario.catalog, moved_id);
+            selectRoutedTitleById(scenario, moved_id);
         tests.check(after_second_update.rows.size() == 1 &&
                         selectAllValue(after_second_update,
                                        after_second_update.rows.front(),
@@ -17522,46 +17833,15 @@ int main(int argc, char* argv[]) {
             titleRowInRange(scenario.fixture, range_id);
         const std::string moved_id = moved_row.values.front();
 
-        auto transferRange = [&](const std::string& target_group,
-                                 int epoch) {
-            tests.check(commitCommand(
-                            scenario.catalog,
-                            PrepareRangeTransferCommand{
-                                range_id, target_group, epoch}) ==
-                            Result{StatementOkResult{}},
-                        "transfer prepare should commit");
-            tests.check(commitCommand(
-                            scenario.catalog,
-                            CatchUpRangeTransferCommand{range_id, epoch}) ==
-                            Result{StatementOkResult{}},
-                        "transfer catch-up should commit");
-            tests.check(commitCommand(
-                            scenario.catalog,
-                            CommitRangeTransferCommand{range_id, epoch}) ==
-                            Result{StatementOkResult{}},
-                        "transfer commit should switch ownership");
-            auto transfer = latestTransferOn(scenario.catalog, range_id);
-            tests.check(transfer.has_value() &&
-                            transfer->transfer_epoch == epoch &&
-                            transfer->target_group_id == target_group &&
-                            transfer->status == "committed",
-                        "latest manifest should describe the committed move");
-        };
-
         auto updateAndCheck = [&](const std::string& year,
                                   const std::string& expected_group) {
-            tests.check(routeGroupFor(scenario.catalog, moved_id) ==
-                            expected_group,
+            tests.check(routeGroupFor(scenario, moved_id) == expected_group,
                         "router should use current range owner");
-            tests.check(commitCommand(
-                            scenario.catalog,
-                            RoutedSQLCommand{
-                                "UPDATE title SET production_year=" +
-                                year + " WHERE id=" + moved_id}) ==
+            tests.check(updateRoutedTitleYear(scenario, moved_id, year) ==
                             Result{UpdateRowsResult{1}},
-                        "routed update should commit on current owner");
+                        "routed update should commit on current physical owner");
             SelectAllResult selected =
-                selectTitleById(scenario.catalog, moved_id);
+                selectRoutedTitleById(scenario, moved_id);
             tests.check(selected.rows.size() == 1 &&
                             selectAllValue(selected,
                                            selected.rows.front(),
@@ -17569,17 +17849,17 @@ int main(int argc, char* argv[]) {
                         "updated row should be visible after movement");
         };
 
-        updateAndCheck("1998", "group-1");
-        transferRange("group-2", 1);
-        updateAndCheck("1999", "group-2");
-        transferRange("group-1", 2);
-        updateAndCheck("2000", "group-1");
-        transferRange("group-2", 3);
+        updateAndCheck("1998", scenario.source_group.group_id);
+        moveRangePhysically(scenario, range_id, scenario.target_group.group_id, 1);
+        updateAndCheck("1999", scenario.target_group.group_id);
+        moveRangePhysically(scenario, range_id, scenario.source_group.group_id, 2);
+        updateAndCheck("2000", scenario.source_group.group_id);
+        moveRangePhysically(scenario, range_id, scenario.target_group.group_id, 3);
 
-        tests.check(routeGroupFor(scenario.catalog, moved_id) == "group-2",
-                    "final owner should be group-2");
-        SelectAllResult final_row =
-            selectTitleById(scenario.catalog, moved_id);
+        tests.check(routeGroupFor(scenario, moved_id) ==
+                        scenario.target_group.group_id,
+                    "final owner should be target group");
+        SelectAllResult final_row = selectRoutedTitleById(scenario, moved_id);
         size_t final_key_count =
             currentGlobalKeyCount(scenario.catalog, range_id);
         tests.check(final_row.rows.size() == 1 &&
@@ -17587,21 +17867,32 @@ int main(int argc, char* argv[]) {
                                        final_row.rows.front(),
                                        "production_year") == "2000" &&
                         latestGlobalKeyGroupCount(
-                            scenario.catalog, range_id, "group-2") ==
-                            final_key_count &&
+                            scenario.catalog, range_id,
+                            scenario.target_group.group_id) == final_key_count &&
                         latestGlobalKeyGroupCount(
-                            scenario.catalog, range_id, "group-1") == 0,
-                    "repeated movement should leave one active owner and latest row contents");
+                            scenario.catalog, range_id,
+                            scenario.source_group.group_id) == 0 &&
+                        physicalRowCountInRange(
+                            scenario, scenario.source_group, range_id) == 0 &&
+                        physicalRowCountInRange(
+                            scenario, scenario.target_group, range_id) ==
+                            final_key_count,
+                    "repeated movement should leave one active physical owner and latest row contents");
     });
 
     tests.test("Balanced range placement is a no-op", [&] {
         auto scenario = buildRebalanceScenario();
         RebalanceResult first = rebalance(scenario.catalog);
-        tests.check(first.moved, "first rebalance should create balance");
+        tests.check(first.moved, "first rebalance should request balance");
+        completeTransfer(scenario, first);
         RangeConfigResult balanced = configOn(scenario.catalog);
         SelectAllResult transfers =
             catalogTableOn(scenario.catalog, scenario.catalog.leader,
                            "__range_transfers");
+        size_t source_left = physicalRowCountInRange(
+            scenario, scenario.source_group, titleLeftRangeId());
+        size_t target_left = physicalRowCountInRange(
+            scenario, scenario.target_group, titleLeftRangeId());
 
         RebalanceResult second = rebalance(scenario.catalog);
         tests.check(!second.moved,
@@ -17612,6 +17903,13 @@ int main(int argc, char* argv[]) {
                                    scenario.catalog.leader,
                                    "__range_transfers") == transfers,
                     "no-op rebalance should not add transfer rows");
+        tests.check(physicalRowCountInRange(
+                        scenario, scenario.source_group,
+                        titleLeftRangeId()) == source_left &&
+                        physicalRowCountInRange(
+                            scenario, scenario.target_group,
+                            titleLeftRangeId()) == target_left,
+                    "no-op rebalance should not move physical rows");
     });
 
     tests.test("Max-moves zero leaves catalog unchanged", [&] {
@@ -17620,6 +17918,8 @@ int main(int argc, char* argv[]) {
         SelectAllResult transfers_before =
             catalogTableOn(scenario.catalog, scenario.catalog.leader,
                            "__range_transfers");
+        size_t source_rows = selectAllTitles(scenario.source_group).rows.size();
+        size_t target_rows = selectAllTitles(scenario.target_group).rows.size();
         Result result = commitCommand(
             scenario.catalog, RebalanceRangesCommand{"title", 0});
         const auto* no_op = std::get_if<RebalanceResult>(&result);
@@ -17629,22 +17929,26 @@ int main(int argc, char* argv[]) {
                     "zero max moves should not change config");
         tests.check(catalogTableOn(scenario.catalog,
                                    scenario.catalog.leader,
-                                   "__range_transfers") ==
-                        transfers_before,
+                                   "__range_transfers") == transfers_before,
                     "zero max moves should not create transfers");
+        tests.check(selectAllTitles(scenario.source_group).rows.size() ==
+                        source_rows &&
+                        selectAllTitles(scenario.target_group).rows.size() ==
+                            target_rows,
+                    "zero max moves should not move physical rows");
     });
 
     tests.test("Rebalancer result and manifests replicate to followers", [&] {
         auto scenario = buildRebalanceScenario();
         RebalanceResult result = rebalance(scenario.catalog);
         tests.check(result.moved, "rebalance should move a range");
+        completeTransfer(scenario, result);
         RangeConfigResult expected = configOn(scenario.catalog);
         SelectAllResult expected_transfers =
             catalogTableOn(scenario.catalog, scenario.catalog.leader,
                            "__range_transfers");
         for (const auto& replica : scenario.catalog.replicas) {
-            Result config_result =
-                queryConfigOn(scenario.catalog, replica, -1);
+            Result config_result = queryConfigOn(scenario.catalog, replica, -1);
             const auto* replica_config =
                 std::get_if<RangeConfigResult>(&config_result);
             tests.check(replica_config != nullptr &&
@@ -17655,6 +17959,10 @@ int main(int argc, char* argv[]) {
                             expected_transfers,
                         "catalog follower should expose rebalance manifest");
         }
+        tests.check(physicalRowCountInRange(
+                        scenario, scenario.target_group, result.range_id) ==
+                        result.moved_key_count,
+                    "replicated catalog decision should correspond to physical moved rows");
     });
 
     tests.test("Rebalancer is deterministic for same catalog state", [&] {
@@ -17665,7 +17973,7 @@ int main(int argc, char* argv[]) {
         tests.check(first_result == second_result,
                     "same catalog should produce the same rebalance decision");
         tests.check(configOn(first.catalog) == configOn(second.catalog),
-                    "same decision should produce the same config");
+                    "same request should leave active config unchanged");
         tests.check(catalogTableOn(first.catalog, first.catalog.leader,
                                    "__range_transfers") ==
                         catalogTableOn(second.catalog,

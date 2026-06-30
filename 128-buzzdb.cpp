@@ -11776,6 +11776,10 @@ public:
     std::string logFile() const { return buzzdbCompanionFilename(database_file_, ".log"); }
     std::string masterFile() const { return buzzdbCompanionFilename(database_file_, ".master"); }
 
+    void configureOwnedRange(std::string range_id) {
+        owned_range_id_ = std::move(range_id);
+    }
+
     std::string subsystemSummary() const {
         ScopedBuzzDBFileBundle scope(database_file_);
         std::ostringstream out;
@@ -12365,20 +12369,37 @@ private:
         return RouteRejectedResult{};
     }
 
+    bool ownerRangeAcceptsParsedCommand(const Command& parsed) {
+        if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+            return tableExists(insert->table) &&
+                   primaryKeyValueFromInsert(*insert).has_value();
+        }
+        if (const auto* select = std::get_if<SelectWhereCommand>(&parsed)) {
+            return tableExists(select->table) &&
+                   isPrimaryKeyColumn(select->table, select->column);
+        }
+        if (const auto* update = std::get_if<UpdateRowsCommand>(&parsed)) {
+            return tableExists(update->table) &&
+                   isPrimaryKeyColumn(update->table, update->where_column) &&
+                   !isPrimaryKeyColumn(update->table, update->set_column);
+        }
+        if (const auto* remove = std::get_if<DeleteRowsCommand>(&parsed)) {
+            return tableExists(remove->table) &&
+                   isPrimaryKeyColumn(remove->table, remove->column);
+        }
+        return false;
+    }
+
     Result executeOne(const RoutedTransactionCommand& command) {
         if (command.statements.empty()) return RouteRejectedResult{};
+        if (!owned_range_id_.has_value()) return RouteRejectedResult{};
 
         std::vector<Command> parsed;
         parsed.reserve(command.statements.size());
-        std::optional<std::string> transaction_range;
         try {
             for (const auto& statement : command.statements) {
                 parsed.push_back(parseSQL(statement));
-                auto range = singleRangeForParsedCommand(parsed.back());
-                if (!range.has_value()) return RouteRejectedResult{};
-                if (!transaction_range.has_value()) {
-                    transaction_range = *range;
-                } else if (*transaction_range != *range) {
+                if (!ownerRangeAcceptsParsedCommand(parsed.back())) {
                     return RouteRejectedResult{};
                 }
             }
@@ -12386,8 +12407,7 @@ private:
             return RouteRejectedResult{};
         }
 
-        auto txn = db_->beginLoggedTxn("routed-txn");
-        std::vector<InsertRowCommand> catalog_rows;
+        auto txn = db_->beginLoggedTxn("owner-range-txn");
         try {
             for (const auto& parsed_command : parsed) {
                 Result result = executeInTxn(parsed_command, txn);
@@ -12395,34 +12415,14 @@ private:
                     db_->abort(txn);
                     return RouteRejectedResult{};
                 }
-                if (const auto* insert =
-                        std::get_if<InsertRowCommand>(&parsed_command)) {
-                    auto catalog_row = globalKeyCatalogRow(*insert);
-                    if (catalog_row.has_value()) {
-                        catalog_rows.push_back(*catalog_row);
-                    }
-                }
-                const auto* remove =
-                    std::get_if<DeleteRowsCommand>(&parsed_command);
-                const auto* deleted = std::get_if<DeleteRowsResult>(&result);
-                if (remove != nullptr && deleted != nullptr &&
-                    deleted->count > 0) {
-                    auto catalog_row = globalKeyDeleteCatalogRow(*remove);
-                    if (catalog_row.has_value()) {
-                        catalog_rows.push_back(*catalog_row);
-                    }
-                }
             }
-            executeSystemCatalogRowsInTxn(catalog_rows, txn);
             db_->commit(txn);
         } catch (const std::exception&) {
             db_->abort(txn);
             return SchemaMismatchResult{};
         }
 
-        return TransactionOkResult{
-            transaction_range.value_or("-"),
-            command.statements.size()};
+        return TransactionOkResult{*owned_range_id_, command.statements.size()};
     }
 
     RangeDescriptor bestRangeForKey(const std::string& key) {
@@ -13043,6 +13043,7 @@ private:
 
     std::string database_file_;
     bool owns_bundle_ = false;
+    std::optional<std::string> owned_range_id_;
     std::unique_ptr<BuzzDB> db_;
 };
 
@@ -15422,256 +15423,578 @@ int main(int argc, char* argv[]) {
         return std::optional<Result>{};
     };
 
-    tests.test("Single-range transaction updates and reads one child", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(506);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 506, request_id,
-            RoutedTransactionCommand{{
-                "UPDATE title SET production_year=1998 WHERE id=" +
-                    fixture.right_values.front(),
-                "PROJECT * FROM title WHERE id=" +
-                    fixture.right_values.front()}},
-            {replicas[1], replicas[2]});
+    struct PhysicalRoutedTransactionCluster {
+        std::string table = "title";
+        std::string source_range_id = defaultRangeIdForTable("title");
+        std::string left_range_id;
+        std::string right_range_id;
+        std::string source_group_id = "group-1";
+        BuzzDBCore catalog;
+        BuzzDBCore source;
+        BuzzDBCore left;
+        BuzzDBCore right;
+        std::vector<std::pair<std::string, std::vector<std::string>>> loaded_rows;
 
-        auto reply = clientReplyResult(state, 506, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{TransactionOkResult{
-                            titleRightRangeId(), 2}},
-                    "transaction should commit on the right child range");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id",
-                               fixture.right_values.front()});
-        const auto* rows = std::get_if<SelectAllResult>(&selected);
-        tests.check(rows != nullptr &&
-                        !rows->rows.empty() &&
-                        selectAllValue(*rows, rows->rows.front(),
-                                       "production_year") == "1998",
-                    "updated row should be visible after routed write");
+        PhysicalRoutedTransactionCluster(std::string left_range,
+                                         std::string right_range)
+            : left_range_id(std::move(left_range)),
+              right_range_id(std::move(right_range)) {
+            source.configureOwnedRange(source_range_id);
+            left.configureOwnedRange(left_range_id);
+            right.configureOwnedRange(right_range_id);
+        }
+
+        static std::string primaryKey(
+            const std::pair<std::string, std::vector<std::string>>& row) {
+            if (row.second.empty()) {
+                throw std::runtime_error("row is missing a primary key");
+            }
+            return row.second.front();
+        }
+
+        static void requireCreateOk(const Result& actual,
+                                    const std::string& message) {
+            if (!std::holds_alternative<CreateTableOkResult>(actual)) {
+                throw std::runtime_error(
+                    message + ": got " + describeResult(actual));
+            }
+        }
+
+        static void requireInsertOk(const Result& actual,
+                                    const std::string& message) {
+            if (!std::holds_alternative<InsertOkResult>(actual)) {
+                throw std::runtime_error(
+                    message + ": got " + describeResult(actual));
+            }
+        }
+
+        static void requireDeletedOne(const Result& actual,
+                                      const std::string& message) {
+            const auto* deleted = std::get_if<DeleteRowsResult>(&actual);
+            if (deleted == nullptr || deleted->count != 1) {
+                throw std::runtime_error(
+                    message + ": got " + describeResult(actual));
+            }
+        }
+
+        void ensureTitleTable(BuzzDBCore& store) {
+            Result count = store.execute(CountRowsCommand{table});
+            if (std::holds_alternative<TableNotFoundResult>(count)) {
+                requireCreateOk(
+                    store.execute(createTitleTableCommand()),
+                    "range store should create title");
+            }
+        }
+
+        void recordCatalogKey(const std::string& primary_key,
+                              const std::string& range_id,
+                              const std::string& replica_group_id,
+                              int descriptor_version,
+                              const std::string& status = "active") {
+            requireInsertOk(
+                catalog.execute(InsertRowCommand{
+                    "__global_keys",
+                    {table,
+                     primary_key,
+                     tableRowKey(table, primary_key),
+                     range_id,
+                     replica_group_id,
+                     std::to_string(descriptor_version),
+                     status}}),
+                "catalog should record key " + primary_key);
+        }
+
+        void loadSourceRows(
+            const std::vector<std::pair<std::string,
+                                        std::vector<std::string>>>& rows) {
+            ensureTitleTable(catalog);
+            ensureTitleTable(source);
+            loaded_rows = rows;
+            for (const auto& row : loaded_rows) {
+                std::string key = primaryKey(row);
+                requireInsertOk(
+                    source.execute(parseSQL("INSERT " + row.first)),
+                    "source should load title " + key);
+                recordCatalogKey(key, source_range_id, source_group_id, 1);
+            }
+        }
+
+        Result splitTable(int descriptor_version = 2) {
+            Result result = catalog.execute(SplitTableCommand{
+                table,
+                source_range_id,
+                left_range_id,
+                right_range_id,
+                descriptor_version});
+            if (!std::holds_alternative<StatementOkResult>(result)) {
+                return result;
+            }
+            moveRowsToCommittedOwners();
+            return result;
+        }
+
+        SelectAllResult selectRows(BuzzDBCore& store,
+                                   const std::string& primary_key) {
+            Result result = store.execute(
+                SelectWhereCommand{table, "id", primary_key});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            return rows == nullptr ? SelectAllResult{} : *rows;
+        }
+
+        size_t rowCount(BuzzDBCore& store) {
+            Result result = store.execute(SelectAllCommand{table});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            return rows == nullptr ? size_t{0} : rows->rows.size();
+        }
+
+        size_t sourceRowCount() { return rowCount(source); }
+        size_t leftRowCount() { return rowCount(left); }
+        size_t rightRowCount() { return rowCount(right); }
+
+        size_t physicalCopies(const std::string& primary_key) {
+            return selectRows(source, primary_key).rows.size() +
+                   selectRows(left, primary_key).rows.size() +
+                   selectRows(right, primary_key).rows.size();
+        }
+
+        BuzzDBCore& storeForRange(const std::string& range_id) {
+            if (range_id == left_range_id) return left;
+            if (range_id == right_range_id) return right;
+            if (range_id == source_range_id) return source;
+            throw std::runtime_error("unknown range id " + range_id);
+        }
+
+        std::string replicaGroupForRange(const std::string& range_id) const {
+            if (range_id == left_range_id || range_id == right_range_id ||
+                range_id == source_range_id) {
+                return source_group_id;
+            }
+            return "-";
+        }
+
+        std::string insertSQLFromValues(const std::vector<std::string>& values) {
+            std::ostringstream out;
+            out << "INSERT " << table;
+            for (const auto& value : values) out << "|" << value;
+            return out.str();
+        }
+
+        void importIfMissing(BuzzDBCore& target,
+                             const std::string& primary_key,
+                             const std::vector<std::string>& values) {
+            ensureTitleTable(target);
+            if (!selectRows(target, primary_key).rows.empty()) return;
+            requireInsertOk(
+                target.execute(parseSQL(insertSQLFromValues(values))),
+                "target should import title " + primary_key);
+        }
+
+        RouteResult routePoint(const std::string& primary_key) {
+            Result result = catalog.execute(
+                ExplainRouteCommand{table, primary_key, false});
+            const auto* route = std::get_if<RouteResult>(&result);
+            if (route == nullptr) {
+                throw std::runtime_error("expected route result");
+            }
+            return *route;
+        }
+
+        bool oneRange(const RouteResult& route) const {
+            return route.range_ids.size() == 1 &&
+                   route.replica_group_ids.size() == 1 &&
+                   route.descriptor_versions.size() == 1;
+        }
+
+        void moveRowsToCommittedOwners() {
+            for (const auto& row : loaded_rows) {
+                std::string key = primaryKey(row);
+                SelectAllResult selected = selectRows(source, key);
+                if (selected.rows.empty()) continue;
+                RouteResult route = routePoint(key);
+                if (!oneRange(route)) {
+                    throw std::runtime_error(
+                        "split route should name one owner for " + key);
+                }
+                BuzzDBCore& target = storeForRange(route.range_ids.front());
+                importIfMissing(target, key, selected.rows.front());
+                if (route.range_ids.front() != source_range_id) {
+                    requireDeletedOne(
+                        source.execute(DeleteRowsCommand{table, "id", key}),
+                        "source should remove moved title " + key);
+                }
+            }
+        }
+
+        std::optional<RouteResult> routeForParsedCommand(
+            const Command& parsed) {
+            if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
+                if (insert->table != table || insert->values.empty()) {
+                    return std::nullopt;
+                }
+                Result result = catalog.execute(ExplainRouteCommand{
+                    insert->table, insert->values.front(), false});
+                const auto* route = std::get_if<RouteResult>(&result);
+                if (route == nullptr || !oneRange(*route)) return std::nullopt;
+                return *route;
+            }
+            if (const auto* select = std::get_if<SelectWhereCommand>(&parsed)) {
+                if (select->table != table || select->column != "id") {
+                    return std::nullopt;
+                }
+                Result result = catalog.execute(ExplainRouteCommand{
+                    select->table, select->value, false});
+                const auto* route = std::get_if<RouteResult>(&result);
+                if (route == nullptr || !oneRange(*route)) return std::nullopt;
+                return *route;
+            }
+            if (const auto* update = std::get_if<UpdateRowsCommand>(&parsed)) {
+                if (update->table != table || update->where_column != "id" ||
+                    update->set_column == "id") {
+                    return std::nullopt;
+                }
+                Result result = catalog.execute(ExplainRouteCommand{
+                    update->table, update->where_value, false});
+                const auto* route = std::get_if<RouteResult>(&result);
+                if (route == nullptr || !oneRange(*route)) return std::nullopt;
+                return *route;
+            }
+            if (const auto* remove = std::get_if<DeleteRowsCommand>(&parsed)) {
+                if (remove->table != table || remove->column != "id") {
+                    return std::nullopt;
+                }
+                Result result = catalog.execute(ExplainRouteCommand{
+                    remove->table, remove->value, false});
+                const auto* route = std::get_if<RouteResult>(&result);
+                if (route == nullptr || !oneRange(*route)) return std::nullopt;
+                return *route;
+            }
+            if (const auto* scan = std::get_if<SelectAllCommand>(&parsed)) {
+                if (scan->table != table) return std::nullopt;
+                Result result = catalog.execute(
+                    ExplainRouteCommand{scan->table, "", true});
+                const auto* route = std::get_if<RouteResult>(&result);
+                if (route == nullptr || !oneRange(*route)) return std::nullopt;
+                return *route;
+            }
+            return std::nullopt;
+        }
+
+        bool catalogHasLatestKey(const std::string& primary_key,
+                                 const std::string& expected_range,
+                                 const std::string& expected_status) {
+            Result result = catalog.execute(
+                ReadSystemCatalogCommand{"__global_keys"});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            if (rows == nullptr) return false;
+            auto range_col = catalogColumnIndex(*rows, "range_id");
+            auto key_col = catalogColumnIndex(*rows, "primary_key");
+            auto version_col = catalogColumnIndex(*rows, "descriptor_version");
+            auto status_col = catalogColumnIndex(*rows, "status");
+            if (!range_col.has_value() || !key_col.has_value() ||
+                !version_col.has_value() || !status_col.has_value()) {
+                return false;
+            }
+            int best_version = -1;
+            std::string best_range;
+            std::string best_status;
+            for (const auto& row : rows->rows) {
+                if (*key_col >= row.size() || row[*key_col] != primary_key ||
+                    *version_col >= row.size()) {
+                    continue;
+                }
+                int version = std::stoi(row[*version_col]);
+                if (version >= best_version) {
+                    best_version = version;
+                    best_range = *range_col < row.size() ? row[*range_col] : "";
+                    best_status = *status_col < row.size() ? row[*status_col] : "";
+                }
+            }
+            return best_version >= 0 && best_range == expected_range &&
+                   best_status == expected_status;
+        }
+
+        Result execute(const RoutedTransactionCommand& command) {
+            if (command.statements.empty()) return RouteRejectedResult{};
+            std::vector<Command> parsed;
+            std::vector<RouteResult> routes;
+            parsed.reserve(command.statements.size());
+            routes.reserve(command.statements.size());
+            std::optional<std::string> transaction_range;
+            try {
+                for (const auto& statement : command.statements) {
+                    parsed.push_back(parseSQL(statement));
+                    auto route = routeForParsedCommand(parsed.back());
+                    if (!route.has_value()) return RouteRejectedResult{};
+                    if (!transaction_range.has_value()) {
+                        transaction_range = route->range_ids.front();
+                    } else if (*transaction_range != route->range_ids.front()) {
+                        return RouteRejectedResult{};
+                    }
+                    routes.push_back(*route);
+                }
+            } catch (const std::exception&) {
+                return RouteRejectedResult{};
+            }
+
+            BuzzDBCore& owner = storeForRange(*transaction_range);
+            std::vector<std::tuple<std::string, std::string, int, std::string>>
+                catalog_updates;
+            for (size_t i = 0; i < parsed.size(); ++i) {
+                if (const auto* insert = std::get_if<InsertRowCommand>(&parsed[i])) {
+                    catalog_updates.push_back({
+                        insert->values.front(),
+                        routes[i].range_ids.front(),
+                        routes[i].descriptor_versions.front(),
+                        "active"});
+                } else if (const auto* remove =
+                               std::get_if<DeleteRowsCommand>(&parsed[i])) {
+                    if (!selectRows(owner, remove->value).rows.empty()) {
+                        catalog_updates.push_back({
+                            remove->value,
+                            routes[i].range_ids.front(),
+                            routes[i].descriptor_versions.front(),
+                            "deleted"});
+                    }
+                }
+            }
+
+            Result owner_result = owner.execute(command);
+            if (!std::holds_alternative<TransactionOkResult>(owner_result)) {
+                return owner_result;
+            }
+
+            for (const auto& [primary_key, range_id, descriptor_version, status]
+                     : catalog_updates) {
+                recordCatalogKey(primary_key,
+                                 range_id,
+                                 replicaGroupForRange(range_id),
+                                 descriptor_version,
+                                 status);
+            }
+            return TransactionOkResult{*transaction_range,
+                                       command.statements.size()};
+        }
+    };
+
+    auto makePhysicalTxnCluster = [&](const TitleSplitFixture& fixture) {
+        auto cluster = std::make_unique<PhysicalRoutedTransactionCluster>(
+            titleLeftRangeId(), titleRightRangeId());
+        cluster->loadSourceRows(fixture.rows);
+        Result split = cluster->splitTable();
+        tests.check(std::holds_alternative<StatementOkResult>(split),
+                    "physical transaction cluster should split title rows");
+        return cluster;
+    };
+
+    tests.test("Unconfigured local store rejects routed transaction command", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            BuzzDBCore db;
+            tests.check(db.execute(createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        "local store should create title table");
+            for (const auto& row : fixture.rows) {
+                tests.check(db.execute(parseSQL("INSERT " + row.first)) ==
+                                Result{InsertOkResult{}},
+                            "local store should load title row");
+            }
+            tests.check(db.execute(splitTitleCommand()) ==
+                            Result{StatementOkResult{}},
+                        "local store should have split metadata");
+            std::string id = fixture.right_values.front();
+            Result result = db.execute(RoutedTransactionCommand{{
+                "UPDATE title SET production_year=2096 WHERE id=" + id,
+                "PROJECT * FROM title WHERE id=" + id}});
+            tests.check(result == Result{RouteRejectedResult{}},
+                        "unconfigured store must not pretend to be a routed owner");
+            Result selected = db.execute(SelectWhereCommand{"title", "id", id});
+            const auto* rows = std::get_if<SelectAllResult>(&selected);
+            tests.check(rows != nullptr && !rows->rows.empty() &&
+                            selectAllValue(*rows,
+                                           rows->rows.front(),
+                                           "production_year") ==
+                                fixture.right_values[3],
+                        "rejected local routed txn should not mutate data");
+            return 0;
+        });
     });
 
-    tests.test("Single-range insert transaction records child ownership", [&] {
-        TitleInsertFixture insert_fixture = titleInsertFixture();
-        const auto& fixture = insert_fixture.split_fixture;
-        const auto& held_out = insert_fixture.held_out_row;
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitStateFor(509, fixture);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 509, request_id,
-            RoutedTransactionCommand{{
+    tests.test("Physical insert transaction records child ownership", [&] {
+        runWithSuppressedStdout([&] {
+            TitleInsertFixture insert_fixture = titleInsertFixture();
+            const auto& fixture = insert_fixture.split_fixture;
+            const auto& held_out = insert_fixture.held_out_row;
+            auto cluster = makePhysicalTxnCluster(fixture);
+            std::string id = held_out.second.front();
+            RouteResult route = cluster->routePoint(id);
+            tests.check(route.range_ids.size() == 1,
+                        "held-out title should route to one child");
+            Result result = cluster->execute(RoutedTransactionCommand{{
                 "INSERT " + held_out.first,
-                "PROJECT * FROM title WHERE id=" +
-                    held_out.second.front()}},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 509, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{TransactionOkResult{
-                            titleRightRangeId(), 2}},
-                    "insert transaction should commit on one range");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        tests.check(catalogHasRowOn(
-                        leader_node, "__global_keys",
-                        {{"table_name", "title"},
-                         {"primary_key", held_out.second.front()},
-                         {"range_id", titleRightRangeId()},
-                         {"descriptor_version", "2"},
-                         {"status", "active"}}),
-                    "inserted held-out IMDB row should land in right child");
-        tests.check(currentGlobalKeyCountOn(leader_node,
-                                            titleRightRangeId()) ==
-                        fixture.rightCount() + 1,
-                    "right child should own the inserted row key");
+                "PROJECT * FROM title WHERE id=" + id}});
+            tests.check(result == Result{TransactionOkResult{
+                            route.range_ids.front(), 2}},
+                        "physical insert transaction should commit on owner");
+            BuzzDBCore& owner = cluster->storeForRange(route.range_ids.front());
+            tests.check(!cluster->selectRows(owner, id).rows.empty(),
+                        "owner shard should contain inserted row");
+            tests.check(cluster->catalogHasLatestKey(id,
+                                                     route.range_ids.front(),
+                                                     "active"),
+                        "catalog should publish inserted row ownership after commit");
+            tests.check(cluster->physicalCopies(id) == 1,
+                        "inserted row should have one physical copy");
+            return 0;
+        });
     });
 
-    tests.test("Single-range delete transaction tombstones ownership", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(514);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 514, request_id,
-            RoutedTransactionCommand{{
-                "DELETE FROM title WHERE id=" + fixture.left_values.front()}},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 514, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{TransactionOkResult{
+    tests.test("Physical delete transaction tombstones ownership", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makePhysicalTxnCluster(fixture);
+            std::string id = fixture.left_values.front();
+            Result result = cluster->execute(RoutedTransactionCommand{{
+                "DELETE FROM title WHERE id=" + id}});
+            tests.check(result == Result{TransactionOkResult{
                             titleLeftRangeId(), 1}},
-                    "delete transaction should commit on the left range");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", fixture.left_values.front()});
-        const auto* rows = std::get_if<SelectAllResult>(&selected);
-        tests.check(rows != nullptr && rows->rows.empty(),
-                    "deleted title row should no longer be visible");
-        tests.check(catalogHasRowOn(
-                        leader_node, "__global_keys",
-                        {{"table_name", "title"},
-                         {"primary_key", fixture.left_values.front()},
-                         {"range_id", titleLeftRangeId()},
-                         {"descriptor_version", "2"},
-                         {"status", "deleted"}}),
-                    "deleted row should leave a catalog tombstone");
-        tests.check(currentGlobalKeyCountOn(leader_node,
-                                            titleLeftRangeId()) ==
-                        fixture.leftCount() - 1,
-                    "left child live-key count should drop after delete");
+                        "physical delete transaction should commit on left owner");
+            tests.check(cluster->selectRows(cluster->left, id).rows.empty(),
+                        "owner shard should remove deleted row");
+            tests.check(cluster->catalogHasLatestKey(id,
+                                                     titleLeftRangeId(),
+                                                     "deleted"),
+                        "catalog should tombstone deleted ownership after commit");
+            tests.check(cluster->physicalCopies(id) == 0,
+                        "deleted row should leave no physical copy");
+            return 0;
+        });
     });
 
-    tests.test("Cross-range transaction is rejected before execution", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(510);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 510, request_id,
-            RoutedTransactionCommand{{
-                "UPDATE title SET production_year=1998 WHERE id=" +
-                    fixture.left_values.front(),
-                "UPDATE title SET production_year=1998 WHERE id=" +
-                    fixture.right_values.front()}},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 510, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{RouteRejectedResult{}},
-                    "cross-range transaction should be rejected in v128");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        Result left = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", fixture.left_values.front()});
-        Result right = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", fixture.right_values.front()});
-        const auto* left_rows = std::get_if<SelectAllResult>(&left);
-        const auto* right_rows = std::get_if<SelectAllResult>(&right);
-        tests.check(left_rows != nullptr && !left_rows->rows.empty() &&
-                        selectAllValue(*left_rows, left_rows->rows.front(),
-                                       "production_year") ==
-                            fixture.left_values[3],
-                    "left row should be unchanged after rejected txn");
-        tests.check(right_rows != nullptr && !right_rows->rows.empty() &&
-                        selectAllValue(*right_rows, right_rows->rows.front(),
-                                       "production_year") ==
-                            fixture.right_values[3],
-                    "right row should be unchanged after rejected txn");
+    tests.test("Physical multi-range scan transaction is rejected", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makePhysicalTxnCluster(fixture);
+            Result result = cluster->execute(
+                RoutedTransactionCommand{{"PROJECT * FROM title"}});
+            tests.check(result == Result{RouteRejectedResult{}},
+                        "multi-range scan transaction should be rejected");
+            return 0;
+        });
     });
 
-    tests.test("Multi-range scan transaction is rejected after split", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(511);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 511, request_id,
-            RoutedTransactionCommand{{"PROJECT * FROM title"}},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 511, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{RouteRejectedResult{}},
-                    "multi-range scan transaction should be rejected in v128");
+    tests.test("Physical non-primary-key transaction predicate is rejected", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makePhysicalTxnCluster(fixture);
+            Result result = cluster->execute(RoutedTransactionCommand{{
+                "PROJECT * FROM title WHERE production_year=2011"}});
+            tests.check(result == Result{RouteRejectedResult{}},
+                        "non-primary-key predicate needs a later planner");
+            return 0;
+        });
     });
 
-    tests.test("Non-primary-key transaction predicate is rejected", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(512);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 512, request_id,
-            RoutedTransactionCommand{{
-                "PROJECT * FROM title WHERE production_year=2011"}},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 512, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{RouteRejectedResult{}},
-                    "non-primary-key predicate needs a later planner");
+    tests.test("Physical primary-key update transaction is rejected", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makePhysicalTxnCluster(fixture);
+            std::string id = fixture.right_values.front();
+            Result result = cluster->execute(RoutedTransactionCommand{{
+                "UPDATE title SET id=999999 WHERE id=" + id}});
+            tests.check(result == Result{RouteRejectedResult{}},
+                        "primary-key update should be rejected before owner dispatch");
+            tests.check(!cluster->selectRows(cluster->right, id).rows.empty(),
+                        "original row should remain on owner shard");
+            tests.check(cluster->selectRows(cluster->right, "999999").rows.empty(),
+                        "rejected primary-key update should not create a new key");
+            return 0;
+        });
     });
 
-    tests.test("Primary-key update transaction is rejected", [&] {
-        TitleSplitFixture fixture = titleSplitFixture();
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitState(515);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 515, request_id,
-            RoutedTransactionCommand{{
-                "UPDATE title SET id=999999 WHERE id=" +
-                    fixture.right_values.front()}},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 515, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{RouteRejectedResult{}},
-                    "primary-key updates should be rejected by the router");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        Result old_key = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id",
-                               fixture.right_values.front()});
-        Result new_key = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", "999999"});
-        const auto* old_rows = std::get_if<SelectAllResult>(&old_key);
-        const auto* new_rows = std::get_if<SelectAllResult>(&new_key);
-        tests.check(old_rows != nullptr && !old_rows->rows.empty(),
-                    "original primary key should still find the row");
-        tests.check(new_rows != nullptr && new_rows->rows.empty(),
-                    "rejected primary-key update should not create new key");
+    tests.test("Physical single-range transaction dispatches only owner shard", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makePhysicalTxnCluster(fixture);
+            std::string id = fixture.right_values.front();
+            Result result = cluster->execute(RoutedTransactionCommand{{
+                "UPDATE title SET production_year=2095 WHERE id=" + id,
+                "PROJECT * FROM title WHERE id=" + id}});
+            tests.check(result == Result{TransactionOkResult{
+                            titleRightRangeId(), 2}},
+                        "physical transaction should commit on right owner");
+            SelectAllResult owner_rows = cluster->selectRows(cluster->right, id);
+            tests.check(!owner_rows.rows.empty() &&
+                            selectAllValue(owner_rows,
+                                           owner_rows.rows.front(),
+                                           "production_year") == "2095",
+                        "owner shard should contain updated value");
+            tests.check(cluster->selectRows(cluster->left, id).rows.empty(),
+                        "non-owner shard should not contain the row");
+            tests.check(cluster->sourceRowCount() == 0 &&
+                            cluster->leftRowCount() == fixture.leftCount() &&
+                            cluster->rightRowCount() == fixture.rightCount(),
+                        "transaction should not move rows between shards");
+            tests.check(cluster->physicalCopies(id) == 1,
+                        "updated title should still have one physical copy");
+            return 0;
+        });
     });
 
-    tests.test("Execution failure aborts earlier insert and metadata", [&] {
-        TitleInsertFixture insert_fixture = titleInsertFixture();
-        const auto& fixture = insert_fixture.split_fixture;
-        const auto& held_out = insert_fixture.held_out_row;
-        std::vector<Address> replicas = quorumReplicaAddresses(3);
-        Address leader = replicas[0];
-        Address client = ScenarioAddress::client1();
-        SearchState state = buildTitleSplitStateFor(513, fixture);
-        int request_id = static_cast<int>(fixture.rows.size()) + 5;
-        state = deliverConsensusCommandToQuorum(
-            state, leader, client, 513, request_id,
-            RoutedTransactionCommand{{
+    tests.test("Physical cross-range transaction is rejected before execution", [&] {
+        runWithSuppressedStdout([&] {
+            TitleSplitFixture fixture = titleSplitFixture();
+            auto cluster = makePhysicalTxnCluster(fixture);
+            std::string left_id = fixture.left_values.front();
+            std::string right_id = fixture.right_values.front();
+            Result result = cluster->execute(RoutedTransactionCommand{{
+                "UPDATE title SET production_year=2091 WHERE id=" + left_id,
+                "UPDATE title SET production_year=2092 WHERE id=" + right_id}});
+            tests.check(result == Result{RouteRejectedResult{}},
+                        "cross-range transaction should be rejected before owner dispatch");
+            SelectAllResult left_rows = cluster->selectRows(cluster->left, left_id);
+            SelectAllResult right_rows = cluster->selectRows(cluster->right, right_id);
+            tests.check(!left_rows.rows.empty() &&
+                            selectAllValue(left_rows,
+                                           left_rows.rows.front(),
+                                           "production_year") ==
+                                fixture.left_values[3],
+                        "left owner should remain unchanged");
+            tests.check(!right_rows.rows.empty() &&
+                            selectAllValue(right_rows,
+                                           right_rows.rows.front(),
+                                           "production_year") ==
+                                fixture.right_values[3],
+                        "right owner should remain unchanged");
+            return 0;
+        });
+    });
+
+    tests.test("Physical transaction abort rolls back data and catalog metadata", [&] {
+        runWithSuppressedStdout([&] {
+            TitleInsertFixture insert_fixture = titleInsertFixture();
+            const auto& fixture = insert_fixture.split_fixture;
+            const auto& held_out = insert_fixture.held_out_row;
+            auto cluster = makePhysicalTxnCluster(fixture);
+            std::string id = held_out.second.front();
+            RouteResult route = cluster->routePoint(id);
+            tests.check(route.range_ids.size() == 1,
+                        "held-out title should route to one child before insert");
+            Result result = cluster->execute(RoutedTransactionCommand{{
                 "INSERT " + held_out.first,
-                "UPDATE title SET production_year=not_an_int WHERE id=" +
-                    held_out.second.front()}},
-            {replicas[1], replicas[2]});
-
-        auto reply = clientReplyResult(state, 513, request_id);
-        tests.check(reply.has_value() &&
-                        *reply == Result{SchemaMismatchResult{}},
-                    "bad second statement should abort the transaction");
-        const auto* leader_node = state.nodeAs<ConsensusReplica>(leader);
-        Result selected = leader_node->executeReadOnlyForTest(
-            SelectWhereCommand{"title", "id", held_out.second.front()});
-        const auto* rows = std::get_if<SelectAllResult>(&selected);
-        tests.check(rows != nullptr && rows->rows.empty(),
-                    "aborted insert should not leave the held-out row");
-        tests.check(!catalogHasRowOn(
-                        leader_node, "__global_keys",
-                        {{"table_name", "title"},
-                         {"primary_key", held_out.second.front()},
-                         {"range_id", titleRightRangeId()},
-                         {"status", "active"}}),
-                    "aborted insert should not leave active route metadata");
+                "UPDATE title SET production_year=not_an_int WHERE id=" + id}});
+            tests.check(result == Result{SchemaMismatchResult{}},
+                        "bad second statement should abort owner transaction");
+            BuzzDBCore& owner = cluster->storeForRange(route.range_ids.front());
+            tests.check(cluster->selectRows(owner, id).rows.empty(),
+                        "aborted insert should not remain in physical owner");
+            tests.check(!cluster->catalogHasLatestKey(id,
+                                                      route.range_ids.front(),
+                                                      "active"),
+                        "aborted insert should not publish active ownership");
+            tests.check(cluster->physicalCopies(id) == 0,
+                        "aborted insert should leave no physical copy");
+            return 0;
+        });
     });
 
     return tests.finish();

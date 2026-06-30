@@ -12047,7 +12047,6 @@ struct SelectWhereCommand {
 
 struct QuerySQLCommand { std::string sql; };
 struct CountRowsCommand { std::string table; };
-struct LoadJobDatabaseCommand { std::string data_file; };
 struct CheckpointCommand {};
 
 using Command = std::variant<
@@ -12059,7 +12058,6 @@ using Command = std::variant<
     SelectWhereCommand,
     QuerySQLCommand,
     CountRowsCommand,
-    LoadJobDatabaseCommand,
     CheckpointCommand>;
 
 struct CreateTableOkResult {};
@@ -12155,8 +12153,6 @@ std::string describeCommand(const Command& command) {
                 out << "QuerySQL(" << value.sql << ")";
             } else if constexpr (std::is_same_v<T, CountRowsCommand>) {
                 out << "CountRows(" << value.table << ")";
-            } else if constexpr (std::is_same_v<T, LoadJobDatabaseCommand>) {
-                out << "LoadJobDatabase(" << value.data_file << ")";
             } else if constexpr (std::is_same_v<T, CheckpointCommand>) {
                 out << "Checkpoint";
             }
@@ -12780,17 +12776,6 @@ private:
         if (!tableExists(command.table)) return TableNotFoundResult{};
         auto& metadata = db_->catalog.getTable(command.table);
         return CountRowsResult{metadata.row_count};
-    }
-
-    Result executeOne(const LoadJobDatabaseCommand& command) {
-        try {
-            bootstrapJobDatabase(command.data_file, false);
-            const std::string query = jobDistributorJoinQuery();
-            cached_query_results_[query] = executeQueryRowCount(query);
-            return StatementOkResult{};
-        } catch (const std::exception&) {
-            return SchemaMismatchResult{};
-        }
     }
 
     Result executeOne(const CheckpointCommand&) {
@@ -15725,11 +15710,34 @@ Workload createExplicitJobJoinWorkload(const std::string& data_file) {
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
-Workload createJobLoadWorkload(const std::string& data_file) {
-    std::vector<Command> commands{
-        LoadJobDatabaseCommand{data_file},
-        QuerySQLCommand{jobDistributorJoinQuery()}
-    };
+std::vector<Command> createTitleWriteCommands(const std::string& data_file) {
+    std::vector<std::string> title_rows =
+        requireTupleLinesFromFile(data_file, "title", 2);
+    std::vector<std::string> first_title =
+        tupleValuesFromLine(title_rows[0], "title");
+    std::vector<std::string> second_title =
+        tupleValuesFromLine(title_rows[1], "title");
+    if (first_title.size() < 4 || second_title.size() < 4) {
+        throw std::runtime_error("title rows must include production_year");
+    }
+
+    std::vector<Command> commands{createTitleTableCommand()};
+    commands.push_back(parseSQL("INSERT " + title_rows[0]));
+    commands.push_back(parseSQL("INSERT " + title_rows[1]));
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(first_title[3]),
+        "id", first_title[0]});
+    commands.push_back(UpdateRowsCommand{
+        "title", "production_year", replacementProductionYear(second_title[3]),
+        "id", second_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", first_title[0]});
+    commands.push_back(SelectWhereCommand{"title", "id", second_title[0]});
+    commands.push_back(CountRowsCommand{"title"});
+    return commands;
+}
+
+Workload createTitleWriteWorkload(const std::string& data_file) {
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
     return Workload(commands, buzzDBOracleResults(commands));
 }
 
@@ -15928,7 +15936,7 @@ void printDistributedServiceTrace(const std::string& data_file) {
     Address server = ScenarioAddress::server1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientBuzzDBScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientBuzzDBScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings = scenario.settings;
     SearchState state = scenario.state;
 
@@ -16163,7 +16171,7 @@ void printActualPrimaryBackupSearchStates(size_t count,
     Address backup = ScenarioAddress::backup1();
     Address client = ScenarioAddress::client1();
     Scenario scenario =
-        oneClientPrimaryBackupScenario(createExplicitJobJoinWorkload(data_file));
+        oneClientPrimaryBackupScenario(createTitleWriteWorkload(data_file));
     SearchSettings settings;
     settings.max_depth = 5;
     settings.max_states = 1000;
@@ -16289,7 +16297,7 @@ void printPrimaryBackupTrace(const std::string& data_file) {
     Address primary = ScenarioAddress::server1();
     Address backup = ScenarioAddress::backup1();
     Address client = ScenarioAddress::client1();
-    std::vector<Command> commands = createExplicitJobJoinCommands(data_file);
+    std::vector<Command> commands = createTitleWriteCommands(data_file);
     Scenario scenario =
         oneClientPrimaryBackupScenario(
             Workload(commands, buzzDBOracleResults(commands)));
@@ -16511,7 +16519,7 @@ void removeBuzzDBBundle(const std::string& database_file) {
 }
 
 void printLocalBuzzDBTrace(const std::string& data_file) {
-    std::cout << "\nTrace: real v104 BuzzDB core through simulator commands" << std::endl;
+    std::cout << "\nTrace: real BuzzDB core through simulator commands" << std::endl;
     std::vector<std::string> title_rows =
         requireTupleLinesFromFile(data_file, "title", 2);
     std::vector<std::string> first_title =
@@ -16565,8 +16573,8 @@ std::string defaultImdbInputFile() {
     return "imdb.txt";
 }
 
-void printV104BootstrapTrace(const std::string& data_file) {
-    std::cout << "Trace: v104-style bootstrap from an IMDB tuple file" << std::endl;
+void printBuzzDBBootstrapTrace(const std::string& data_file) {
+    std::cout << "Trace: BuzzDB bootstrap from an IMDB tuple file" << std::endl;
     std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("buzzdb-v110-bootstrap-trace-" + std::to_string(::getpid()));
     std::filesystem::remove_all(dir);
@@ -16907,7 +16915,7 @@ int main(int argc, char* argv[]) {
     printPrimaryBackupTrace(imdb_file);
     printFullPrimaryBackupLoadTrace(imdb_file);
     printActualPrimaryBackupSearchStates(20, imdb_file);
-    printV104BootstrapTrace(imdb_file);
+    printBuzzDBBootstrapTrace(imdb_file);
 
     TestRunner tests;
     Address server("server1");
@@ -16915,7 +16923,7 @@ int main(int argc, char* argv[]) {
 
     tests.test("SearchSettings uses explicit delivery priority", [&] {
         SearchSettings settings;
-        Command first_command = createExplicitJobJoinCommands(imdb_file).front();
+        Command first_command = createTitleWriteCommands(imdb_file).front();
         MessageEnvelope envelope{
             1,
             client,
@@ -16940,7 +16948,7 @@ int main(int argc, char* argv[]) {
         tests.check(settings.shouldDeliver(envelope), "resetNetwork should restore delivery");
     });
 
-    tests.test("BuzzDBCore routes commands through real v104 storage", [&] {
+    tests.test("BuzzDBCore routes commands through real storage", [&] {
         std::vector<std::string> title_rows =
             requireTupleLinesFromFile(imdb_file, "title", 2);
         std::vector<std::string> first_title =
@@ -16962,14 +16970,14 @@ int main(int argc, char* argv[]) {
         tests.check(db.execute(InsertRowCommand{"title", second_title}) == Result{InsertOkResult{}},
                     "second insert should succeed");
         tests.check(db.execute(CountRowsCommand{"title"}) == Result{CountRowsResult{2}},
-                    "count should reflect v104 table metadata");
+                    "count should reflect table metadata");
         tests.check(db.execute(parseSQL("PROJECT * FROM title")) == Result{SelectAllResult{
                         {"id", "title", "kind_id", "production_year"},
                         {first_title, second_title}}},
-                    "PROJECT * should scan through v104 operators");
+                    "PROJECT * should scan through BuzzDB operators");
     });
 
-    tests.test("BuzzDBCore uses real v104 ARIES log and master files", [&] {
+    tests.test("BuzzDBCore uses real ARIES log and master files", [&] {
         std::vector<std::string> title_rows =
             requireTupleLinesFromFile(imdb_file, "title", 1);
         std::vector<std::string> first_title =
@@ -16984,7 +16992,7 @@ int main(int argc, char* argv[]) {
         {
             BuzzDBCore db(db_file);
             tests.check(buzzdbCompanionFilename(db_file, ".log").find("buzzdb.log") != std::string::npos,
-                        "v104 companion log should be buzzdb.log");
+                        "companion log should be buzzdb.log");
             tests.check(db.execute(createTitleTableCommand()) == Result{CreateTableOkResult{}},
                         "create table should succeed");
             tests.check(db.execute(parseSQL("INSERT " + title_rows[0])) == Result{InsertOkResult{}},
@@ -16992,15 +17000,15 @@ int main(int argc, char* argv[]) {
             tests.check(db.execute(parseSQL("UPDATE title SET production_year=" +
                                             updated_year + " WHERE id=" +
                                             first_title[0])) == Result{UpdateRowsResult{1}},
-                        "update should go through v104 logged update operator");
+                        "update should go through the logged update operator");
             tests.check(db.execute(CheckpointCommand{}) == Result{CheckpointOkResult{}},
-                        "checkpoint should use v104 RecoveryManager");
+                        "checkpoint should use the RecoveryManager");
             tests.check(std::filesystem::exists(buzzdbCompanionFilename(db_file, ".log")),
-                        "real v104 recovery log should exist");
+                        "real recovery log should exist");
             tests.check(std::filesystem::exists(buzzdbCompanionFilename(db_file, ".master")),
-                        "real v104 master record should exist");
+                        "real master record should exist");
             tests.check(db.stableLogForces() > 0 && db.flushedLSN() > 0,
-                        "v104 recovery manager should force real log records");
+                        "recovery manager should force real log records");
         }
         removeBuzzDBBundle(db_file);
         std::error_code ec;
@@ -17038,10 +17046,10 @@ int main(int argc, char* argv[]) {
                                         first_title[0])) == Result{SelectAllResult{
                         {"id", "title", "kind_id", "production_year"},
                         {updated_first_title}}},
-                    "SELECT * WHERE should be translated to a v104 PROJECT query");
+                    "SELECT * WHERE should be translated to a PROJECT query");
     });
 
-    tests.test("BuzzDBCore bootstraps v104 JOB tables from an IMDB tuple file", [&] {
+    tests.test("BuzzDBCore bootstraps JOB tables from an IMDB tuple file", [&] {
         std::filesystem::path dir = std::filesystem::temp_directory_path() / "buzzdb-v110-bootstrap-test";
         std::filesystem::remove_all(dir);
         std::filesystem::create_directories(dir);
@@ -17051,7 +17059,7 @@ int main(int argc, char* argv[]) {
             tests.check(std::filesystem::exists(dir / "buzzdb.dat"),
                         "bootstrap should generate buzzdb.dat");
             tests.check(db.tableNames().size() == 14,
-                        "v104 bootstrap should create the JOB/IMDB table set");
+                        "bootstrap should create the JOB/IMDB table set");
             Result title_count = db.execute(CountRowsCommand{"title"});
             const auto* title_rows = std::get_if<CountRowsResult>(&title_count);
             tests.check(title_rows != nullptr && title_rows->count > 0,
@@ -17071,7 +17079,7 @@ int main(int argc, char* argv[]) {
 
     tests.test("Simulator server calls BuzzDBApplication once per client request", [&] {
         Scenario scenario =
-            oneClientBuzzDBScenario(createExplicitJobJoinWorkload(imdb_file));
+            oneClientBuzzDBScenario(createTitleWriteWorkload(imdb_file));
         SearchState state = scenario.state;
         auto first = state.stepEvent(state.events().front());
         tests.check(first.has_value(), "client request should be deliverable");
@@ -17085,7 +17093,7 @@ int main(int argc, char* argv[]) {
         Address client = ScenarioAddress::client1();
         SearchSettings settings;
         SearchState state = oneClientBuzzDBScenario(
-            createExplicitJobJoinWorkload(imdb_file)).state;
+            createTitleWriteWorkload(imdb_file)).state;
 
         EventRef initial_request = requireMessageEvent(
             state,
@@ -17142,7 +17150,7 @@ int main(int argc, char* argv[]) {
         SearchSettings settings;
         SearchState state =
             oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file)).state;
+                createTitleWriteWorkload(imdb_file)).state;
 
         EventRef client_request = requireMessageEvent(
             state,
@@ -17220,7 +17228,7 @@ int main(int argc, char* argv[]) {
         Address backup = ScenarioAddress::backup1();
         SearchState state =
             oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file)).state;
+                createTitleWriteWorkload(imdb_file)).state;
         const auto* primary_node = state.nodeAs<PrimaryBackupServer>(primary);
         const auto* backup_node = state.nodeAs<BackupReplica>(backup);
         tests.check(primary_node != nullptr && backup_node != nullptr,
@@ -17236,7 +17244,7 @@ int main(int argc, char* argv[]) {
         SearchSettings settings;
         SearchState state =
             oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file)).state;
+                createTitleWriteWorkload(imdb_file)).state;
 
         EventRef client_request = requireMessageEvent(
             state,
@@ -17302,7 +17310,7 @@ int main(int argc, char* argv[]) {
         Address primary = ScenarioAddress::server1();
         Address backup = ScenarioAddress::backup1();
         Address client = ScenarioAddress::client1();
-        std::vector<Command> commands = createExplicitJobJoinCommands(imdb_file);
+        std::vector<Command> commands = createTitleWriteCommands(imdb_file);
         Scenario scenario =
             oneClientPrimaryBackupScenario(
                 Workload(commands, buzzDBOracleResults(commands)));
@@ -17332,10 +17340,10 @@ int main(int argc, char* argv[]) {
                     "client should finish the explicit command workload");
         tests.check(client_node->results().size() == commands.size(),
                     "client should receive one result per explicit command");
-        const auto* query_rows =
-            std::get_if<QueryRowsResult>(&client_node->results().back());
-        tests.check(query_rows != nullptr && query_rows->count == 2,
-                    "final query should return the two explicit distributor rows");
+        const auto* count_rows =
+            std::get_if<CountRowsResult>(&client_node->results().back());
+        tests.check(count_rows != nullptr && count_rows->count == 2,
+                    "final count should include the two real title rows");
         for (size_t i = 0; i < commands.size(); ++i) {
             int request_id = static_cast<int>(i + 1);
             tests.check(primary_node->executionCount(1, request_id) == 1,
@@ -17401,7 +17409,7 @@ int main(int argc, char* argv[]) {
         Address client = ScenarioAddress::client1();
         Scenario scenario =
             oneClientPrimaryBackupScenario(
-                createExplicitJobJoinWorkload(imdb_file));
+                createTitleWriteWorkload(imdb_file));
         SearchSettings settings;
         settings.max_depth = 4;
         settings.max_states = 120;
