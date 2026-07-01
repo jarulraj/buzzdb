@@ -61,13 +61,13 @@ public:
     std::unique_ptr<char[]> data;
 
 public:
-    Field(int i) : type(INT) { 
+    Field(int i) : type(INT) {
         data_length = sizeof(int);
         data = std::make_unique<char[]>(data_length);
         std::memcpy(data.get(), &i, data_length);
     }
 
-    Field(float f) : type(FLOAT) { 
+    Field(float f) : type(FLOAT) {
         data_length = sizeof(float);
         data = std::make_unique<char[]>(data_length);
         std::memcpy(data.get(), &f, data_length);
@@ -101,13 +101,13 @@ public:
     }
 
     FieldType getType() const { return type; }
-    int asInt() const { 
+    int asInt() const {
         return *reinterpret_cast<int*>(data.get());
     }
-    float asFloat() const { 
+    float asFloat() const {
         return *reinterpret_cast<float*>(data.get());
     }
-    std::string asString() const { 
+    std::string asString() const {
         return std::string(data.get());
     }
 
@@ -469,7 +469,7 @@ struct PageHeader {
 };
 
 struct Slot {
-    bool empty = true;                 // Is the slot empty?    
+    bool empty = true;                 // Is the slot empty?
     uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
     uint16_t length = INVALID_VALUE;    // Length of the slot
 };
@@ -535,9 +535,9 @@ public:
 
         // Check for first slot with enough space
         size_t slot_itr = 0;
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());        
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
         for (; slot_itr < MAX_SLOTS; slot_itr++) {
-            if (slot_array[slot_itr].empty == true and 
+            if (slot_array[slot_itr].empty == true and
                 slot_array[slot_itr].length >= tuple_size) {
                 break;
             }
@@ -582,8 +582,8 @@ public:
         }
 
         // Copy serialized data into the page
-        std::memcpy(page_data.get() + offset, 
-                    serializedTuple.c_str(), 
+        std::memcpy(page_data.get() + offset,
+                    serializedTuple.c_str(),
                     tuple_size);
 
         return slot_itr;
@@ -701,7 +701,7 @@ std::string database_filename = "buzzdb.dat";
 constexpr bool TRACE_STORAGE = false;
 
 class StorageManager {
-public:    
+public:
     std::fstream fileStream;
     size_t num_pages = 0;
     size_t stable_storage_forces = 0;
@@ -748,8 +748,8 @@ public:
             fileStream.clear(); // Reset the state
             fileStream.open(database_filename, std::ios::out);
         }
-        fileStream.close(); 
-        fileStream.open(database_filename, std::ios::in | std::ios::out); 
+        fileStream.close();
+        fileStream.open(database_filename, std::ios::in | std::ios::out);
 
         fileStream.seekg(0, std::ios::end);
         num_pages = fileStream.tellg() / PAGE_SIZE;
@@ -783,11 +783,11 @@ public:
 
     // Write a page to disk
     void flush(uint16_t page_id, const std::unique_ptr<SlottedPage>& page) {
-        size_t page_offset = page_id * PAGE_SIZE;        
+        size_t page_offset = page_id * PAGE_SIZE;
 
         // Move the write pointer
         fileStream.seekp(page_offset, std::ios::beg);
-        fileStream.write(page->page_data.get(), PAGE_SIZE);        
+        fileStream.write(page->page_data.get(), PAGE_SIZE);
         forceDatabaseFileToStableStorage();
     }
 
@@ -849,7 +849,7 @@ public:
         if (map.find(page_id) != map.end()) {
             found = true;
             lruList.erase(map[page_id]);
-            map.erase(page_id);            
+            map.erase(page_id);
         }
 
         // If cache is full, evict
@@ -923,7 +923,7 @@ private:
     }
 
 public:
-    BufferManager(): 
+    BufferManager():
     policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
     void setWalForceCallback(std::function<bool(LSN)> callback) {
@@ -4458,7 +4458,7 @@ public:
     }
 };
 
-// Transaction and Operator Context 
+// Transaction and Operator Context
 // -----------------------------------------------------------------------------
 
 struct TxnContext {
@@ -12701,14 +12701,31 @@ public:
         Result result = StatementOkResult{};
     };
 
-    explicit ControlPlaneRuntime(Executor catalog)
-        : catalog_(std::move(catalog)) {}
+    explicit ControlPlaneRuntime(Executor catalog, int txn_timeout_ticks = 3)
+        : catalog_(std::move(catalog)),
+          txn_timeout_ticks_(txn_timeout_ticks) {}
+
+    ControlPlaneRuntime(Executor catalog,
+                        bool control_plane_leader,
+                        int txn_timeout_ticks = 3,
+                        int metadata_retention_ticks = 2)
+        : catalog_(std::move(catalog)),
+          control_plane_leader_(control_plane_leader),
+          txn_timeout_ticks_(txn_timeout_ticks),
+          metadata_retention_ticks_(metadata_retention_ticks) {}
 
     void registerReplicaGroup(std::string group_id, Executor executor) {
         replica_groups_[std::move(group_id)] = std::move(executor);
     }
 
     StepResult tick() {
+        if (!control_plane_leader_) {
+            StepResult step;
+            step.status_after = "not_leader";
+            step.result = ConfigRejectedResult{};
+            return step;
+        }
+
         std::vector<TransferRecord> transfers = activeTransfers();
         if (!transfers.empty()) {
             std::sort(
@@ -12729,19 +12746,50 @@ public:
         }
 
         std::vector<TxnRecord> transactions = activeTransactions();
-        if (transactions.empty()) return StepResult{};
-        std::sort(
-            transactions.begin(),
-            transactions.end(),
-            [](const TxnRecord& lhs, const TxnRecord& rhs) {
-                if (txnStatusPriority(lhs.status) !=
-                    txnStatusPriority(rhs.status)) {
-                    return txnStatusPriority(lhs.status) <
-                           txnStatusPriority(rhs.status);
-                }
-                return lhs.txn_id < rhs.txn_id;
-            });
-        return advance(transactions.front());
+        if (!transactions.empty()) {
+            std::sort(
+                transactions.begin(),
+                transactions.end(),
+                [](const TxnRecord& lhs, const TxnRecord& rhs) {
+                    if (txnStatusPriority(lhs.status) !=
+                        txnStatusPriority(rhs.status)) {
+                        return txnStatusPriority(lhs.status) <
+                               txnStatusPriority(rhs.status);
+                    }
+                    return lhs.txn_id < rhs.txn_id;
+                });
+            return advance(transactions.front());
+        }
+
+        std::vector<ParticipantRecord> participants =
+            activeParticipantRecords();
+        if (!participants.empty()) {
+            std::sort(
+                participants.begin(),
+                participants.end(),
+                [](const ParticipantRecord& lhs,
+                   const ParticipantRecord& rhs) {
+                    if (lhs.txn_id != rhs.txn_id) {
+                        return lhs.txn_id < rhs.txn_id;
+                    }
+                    return lhs.range_id < rhs.range_id;
+                });
+            return advance(participants.front());
+        }
+
+        std::vector<TxnRecord> terminal =
+            collectibleTransactions(latestControlPlaneEpoch());
+        if (!terminal.empty()) {
+            std::sort(
+                terminal.begin(),
+                terminal.end(),
+                [](const TxnRecord& lhs, const TxnRecord& rhs) {
+                    return lhs.txn_id < rhs.txn_id;
+                });
+            return collect(terminal.front());
+        }
+
+        return StepResult{};
     }
 
     size_t runUntilIdle(size_t max_steps = 1000) {
@@ -12783,6 +12831,23 @@ private:
         size_t participant_index = 0;
     };
 
+    struct ParticipantRecord {
+        std::string txn_id;
+        std::string range_id;
+        std::string replica_group_id;
+        size_t statement_count = 0;
+        std::string status;
+    };
+
+    struct TxnLivenessRecord {
+        bool exists = false;
+        std::string txn_id;
+        std::string owner;
+        int epoch = 0;
+        int deadline_epoch = 0;
+        std::string status;
+    };
+
     static int statusRank(const std::string& status) {
         if (status == "requested") return 0;
         if (status == "prepared") return 1;
@@ -12814,11 +12879,22 @@ private:
     static int txnStatusPriority(const std::string& status) {
         if (status == "prepared") return 0;
         if (status == "committed") return 1;
+        if (status == "aborted") return 2;
         return 100;
     }
 
     static bool activeTxnStatus(const std::string& status) {
-        return status == "prepared" || status == "committed";
+        return status == "prepared" ||
+               status == "committed" ||
+               status == "aborted";
+    }
+
+    static bool finalParticipantStatus(const std::string& status) {
+        return status == "committed" || status == "aborted";
+    }
+
+    static bool unresolvedParticipantStatus(const std::string& status) {
+        return status == "prepared" || status == "waiting";
     }
 
     static int hexDigit(char ch) {
@@ -12865,6 +12941,117 @@ private:
             return *rows;
         }
         return std::nullopt;
+    }
+
+    int latestControlPlaneEpoch() const {
+        auto rows = readCatalogTable("__control_plane_ticks");
+        if (!rows.has_value()) return 0;
+        int latest = 0;
+        for (const auto& row : rows->rows) {
+            auto epoch = valueAt(*rows, row, "epoch");
+            if (!epoch.has_value()) continue;
+            latest = std::max(latest, std::stoi(*epoch));
+        }
+        return latest;
+    }
+
+    std::optional<int> nextControlPlaneEpoch() {
+        int next = latestControlPlaneEpoch() + 1;
+        Result result = catalog_(
+            Command{InsertRowCommand{
+                "__control_plane_ticks",
+                {"txn-janitor", std::to_string(next)}}});
+        if (!std::holds_alternative<InsertOkResult>(result)) {
+            return std::nullopt;
+        }
+        return next;
+    }
+
+    TxnLivenessRecord latestTxnLiveness(
+        const std::string& txn_id) const {
+        auto rows = readCatalogTable("__txn_liveness");
+        if (!rows.has_value()) return TxnLivenessRecord{};
+
+        TxnLivenessRecord latest;
+        for (const auto& row : rows->rows) {
+            auto row_txn_id = valueAt(*rows, row, "txn_id");
+            auto owner = valueAt(*rows, row, "owner");
+            auto epoch = valueAt(*rows, row, "epoch");
+            auto deadline = valueAt(*rows, row, "deadline_epoch");
+            auto status = valueAt(*rows, row, "status");
+            if (!row_txn_id.has_value() ||
+                *row_txn_id != txn_id ||
+                !owner.has_value() ||
+                *owner != "coordinator" ||
+                !epoch.has_value() ||
+                !deadline.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+            TxnLivenessRecord record{
+                true,
+                *row_txn_id,
+                *owner,
+                std::stoi(*epoch),
+                std::stoi(*deadline),
+                *status};
+            if (!latest.exists || record.epoch >= latest.epoch) {
+                latest = std::move(record);
+            }
+        }
+        return latest;
+    }
+
+    std::optional<TxnLivenessRecord> touchTxnLiveness(
+        const TxnRecord& transaction,
+        int epoch) {
+        TxnLivenessRecord previous =
+            latestTxnLiveness(transaction.txn_id);
+        int deadline = epoch + txn_timeout_ticks_;
+        if (previous.exists &&
+            previous.status == transaction.status &&
+            previous.deadline_epoch > 0) {
+            deadline = previous.deadline_epoch;
+        }
+        Result result = catalog_(
+            Command{InsertRowCommand{
+                "__txn_liveness",
+                {transaction.txn_id,
+                 "coordinator",
+                 std::to_string(epoch),
+                 std::to_string(deadline),
+                 transaction.status}}});
+        if (!std::holds_alternative<InsertOkResult>(result)) {
+            return std::nullopt;
+        }
+        return TxnLivenessRecord{
+            true,
+            transaction.txn_id,
+            "coordinator",
+            epoch,
+            deadline,
+            transaction.status};
+    }
+
+    bool markTxnLiveness(const std::string& txn_id,
+                         int epoch,
+                         const std::string& status) {
+        Result result = catalog_(
+            Command{InsertRowCommand{
+                "__txn_liveness",
+                {txn_id,
+                 "coordinator",
+                 std::to_string(epoch),
+                 std::to_string(epoch + metadata_retention_ticks_),
+                 status}}});
+        return std::holds_alternative<InsertOkResult>(result);
+    }
+
+    bool txnAlreadyResolved(const std::string& txn_id) const {
+        TxnLivenessRecord record = latestTxnLiveness(txn_id);
+        return record.exists &&
+               (record.status == "resolved" ||
+                record.status == "collected");
     }
 
     std::vector<TransferRecord> activeTransfers() const {
@@ -12947,7 +13134,8 @@ private:
         std::vector<TxnRecord> transactions;
         for (const auto& [txn_id, record] : latest) {
             (void)txn_id;
-            if (activeTxnStatus(record.status)) {
+            if (activeTxnStatus(record.status) &&
+                !txnAlreadyResolved(record.txn_id)) {
                 transactions.push_back(record);
             }
         }
@@ -13030,6 +13218,207 @@ private:
             statements.push_back(statement);
         }
         return statements;
+    }
+
+    static std::optional<SelectAllResult> readExecutorTable(
+        const Executor& executor,
+        const std::string& table) {
+        Result result = executor(Command{ReadSystemCatalogCommand{table}});
+        if (const auto* rows = std::get_if<SelectAllResult>(&result)) {
+            return *rows;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<TxnRecord> coordinatorRecord(
+        const std::string& txn_id) const {
+        auto rows = readCatalogTable("__distributed_txns");
+        if (!rows.has_value()) return std::nullopt;
+
+        std::optional<TxnRecord> latest;
+        for (const auto& row : rows->rows) {
+            auto row_txn_id = valueAt(*rows, row, "txn_id");
+            auto statement_count = valueAt(*rows, row, "statement_count");
+            auto participant_count = valueAt(*rows, row, "participant_count");
+            auto status = valueAt(*rows, row, "status");
+            if (!row_txn_id.has_value() ||
+                *row_txn_id != txn_id ||
+                !statement_count.has_value() ||
+                !participant_count.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+            TxnRecord record;
+            record.txn_id = *row_txn_id;
+            record.statement_count =
+                static_cast<size_t>(std::stoull(*statement_count));
+            record.participant_count =
+                static_cast<size_t>(std::stoull(*participant_count));
+            record.status = *status;
+            if (!latest.has_value() ||
+                txnStatusRank(record.status) >=
+                    txnStatusRank(latest->status)) {
+                latest = std::move(record);
+            }
+        }
+        return latest;
+    }
+
+    static int participantStatusRank(const std::string& status) {
+        if (status == "committed") return 3;
+        if (status == "aborted") return 2;
+        if (status == "waiting") return 1;
+        if (status == "prepared") return 1;
+        return 0;
+    }
+
+    std::vector<ParticipantRecord> activeParticipantRecords() const {
+        std::map<std::tuple<std::string, std::string, std::string>,
+                 ParticipantRecord> latest;
+        for (const auto& [group_id, executor] : replica_groups_) {
+            auto rows = readExecutorTable(executor, "__participant_txns");
+            if (!rows.has_value()) continue;
+            for (const auto& row : rows->rows) {
+                auto txn_id = valueAt(*rows, row, "txn_id");
+                auto range_id = valueAt(*rows, row, "range_id");
+                auto replica_group_id =
+                    valueAt(*rows, row, "replica_group_id");
+                auto statement_count =
+                    valueAt(*rows, row, "statement_count");
+                auto status = valueAt(*rows, row, "status");
+                if (!txn_id.has_value() ||
+                    !range_id.has_value() ||
+                    !replica_group_id.has_value() ||
+                    !statement_count.has_value() ||
+                    !status.has_value() ||
+                    *replica_group_id != group_id) {
+                    continue;
+                }
+                ParticipantRecord record{
+                    *txn_id,
+                    *range_id,
+                    *replica_group_id,
+                    static_cast<size_t>(std::stoull(*statement_count)),
+                    *status};
+                auto key = std::make_tuple(record.txn_id,
+                                           record.range_id,
+                                           record.replica_group_id);
+                auto it = latest.find(key);
+                if (it == latest.end() ||
+                    participantStatusRank(record.status) >=
+                        participantStatusRank(it->second.status)) {
+                    latest[key] = std::move(record);
+                }
+            }
+        }
+
+        std::vector<ParticipantRecord> records;
+        for (const auto& [key, record] : latest) {
+            (void)key;
+            if (!unresolvedParticipantStatus(record.status)) continue;
+            auto coordinator = coordinatorRecord(record.txn_id);
+            if (!coordinator.has_value() ||
+                coordinator->status == "aborted" ||
+                coordinator->status == "committed" ||
+                coordinator->status == "ended") {
+                records.push_back(record);
+            }
+        }
+        return records;
+    }
+
+    bool hasPendingCollection() const {
+        auto rows = readCatalogTable("__distributed_txns");
+        if (!rows.has_value()) return false;
+
+        std::map<std::string, TxnRecord> latest;
+        for (const auto& row : rows->rows) {
+            auto txn_id = valueAt(*rows, row, "txn_id");
+            auto statement_count = valueAt(*rows, row, "statement_count");
+            auto participant_count = valueAt(*rows, row, "participant_count");
+            auto status = valueAt(*rows, row, "status");
+            if (!txn_id.has_value() ||
+                !statement_count.has_value() ||
+                !participant_count.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+            TxnRecord record;
+            record.txn_id = *txn_id;
+            record.statement_count =
+                static_cast<size_t>(std::stoull(*statement_count));
+            record.participant_count =
+                static_cast<size_t>(std::stoull(*participant_count));
+            record.status = *status;
+            auto it = latest.find(record.txn_id);
+            if (it == latest.end() ||
+                txnStatusRank(record.status) >=
+                    txnStatusRank(it->second.status)) {
+                latest[record.txn_id] = std::move(record);
+            }
+        }
+
+        for (const auto& [txn_id, record] : latest) {
+            (void)txn_id;
+            if (record.status != "ended" && record.status != "aborted") {
+                continue;
+            }
+            TxnLivenessRecord liveness =
+                latestTxnLiveness(record.txn_id);
+            if (liveness.exists && liveness.status == "resolved") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::vector<TxnRecord> collectibleTransactions(int current_epoch) const {
+        auto rows = readCatalogTable("__distributed_txns");
+        if (!rows.has_value()) return {};
+
+        std::map<std::string, TxnRecord> latest;
+        for (const auto& row : rows->rows) {
+            auto txn_id = valueAt(*rows, row, "txn_id");
+            auto statement_count = valueAt(*rows, row, "statement_count");
+            auto participant_count = valueAt(*rows, row, "participant_count");
+            auto status = valueAt(*rows, row, "status");
+            if (!txn_id.has_value() ||
+                !statement_count.has_value() ||
+                !participant_count.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+            TxnRecord record;
+            record.txn_id = *txn_id;
+            record.statement_count =
+                static_cast<size_t>(std::stoull(*statement_count));
+            record.participant_count =
+                static_cast<size_t>(std::stoull(*participant_count));
+            record.status = *status;
+            auto it = latest.find(record.txn_id);
+            if (it == latest.end() ||
+                txnStatusRank(record.status) >=
+                    txnStatusRank(it->second.status)) {
+                latest[record.txn_id] = std::move(record);
+            }
+        }
+
+        std::vector<TxnRecord> records;
+        for (const auto& [txn_id, record] : latest) {
+            (void)txn_id;
+            if (record.status != "ended" && record.status != "aborted") {
+                continue;
+            }
+            TxnLivenessRecord liveness =
+                latestTxnLiveness(record.txn_id);
+            if (!liveness.exists ||
+                liveness.status != "resolved" ||
+                current_epoch < liveness.deadline_epoch) {
+                continue;
+            }
+            records.push_back(record);
+        }
+        return records;
     }
 
     std::optional<RangeSpec> rangeSpecFor(
@@ -13129,12 +13518,67 @@ private:
             return step;
         }
 
+        std::optional<int> epoch = nextControlPlaneEpoch();
+        if (!epoch.has_value()) return step;
+        std::optional<TxnLivenessRecord> liveness =
+            touchTxnLiveness(transaction, *epoch);
+        if (!liveness.has_value()) return step;
+
         if (transaction.status == "prepared") {
+            if (*epoch >= liveness->deadline_epoch) {
+                bool all_participants_reached = true;
+                for (const auto& participant : participants) {
+                    auto executor =
+                        replica_groups_.find(participant.replica_group_id);
+                    if (executor == replica_groups_.end()) {
+                        all_participants_reached = false;
+                        continue;
+                    }
+                    Result aborted = executor->second(
+                        Command{AbortTxnParticipantCommand{
+                            transaction.txn_id,
+                            participant.range_id,
+                            participant.replica_group_id}});
+                    const auto* aborted_result =
+                        std::get_if<DistributedTxnResult>(&aborted);
+                    if (aborted_result == nullptr) {
+                        if (std::holds_alternative<RouteRejectedResult>(
+                                aborted)) {
+                            continue;
+                        }
+                        step.result = std::move(aborted);
+                        return step;
+                    }
+                    if (aborted_result->status != "aborted") {
+                        step.result = std::move(aborted);
+                        return step;
+                    }
+                }
+                step.status_after = "aborted";
+                step.result = catalog_(
+                    Command{AbortPreparedDistributedTransactionCommand{
+                        transaction.txn_id}});
+                const auto* aborted =
+                    std::get_if<DistributedTxnResult>(&step.result);
+                step.advanced =
+                    aborted != nullptr && aborted->status == "aborted";
+                if (step.advanced && all_participants_reached) {
+                    markTxnLiveness(transaction.txn_id,
+                                    *epoch,
+                                    "resolved");
+                }
+                return step;
+            }
+
             bool any_abort = false;
+            bool any_wait = false;
             for (const auto& participant : participants) {
                 auto executor =
                     replica_groups_.find(participant.replica_group_id);
-                if (executor == replica_groups_.end()) return step;
+                if (executor == replica_groups_.end()) {
+                    any_wait = true;
+                    continue;
+                }
                 Result prepared = executor->second(
                     Command{PrepareTxnParticipantCommand{
                         transaction.txn_id,
@@ -13149,6 +13593,8 @@ private:
                 }
                 if (prepared_result->status == "aborted") {
                     any_abort = true;
+                } else if (prepared_result->status == "waiting") {
+                    any_wait = true;
                 } else if (prepared_result->status != "prepared" &&
                            prepared_result->status != "committed") {
                     step.result = std::move(prepared);
@@ -13185,6 +13631,13 @@ private:
                 return step;
             }
 
+            if (any_wait) {
+                step.status_after = "waiting";
+                step.result = StatementOkResult{};
+                step.advanced = true;
+                return step;
+            }
+
             step.status_after = "committed";
             step.result = catalog_(
                 Command{CommitPreparedDistributedTransactionCommand{
@@ -13200,7 +13653,40 @@ private:
             for (const auto& participant : participants) {
                 auto executor =
                     replica_groups_.find(participant.replica_group_id);
-                if (executor == replica_groups_.end()) return step;
+                if (executor == replica_groups_.end()) {
+                    step.status_after = "waiting";
+                    step.result = StatementOkResult{};
+                    step.advanced = false;
+                    return step;
+                }
+                Result status = executor->second(
+                    Command{ReadTxnParticipantStatusCommand{
+                        transaction.txn_id,
+                        participant.range_id,
+                        participant.replica_group_id}});
+                const auto* status_result =
+                    std::get_if<DistributedTxnResult>(&status);
+                if (status_result == nullptr) {
+                    if (!std::holds_alternative<RouteRejectedResult>(
+                            status)) {
+                        step.result = std::move(status);
+                        return step;
+                    }
+                    Result prepared = executor->second(
+                        Command{PrepareTxnParticipantCommand{
+                            transaction.txn_id,
+                            participant.range_id,
+                            participant.replica_group_id,
+                            statements}});
+                    const auto* prepared_result =
+                        std::get_if<DistributedTxnResult>(&prepared);
+                    if (prepared_result == nullptr ||
+                        (prepared_result->status != "prepared" &&
+                         prepared_result->status != "committed")) {
+                        step.result = std::move(prepared);
+                        return step;
+                    }
+                }
                 Result committed = executor->second(
                     Command{CommitTxnParticipantCommand{
                         transaction.txn_id,
@@ -13222,14 +13708,166 @@ private:
                 std::get_if<DistributedTxnResult>(&step.result);
             step.advanced =
                 completed != nullptr && completed->status == "committed";
+            if (step.advanced) {
+                markTxnLiveness(transaction.txn_id,
+                                *epoch,
+                                "resolved");
+            }
+            return step;
+        }
+
+        if (transaction.status == "aborted") {
+            for (const auto& participant : participants) {
+                auto executor =
+                    replica_groups_.find(participant.replica_group_id);
+                if (executor == replica_groups_.end()) {
+                    step.status_after = "waiting";
+                    step.result = StatementOkResult{};
+                    step.advanced = false;
+                    return step;
+                }
+                Result aborted = executor->second(
+                    Command{AbortTxnParticipantCommand{
+                        transaction.txn_id,
+                        participant.range_id,
+                        participant.replica_group_id}});
+                const auto* aborted_result =
+                    std::get_if<DistributedTxnResult>(&aborted);
+                if (aborted_result == nullptr) {
+                    if (std::holds_alternative<RouteRejectedResult>(
+                            aborted)) {
+                        continue;
+                    }
+                    step.result = std::move(aborted);
+                    return step;
+                }
+                if (aborted_result->status != "aborted") {
+                    step.result = std::move(aborted);
+                    return step;
+                }
+            }
+            step.status_after = "resolved";
+            step.result = StatementOkResult{};
+            step.advanced = markTxnLiveness(transaction.txn_id,
+                                            *epoch,
+                                            "resolved");
             return step;
         }
 
         return step;
     }
 
+    StepResult advance(const ParticipantRecord& participant) {
+        StepResult step;
+        step.range_id = participant.range_id;
+        step.status_before = participant.status;
+        step.result = ConfigRejectedResult{};
+
+        auto executor = replica_groups_.find(participant.replica_group_id);
+        if (executor == replica_groups_.end()) return step;
+
+        std::optional<TxnRecord> coordinator =
+            coordinatorRecord(participant.txn_id);
+        if (!coordinator.has_value() || coordinator->status == "aborted") {
+            Result aborted = executor->second(
+                Command{AbortTxnParticipantCommand{
+                    participant.txn_id,
+                    participant.range_id,
+                    participant.replica_group_id}});
+            const auto* aborted_result =
+                std::get_if<DistributedTxnResult>(&aborted);
+            if (aborted_result == nullptr ||
+                aborted_result->status != "aborted") {
+                step.result = std::move(aborted);
+                return step;
+            }
+            step.status_after = "aborted";
+            step.result = std::move(aborted);
+            step.advanced = true;
+            return step;
+        }
+
+        if (coordinator->status == "committed" ||
+            coordinator->status == "ended") {
+            Result committed = executor->second(
+                Command{CommitTxnParticipantCommand{
+                    participant.txn_id,
+                    participant.range_id,
+                    participant.replica_group_id}});
+            const auto* committed_result =
+                std::get_if<DistributedTxnResult>(&committed);
+            if (committed_result == nullptr ||
+                committed_result->status != "committed") {
+                step.result = std::move(committed);
+                return step;
+            }
+            step.status_after = "committed";
+            step.result = std::move(committed);
+            step.advanced = true;
+            return step;
+        }
+
+        return step;
+    }
+
+    StepResult collect(const TxnRecord& transaction) {
+        StepResult step;
+        step.range_id = transaction.txn_id;
+        step.status_before = transaction.status;
+        step.status_after = "collected";
+
+        std::vector<Command> catalog_deletes{
+            DeleteRowsCommand{"__distributed_txns",
+                              "txn_id",
+                              transaction.txn_id},
+            DeleteRowsCommand{"__txn_participants",
+                              "txn_id",
+                              transaction.txn_id},
+            DeleteRowsCommand{"__txn_statements",
+                              "txn_id",
+                              transaction.txn_id},
+            DeleteRowsCommand{"__txn_liveness",
+                              "txn_id",
+                              transaction.txn_id}};
+        for (const auto& command : catalog_deletes) {
+            Result result = catalog_(command);
+            if (!std::holds_alternative<DeleteRowsResult>(result)) {
+                step.result = std::move(result);
+                return step;
+            }
+        }
+
+        std::vector<Command> participant_deletes{
+            DeleteRowsCommand{"__participant_txns",
+                              "txn_id",
+                              transaction.txn_id},
+            DeleteRowsCommand{"__participant_statements",
+                              "txn_id",
+                              transaction.txn_id},
+            DeleteRowsCommand{"__txn_intents",
+                              "txn_id",
+                              transaction.txn_id}};
+        for (const auto& [group_id, executor] : replica_groups_) {
+            (void)group_id;
+            for (const auto& command : participant_deletes) {
+                Result result = executor(command);
+                if (!std::holds_alternative<DeleteRowsResult>(result)) {
+                    step.result = std::move(result);
+                    return step;
+                }
+            }
+        }
+
+        step.result = StatementOkResult{};
+        step.advanced = true;
+        return step;
+    }
+
     Executor catalog_;
     std::map<std::string, Executor> replica_groups_;
+    bool control_plane_leader_ = true;
+    int txn_timeout_ticks_ = 3;
+    int metadata_retention_ticks_ = 2;
 };
 
 std::string adapterTrim(const std::string& input) {
@@ -13465,6 +14103,8 @@ const std::vector<std::string>& systemCatalogTableNames() {
         "__participant_txns",
         "__participant_statements",
         "__txn_intents",
+        "__control_plane_ticks",
+        "__txn_liveness",
         "__schema_versions"
     };
     return names;
@@ -13970,6 +14610,13 @@ private:
             "__txn_intents",
             {"txn_id:string", "range_id:string", "replica_group_id:string",
              "write_key:string", "status:string"});
+        createSystemCatalogTableIfMissing(
+            "__control_plane_ticks",
+            {"runtime_id:string", "epoch:int"});
+        createSystemCatalogTableIfMissing(
+            "__txn_liveness",
+            {"txn_id:string", "owner:string", "epoch:int",
+             "deadline_epoch:int", "status:string"});
         createSystemCatalogTableIfMissing(
             "__schema_versions",
             {"table_name:string", "schema_version:int"});
@@ -15493,6 +16140,7 @@ private:
     int participantTxnStatusRank(const std::string& status) const {
         if (status == "committed") return 3;
         if (status == "aborted") return 2;
+        if (status == "waiting") return 1;
         if (status == "prepared") return 1;
         return 0;
     }
@@ -15709,7 +16357,7 @@ private:
             if (row.size() < 5 ||
                 row[0] != txn_id ||
                 row[1] != range_id ||
-                row[4] != "prepared") {
+                (row[4] != "prepared" && row[4] != "waiting")) {
                 continue;
             }
             indexed.push_back({
@@ -15741,7 +16389,7 @@ private:
                 row[0] != txn_id ||
                 row[1] != range_id ||
                 row[2] != replica_group_id ||
-                row[4] != "prepared") {
+                (row[4] != "prepared" && row[4] != "waiting")) {
                 continue;
             }
             keys.insert(row[3]);
@@ -16299,7 +16947,7 @@ private:
             hasPreparedIntentConflict(command.txn_id,
                                       command.participant_range_id,
                                       write_keys)
-                ? "aborted"
+                ? "waiting"
                 : "prepared";
 
         auto txn = db_->beginLoggedTxn("prepare-participant-" +
@@ -20382,15 +21030,16 @@ void printPartitionedSQLTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v138; "
-                  << "this version focuses on real 2PC participant state."
+        std::cerr << "--measure-restart is not available in v139; "
+                  << "this version focuses on distributed transaction liveness."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v138: real 2PC participant state" << std::endl;
+    std::cout << "BuzzDB v139: distributed transaction liveness"
+              << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
     if (!tests_only) {
@@ -20803,6 +21452,26 @@ int main(int argc, char* argv[]) {
             {{"txn_id", txn_id}, {"status", status}});
     };
 
+    auto txnHasLivenessStatus =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            const std::string& status) {
+            return selectAllHasRow(
+                catalogTableOn(group, group.leader, "__txn_liveness"),
+                {{"txn_id", txn_id},
+                 {"owner", "coordinator"},
+                 {"status", status}});
+        };
+
+    auto catalogHasTxnRow =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& table,
+            const std::string& txn_id) {
+            return selectAllHasRow(
+                catalogTableOn(group, group.leader, table),
+                {{"txn_id", txn_id}});
+        };
+
     struct RangeTransferView {
         std::string range_id;
         std::string source_group_id;
@@ -21115,6 +21784,49 @@ int main(int argc, char* argv[]) {
                     "coordinator prepare alone should not create participant state");
     });
 
+    tests.test("Control plane runtime is inert on non-leader", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[0];
+        std::string new_year = replacementProductionYear(row.values[3]);
+        std::string txn_id = "txn-nonleader-runtime";
+        runPrepare(
+            scenario.catalog,
+            txn_id,
+            {"UPDATE title SET production_year=" + new_year +
+             " WHERE id=" + row.values[0]});
+
+        ControlPlaneRuntime follower{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            },
+            false};
+        follower.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        follower.registerReplicaGroup(
+            scenario.index_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.index_owner, command);
+            });
+
+        auto step = follower.tick();
+        tests.check(!step.advanced &&
+                        step.status_after == "not_leader" &&
+                        std::holds_alternative<ConfigRejectedResult>(
+                            step.result),
+                    "non-leader runtime should refuse to drive control-plane work");
+        tests.check(txnHasStatus(scenario.catalog, txn_id, "prepared") &&
+                        catalogTableOn(scenario.table_owner,
+                                       scenario.table_owner.leader,
+                                       "__participant_txns").rows.empty() &&
+                        catalogTableOn(scenario.index_owner,
+                                       scenario.index_owner.leader,
+                                       "__participant_txns").rows.empty(),
+                    "non-leader tick should not create participant records");
+    });
+
     tests.test("Control plane runtime prepares participants before apply", [&] {
         auto scenario = buildIndexScenario();
         const auto& row = scenario.fixture.initial_rows[1];
@@ -21167,6 +21879,143 @@ int main(int argc, char* argv[]) {
                                     old_year).primary_keys,
                         row.values[0]),
                     "prepared participant transaction should not change the index owner");
+    });
+
+    tests.test("Coordinator crash after decision is recovered by new runtime", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[1];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        std::string txn_id = "txn-coordinator-crash-after-decision";
+        runPrepare(scenario.catalog, txn_id, statements);
+
+        auto before_crash = controlPlaneRuntime(scenario);
+        auto decision = before_crash.tick();
+        tests.check(decision.advanced &&
+                        decision.status_after == "committed" &&
+                        txnHasStatus(scenario.catalog, txn_id, "committed") &&
+                        firstRowValue(
+                            selectTitleById(scenario.table_owner,
+                                            row.values[0]),
+                            "production_year") == old_year,
+                    "first runtime should durably decide commit before data is visible");
+
+        auto recovered = controlPlaneRuntime(scenario);
+        tests.check(recovered.runUntilIdle() == 1,
+                    "new runtime should finish participants from the durable decision");
+        tests.check(txnHasStatus(scenario.catalog, txn_id, "ended") &&
+                        firstRowValue(
+                            selectTitleById(scenario.table_owner,
+                                            row.values[0]),
+                            "production_year") == new_year &&
+                        !containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        old_year).primary_keys,
+                            row.values[0]) &&
+                        containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        new_year).primary_keys,
+                            row.values[0]),
+                    "recovered runtime should apply every participant once");
+    });
+
+    tests.test("Participant crash after prepare is recovered idempotently", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[2];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        std::string txn_id = "txn-participant-crash-after-prepare";
+        std::string table_range = defaultRangeIdForTable("title");
+        std::string index_range = defaultRangeIdForIndex(title_year_index);
+        runPrepare(scenario.catalog, txn_id, statements);
+
+        Result table_prepared = commitCommand(
+            scenario.table_owner,
+            PrepareTxnParticipantCommand{
+                txn_id,
+                table_range,
+                scenario.table_owner.group_id,
+                statements});
+        tests.check(std::holds_alternative<DistributedTxnResult>(
+                        table_prepared) &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "prepared"),
+                    "table participant should durably prepare before crashing");
+
+        auto recovered = controlPlaneRuntime(scenario);
+        tests.check(recovered.runUntilIdle() == 2,
+                    "runtime should reuse prepared participant and finish the transaction");
+        tests.check(txnHasStatus(scenario.catalog, txn_id, "ended") &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "committed") &&
+                        participantHasStatus(scenario.index_owner,
+                                             txn_id,
+                                             index_range,
+                                             "committed") &&
+                        firstRowValue(
+                            selectTitleById(scenario.table_owner,
+                                            row.values[0]),
+                            "production_year") == new_year,
+                    "prepared participant recovery should converge both groups");
+    });
+
+    tests.test("Committed decision prepares participant that missed prepare", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[2];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        std::string txn_id = "txn-decision-before-prepare";
+        std::string table_range = defaultRangeIdForTable("title");
+        std::string index_range = defaultRangeIdForIndex(title_year_index);
+        runPrepare(scenario.catalog, txn_id, statements);
+        tests.check(std::holds_alternative<DistributedTxnResult>(
+                        commitPrepared(scenario.catalog, txn_id, false)),
+                    "coordinator should durably record commit decision");
+        tests.check(!catalogHasTxnRow(scenario.table_owner,
+                                      "__participant_txns",
+                                      txn_id) &&
+                        !catalogHasTxnRow(scenario.index_owner,
+                                          "__participant_txns",
+                                          txn_id),
+                    "participants should not have prepared yet");
+
+        auto runtime = controlPlaneRuntime(scenario);
+        tests.check(runtime.runUntilIdle() == 1,
+                    "runtime should prepare then commit participants from durable decision");
+        tests.check(txnHasStatus(scenario.catalog, txn_id, "ended") &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "committed") &&
+                        participantHasStatus(scenario.index_owner,
+                                             txn_id,
+                                             index_range,
+                                             "committed") &&
+                        firstRowValue(
+                            selectTitleById(scenario.table_owner,
+                                            row.values[0]),
+                            "production_year") == new_year &&
+                        !containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        old_year).primary_keys,
+                            row.values[0]),
+                    "commit-before-prepare recovery should update every participant");
     });
 
     tests.test("Control plane runtime commits participants and ends transaction", [&] {
@@ -21332,6 +22181,202 @@ int main(int argc, char* argv[]) {
                     "runtime should preserve commit decision and update every participant");
     });
 
+    tests.test("Aborted coordinator decision aborts prepared participants", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[4];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        std::string txn_id = "txn-aborted-decision-recovers";
+        std::string table_range = defaultRangeIdForTable("title");
+        std::string index_range = defaultRangeIdForIndex(title_year_index);
+        runPrepare(scenario.catalog, txn_id, statements);
+        tests.check(std::holds_alternative<DistributedTxnResult>(
+                        commitCommand(
+                            scenario.table_owner,
+                            PrepareTxnParticipantCommand{
+                                txn_id,
+                                table_range,
+                                scenario.table_owner.group_id,
+                                statements})) &&
+                        std::holds_alternative<DistributedTxnResult>(
+                            commitCommand(
+                                scenario.index_owner,
+                                PrepareTxnParticipantCommand{
+                                    txn_id,
+                                    index_range,
+                                    scenario.index_owner.group_id,
+                                    statements})),
+                    "participants should durably prepare before coordinator abort");
+        tests.check(std::holds_alternative<DistributedTxnResult>(
+                        abortPrepared(scenario.catalog, txn_id)),
+                    "coordinator should durably abort");
+
+        auto runtime = controlPlaneRuntime(scenario);
+        tests.check(runtime.runUntilIdle() == 1,
+                    "runtime should drive aborted decision to participants");
+        tests.check(txnHasStatus(scenario.catalog, txn_id, "aborted") &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "aborted") &&
+                        participantHasStatus(scenario.index_owner,
+                                             txn_id,
+                                             index_range,
+                                             "aborted") &&
+                        participantIntentHasStatus(scenario.table_owner,
+                                                   txn_id,
+                                                   table_range,
+                                                   "aborted") &&
+                        participantIntentHasStatus(scenario.index_owner,
+                                                   txn_id,
+                                                   index_range,
+                                                   "aborted"),
+                    "aborted decision should clean participant intents");
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner, row.values[0]),
+                        "production_year") == old_year &&
+                        !containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        new_year).primary_keys,
+                            row.values[0]),
+                    "aborted prepared transaction should not expose writes");
+
+        Result duplicate_coordinator_abort =
+            abortPrepared(scenario.catalog, txn_id);
+        Result duplicate_table_abort =
+            commitCommand(
+                scenario.table_owner,
+                AbortTxnParticipantCommand{
+                    txn_id,
+                    table_range,
+                    scenario.table_owner.group_id});
+        tests.check(std::get<DistributedTxnResult>(
+                        duplicate_coordinator_abort).status == "aborted" &&
+                        std::get<DistributedTxnResult>(
+                            duplicate_table_abort).status == "aborted",
+                    "duplicate coordinator and participant abort should be idempotent");
+    });
+
+    tests.test("Orphan prepared participant is aborted by janitor", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[4];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        std::string txn_id = "txn-orphan-participant";
+        std::string table_range = defaultRangeIdForTable("title");
+
+        Result prepared = commitCommand(
+            scenario.table_owner,
+            PrepareTxnParticipantCommand{
+                txn_id,
+                table_range,
+                scenario.table_owner.group_id,
+                statements});
+        tests.check(std::get<DistributedTxnResult>(prepared).status ==
+                        "prepared" &&
+                        !txnHasStatus(scenario.catalog,
+                                      txn_id,
+                                      "prepared"),
+                    "participant can have durable prepared state without coordinator recovery record");
+
+        auto runtime = controlPlaneRuntime(scenario);
+        auto step = runtime.tick();
+        tests.check(step.advanced &&
+                        step.range_id == table_range &&
+                        step.status_after == "aborted" &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "aborted"),
+                    "runtime should scan participant records and abort orphan prepare");
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner, row.values[0]),
+                        "production_year") == old_year,
+                    "orphan participant abort should not apply writes");
+    });
+
+    tests.test("Control plane janitor aborts unavailable participant prepare", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[5];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        std::string txn_id = "txn-timeout-missing-participant";
+        std::string table_range = defaultRangeIdForTable("title");
+        std::string index_range = defaultRangeIdForIndex(title_year_index);
+        runPrepare(scenario.catalog, txn_id, statements);
+
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            },
+            2};
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+
+        auto waiting = runtime.tick();
+        tests.check(waiting.advanced &&
+                        waiting.range_id == txn_id &&
+                        waiting.status_before == "prepared" &&
+                        waiting.status_after == "waiting" &&
+                        txnHasStatus(scenario.catalog, txn_id, "prepared") &&
+                        txnHasLivenessStatus(scenario.catalog,
+                                             txn_id,
+                                             "prepared") &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "prepared"),
+                    "missing participant should leave a durable prepared wait");
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner, row.values[0]),
+                        "production_year") == old_year &&
+                        containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        old_year).primary_keys,
+                            row.values[0]) &&
+                        !participantHasStatus(scenario.index_owner,
+                                              txn_id,
+                                              index_range,
+                                              "prepared"),
+                    "waiting transaction should not expose writes or invent missing participant state");
+
+        tests.check(runtime.runUntilIdle() == 2,
+                    "janitor should advance the durable deadline then abort");
+        tests.check(txnHasStatus(scenario.catalog, txn_id, "aborted") &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "aborted") &&
+                        participantIntentHasStatus(scenario.table_owner,
+                                                   txn_id,
+                                                   table_range,
+                                                   "aborted"),
+                    "timeout abort should be durable in coordinator and reachable participant");
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner, row.values[0]),
+                        "production_year") == old_year &&
+                        !containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        new_year).primary_keys,
+                            row.values[0]),
+                    "timeout abort should not apply table or index writes");
+    });
+
     tests.test("Duplicate runtime and commit do not double apply", [&] {
         auto scenario = buildIndexScenario();
         size_t table_count_before = countRowsOn(scenario.table_owner, "title");
@@ -21374,7 +22419,74 @@ int main(int argc, char* argv[]) {
                     "inserted row should have one visible index entry");
     });
 
-    tests.test("Runtime aborts conflicting participant prepare", [&] {
+    tests.test("Janitor collects old ended transaction metadata", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& extra = scenario.fixture.extra_row;
+        std::string txn_id = "txn-metadata-gc";
+        std::string table_range = defaultRangeIdForTable("title");
+        std::string index_range = defaultRangeIdForIndex(title_year_index);
+        runPrepare(scenario.catalog, txn_id, {"INSERT " + extra.line});
+
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            },
+            true,
+            3,
+            0};
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        runtime.registerReplicaGroup(
+            scenario.index_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.index_owner, command);
+            });
+
+        tests.check(runtime.runUntilIdle() == 3,
+                    "runtime should commit then collect immediately expired metadata");
+        tests.check(!catalogHasTxnRow(scenario.catalog,
+                                      "__distributed_txns",
+                                      txn_id) &&
+                        !catalogHasTxnRow(scenario.catalog,
+                                          "__txn_participants",
+                                          txn_id) &&
+                        !catalogHasTxnRow(scenario.catalog,
+                                          "__txn_statements",
+                                          txn_id) &&
+                        !catalogHasTxnRow(scenario.table_owner,
+                                          "__participant_txns",
+                                          txn_id) &&
+                        !catalogHasTxnRow(scenario.table_owner,
+                                          "__txn_intents",
+                                          txn_id) &&
+                        !catalogHasTxnRow(scenario.index_owner,
+                                          "__participant_txns",
+                                          txn_id) &&
+                        !catalogHasTxnRow(scenario.index_owner,
+                                          "__txn_intents",
+                                          txn_id),
+                    "janitor should remove old coordinator and participant metadata");
+        tests.check(containsText(
+                        readIndexOn(scenario.index_owner,
+                                    scenario.index_owner.leader,
+                                    extra.values[3]).primary_keys,
+                        extra.values[0]) &&
+                        countRowsOn(scenario.table_owner, "title") >= 1 &&
+                        !catalogHasTxnRow(scenario.table_owner,
+                                          "__participant_statements",
+                                          txn_id) &&
+                        !catalogHasTxnRow(scenario.index_owner,
+                                          "__participant_statements",
+                                          txn_id),
+                    "metadata GC should not remove committed user data");
+        (void)table_range;
+        (void)index_range;
+    });
+
+    tests.test("Runtime waits then aborts conflicting participant prepare", [&] {
         auto scenario = buildIndexScenario();
         const auto& row = scenario.fixture.initial_rows[5];
         std::string old_year = row.values[3];
@@ -21388,7 +22500,21 @@ int main(int argc, char* argv[]) {
             " WHERE id=" + row.values[0]};
         std::string table_range = defaultRangeIdForTable("title");
         std::string index_range = defaultRangeIdForIndex(title_year_index);
-        auto runtime = controlPlaneRuntime(scenario);
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            },
+            2};
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        runtime.registerReplicaGroup(
+            scenario.index_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.index_owner, command);
+            });
 
         runPrepare(scenario.catalog, "txn-conflict-1", first_statements);
         tests.check(runtime.tick().advanced &&
@@ -21400,15 +22526,46 @@ int main(int argc, char* argv[]) {
         auto conflict_step = runtime.tick();
         tests.check(conflict_step.advanced &&
                         conflict_step.range_id == "txn-conflict-2" &&
-                        conflict_step.status_after == "aborted" &&
+                        conflict_step.status_after == "waiting" &&
                         txnHasStatus(scenario.catalog,
                                      "txn-conflict-2",
-                                     "aborted"),
-                    "runtime should abort a transaction whose participant prepare conflicts");
+                                     "prepared"),
+                    "runtime should durably wait when participant prepare conflicts");
         tests.check(participantHasStatus(scenario.table_owner,
                                          "txn-conflict-2",
                                          table_range,
-                                         "aborted") &&
+                                         "waiting") &&
+                        participantHasStatus(scenario.index_owner,
+                                             "txn-conflict-2",
+                                             index_range,
+                                             "waiting") &&
+                        participantIntentHasStatus(scenario.table_owner,
+                                                   "txn-conflict-2",
+                                                   table_range,
+                                                   "waiting") &&
+                        participantIntentHasStatus(scenario.index_owner,
+                                                   "txn-conflict-2",
+                                                   index_range,
+                                                   "waiting"),
+                    "participant wait should be durable on real range groups");
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner, row.values[0]),
+                        "production_year") == old_year &&
+                        !containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        second_year).primary_keys,
+                            row.values[0]),
+                    "waiting conflicting transaction should not expose writes");
+        tests.check(runtime.runUntilIdle() == 3,
+                    "janitor should timeout the waiter then finish the first commit");
+        tests.check(txnHasStatus(scenario.catalog,
+                                 "txn-conflict-2",
+                                 "aborted") &&
+                        participantHasStatus(scenario.table_owner,
+                                             "txn-conflict-2",
+                                             table_range,
+                                             "aborted") &&
                         participantHasStatus(scenario.index_owner,
                                              "txn-conflict-2",
                                              index_range,
@@ -21421,16 +22578,25 @@ int main(int argc, char* argv[]) {
                                                    "txn-conflict-2",
                                                    index_range,
                                                    "aborted"),
-                    "participant abort should be durable on real range groups");
-        tests.check(firstRowValue(
-                        selectTitleById(scenario.table_owner, row.values[0]),
-                        "production_year") == old_year &&
+                    "janitor abort should clean up waiting participant state");
+        tests.check(txnHasStatus(scenario.catalog,
+                                 "txn-conflict-1",
+                                 "ended") &&
+                        firstRowValue(
+                            selectTitleById(scenario.table_owner,
+                                            row.values[0]),
+                            "production_year") == first_year &&
                         !containsText(
                             readIndexOn(scenario.index_owner,
                                         scenario.index_owner.leader,
                                         second_year).primary_keys,
+                            row.values[0]) &&
+                        containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        first_year).primary_keys,
                             row.values[0]),
-                    "aborted conflicting transaction should not expose writes");
+                    "aborting the waiter should not roll back the earlier commit decision");
     });
 
     tests.test("Participant range and group mismatch is rejected", [&] {
