@@ -22377,6 +22377,79 @@ int main(int argc, char* argv[]) {
                     "timeout abort should not apply table or index writes");
     });
 
+    tests.test("Transaction timeout resumes after runtime restart", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& row = scenario.fixture.initial_rows[5];
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+        std::string txn_id = "txn-timeout-resume-after-restart";
+        std::string table_range = defaultRangeIdForTable("title");
+        std::string index_range = defaultRangeIdForIndex(title_year_index);
+        runPrepare(scenario.catalog, txn_id, statements);
+
+        ControlPlaneRuntime first_runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            },
+            2};
+        first_runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        auto waiting = first_runtime.tick();
+        tests.check(waiting.advanced &&
+                        waiting.status_after == "waiting" &&
+                        txnHasStatus(scenario.catalog, txn_id, "prepared") &&
+                        txnHasLivenessStatus(scenario.catalog,
+                                             txn_id,
+                                             "prepared") &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "prepared") &&
+                        !participantHasStatus(scenario.index_owner,
+                                              txn_id,
+                                              index_range,
+                                              "prepared"),
+                    "first runtime should durably record a waiting transaction");
+
+        ControlPlaneRuntime restarted{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            },
+            2};
+        restarted.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        tests.check(restarted.runUntilIdle() == 2,
+                    "restarted runtime should continue the durable timeout");
+        tests.check(txnHasStatus(scenario.catalog, txn_id, "aborted") &&
+                        participantHasStatus(scenario.table_owner,
+                                             txn_id,
+                                             table_range,
+                                             "aborted") &&
+                        participantIntentHasStatus(scenario.table_owner,
+                                                   txn_id,
+                                                   table_range,
+                                                   "aborted"),
+                    "restarted janitor should abort coordinator and reachable participant");
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner, row.values[0]),
+                        "production_year") == old_year &&
+                        !containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        new_year).primary_keys,
+                            row.values[0]),
+                    "resumed timeout abort should keep writes invisible");
+    });
+
     tests.test("Duplicate runtime and commit do not double apply", [&] {
         auto scenario = buildIndexScenario();
         size_t table_count_before = countRowsOn(scenario.table_owner, "title");

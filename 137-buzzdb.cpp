@@ -20320,6 +20320,65 @@ int main(int argc, char* argv[]) {
                     "target physical HashIndex should answer moved lookup");
     });
 
+    tests.test("Prepared transaction rejects commit after range ownership changes", [&] {
+        auto scenario = buildIndexMovementScenario();
+        const auto& row = scenario.fixture.initial_rows[0];
+        std::string range_id = defaultRangeIdForIndex(title_year_index);
+        std::string old_year = row.values[3];
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + row.values[0]};
+
+        DistributedTxnResult prepared =
+            runPrepare(scenario.catalog,
+                       "txn-reconfig-before-commit",
+                       statements);
+        tests.check(prepared.status == "prepared" &&
+                        containsText(prepared.participant_replica_group_ids,
+                                     scenario.source.group_id),
+                    "prepare should pin the index participant owner from the old config");
+
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        MoveRangeCommand{range_id, scenario.target.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "move should enqueue a real range transfer");
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            }
+        };
+        runtime.registerReplicaGroup(
+            scenario.source.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.source, command);
+            });
+        runtime.registerReplicaGroup(
+            scenario.target.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.target, command);
+            });
+        tests.check(runtime.runUntilIdle() == 3,
+                    "runtime should physically move the range before ownership changes");
+        tests.check(indexRouteGroupOnCatalog(scenario.catalog, old_year) ==
+                        scenario.target.group_id,
+                    "catalog should route the index range to the new owner");
+
+        tests.check(commitPrepared(scenario.catalog,
+                                   "txn-reconfig-before-commit",
+                                   false) ==
+                        Result{ConfigRejectedResult{}},
+                    "stale prepared participants should not be allowed to commit");
+        tests.check(txnHasStatus(scenario.catalog,
+                                 "txn-reconfig-before-commit",
+                                 "prepared") &&
+                        !txnHasStatus(scenario.catalog,
+                                      "txn-reconfig-before-commit",
+                                      "committed"),
+                    "rejected commit should leave only the prepared coordinator record");
+    });
+
     tests.test("Prepared distributed transaction is not visible before decision", [&] {
         auto scenario = buildIndexScenario();
         const auto& row = scenario.fixture.initial_rows[0];

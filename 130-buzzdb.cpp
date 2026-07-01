@@ -17135,6 +17135,47 @@ int main(int argc, char* argv[]) {
                     "full scan route should span both range groups");
     });
 
+    tests.test("Split routing metadata replicates to catalog followers", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenario();
+        SelectAllResult expected_ranges =
+            catalogRowsForGroup(scenario, "__ranges");
+        SelectAllResult expected_keys =
+            catalogRowsForGroup(scenario, "__global_keys");
+        RouteResult expected_left =
+            routeOnCatalog(scenario, scenario.fixture.left_values.front());
+        RouteResult expected_right =
+            routeOnCatalog(scenario, scenario.fixture.right_values.front());
+
+        for (const auto& replica : scenario.catalog.replicas) {
+            const auto* node = scenario.state.nodeAs<ConsensusReplica>(replica);
+            tests.check(node != nullptr,
+                        "catalog replica should exist for replicated route test");
+            if (node == nullptr) continue;
+            Result ranges_result = node->executeReadOnlyForTest(
+                ReadSystemCatalogCommand{"__ranges"});
+            Result keys_result = node->executeReadOnlyForTest(
+                ReadSystemCatalogCommand{"__global_keys"});
+            Result left_result = node->executeReadOnlyForTest(
+                ExplainRouteCommand{
+                    "title", scenario.fixture.left_values.front(), false});
+            Result right_result = node->executeReadOnlyForTest(
+                ExplainRouteCommand{
+                    "title", scenario.fixture.right_values.front(), false});
+            const auto* ranges = std::get_if<SelectAllResult>(&ranges_result);
+            const auto* keys = std::get_if<SelectAllResult>(&keys_result);
+            const auto* left = std::get_if<RouteResult>(&left_result);
+            const auto* right = std::get_if<RouteResult>(&right_result);
+
+            tests.check(ranges != nullptr && *ranges == expected_ranges,
+                        "catalog follower should expose replicated range descriptors");
+            tests.check(keys != nullptr && *keys == expected_keys,
+                        "catalog follower should expose replicated key ownership");
+            tests.check(left != nullptr && *left == expected_left &&
+                            right != nullptr && *right == expected_right,
+                        "catalog follower should route through the same child ranges");
+        }
+    });
+
     tests.test("Split movement leaves exactly one physical copy per title key", [&] {
         auto scenario = buildIntegratedRangeReplicaScenario();
         tests.check(countTitlesInGroup(scenario, scenario.parent_group) == 0,

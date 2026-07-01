@@ -18550,5 +18550,44 @@ int main(int argc, char* argv[]) {
                     "same decision should produce the same manifests");
     });
 
+    tests.test("Runtime stays idle after rebalanced transfer commits", [&] {
+        auto scenario = buildRebalanceScenario();
+        RebalanceResult result = rebalance(scenario.catalog);
+        tests.check(result.moved,
+                    "rebalance should enqueue a real transfer request");
+        completeTransfer(scenario, result);
+
+        RangeConfigResult committed = configOn(scenario.catalog);
+        SelectAllResult transfers =
+            catalogTableOn(scenario.catalog,
+                           scenario.catalog.leader,
+                           "__range_transfers");
+        size_t source_rows =
+            physicalRowCountInRange(scenario,
+                                    scenario.source_group,
+                                    result.range_id);
+        size_t target_rows =
+            physicalRowCountInRange(scenario,
+                                    scenario.target_group,
+                                    result.range_id);
+        ControlPlaneRuntime runtime = controlPlaneRuntime(scenario);
+
+        tests.check(runtime.runUntilIdle() == 0,
+                    "runtime should not rediscover committed rebalance work");
+        tests.check(configOn(scenario.catalog) == committed,
+                    "idle runtime should not append a new range config");
+        tests.check(catalogTableOn(scenario.catalog,
+                                   scenario.catalog.leader,
+                                   "__range_transfers") == transfers,
+                    "idle runtime should not append transfer manifests");
+        tests.check(physicalRowCountInRange(
+                        scenario, scenario.source_group, result.range_id) ==
+                        source_rows &&
+                        physicalRowCountInRange(
+                            scenario, scenario.target_group, result.range_id) ==
+                            target_rows,
+                    "idle runtime should not recopy or delete physical rows");
+    });
+
     return tests.finish();
 }

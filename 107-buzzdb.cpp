@@ -16,7 +16,7 @@
 
 // BuzzDB v107: run settings and controlled network faults.
 //
-// This is the Lab 4 runtime shape without real sockets or threads. Tests can
+// This is the controlled runtime shape without real sockets or threads. Tests can
 // add/remove nodes, add clients after the run starts, partition the network,
 // disable individual links/nodes, and use seeded unreliable delivery.
 

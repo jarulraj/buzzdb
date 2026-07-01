@@ -17783,5 +17783,37 @@ int main(int argc, char* argv[]) {
         }
     });
 
+    tests.test("Historical config is immutable across later requests", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenario();
+        RangeConfigResult base = configOn(scenario);
+        SelectAllResult movements_before = movementRows(scenario);
+
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        JoinReplicaGroupCommand{
+                            "group-2", {"g2s1", "g2s2", "g2s3"}}) ==
+                        Result{StatementOkResult{}},
+                    "join should append movement requests through catalog consensus");
+        tests.check(commitCommand(
+                        scenario,
+                        scenario.catalog,
+                        MoveRangeCommand{titleRightRangeId(), "group-2"}) ==
+                        Result{StatementOkResult{}},
+                    "move should append another movement request");
+
+        Result historical_result =
+            queryConfigOn(scenario, scenario.catalog.leader, base.config_num);
+        const auto* historical =
+            std::get_if<RangeConfigResult>(&historical_result);
+        tests.check(historical != nullptr && *historical == base,
+                    "historical config query should return the original config");
+        tests.check(configOn(scenario) == base,
+                    "requested movement should not change active config");
+        tests.check(movementRows(scenario).rows.size() >
+                        movements_before.rows.size(),
+                    "join and move should leave durable movement requests");
+    });
+
     return tests.finish();
 }

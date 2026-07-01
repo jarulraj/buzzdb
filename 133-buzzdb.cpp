@@ -18499,5 +18499,48 @@ int main(int argc, char* argv[]) {
         }
     });
 
+    tests.test("Runtime is idle after committed transfer", [&] {
+        auto scenario = buildTransferScenario();
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        MoveRangeCommand{titleLeftRangeId(),
+                                         scenario.target_group.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "move should enqueue a real transfer request");
+
+        ControlPlaneRuntime runtime = controlPlaneRuntime(scenario);
+        tests.check(runtime.runUntilIdle() == 3,
+                    "runtime should drive prepare, catch-up, and commit");
+        RangeConfigResult committed = configOn(scenario.catalog);
+        SelectAllResult transfers =
+            catalogTableOn(scenario.catalog,
+                           scenario.catalog.leader,
+                           "__range_transfers");
+        size_t source_rows =
+            physicalRowCountInRange(scenario,
+                                    scenario.source_group,
+                                    titleLeftRangeId());
+        size_t target_rows =
+            physicalRowCountInRange(scenario,
+                                    scenario.target_group,
+                                    titleLeftRangeId());
+
+        tests.check(runtime.runUntilIdle() == 0,
+                    "runtime should find no active work after committed transfer");
+        tests.check(configOn(scenario.catalog) == committed,
+                    "idle runtime should not append another config");
+        tests.check(catalogTableOn(scenario.catalog,
+                                   scenario.catalog.leader,
+                                   "__range_transfers") == transfers,
+                    "idle runtime should not append transfer records");
+        tests.check(physicalRowCountInRange(
+                        scenario, scenario.source_group,
+                        titleLeftRangeId()) == source_rows &&
+                        physicalRowCountInRange(
+                            scenario, scenario.target_group,
+                            titleLeftRangeId()) == target_rows,
+                    "idle runtime should not move physical rows again");
+    });
+
     return tests.finish();
 }

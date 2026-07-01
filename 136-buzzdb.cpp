@@ -15004,6 +15004,57 @@ private:
         return status;
     }
 
+    std::optional<size_t> latestDistributedTxnStatementCount(
+        const std::string& txn_id) {
+        SelectAllResult rows = selectSystemCatalogTable("__distributed_txns");
+        std::optional<size_t> count;
+        int best_rank = 0;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 5 || row[0] != txn_id) {
+                continue;
+            }
+            int rank = distributedTxnStatusRank(row[4]);
+            if (rank >= best_rank) {
+                try {
+                    count = static_cast<size_t>(std::stoull(row[2]));
+                    best_rank = rank;
+                } catch (const std::exception&) {
+                    count.reset();
+                }
+            }
+        }
+        return count;
+    }
+
+    std::vector<TxnParticipant> storedTxnParticipants(
+        const std::string& txn_id) {
+        SelectAllResult rows = selectSystemCatalogTable("__txn_participants");
+        std::map<size_t, std::pair<int, TxnParticipant>> indexed;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 5 || row[0] != txn_id) {
+                continue;
+            }
+            try {
+                size_t index = static_cast<size_t>(std::stoull(row[3]));
+                int rank = distributedTxnStatusRank(row[4]);
+                auto it = indexed.find(index);
+                if (it == indexed.end() || rank >= it->second.first) {
+                    indexed[index] =
+                        {rank, TxnParticipant{row[1], row[2]}};
+                }
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+
+        std::vector<TxnParticipant> participants;
+        for (const auto& [index, participant] : indexed) {
+            (void)index;
+            participants.push_back(participant.second);
+        }
+        return participants;
+    }
+
     Result validateDistributedStatementShape(const Command& parsed) {
         if (const auto* insert = std::get_if<InsertRowCommand>(&parsed)) {
             if (!tableExists(insert->table)) return TableNotFoundResult{};
@@ -15487,6 +15538,28 @@ private:
         ensureSystemCatalogTables();
         if (command.txn_id.empty() || command.statements.empty()) {
             return RouteRejectedResult{};
+        }
+
+        std::string existing_status =
+            latestDistributedTxnStatus(command.txn_id);
+        if (!existing_status.empty()) {
+            std::vector<TxnParticipant> participants =
+                storedTxnParticipants(command.txn_id);
+            if (participants.empty()) return RouteRejectedResult{};
+            std::optional<size_t> statement_count =
+                latestDistributedTxnStatementCount(command.txn_id);
+            if (!statement_count.has_value()) return RouteRejectedResult{};
+            DistributedTxnResult result;
+            result.txn_id = command.txn_id;
+            result.statement_count = *statement_count;
+            result.status =
+                existing_status == "ended" ? "committed" : existing_status;
+            for (const auto& participant : participants) {
+                result.participant_range_ids.push_back(participant.range_id);
+                result.participant_replica_group_ids.push_back(
+                    participant.replica_group_id);
+            }
+            return result;
         }
 
         std::map<std::string, TxnParticipant> participant_map;
@@ -19946,6 +20019,46 @@ int main(int argc, char* argv[]) {
                                  {"status", "committed"}}),
                         "each participant should have prepare and commit rows");
         }
+    });
+
+    tests.test("Coordinator retry with same txn id is idempotent", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& extra = scenario.fixture.extra_row;
+        std::vector<std::string> statements{"INSERT " + extra.line};
+
+        Result first_result = commitCommand(
+            scenario.catalog,
+            DistributedTransactionCommand{"txn-coordinator-retry", statements});
+        const auto* first = std::get_if<DistributedTxnResult>(&first_result);
+        tests.check(first != nullptr && first->status == "committed" &&
+                        containsText(first->participant_range_ids,
+                                     defaultRangeIdForTable("title")) &&
+                        containsText(first->participant_range_ids,
+                                     defaultRangeIdForIndex(title_year_index)),
+                    "first coordinator pass should durably decide both participants");
+        SelectAllResult txns_after_first =
+            catalogTableOn(scenario.catalog,
+                           scenario.catalog.leader,
+                           "__distributed_txns");
+        SelectAllResult participants_after_first =
+            catalogTableOn(scenario.catalog,
+                           scenario.catalog.leader,
+                           "__txn_participants");
+
+        Result retry_result = commitCommand(
+            scenario.catalog,
+            DistributedTransactionCommand{"txn-coordinator-retry", statements});
+        const auto* retry = std::get_if<DistributedTxnResult>(&retry_result);
+        tests.check(retry != nullptr && first != nullptr && *retry == *first,
+                    "retry should return the stored coordinator decision");
+        tests.check(catalogTableOn(scenario.catalog,
+                                   scenario.catalog.leader,
+                                   "__distributed_txns") == txns_after_first &&
+                        catalogTableOn(scenario.catalog,
+                                       scenario.catalog.leader,
+                                       "__txn_participants") ==
+                            participants_after_first,
+                    "retry should not append duplicate coordinator metadata");
     });
 
     tests.test("Multi-statement distributed transaction commits atomically", [&] {

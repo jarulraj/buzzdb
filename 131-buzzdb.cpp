@@ -17483,8 +17483,47 @@ int main(int argc, char* argv[]) {
                         active,
                         {{"range_id", titleRightRangeId()},
                          {"replica_group_id", scenario.left_child_group.group_id},
-                         {"owner_version", "1"}}),
+                        {"owner_version", "1"}}),
                     "latest view should not expose stale owner row");
+    });
+
+    tests.test("Historical ownership keeps superseded parent row", [&] {
+        auto scenario = buildIntegratedRangeReplicaScenario();
+        SelectAllResult active = ownershipRowsForCatalog(scenario, "title");
+        SelectAllResult history =
+            ownershipRowsForCatalog(scenario, "title", false);
+
+        tests.check(active.rows.size() == 2,
+                    "active ownership should expose only child ranges");
+        tests.check(history.rows.size() == 3,
+                    "historical ownership should retain parent plus children");
+        tests.check(selectAllHasRow(
+                        history,
+                        {{"range_id", defaultRangeIdForTable("title")},
+                         {"replica_group_id", scenario.parent_group.group_id},
+                         {"owner_version", "2"},
+                         {"status", "superseded"}}),
+                    "parent owner should remain as superseded history");
+        tests.check(selectAllHasRow(
+                        history,
+                        {{"range_id", titleLeftRangeId()},
+                         {"replica_group_id", scenario.left_child_group.group_id},
+                         {"owner_version", "2"},
+                         {"status", "active"}}) &&
+                        selectAllHasRow(
+                            history,
+                            {{"range_id", titleRightRangeId()},
+                             {"replica_group_id",
+                              scenario.right_child_group.group_id},
+                             {"owner_version", "2"},
+                             {"status", "active"}}),
+                    "historical ownership should also include both active children");
+        RouteResult route =
+            routeOnCatalog(scenario, scenario.fixture.left_values.front());
+        tests.check(route.replica_group_ids ==
+                        std::vector<std::string>{
+                            scenario.left_child_group.group_id},
+                    "routing should ignore superseded parent ownership");
     });
 
     return tests.finish();

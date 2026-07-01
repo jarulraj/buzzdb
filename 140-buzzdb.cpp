@@ -2610,13 +2610,15 @@ public:
 
         for (auto& tuple : tables_heap.readAllTuples()) {
             TableId table_id = static_cast<TableId>(tuple->fields[0]->asInt());
+            std::string table_name = tuple->fields[1]->asString();
             if (table_id == SYS_TABLES_ID ||
                 table_id == SYS_COLUMNS_ID ||
                 table_id == SYS_STATS_ID ||
-                table_id == SYS_STAT_VALUES_ID) {
+                table_id == SYS_STAT_VALUES_ID ||
+                isInternalTableName(table_name)) {
                 continue;
             }
-            table_names.push_back(tuple->fields[1]->asString());
+            table_names.push_back(table_name);
         }
 
         return table_names;
@@ -2643,7 +2645,7 @@ public:
 
         TableMetadata metadata{
             table_id, name, std::move(schema), {first_page},
-            first_page, first_page, 0, false
+            first_page, first_page, 0, isInternalTableName(name)
         };
         auto& cached_metadata = cacheTable(std::move(metadata));
 
@@ -2681,9 +2683,11 @@ public:
     }
 
     void persistTableMetadata(TableMetadata& metadata) {
-        if (!metadata.system_table) {
-            persistTableRecord(metadata);
+        if (metadata.table_id == SYS_TABLES_ID ||
+            metadata.table_id == SYS_COLUMNS_ID) {
+            return;
         }
+        persistTableRecord(metadata);
     }
 
     void persistColumnStats(const std::vector<PersistedColumnStats>& records) {
@@ -2752,6 +2756,10 @@ public:
     }
 
 private:
+    static bool isInternalTableName(const std::string& name) {
+        return name.rfind("__", 0) == 0;
+    }
+
     BootstrapPage getBootstrap() {
         if (buffer_manager.isEmptyDatabase()) {
             throw std::runtime_error("Bootstrap page is not initialized.");
@@ -3377,7 +3385,7 @@ private:
                 first_page,
                 static_cast<PageID>(tuple->fields[3]->asInt()),
                 static_cast<size_t>(tuple->fields[4]->asInt()),
-                false
+                isInternalTableName(tuple->fields[1]->asString())
             };
 
             if (predicate(candidate)) {
@@ -6572,7 +6580,8 @@ public:
         if (!tupleToInsert) {
             return false;
         }
-        if (txn_) {
+        bool use_mvcc = txn_ && !tableHeap.isSystemTable();
+        if (use_mvcc) {
             tupleToInsert->mvcc.begin = HybridLogicalTimestamp::zero();
             tupleToInsert->mvcc.end = HybridLogicalTimestamp::infinity();
             tupleToInsert->mvcc.creator_txn_id = txn_->id;
@@ -6588,7 +6597,7 @@ public:
                 txn_ ? txn_->id : 0
             );
         if (!inserted.has_value()) return false;
-        if (txn_) {
+        if (use_mvcc) {
             txn_->inserted_tuple_ids.push_back(*inserted);
         }
         return true;
@@ -6634,13 +6643,15 @@ public:
             return false;
         }
 
+        TxnContext* mvcc_txn = tableHeap.isSystemTable() ? nullptr
+                                                         : txn_.get();
         updatedCount = tableHeap.updateTuples(
             whereColumn,
             whereValue,
             assignments,
             recoveryManager,
             txn_ ? txn_->id : 0,
-            txn_.get()
+            mvcc_txn
         );
         executed = true;
         return updatedCount > 0;
@@ -6683,12 +6694,14 @@ public:
             return false;
         }
 
+        TxnContext* mvcc_txn = tableHeap.isSystemTable() ? nullptr
+                                                         : txn_.get();
         deletedCount = tableHeap.deleteTuples(
             whereColumn,
             whereValue,
             recoveryManager,
             txn_ ? txn_->id : 0,
-            txn_.get()
+            mvcc_txn
         );
         executed = true;
         return deletedCount > 0;
@@ -12417,6 +12430,8 @@ struct PrepareRangeTransferCommand {
 struct CatchUpRangeTransferCommand {
     std::string range_id;
     int transfer_epoch = 1;
+    size_t source_key_count = 0;
+    size_t target_key_count = 0;
 };
 
 struct CommitRangeTransferCommand {
@@ -12438,6 +12453,7 @@ struct ImportRangeRowsCommand {
     std::string start_key;
     std::string end_key;
     std::vector<std::vector<std::string>> rows;
+    std::vector<std::vector<std::string>> client_session_rows;
 };
 
 struct DeleteRangeRowsCommand {
@@ -12738,7 +12754,9 @@ bool operator==(const PrepareRangeTransferCommand& lhs,
 bool operator==(const CatchUpRangeTransferCommand& lhs,
                 const CatchUpRangeTransferCommand& rhs) {
     return lhs.range_id == rhs.range_id &&
-           lhs.transfer_epoch == rhs.transfer_epoch;
+           lhs.transfer_epoch == rhs.transfer_epoch &&
+           lhs.source_key_count == rhs.source_key_count &&
+           lhs.target_key_count == rhs.target_key_count;
 }
 bool operator==(const CommitRangeTransferCommand& lhs,
                 const CommitRangeTransferCommand& rhs) {
@@ -12755,7 +12773,8 @@ bool operator==(const ImportRangeRowsCommand& lhs,
     return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
            lhs.target_replica_group_id == rhs.target_replica_group_id &&
            lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
-           lhs.rows == rhs.rows;
+           lhs.rows == rhs.rows &&
+           lhs.client_session_rows == rhs.client_session_rows;
 }
 bool operator==(const DeleteRangeRowsCommand& lhs,
                 const DeleteRangeRowsCommand& rhs) {
@@ -12826,6 +12845,8 @@ struct RangeRowsResult {
     std::string end_key;
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
+    std::vector<std::string> client_session_columns;
+    std::vector<std::vector<std::string>> client_session_rows;
 };
 struct RouteResult {
     std::string start_key;
@@ -12922,7 +12943,9 @@ bool operator==(const SelectAllResult& lhs, const SelectAllResult& rhs) { return
 bool operator==(const RangeRowsResult& lhs, const RangeRowsResult& rhs) {
     return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
            lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
-           lhs.columns == rhs.columns && lhs.rows == rhs.rows;
+           lhs.columns == rhs.columns && lhs.rows == rhs.rows &&
+           lhs.client_session_columns == rhs.client_session_columns &&
+           lhs.client_session_rows == rhs.client_session_rows;
 }
 bool operator==(const RouteResult& lhs, const RouteResult& rhs) {
     return lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
@@ -13201,7 +13224,9 @@ std::string describeCommand(const Command& command) {
                     << ", epoch=" << value.transfer_epoch << ")";
             } else if constexpr (std::is_same_v<T, CatchUpRangeTransferCommand>) {
                 out << "CatchUpRangeTransfer(" << value.range_id
-                    << ", epoch=" << value.transfer_epoch << ")";
+                    << ", epoch=" << value.transfer_epoch
+                    << ", source_keys=" << value.source_key_count
+                    << ", target_keys=" << value.target_key_count << ")";
             } else if constexpr (std::is_same_v<T, CommitRangeTransferCommand>) {
                 out << "CommitRangeTransfer(" << value.range_id
                     << ", epoch=" << value.transfer_epoch << ")";
@@ -13308,12 +13333,18 @@ public:
     }
 
     Result catchUp() {
-        Result copied = copySourceToTarget();
+        size_t source_key_count = 0;
+        size_t target_key_count = 0;
+        Result copied = copySourceToTarget(&source_key_count,
+                                           &target_key_count);
         if (!std::holds_alternative<StatementOkResult>(copied)) {
             return copied;
         }
         return catalog_(
-            Command{CatchUpRangeTransferCommand{range_id_, transfer_epoch_}});
+            Command{CatchUpRangeTransferCommand{range_id_,
+                                                transfer_epoch_,
+                                                source_key_count,
+                                                target_key_count}});
     }
 
     Result commit() {
@@ -13347,12 +13378,16 @@ public:
     }
 
 private:
-    Result copySourceToTarget() {
+    Result copySourceToTarget(size_t* source_key_count = nullptr,
+                              size_t* target_key_count = nullptr) {
         Result exported = source_(
             Command{ExportRangeRowsCommand{
                 table_, range_id_, start_key_, end_key_}});
         const auto* rows = std::get_if<RangeRowsResult>(&exported);
         if (rows == nullptr) return exported;
+        if (source_key_count != nullptr) {
+            *source_key_count = rows->rows.size();
+        }
         Result imported = target_(
             Command{ImportRangeRowsCommand{
                 table_,
@@ -13360,9 +13395,14 @@ private:
                 target_replica_group_id_,
                 start_key_,
                 end_key_,
-                rows->rows}});
-        if (!std::holds_alternative<CountRowsResult>(imported)) {
+                rows->rows,
+                rows->client_session_rows}});
+        const auto* count = std::get_if<CountRowsResult>(&imported);
+        if (count == nullptr) {
             return imported;
+        }
+        if (target_key_count != nullptr) {
+            *target_key_count = count->count;
         }
         return StatementOkResult{};
     }
@@ -14832,6 +14872,7 @@ const std::vector<std::string>& systemCatalogTableNames() {
         "__txn_intents",
         "__control_plane_ticks",
         "__txn_liveness",
+        "__range_client_sessions",
         "__schema_versions"
     };
     return names;
@@ -15163,6 +15204,69 @@ public:
     std::string logFile() const { return buzzdbCompanionFilename(database_file_, ".log"); }
     std::string masterFile() const { return buzzdbCompanionFilename(database_file_, ".master"); }
 
+    std::optional<Result> cachedClientResultForCommand(
+        const Command& command,
+        int client_id,
+        int request_id) {
+        ScopedBuzzDBFileBundle scope(database_file_);
+        if (!tableExists("__range_client_sessions")) return std::nullopt;
+        std::optional<std::string> range_id;
+        try {
+            range_id = clientSessionRangeForCommand(command);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+        if (!range_id.has_value()) return std::nullopt;
+
+        SelectAllResult sessions =
+            selectSystemCatalogTable("__range_client_sessions");
+        for (const auto& row : sessions.rows) {
+            if (row.size() < 6 ||
+                row[0] != *range_id ||
+                row[1] != std::to_string(client_id) ||
+                row[2] != std::to_string(request_id) ||
+                row[5] != "active") {
+                continue;
+            }
+            return decodeClientSessionResult(row[3], row[4]);
+        }
+        return std::nullopt;
+    }
+
+    void recordClientResultForCommand(const Command& command,
+                                      int client_id,
+                                      int request_id,
+                                      const Result& result) {
+        ScopedBuzzDBFileBundle scope(database_file_);
+        ensureSystemCatalogTables();
+        auto range_id = clientSessionRangeForCommand(command);
+        auto encoded = encodeClientSessionResult(result);
+        if (!range_id.has_value() || !encoded.has_value()) return;
+
+        SelectAllResult sessions =
+            selectSystemCatalogTable("__range_client_sessions");
+        for (const auto& row : sessions.rows) {
+            if (row.size() >= 6 &&
+                row[0] == *range_id &&
+                row[1] == std::to_string(client_id) &&
+                row[2] == std::to_string(request_id) &&
+                row[5] == "active") {
+                return;
+            }
+        }
+
+        insertSystemCatalogRows({
+            InsertRowCommand{
+                "__range_client_sessions",
+                {*range_id,
+                 std::to_string(client_id),
+                 std::to_string(request_id),
+                 encoded->first,
+                 encoded->second,
+                 "active"}}
+        });
+    }
+
     std::string subsystemSummary() const {
         ScopedBuzzDBFileBundle scope(database_file_);
         std::ostringstream out;
@@ -15220,6 +15324,94 @@ public:
     }
 
 private:
+    static std::optional<std::pair<std::string, std::string>>
+    encodeClientSessionResult(const Result& result) {
+        if (std::holds_alternative<InsertOkResult>(result)) {
+            return std::make_pair(std::string("InsertOk"), std::string("ok"));
+        }
+        if (const auto* updated = std::get_if<UpdateRowsResult>(&result)) {
+            return std::make_pair(std::string("UpdateRows"),
+                                  std::to_string(updated->count));
+        }
+        if (const auto* deleted = std::get_if<DeleteRowsResult>(&result)) {
+            return std::make_pair(std::string("DeleteRows"),
+                                  std::to_string(deleted->count));
+        }
+        if (std::holds_alternative<StatementOkResult>(result)) {
+            return std::make_pair(std::string("StatementOk"),
+                                  std::string("ok"));
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<Result> decodeClientSessionResult(
+        const std::string& kind,
+        const std::string& value) {
+        if (kind == "InsertOk") return Result{InsertOkResult{}};
+        if (kind == "UpdateRows") {
+            return Result{
+                UpdateRowsResult{
+                    static_cast<size_t>(std::stoull(value.empty() ? "0"
+                                                                  : value))}};
+        }
+        if (kind == "DeleteRows") {
+            return Result{
+                DeleteRowsResult{
+                    static_cast<size_t>(std::stoull(value.empty() ? "0"
+                                                                  : value))}};
+        }
+        if (kind == "StatementOk") return Result{StatementOkResult{}};
+        return std::nullopt;
+    }
+
+    std::optional<std::string> clientSessionRangeForCommand(
+        const Command& command) {
+        if (const auto* routed = std::get_if<RoutedSQLCommand>(&command)) {
+            try {
+                return clientSessionRangeForCommand(parseSQL(routed->sql));
+            } catch (const std::exception&) {
+                return std::nullopt;
+            }
+        }
+
+        std::optional<std::string> table;
+        std::optional<std::string> primary_key;
+        if (const auto* insert = std::get_if<InsertRowCommand>(&command)) {
+            table = insert->table;
+            primary_key = primaryKeyValueFromInsert(*insert);
+        } else if (const auto* update =
+                       std::get_if<UpdateRowsCommand>(&command)) {
+            if (!isPrimaryKeyColumn(update->table, update->where_column) ||
+                isPrimaryKeyColumn(update->table, update->set_column)) {
+                return std::nullopt;
+            }
+            table = update->table;
+            primary_key = update->where_value;
+        } else if (const auto* remove =
+                       std::get_if<DeleteRowsCommand>(&command)) {
+            if (!isPrimaryKeyColumn(remove->table, remove->column)) {
+                return std::nullopt;
+            }
+            table = remove->table;
+            primary_key = remove->value;
+        } else {
+            return std::nullopt;
+        }
+
+        if (!table.has_value() ||
+            isSystemCatalogTable(*table) ||
+            !primary_key.has_value()) {
+            return std::nullopt;
+        }
+        Result routed =
+            explainRoute(ExplainRouteCommand{*table, *primary_key, false});
+        const auto* route = std::get_if<RouteResult>(&routed);
+        if (route == nullptr || route->range_ids.size() != 1) {
+            return std::nullopt;
+        }
+        return route->range_ids.front();
+    }
+
     static void copyBundle(const std::string& from_database_file,
                            const std::string& to_database_file) {
         std::filesystem::create_directories(std::filesystem::path(to_database_file).parent_path());
@@ -15254,16 +15446,24 @@ private:
     }
 
     bool tableExists(const std::string& table) {
-        auto names = db_->userTableNames();
-        return std::find(names.begin(), names.end(), table) != names.end();
+        try {
+            (void)db_->catalog.getTable(table);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
     }
 
     void createSystemCatalogTableIfMissing(
         const std::string& table,
         const std::vector<std::string>& columns) {
-        if (tableExists(table)) return;
+        if (tableExists(table)) {
+            db_->catalog.getTable(table).system_table = true;
+            return;
+        }
         auto schema = adapterMakeTableSchema(columns);
         db_->catalog.createTable(table, std::move(schema));
+        db_->catalog.getTable(table).system_table = true;
     }
 
     void ensureSystemCatalogTables() {
@@ -15297,6 +15497,7 @@ private:
             {"range_id:string", "source_group_id:string",
              "target_group_id:string", "transfer_epoch:int",
              "snapshot_key_count:int", "catchup_key_count:int",
+             "source_copy_key_count:int", "target_copy_key_count:int",
              "prepared_config_num:int", "status:string"});
         createSystemCatalogTableIfMissing(
             "__global_keys",
@@ -15347,6 +15548,10 @@ private:
             "__txn_liveness",
             {"txn_id:string", "owner:string", "epoch:int",
              "deadline_epoch:int", "status:string"});
+        createSystemCatalogTableIfMissing(
+            "__range_client_sessions",
+            {"range_id:string", "client_id:int", "request_id:int",
+             "result_kind:string", "result_value:string", "status:string"});
         createSystemCatalogTableIfMissing(
             "__schema_versions",
             {"table_name:string", "schema_version:int"});
@@ -15420,11 +15625,8 @@ private:
     }
 
     SelectAllResult selectSystemCatalogTable(const std::string& table) {
-        Result result = executeOne(SelectAllCommand{table});
-        if (const auto* rows = std::get_if<SelectAllResult>(&result)) {
-            return *rows;
-        }
-        return SelectAllResult{};
+        if (!tableExists(table)) return SelectAllResult{};
+        return systemCatalogTableView(table);
     }
 
     std::optional<std::string> storedClusterId() {
@@ -16185,6 +16387,8 @@ private:
         int transfer_epoch = 0;
         size_t snapshot_key_count = 0;
         size_t catchup_key_count = 0;
+        size_t source_copy_key_count = 0;
+        size_t target_copy_key_count = 0;
         int prepared_config_num = 0;
         std::string status = "prepared";
     };
@@ -16193,7 +16397,7 @@ private:
         SelectAllResult rows = selectSystemCatalogTable("__range_transfers");
         std::vector<RangeTransferRecord> records;
         for (const auto& row : rows.rows) {
-            if (row.size() < 8) continue;
+            if (row.size() < 10) continue;
             records.push_back(
                 RangeTransferRecord{
                     row[0],
@@ -16202,8 +16406,10 @@ private:
                     std::stoi(row[3]),
                     static_cast<size_t>(std::stoull(row[4])),
                     static_cast<size_t>(std::stoull(row[5])),
-                    std::stoi(row[6]),
-                    row[7]});
+                    static_cast<size_t>(std::stoull(row[6])),
+                    static_cast<size_t>(std::stoull(row[7])),
+                    std::stoi(row[8]),
+                    row[9]});
         }
         return records;
     }
@@ -16231,6 +16437,8 @@ private:
                  std::to_string(record.transfer_epoch),
                  std::to_string(record.snapshot_key_count),
                  std::to_string(record.catchup_key_count),
+                 std::to_string(record.source_copy_key_count),
+                 std::to_string(record.target_copy_key_count),
                  std::to_string(record.prepared_config_num),
                  record.status}}
         });
@@ -16279,6 +16487,8 @@ private:
             source->replica_group_id,
             target_group_id,
             nextRangeTransferEpoch(range_id),
+            0,
+            0,
             0,
             0,
             config_num,
@@ -18181,6 +18391,27 @@ private:
         };
     }
 
+    SelectAllResult systemCatalogTableView(const std::string& table) {
+        auto& metadata = db_->catalog.getTable(table);
+        TableHeap heap(metadata, db_->buffer_manager);
+        std::vector<std::vector<std::string>> rows;
+        for (auto& tuple : heap.readAllTuples()) {
+            std::vector<std::string> values;
+            values.reserve(tuple->fields.size());
+            for (const auto& field : tuple->fields) {
+                if (!field) {
+                    values.clear();
+                    break;
+                }
+                values.push_back(fieldToString(*field));
+            }
+            if (!values.empty() || tuple->fields.empty()) {
+                rows.push_back(std::move(values));
+            }
+        }
+        return SelectAllResult{columnNames(table), std::move(rows)};
+    }
+
     std::string insertStatement(const InsertRowCommand& command) const {
         std::ostringstream out;
         out << "INSERT " << command.table;
@@ -18268,15 +18499,21 @@ private:
         if (!tableExists(command.table) || command.range_id.empty()) {
             return TableNotFoundResult{};
         }
+        ensureSystemCatalogTables();
+        ensureSystemCatalogTables();
         SelectAllResult all = queryResultToSelectAll(
             command.table, db_->executeQuery("PROJECT * FROM " + command.table,
                                              nullptr, false));
+        SelectAllResult sessions =
+            selectSystemCatalogTable("__range_client_sessions");
         RangeRowsResult result{
             command.table,
             command.range_id,
             command.start_key,
             command.end_key,
             all.columns,
+            {},
+            sessions.columns,
             {}};
         for (const auto& row : all.rows) {
             if (rowBelongsToRange(command.table,
@@ -18286,6 +18523,13 @@ private:
                                   command.start_key,
                                   command.end_key)) {
                 result.rows.push_back(row);
+            }
+        }
+        for (const auto& row : sessions.rows) {
+            if (row.size() >= 6 &&
+                row[0] == command.range_id &&
+                row[5] == "active") {
+                result.client_session_rows.push_back(row);
             }
         }
         return result;
@@ -18305,6 +18549,9 @@ private:
                                              "range_id",
                                              command.range_id});
             if (const auto* count = std::get_if<DeleteRowsResult>(&result)) {
+                executeOne(DeleteRowsCommand{"__range_client_sessions",
+                                             "range_id",
+                                             command.range_id});
                 return *count;
             }
             return result;
@@ -18334,6 +18581,9 @@ private:
                 return result;
             }
         }
+        executeOne(DeleteRowsCommand{"__range_client_sessions",
+                                     "range_id",
+                                     command.range_id});
         return DeleteRowsResult{deleted};
     }
 
@@ -18362,6 +18612,15 @@ private:
             Result result = executeOne(InsertRowCommand{command.table, row});
             if (!std::holds_alternative<InsertOkResult>(result)) return result;
             ++inserted;
+        }
+        for (auto row : command.client_session_rows) {
+            if (row.size() < 6) continue;
+            row[0] = command.range_id;
+            Result result = executeOne(
+                InsertRowCommand{"__range_client_sessions", row});
+            if (!std::holds_alternative<InsertOkResult>(result)) {
+                return result;
+            }
         }
         return CountRowsResult{inserted};
     }
@@ -19119,6 +19378,8 @@ private:
                 command.transfer_epoch,
                 logicalKeyCountForRangeId(command.range_id),
                 0,
+                0,
+                0,
                 latest_config,
                 "prepared"});
         return StatementOkResult{};
@@ -19139,11 +19400,18 @@ private:
             source->replica_group_id != transfer->source_group_id) {
             return ConfigRejectedResult{};
         }
-        size_t current_keys = logicalKeyCountForRangeId(command.range_id);
+        if ((command.source_key_count == 0 &&
+             command.target_key_count == 0 &&
+             transfer->snapshot_key_count > 0) ||
+            command.target_key_count != command.source_key_count) {
+            return ConfigRejectedResult{};
+        }
         transfer->catchup_key_count =
-            current_keys > transfer->snapshot_key_count
-                ? current_keys - transfer->snapshot_key_count
+            command.source_key_count > transfer->snapshot_key_count
+                ? command.source_key_count - transfer->snapshot_key_count
                 : 0;
+        transfer->source_copy_key_count = command.source_key_count;
+        transfer->target_copy_key_count = command.target_key_count;
         transfer->prepared_config_num = latest_config;
         transfer->status = "caught_up";
         appendRangeTransferRecord(*transfer);
@@ -19157,6 +19425,13 @@ private:
         if (!transfer.has_value() ||
             transfer->transfer_epoch != command.transfer_epoch ||
             transfer->status != "caught_up") {
+            return ConfigRejectedResult{};
+        }
+
+        if (transfer->source_copy_key_count !=
+                transfer->target_copy_key_count ||
+            (transfer->snapshot_key_count > 0 &&
+             transfer->target_copy_key_count == 0)) {
             return ConfigRejectedResult{};
         }
 
@@ -19474,7 +19749,7 @@ private:
         if (command.table == "__tables") {
             return tableCatalogView();
         }
-        return executeOne(SelectAllCommand{command.table});
+        return systemCatalogTableView(command.table);
     }
 
     std::string database_file_;
@@ -20805,6 +21080,19 @@ private:
             });
             return;
         }
+        auto durable_cached = db_.cachedClientResultForCommand(
+            request.command,
+            request.client_id,
+            request.request_id);
+        if (durable_cached.has_value()) {
+            session_results_[key] = *durable_cached;
+            ctx.send(client, ClientReply{
+                request.client_id,
+                request.request_id,
+                *durable_cached
+            });
+            return;
+        }
         if (pending_by_request_.count(key) != 0) {
             return;
         }
@@ -21111,7 +21399,12 @@ private:
                 result = cached->second;
             } else {
                 result = runWithSuppressedStdout([&] {
-                    return db_.execute(entry.command);
+                    Result applied = db_.execute(entry.command);
+                    db_.recordClientResultForCommand(entry.command,
+                                                     entry.client_id,
+                                                     entry.request_id,
+                                                     applied);
+                    return applied;
                 });
                 session_results_[key] = result;
                 execution_count_[key]++;
@@ -21935,6 +22228,36 @@ int main(int argc, char* argv[]) {
         });
     });
 
+    tests.test("HLC MVCC abort discards unpublished versions", [&] {
+        withLocalMVCCDB([&](BuzzDB& db) {
+            auto seed = db.begin("seed");
+            db.executeStatement("INSERT kv|1|10", seed, 0, false);
+            db.commit(seed);
+
+            auto updater = db.begin("aborted-updater");
+            db.executeStatement("UPDATE kv SET value=20 WHERE id=1", updater, 0, false);
+            tests.check(localValueFor(db, updater) == 20,
+                        "writer should see its unpublished successor before abort");
+            db.abort(updater);
+            tests.check(localValueFor(db, nullptr) == 10,
+                        "aborted update should leave the committed predecessor visible");
+
+            auto inserter = db.begin("aborted-inserter");
+            db.executeStatement("INSERT kv|2|99", inserter, 0, false);
+            db.abort(inserter);
+            QueryTable inserted =
+                db.executeQuery("PROJECT * FROM kv WHERE {id}=2", nullptr, false);
+            tests.check(inserted.empty(),
+                        "aborted insert should not leave a visible version");
+
+            auto next = db.begin("next-writer");
+            db.executeStatement("UPDATE kv SET value=30 WHERE id=1", next, 0, false);
+            db.commit(next);
+            tests.check(localValueFor(db, nullptr) == 30,
+                        "later writer should commit after aborted versions are cleaned");
+        });
+    });
+
     tests.test("HLC MVCC rejects concurrent writers without 2PL waiting", [&] {
         withLocalMVCCDB([&](BuzzDB& db) {
             auto seed = db.begin("seed");
@@ -22126,6 +22449,68 @@ int main(int argc, char* argv[]) {
         }
         return *reply;
     };
+
+    auto commitCommandWithRequestId =
+        [&](ConsensusGroupHarness& group,
+            int request_id,
+            const Command& command) {
+            group.next_request_id =
+                std::max(group.next_request_id, request_id + 1);
+            group.state = deliverConsensusCommandToQuorum(
+                group.state,
+                group.leader,
+                group.client,
+                group.client_id,
+                request_id,
+                command,
+                {group.replicas[1], group.replicas[2]});
+            auto reply =
+                clientReplyFor(group.state, group.client_id, request_id);
+            if (!reply.has_value()) {
+                throw std::runtime_error(
+                    "missing client reply for " + describeCommand(command));
+            }
+            return *reply;
+        };
+
+    auto immediateClientCommandWithRequestId =
+        [&](ConsensusGroupHarness& group,
+            const Address& target,
+            int request_id,
+            const Command& command) {
+            group.next_request_id =
+                std::max(group.next_request_id, request_id + 1);
+            group.state.send(
+                group.client,
+                target,
+                ClientRequest{group.client_id, request_id, command});
+            group.state = stepRequired(
+                group.state,
+                requireMessageEvent(
+                    group.state,
+                    [&](const MessageEnvelope& envelope) {
+                        const auto* request =
+                            std::get_if<ClientRequest>(&envelope.message);
+                        return request != nullptr &&
+                               request->client_id == group.client_id &&
+                               request->request_id == request_id &&
+                               envelope.from.rootAddress() ==
+                                   group.client.rootAddress() &&
+                               envelope.to.rootAddress() ==
+                                   target.rootAddress();
+                    },
+                    "immediate client request",
+                    SearchSettings{}),
+                SearchSettings{});
+            auto reply =
+                clientReplyFor(group.state, group.client_id, request_id);
+            if (!reply.has_value()) {
+                throw std::runtime_error(
+                    "missing immediate client reply for " +
+                    describeCommand(command));
+            }
+            return *reply;
+        };
 
     struct IndexScenario {
         TitleIndexFixture fixture;
@@ -22427,6 +22812,8 @@ int main(int argc, char* argv[]) {
         int transfer_epoch = 0;
         size_t snapshot_key_count = 0;
         size_t catchup_key_count = 0;
+        size_t source_copy_key_count = 0;
+        size_t target_copy_key_count = 0;
         int prepared_config_num = 0;
         std::string status;
     };
@@ -22444,12 +22831,17 @@ int main(int argc, char* argv[]) {
             auto epoch = selectAllValue(transfers, row, "transfer_epoch");
             auto snapshot = selectAllValue(transfers, row, "snapshot_key_count");
             auto catchup = selectAllValue(transfers, row, "catchup_key_count");
+            auto source_copy =
+                selectAllValue(transfers, row, "source_copy_key_count");
+            auto target_copy =
+                selectAllValue(transfers, row, "target_copy_key_count");
             auto config = selectAllValue(transfers, row, "prepared_config_num");
             auto status = selectAllValue(transfers, row, "status");
             if (!row_range.has_value() || *row_range != range_id ||
                 !source.has_value() || !target.has_value() ||
                 !epoch.has_value() || !snapshot.has_value() ||
-                !catchup.has_value() || !config.has_value() ||
+                !catchup.has_value() || !source_copy.has_value() ||
+                !target_copy.has_value() || !config.has_value() ||
                 !status.has_value()) {
                 continue;
             }
@@ -22460,6 +22852,8 @@ int main(int argc, char* argv[]) {
                 std::stoi(*epoch),
                 static_cast<size_t>(std::stoull(*snapshot)),
                 static_cast<size_t>(std::stoull(*catchup)),
+                static_cast<size_t>(std::stoull(*source_copy)),
+                static_cast<size_t>(std::stoull(*target_copy)),
                 std::stoi(*config),
                 *status};
             if (!latest.has_value() ||
@@ -22646,6 +23040,12 @@ int main(int argc, char* argv[]) {
         auto caught_up_step = runtime.tick();
         tests.check(caught_up_step.result == Result{StatementOkResult{}},
                     "control plane runtime catch-up should complete before ownership switch");
+        auto caught_up = latestTransferOn(scenario.catalog, range_id);
+        tests.check(caught_up.has_value() &&
+                        caught_up->status == "caught_up" &&
+                        caught_up->source_copy_key_count == source_before &&
+                        caught_up->target_copy_key_count == source_before,
+                    "catch-up should record runtime-measured source and target copy proof");
         tests.check(indexRouteGroupOnCatalog(scenario.catalog, year) ==
                         scenario.source.group_id,
                     "catch-up should still not switch catalog ownership");
@@ -22673,6 +23073,132 @@ int main(int argc, char* argv[]) {
                         containsText(lookup.primary_keys,
                                      expected_primary_key),
                     "target physical HashIndex should answer moved lookup");
+    });
+
+
+    tests.test("Range movement migrates client request dedupe metadata", [&] {
+        auto scenario = buildIndexScenario();
+        const auto& extra = scenario.fixture.extra_row;
+        std::string table_range = defaultRangeIdForTable("title");
+        InsertRowCommand insert_extra{"title", extra.values};
+        int migrated_request_id = 700;
+
+        tests.check(commitCommandWithRequestId(
+                        scenario.table_owner,
+                        migrated_request_id,
+                        insert_extra) == Result{InsertOkResult{}},
+                    "first client insert should commit on the old owner");
+        tests.check(countRowsOn(scenario.table_owner, "title") ==
+                        scenario.fixture.initial_rows.size() + 1,
+                    "old owner should contain the inserted row before movement");
+
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        MoveRangeCommand{table_range,
+                                         scenario.index_owner.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "table range move should create transfer metadata");
+        auto runtime = controlPlaneRuntime(scenario);
+        auto prepared = runtime.tick();
+        auto caught_up = runtime.tick();
+        auto committed = runtime.tick();
+        tests.check(prepared.advanced &&
+                        prepared.status_before == "requested" &&
+                        prepared.status_after == "prepared" &&
+                        caught_up.advanced &&
+                        caught_up.status_before == "prepared" &&
+                        caught_up.status_after == "caught_up" &&
+                        committed.advanced &&
+                        committed.status_before == "caught_up" &&
+                        committed.status_after == "committed",
+                    "runtime should prepare, catch up, and commit the table range; observed " +
+                        prepared.status_before + "->" +
+                        prepared.status_after + " " +
+                        describeResult(prepared.result) + ", " +
+                        caught_up.status_before + "->" +
+                        caught_up.status_after + " " +
+                        describeResult(caught_up.result) + ", " +
+                        committed.status_before + "->" +
+                        committed.status_after + " " +
+                        describeResult(committed.result));
+        tests.check(countRowsOn(scenario.table_owner, "title") == 0 &&
+                        countRowsOn(scenario.index_owner, "title") ==
+                            scenario.fixture.initial_rows.size() + 1,
+                    "new owner should hold the moved table rows");
+        tests.check(selectAllHasRow(
+                        catalogTableOn(scenario.index_owner,
+                                       scenario.index_owner.leader,
+                                       "__range_client_sessions"),
+                        {{"range_id", table_range},
+                         {"client_id",
+                          std::to_string(scenario.table_owner.client_id)},
+                         {"request_id",
+                          std::to_string(migrated_request_id)},
+                         {"result_kind", "InsertOk"},
+                         {"status", "active"}}),
+                    "new owner should import durable range client-session metadata");
+        tests.check(!selectAllHasRow(
+                        catalogTableOn(scenario.table_owner,
+                                       scenario.table_owner.leader,
+                                       "__range_client_sessions"),
+                        {{"range_id", table_range},
+                         {"client_id",
+                          std::to_string(scenario.table_owner.client_id)},
+                         {"request_id",
+                          std::to_string(migrated_request_id)}}),
+                    "old owner should delete moved range client-session metadata");
+
+        scenario.index_owner.client_id = scenario.table_owner.client_id;
+        Result duplicate = immediateClientCommandWithRequestId(
+            scenario.index_owner,
+            scenario.index_owner.leader,
+            migrated_request_id,
+            insert_extra);
+        tests.check(duplicate == Result{InsertOkResult{}} &&
+                        countRowsOn(scenario.index_owner, "title") ==
+                            scenario.fixture.initial_rows.size() + 1,
+                    "duplicate client insert after movement should return cached result without reapplying");
+    });
+
+    tests.test("Catalog-only transfer cannot commit without copy proof", [&] {
+        auto scenario = buildIndexMovementScenario();
+        std::string range_id = defaultRangeIdForIndex(title_year_index);
+        std::string year = scenario.fixture.duplicate_year;
+        size_t source_before = physicalIndexEntryCount(scenario.source, range_id);
+
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        MoveRangeCommand{range_id, scenario.target.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "move should create a requested transfer");
+        auto requested = latestTransferOn(scenario.catalog, range_id);
+        tests.check(requested.has_value(),
+                    "requested transfer should be visible in catalog");
+        int epoch = requested->transfer_epoch;
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        PrepareRangeTransferCommand{
+                            range_id, scenario.target.group_id, epoch}) ==
+                        Result{StatementOkResult{}},
+                    "direct prepare may snapshot metadata but cannot copy data");
+        tests.check(physicalIndexEntryCount(scenario.target, range_id) == 0,
+                    "direct catalog prepare should not invent target rows");
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        CatchUpRangeTransferCommand{range_id, epoch}) ==
+                        Result{ConfigRejectedResult{}},
+                    "catch-up without runtime copy proof should be rejected");
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        CommitRangeTransferCommand{range_id, epoch}) ==
+                        Result{ConfigRejectedResult{}},
+                    "commit should reject a transfer without copied target rows");
+        tests.check(indexRouteGroupOnCatalog(scenario.catalog, year) ==
+                        scenario.source.group_id &&
+                        physicalIndexEntryCount(scenario.source, range_id) ==
+                            source_before &&
+                        physicalIndexEntryCount(scenario.target, range_id) == 0,
+                    "failed catalog-only transfer should leave source ownership and data intact");
     });
 
     tests.test("Coordinator prepare is metadata only until runtime ticks", [&] {
