@@ -49,8 +49,6 @@ void printThreadSafe(const std::string& line) {
     std::cout << line << std::endl;
 }
 
-static constexpr int RECOVERY_TXN_ID = -1;
-
 struct HybridLogicalTimestamp {
     int64_t physical = 0;
     int32_t logical = 0;
@@ -1538,12 +1536,8 @@ private:
     size_t log_force_skips = 0;
     size_t checkpoints_written = 0;
     size_t checkpoint_analysis_start_lsn = 0;
-    size_t restart_undo_locks_reacquired = 0;
-    size_t restart_undo_deadlocks_resolved = 0;
     std::map<int, TxnTableEntry> active_transaction_table;
     std::map<int, TxnRecoveryState> txn_states;
-    std::function<bool(TableId, PageID, size_t)> restart_undo_lock_callback;
-    std::function<void()> restart_undo_release_callback;
 
     static std::string txnStatusName(TxnStatus status) {
         switch (status) {
@@ -1698,13 +1692,6 @@ public:
     void checkpoint();
     void createFuzzyImageCopy();
     void recover();
-    void setRestartUndoLockCallback(
-        std::function<bool(TableId, PageID, size_t)> callback) {
-        restart_undo_lock_callback = std::move(callback);
-    }
-    void setRestartUndoReleaseCallback(std::function<void()> callback) {
-        restart_undo_release_callback = std::move(callback);
-    }
     LSN logUpdate(TableId table_id,
                    PageID page_id,
                    size_t slot_id,
@@ -4131,18 +4118,6 @@ void RecoveryManager::recover() {
             }
             auto& metadata = catalog.getTable(record->second->table_id);
             TableHeap table(metadata, buffer_manager);
-            if (restart_undo_lock_callback) {
-                // Early availability: recovery must lock rows before undoing them.
-                bool resolved_deadlock = restart_undo_lock_callback(
-                    record->second->table_id,
-                    record->second->page_id,
-                    record->second->slot_id
-                );
-                restart_undo_locks_reacquired++;
-                if (resolved_deadlock) {
-                    restart_undo_deadlocks_resolved++;
-                }
-            }
             PageUpdateLogRecord undo_record;
             undo_record.kind = record->second->kind;
             undo_record.lsn = record->second->lsn;
@@ -4212,10 +4187,6 @@ void RecoveryManager::recover() {
                   << " LSN " << end_lsn
                   << " prevLSN " << entry.second.last_lsn
                   << " during restart" << std::endl;
-    }
-
-    if (restart_undo_release_callback) {
-        restart_undo_release_callback();
     }
 
     restart_redo_records += redone;
@@ -4941,299 +4912,6 @@ public:
     }
 };
 
-class DirectedGraph {
-public:
-    void setOutgoingEdges(int from, const std::vector<int>& to_nodes) {
-        adjacency[from] = to_nodes;
-        for (int to : to_nodes) {
-            adjacency[to];
-        }
-    }
-
-    void removeNode(int node) {
-        adjacency.erase(node);
-        for (auto& entry : adjacency) {
-            auto& edges = entry.second;
-            edges.erase(
-                std::remove(edges.begin(), edges.end(), node),
-                edges.end()
-            );
-        }
-    }
-
-    std::vector<int> cycleFrom(int node) const {
-        std::vector<int> path;
-        std::map<int, bool> visited;
-        if (findCycleToTarget(node, node, visited, path)) {
-            path.push_back(node);
-            return path;
-        }
-        return {};
-    }
-
-private:
-    std::map<int, std::vector<int>> adjacency;
-
-    bool findCycleToTarget(int current,
-                           int target,
-                           std::map<int, bool>& visited,
-                           std::vector<int>& path) const {
-        visited[current] = true;
-        path.push_back(current);
-
-        auto it = adjacency.find(current);
-        if (it != adjacency.end()) {
-            for (int next : it->second) {
-                if (next == target) {
-                    return true;
-                }
-                if (!visited[next] &&
-                    findCycleToTarget(next, target, visited, path)) {
-                    return true;
-                }
-            }
-        }
-
-        path.pop_back();
-        return false;
-    }
-};
-
-enum class LockMode { S, X };
-
-class LockManager {
-    struct LockGrant {
-        int txn_id;
-        LockMode mode;
-    };
-
-    struct LockState {
-        std::vector<LockGrant> grants;
-    };
-
-public:
-    struct LockRequestResult {
-        bool granted = false;
-        bool deadlock = false;
-        bool timed_out = false;
-        bool canceled = false;
-        std::string reason;
-        std::vector<int> blockers;
-        std::vector<int> cycle;
-    };
-
-    void setWaitObserver(
-        std::function<void(int, const std::vector<int>&)> observer) {
-        wait_observer = std::move(observer);
-    }
-
-    static std::string modeName(LockMode mode) {
-        switch (mode) {
-            case LockMode::S:
-                return "S";
-            case LockMode::X:
-                return "X";
-        }
-        throw std::runtime_error("Unknown lock mode.");
-    }
-
-    LockRequestResult waitFor(int txn_id,
-                              const std::string& resource,
-                              LockMode mode,
-                              std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> guard(latch);
-        LockRequestResult result;
-        if (canceled_txns.find(txn_id) != canceled_txns.end()) {
-            result.canceled = true;
-            result.reason = "transaction was canceled to resolve a deadlock";
-            return result;
-        }
-        while (!canGrant(txn_id, resource, mode)) {
-            if (canceled_txns.find(txn_id) != canceled_txns.end()) {
-                result.canceled = true;
-                result.reason = "transaction was canceled to resolve a deadlock";
-                removeWaitEdges(txn_id);
-                return result;
-            }
-            auto blockers = blockersFor(txn_id, resource, mode);
-            setWaitEdges(txn_id, blockers);
-            notifyWaitObserver(txn_id, blockers);
-            result.blockers = blockers;
-            result.cycle = findCycleFrom(txn_id);
-            if (!result.cycle.empty()) {
-                result.deadlock = true;
-                result.reason = "waits-for cycle detected";
-                removeWaitEdges(txn_id);
-                return result;
-            }
-
-            if (lock_cv.wait_for(guard, timeout) == std::cv_status::timeout) {
-                result.timed_out = true;
-                result.reason = incompatibleHolderLabel(
-                    locks[resource], txn_id, mode
-                );
-                removeWaitEdges(txn_id);
-                return result;
-            }
-        }
-
-        removeWaitEdges(txn_id);
-        grantLock(locks[resource], txn_id, mode);
-        result.granted = true;
-        return result;
-    }
-
-    bool cancel(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        bool released = false;
-        canceled_txns.insert(txn_id);
-        removeWaitEdges(txn_id);
-        for (auto& entry : locks) {
-            auto& state = entry.second;
-            auto old_size = state.grants.size();
-            state.grants.erase(
-                std::remove_if(state.grants.begin(),
-                               state.grants.end(),
-                               [txn_id](const LockGrant& grant) {
-                                   return grant.txn_id == txn_id;
-                               }),
-                state.grants.end()
-            );
-            released = released || old_size != state.grants.size();
-        }
-        lock_cv.notify_all();
-        return released;
-    }
-
-    bool releaseAll(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        bool released = false;
-        removeWaitEdges(txn_id);
-        for (auto& entry : locks) {
-            auto& state = entry.second;
-            auto old_size = state.grants.size();
-            state.grants.erase(
-                std::remove_if(state.grants.begin(),
-                               state.grants.end(),
-                               [txn_id](const LockGrant& grant) {
-                                   return grant.txn_id == txn_id;
-                               }),
-                state.grants.end()
-            );
-            released = released || old_size != state.grants.size();
-        }
-        if (released) {
-            lock_cv.notify_all();
-        }
-        return released;
-    }
-
-private:
-    std::mutex latch;
-    std::condition_variable lock_cv;
-    std::map<std::string, LockState> locks;
-    DirectedGraph waits_for;
-    std::set<int> canceled_txns;
-    std::function<void(int, const std::vector<int>&)> wait_observer;
-
-    bool canGrant(int txn_id, const std::string& resource, LockMode mode) {
-        auto& state = locks[resource];
-        return std::all_of(
-            state.grants.begin(),
-            state.grants.end(),
-            [txn_id, mode](const LockGrant& grant) {
-                return grant.txn_id == txn_id ||
-                       compatible(mode, grant.mode);
-            }
-        );
-    }
-
-    std::vector<int> blockersFor(int txn_id,
-                                 const std::string& resource,
-                                 LockMode mode) {
-        std::vector<int> blockers;
-        auto& state = locks[resource];
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id != txn_id &&
-                !compatible(mode, grant.mode) &&
-                std::find(blockers.begin(), blockers.end(), grant.txn_id) ==
-                    blockers.end()) {
-                blockers.push_back(grant.txn_id);
-            }
-        }
-        return blockers;
-    }
-
-    void setWaitEdges(int txn_id, const std::vector<int>& blockers) {
-        waits_for.setOutgoingEdges(txn_id, blockers);
-    }
-
-    void notifyWaitObserver(int txn_id, const std::vector<int>& blockers) {
-        if (wait_observer) {
-            wait_observer(txn_id, blockers);
-        }
-    }
-
-    void removeWaitEdges(int txn_id) {
-        waits_for.removeNode(txn_id);
-    }
-
-    std::vector<int> findCycleFrom(int txn_id) const {
-        return waits_for.cycleFrom(txn_id);
-    }
-
-    static bool compatible(LockMode requested, LockMode held) {
-        if (requested == LockMode::S) {
-            return held == LockMode::S;
-        }
-        return false;
-    }
-
-    static bool strongerOrEqual(LockMode held, LockMode requested) {
-        if (held == requested || held == LockMode::X) {
-            return true;
-        }
-        return false;
-    }
-
-    static void grantLock(LockState& state, int txn_id, LockMode mode) {
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id == txn_id &&
-                strongerOrEqual(grant.mode, mode)) {
-                return;
-            }
-        }
-
-        state.grants.erase(
-            std::remove_if(state.grants.begin(),
-                           state.grants.end(),
-                           [txn_id, mode](const LockGrant& grant) {
-                               return grant.txn_id == txn_id &&
-                                      strongerOrEqual(mode, grant.mode);
-                           }),
-            state.grants.end()
-        );
-        state.grants.push_back({txn_id, mode});
-    }
-
-    static std::string incompatibleHolderLabel(const LockState& state,
-                                               int txn_id,
-                                               LockMode mode) {
-        std::string label;
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id == txn_id || compatible(mode, grant.mode)) {
-                continue;
-            }
-            if (!label.empty()) {
-                label += ", ";
-            }
-            label += modeName(grant.mode) + " lock is held by T" +
-                     std::to_string(grant.txn_id);
-        }
-        return label.empty() ? "lock is not compatible" : label;
-    }
-};
-
 enum class AccessType { Read, Write };
 
 struct ConcurrencyControlResource {
@@ -5251,10 +4929,7 @@ struct ConcurrencyControlRequest {
 
 struct ConcurrencyControlResult {
     bool granted = true;
-    bool deadlock = false;
-    bool canceled = false;
     std::string reason;
-    std::vector<int> cycle;
 };
 
 class ConcurrencyControlPolicy {
@@ -5266,72 +4941,6 @@ public:
     virtual void commit(int txn_id) = 0;
     virtual void abort(int txn_id) = 0;
     virtual bool cancel(int txn_id) = 0;
-};
-
-class TwoPhaseLockingPolicy : public ConcurrencyControlPolicy {
-    LockManager& lock_manager;
-    std::function<void(const std::string&)> log;
-    std::function<std::string(const std::vector<int>&)> path_label;
-
-    static LockMode modeFor(AccessType type) {
-        return type == AccessType::Read ? LockMode::S : LockMode::X;
-    }
-
-public:
-    TwoPhaseLockingPolicy(
-        LockManager& lock_manager,
-        std::function<void(const std::string&)> log,
-        std::function<std::string(const std::vector<int>&)> path_label)
-        : lock_manager(lock_manager),
-          log(std::move(log)),
-          path_label(std::move(path_label)) {}
-
-    ConcurrencyControlResult beforeAccess(
-        const ConcurrencyControlRequest& request) override {
-        LockMode mode = modeFor(request.type);
-        auto mode_name = LockManager::modeName(mode);
-        for (const auto& resource : request.resources) {
-            log(request.txn_label + " inferred " + mode_name +
-                " lock on " + resource.label + " for " + request.reason);
-            auto result = lock_manager.waitFor(
-                request.txn_id,
-                resource.key,
-                mode,
-                std::chrono::milliseconds(500)
-            );
-
-            if (result.granted) {
-                continue;
-            }
-            if (result.deadlock) {
-                return {false, true, false,
-                        "waits-for graph cycle: " + path_label(result.cycle),
-                        result.cycle};
-            }
-            if (result.canceled) {
-                return {false, false, true, result.reason, result.cycle};
-            }
-            return {false, false, false, result.reason, result.cycle};
-        }
-        return {};
-    }
-
-    void begin(int txn_id, const std::string& txn_label) override {
-        (void)txn_id;
-        (void)txn_label;
-    }
-
-    void commit(int txn_id) override {
-        lock_manager.releaseAll(txn_id);
-    }
-
-    void abort(int txn_id) override {
-        lock_manager.releaseAll(txn_id);
-    }
-
-    bool cancel(int txn_id) override {
-        return lock_manager.cancel(txn_id);
-    }
 };
 
 class HLCMVCCPolicy : public ConcurrencyControlPolicy {
@@ -5364,9 +4973,7 @@ public:
         std::lock_guard<std::mutex> guard(latch);
         auto txn_it = txns.find(request.txn_id);
         if (txn_it == txns.end()) {
-            return {false, false, false,
-                    "transaction has no HLC/MVCC state",
-                    {}};
+            return {false, "transaction has no HLC/MVCC state"};
         }
 
         if (request.type == AccessType::Write) {
@@ -11140,7 +10747,6 @@ public:
     Catalog catalog;
     RecoveryManager recovery_manager;
     TransactionManager txn_manager;
-    LockManager concurrency_control_lock_manager;
     std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
     std::mutex execution_latch;
     std::mutex txn_label_latch;
@@ -11154,16 +10760,6 @@ public:
           recovery_manager(buffer_manager, catalog) {
         concurrency_control_policy = std::make_unique<HLCMVCCPolicy>(
             [this](const std::string& line) { logConcurrencyControl(line); }
-        );
-        recovery_manager.setRestartUndoLockCallback(
-            [this](TableId table_id, PageID page_id, size_t slot_id) {
-                return acquireRestartUndoLock(table_id, page_id, slot_id);
-            }
-        );
-        recovery_manager.setRestartUndoReleaseCallback(
-            [this]() {
-                releaseRestartUndoLocks();
-            }
         );
         catalog.bootstrap();
         if (catalog.isNewDatabase()) {
@@ -11435,28 +11031,6 @@ public:
             txn->label;
     }
 
-    std::string txnIdLabel(int txn_id) {
-        if (txn_id == RECOVERY_TXN_ID) {
-            return "RECOVERY";
-        }
-        std::lock_guard<std::mutex> guard(txn_label_latch);
-        auto it = txn_labels.find(txn_id);
-        return it == txn_labels.end() ?
-            "T" + std::to_string(txn_id) :
-            it->second;
-    }
-
-    std::string txnPathLabel(const std::vector<int>& path) {
-        std::string label;
-        for (int txn_id : path) {
-            if (!label.empty()) {
-                label += " -> ";
-            }
-            label += txnIdLabel(txn_id);
-        }
-        return label.empty() ? "none" : label;
-    }
-
     static std::string tableResourceKey(const std::string& table_name) {
         return "table:" + table_name;
     }
@@ -11470,13 +11044,6 @@ public:
         return {tableResourceKey(table_name), tableResourceLabel(table_name)};
     }
 
-    static std::string tupleResourceKey(TableId table_id,
-                                        PageID page_id,
-                                        size_t slot_id) {
-        return "tuple:" + std::to_string(table_id) + ":" +
-               std::to_string(page_id) + ":" + std::to_string(slot_id);
-    }
-
     static std::string statementTypeName(StatementType type) {
         switch (type) {
             case StatementType::INSERT:
@@ -11486,7 +11053,8 @@ public:
             case StatementType::DELETE:
                 return "DELETE";
             default:
-                throw std::runtime_error("Statement type does not need a table lock.");
+                throw std::runtime_error(
+                    "Statement type does not need tracked write access.");
         }
     }
 
@@ -11518,64 +11086,9 @@ public:
             }
             return true;
         }
-        if (result.deadlock) {
-            logConcurrencyControl("deadlock detected; " + result.reason);
-            abort(txn);
-            return false;
-        }
-        if (result.canceled) {
-            logConcurrencyControl(txnLabel(txn) + " access canceled; " + result.reason);
-            txn_manager.abort(*txn);
-            return false;
-        }
-
-        logConcurrencyControl(txnLabel(txn) + " access blocked; " + result.reason);
+        logConcurrencyControl(txnLabel(txn) + " access rejected; " +
+                              result.reason);
         return false;
-    }
-
-    bool acquireRestartUndoLock(TableId table_id, PageID page_id, size_t slot_id) {
-        ConcurrencyControlResource resource{
-            tupleResourceKey(table_id, page_id, slot_id),
-            "tuple " + std::to_string(table_id) + "." +
-            std::to_string(page_id) + "." + std::to_string(slot_id)
-        };
-        auto result = concurrency_control_policy->beforeAccess({
-            RECOVERY_TXN_ID,
-            "RECOVERY",
-            AccessType::Write,
-            {resource},
-            "physiological restart undo"
-        });
-        if (result.granted) {
-            return false;
-        }
-        if (!result.deadlock) {
-            throw std::runtime_error(
-                "Recovery could not reacquire restart undo lock: " + result.reason
-            );
-        }
-
-        logConcurrencyControl("deadlock during restart undo; " + result.reason);
-        for (int txn_id : result.cycle) {
-            if (txn_id > 0) {
-                concurrency_control_policy->cancel(txn_id);
-            }
-        }
-        auto retry = concurrency_control_policy->beforeAccess({
-            RECOVERY_TXN_ID,
-            "RECOVERY",
-            AccessType::Write,
-            {resource},
-            "physiological restart undo"
-        });
-        if (!retry.granted) {
-            throw std::runtime_error("Recovery lock retry failed after deadlock.");
-        }
-        return true;
-    }
-
-    void releaseRestartUndoLocks() {
-        concurrency_control_policy->abort(RECOVERY_TXN_ID);
     }
 
     std::vector<std::string> queryTableNames(const QueryComponents& components) {
@@ -11589,8 +11102,8 @@ public:
         return table_names;
     }
 
-    bool acquireStatementLocks(const TxnPtr& txn,
-                               const StatementComponents& components) {
+    bool acquireStatementAccess(const TxnPtr& txn,
+                                const StatementComponents& components) {
         if (!txn || (components.type != StatementType::INSERT &&
                      components.type != StatementType::UPDATE &&
                      components.type != StatementType::DELETE)) {
@@ -11604,8 +11117,8 @@ public:
         );
     }
 
-    bool acquireQueryLocks(const TxnPtr& txn,
-                           const QueryComponents& components) {
+    bool acquireQueryAccess(const TxnPtr& txn,
+                            const QueryComponents& components) {
         if (!txn) {
             return true;
         }
@@ -11796,7 +11309,7 @@ public:
         }
 
         if (acquire_concurrency_control &&
-            !acquireStatementLocks(txn, components)) {
+            !acquireStatementAccess(txn, components)) {
             return;
         }
 
@@ -12048,7 +11561,7 @@ public:
                             const std::vector<size_t>& final_sort_attrs = {}) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
-        if (!acquireQueryLocks(txn, components)) {
+        if (!acquireQueryAccess(txn, components)) {
             return {};
         }
 
@@ -12269,6 +11782,35 @@ struct SelectWhereCommand {
     HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
 };
 
+struct RangeReadCommand {
+    std::string table;
+    std::string range_id;
+    std::string start_key;
+    std::string end_key;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+};
+
+struct QueryFragment {
+    std::string query_id;
+    size_t fragment_id = 0;
+    size_t attempt_id = 1;
+    std::string sql;
+    std::string table;
+    std::string range_id;
+    std::string replica_group_id;
+    std::string start_key;
+    std::string end_key;
+    std::string predicate_column;
+    std::string predicate_value;
+    std::string aggregate_function;
+    std::string aggregate_column;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+};
+
+struct ExecuteQueryFragmentCommand {
+    QueryFragment fragment;
+};
+
 struct ExplainRouteCommand {
     std::string table;
     std::string primary_key;
@@ -12381,6 +11923,13 @@ struct SplitTableCommand {
     int descriptor_version = 1;
     std::string left_replica_group_id = "";
     std::string right_replica_group_id = "";
+};
+
+struct PlanTableSplitCommand {
+    std::string table;
+    std::string source_range_id = "";
+    size_t target_range_count = 2;
+    std::vector<std::string> target_replica_group_ids = {};
 };
 
 struct BootstrapClusterCommand {
@@ -12523,6 +12072,8 @@ struct QueryRangeConfigCommand {
 
 struct ReadSystemCatalogCommand { std::string table; };
 
+struct ReadReplicaSafeTimestampCommand {};
+
 using Command = std::variant<
     CreateTableCommand,
     InsertRowCommand,
@@ -12530,6 +12081,8 @@ using Command = std::variant<
     UpdateRowsCommand,
     SelectAllCommand,
     SelectWhereCommand,
+    RangeReadCommand,
+    ExecuteQueryFragmentCommand,
     ExplainRouteCommand,
     RoutedSQLCommand,
     RoutedTransactionCommand,
@@ -12551,6 +12104,7 @@ using Command = std::variant<
     RegisterRangeCommand,
     SplitRangeCommand,
     SplitTableCommand,
+    PlanTableSplitCommand,
     BootstrapClusterCommand,
     DiscoverClusterNodeCommand,
     AddLearnerToGroupCommand,
@@ -12574,7 +12128,8 @@ using Command = std::variant<
     ExplainIndexLookupCommand,
     ReadSecondaryIndexCommand,
     QueryRangeConfigCommand,
-    ReadSystemCatalogCommand>;
+    ReadSystemCatalogCommand,
+    ReadReplicaSafeTimestampCommand>;
 
 bool operator==(const CreateTableCommand& lhs, const CreateTableCommand& rhs) {
     return lhs.table == rhs.table && lhs.columns == rhs.columns;
@@ -12598,6 +12153,31 @@ bool operator==(const SelectAllCommand& lhs, const SelectAllCommand& rhs) {
 bool operator==(const SelectWhereCommand& lhs, const SelectWhereCommand& rhs) {
     return lhs.table == rhs.table && lhs.column == rhs.column &&
            lhs.value == rhs.value && lhs.read_ts == rhs.read_ts;
+}
+bool operator==(const RangeReadCommand& lhs, const RangeReadCommand& rhs) {
+    return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
+           lhs.read_ts == rhs.read_ts;
+}
+bool operator==(const QueryFragment& lhs, const QueryFragment& rhs) {
+    return lhs.query_id == rhs.query_id &&
+           lhs.fragment_id == rhs.fragment_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.sql == rhs.sql &&
+           lhs.table == rhs.table &&
+           lhs.range_id == rhs.range_id &&
+           lhs.replica_group_id == rhs.replica_group_id &&
+           lhs.start_key == rhs.start_key &&
+           lhs.end_key == rhs.end_key &&
+           lhs.predicate_column == rhs.predicate_column &&
+           lhs.predicate_value == rhs.predicate_value &&
+           lhs.aggregate_function == rhs.aggregate_function &&
+           lhs.aggregate_column == rhs.aggregate_column &&
+           lhs.read_ts == rhs.read_ts;
+}
+bool operator==(const ExecuteQueryFragmentCommand& lhs,
+                const ExecuteQueryFragmentCommand& rhs) {
+    return lhs.fragment == rhs.fragment;
 }
 bool operator==(const ExplainRouteCommand& lhs,
                 const ExplainRouteCommand& rhs) {
@@ -12712,6 +12292,13 @@ bool operator==(const SplitTableCommand& lhs,
            lhs.descriptor_version == rhs.descriptor_version &&
            lhs.left_replica_group_id == rhs.left_replica_group_id &&
            lhs.right_replica_group_id == rhs.right_replica_group_id;
+}
+bool operator==(const PlanTableSplitCommand& lhs,
+                const PlanTableSplitCommand& rhs) {
+    return lhs.table == rhs.table &&
+           lhs.source_range_id == rhs.source_range_id &&
+           lhs.target_range_count == rhs.target_range_count &&
+           lhs.target_replica_group_ids == rhs.target_replica_group_ids;
 }
 bool operator==(const BootstrapClusterCommand& lhs,
                 const BootstrapClusterCommand& rhs) {
@@ -12843,6 +12430,10 @@ bool operator==(const ReadSystemCatalogCommand& lhs,
                 const ReadSystemCatalogCommand& rhs) {
     return lhs.table == rhs.table;
 }
+bool operator==(const ReadReplicaSafeTimestampCommand&,
+                const ReadReplicaSafeTimestampCommand&) {
+    return true;
+}
 
 bool operator==(const Command& lhs, const Command& rhs) {
     return lhs.index() == rhs.index() &&
@@ -12867,6 +12458,40 @@ struct SelectAllResult {
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
 };
+struct FragmentResult {
+    bool complete = false;
+    std::string query_id;
+    size_t fragment_id = 0;
+    size_t attempt_id = 0;
+    std::string range_id;
+    std::string replica_group_id;
+    bool aggregate = false;
+    std::string aggregate_function;
+    std::string aggregate_column;
+    size_t partial_count = 0;
+    int64_t partial_sum = 0;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
+struct DistributedQueryResult {
+    bool complete = false;
+    std::string query_id;
+    std::string sql;
+    std::string table;
+    std::string start_key;
+    std::string end_key;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+    std::string aggregate_function;
+    std::string aggregate_column;
+    size_t final_count = 0;
+    int64_t final_sum = 0;
+    std::vector<QueryFragment> fragments;
+    std::vector<FragmentResult> fragment_results;
+    std::vector<size_t> fragment_row_counts;
+    std::vector<std::string> explain_lines;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
 struct RangeRowsResult {
     std::string table;
     std::string range_id;
@@ -12876,6 +12501,18 @@ struct RangeRowsResult {
     std::vector<std::vector<std::string>> rows;
     std::vector<std::string> client_session_columns;
     std::vector<std::vector<std::string>> client_session_rows;
+};
+struct DistributedRangeReadResult {
+    bool complete = false;
+    std::string table;
+    std::string start_key;
+    std::string end_key;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+    std::vector<std::string> range_ids;
+    std::vector<std::string> replica_group_ids;
+    std::vector<size_t> fragment_row_counts;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
 };
 struct RouteResult {
     std::string start_key;
@@ -12938,6 +12575,18 @@ struct InvalidSchemaResult {};
 struct ClusterRejectedResult {};
 struct ConfigRejectedResult {};
 struct RouteRejectedResult {};
+struct ReplicaSafeTimestampResult {
+    std::string replica_id;
+    bool leader = false;
+    HybridLogicalTimestamp safe_ts = HybridLogicalTimestamp::zero();
+    int applied_index = 0;
+};
+struct FollowerReadRejectedResult {
+    std::string replica_id;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+    HybridLogicalTimestamp safe_ts = HybridLogicalTimestamp::zero();
+    int applied_index = 0;
+};
 
 using Result = std::variant<
     CreateTableOkResult,
@@ -12945,7 +12594,10 @@ using Result = std::variant<
     DeleteRowsResult,
     UpdateRowsResult,
     SelectAllResult,
+    FragmentResult,
+    DistributedQueryResult,
     RangeRowsResult,
+    DistributedRangeReadResult,
     RouteResult,
     RangeConfigResult,
     TransactionOkResult,
@@ -12962,19 +12614,65 @@ using Result = std::variant<
     InvalidSchemaResult,
     ClusterRejectedResult,
     ConfigRejectedResult,
-    RouteRejectedResult>;
+    RouteRejectedResult,
+    ReplicaSafeTimestampResult,
+    FollowerReadRejectedResult>;
 
 bool operator==(const CreateTableOkResult&, const CreateTableOkResult&) { return true; }
 bool operator==(const InsertOkResult&, const InsertOkResult&) { return true; }
 bool operator==(const DeleteRowsResult& lhs, const DeleteRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const UpdateRowsResult& lhs, const UpdateRowsResult& rhs) { return lhs.count == rhs.count; }
 bool operator==(const SelectAllResult& lhs, const SelectAllResult& rhs) { return lhs.columns == rhs.columns && lhs.rows == rhs.rows; }
+bool operator==(const FragmentResult& lhs, const FragmentResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.query_id == rhs.query_id &&
+           lhs.fragment_id == rhs.fragment_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.range_id == rhs.range_id &&
+           lhs.replica_group_id == rhs.replica_group_id &&
+           lhs.aggregate == rhs.aggregate &&
+           lhs.aggregate_function == rhs.aggregate_function &&
+           lhs.aggregate_column == rhs.aggregate_column &&
+           lhs.partial_count == rhs.partial_count &&
+           lhs.partial_sum == rhs.partial_sum &&
+           lhs.columns == rhs.columns &&
+           lhs.rows == rhs.rows;
+}
+bool operator==(const DistributedQueryResult& lhs,
+                const DistributedQueryResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.query_id == rhs.query_id &&
+           lhs.sql == rhs.sql &&
+           lhs.table == rhs.table &&
+           lhs.start_key == rhs.start_key &&
+           lhs.end_key == rhs.end_key &&
+           lhs.read_ts == rhs.read_ts &&
+           lhs.aggregate_function == rhs.aggregate_function &&
+           lhs.aggregate_column == rhs.aggregate_column &&
+           lhs.final_count == rhs.final_count &&
+           lhs.final_sum == rhs.final_sum &&
+           lhs.fragments == rhs.fragments &&
+           lhs.fragment_results == rhs.fragment_results &&
+           lhs.fragment_row_counts == rhs.fragment_row_counts &&
+           lhs.explain_lines == rhs.explain_lines &&
+           lhs.columns == rhs.columns &&
+           lhs.rows == rhs.rows;
+}
 bool operator==(const RangeRowsResult& lhs, const RangeRowsResult& rhs) {
     return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
            lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
            lhs.columns == rhs.columns && lhs.rows == rhs.rows &&
            lhs.client_session_columns == rhs.client_session_columns &&
            lhs.client_session_rows == rhs.client_session_rows;
+}
+bool operator==(const DistributedRangeReadResult& lhs,
+                const DistributedRangeReadResult& rhs) {
+    return lhs.complete == rhs.complete && lhs.table == rhs.table &&
+           lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
+           lhs.read_ts == rhs.read_ts && lhs.range_ids == rhs.range_ids &&
+           lhs.replica_group_ids == rhs.replica_group_ids &&
+           lhs.fragment_row_counts == rhs.fragment_row_counts &&
+           lhs.columns == rhs.columns && lhs.rows == rhs.rows;
 }
 bool operator==(const RouteResult& lhs, const RouteResult& rhs) {
     return lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
@@ -13042,6 +12740,20 @@ bool operator==(const InvalidSchemaResult&, const InvalidSchemaResult&) { return
 bool operator==(const ClusterRejectedResult&, const ClusterRejectedResult&) { return true; }
 bool operator==(const ConfigRejectedResult&, const ConfigRejectedResult&) { return true; }
 bool operator==(const RouteRejectedResult&, const RouteRejectedResult&) { return true; }
+bool operator==(const ReplicaSafeTimestampResult& lhs,
+                const ReplicaSafeTimestampResult& rhs) {
+    return lhs.replica_id == rhs.replica_id &&
+           lhs.leader == rhs.leader &&
+           lhs.safe_ts == rhs.safe_ts &&
+           lhs.applied_index == rhs.applied_index;
+}
+bool operator==(const FollowerReadRejectedResult& lhs,
+                const FollowerReadRejectedResult& rhs) {
+    return lhs.replica_id == rhs.replica_id &&
+           lhs.read_ts == rhs.read_ts &&
+           lhs.safe_ts == rhs.safe_ts &&
+           lhs.applied_index == rhs.applied_index;
+}
 
 bool operator==(const Result& lhs, const Result& rhs) {
     return lhs.index() == rhs.index() &&
@@ -13092,6 +12804,39 @@ std::string describeCommand(const Command& command) {
                 if (!value.read_ts.isZero()) {
                     out << " @ " << hlcToString(value.read_ts);
                 }
+            } else if constexpr (std::is_same_v<T, RangeReadCommand>) {
+                out << "RangeRead(" << value.table
+                    << ", range=" << value.range_id
+                    << ", [" << value.start_key << ", "
+                    << value.end_key << ")";
+                if (!value.read_ts.isZero()) {
+                    out << ", read_ts=" << hlcToString(value.read_ts);
+                }
+                out << ")";
+            } else if constexpr (std::is_same_v<T, ExecuteQueryFragmentCommand>) {
+                out << "ExecuteQueryFragment(" << value.fragment.query_id
+                    << "#" << value.fragment.fragment_id
+                    << ", attempt=" << value.fragment.attempt_id
+                    << ", range=" << value.fragment.range_id
+                    << ", group=" << value.fragment.replica_group_id
+                    << ", [" << value.fragment.start_key << ", "
+                    << value.fragment.end_key << ")";
+                if (!value.fragment.predicate_column.empty()) {
+                    out << ", where " << value.fragment.predicate_column
+                        << "=" << value.fragment.predicate_value;
+                }
+                if (!value.fragment.aggregate_function.empty()) {
+                    out << ", partial "
+                        << value.fragment.aggregate_function;
+                    if (!value.fragment.aggregate_column.empty()) {
+                        out << "(" << value.fragment.aggregate_column << ")";
+                    }
+                }
+                if (!value.fragment.read_ts.isZero()) {
+                    out << ", read_ts="
+                        << hlcToString(value.fragment.read_ts);
+                }
+                out << ")";
             } else if constexpr (std::is_same_v<T, ExplainRouteCommand>) {
                 out << "ExplainRoute(" << value.table;
                 if (value.full_scan) {
@@ -13196,6 +12941,24 @@ std::string describeCommand(const Command& command) {
                                    ? "source-group"
                                    : value.right_replica_group_id)
                     << ", version=" << value.descriptor_version << ")";
+            } else if constexpr (std::is_same_v<T, PlanTableSplitCommand>) {
+                out << "PlanTableSplit(" << value.table
+                    << ", source="
+                    << (value.source_range_id.empty()
+                            ? "default"
+                            : value.source_range_id)
+                    << ", ranges=" << value.target_range_count;
+                if (!value.target_replica_group_ids.empty()) {
+                    out << ", target_groups=[";
+                    for (size_t i = 0;
+                         i < value.target_replica_group_ids.size();
+                         ++i) {
+                        if (i != 0) out << ", ";
+                        out << value.target_replica_group_ids[i];
+                    }
+                    out << "]";
+                }
+                out << ")";
             } else if constexpr (std::is_same_v<T, BootstrapClusterCommand>) {
                 out << "BootstrapCluster(" << value.cluster_id
                     << ", node=" << value.bootstrap_node_id
@@ -13303,6 +13066,8 @@ std::string describeCommand(const Command& command) {
                 out << "QueryRangeConfig(" << value.config_num << ")";
             } else if constexpr (std::is_same_v<T, ReadSystemCatalogCommand>) {
                 out << "ReadSystemCatalog(" << value.table << ")";
+            } else if constexpr (std::is_same_v<T, ReadReplicaSafeTimestampCommand>) {
+                out << "ReadReplicaSafeTimestamp";
             }
             return out.str();
         },
@@ -13319,7 +13084,10 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, DeleteRowsResult>) out << "DeleteRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, UpdateRowsResult>) out << "UpdateRows(" << value.count << ")";
             else if constexpr (std::is_same_v<T, SelectAllResult>) out << "SelectAll(columns=" << value.columns.size() << ", rows=" << value.rows.size() << ")";
+            else if constexpr (std::is_same_v<T, FragmentResult>) out << "FragmentResult(query=" << value.query_id << ", fragment=" << value.fragment_id << ", complete=" << (value.complete ? "true" : "false") << ", rows=" << value.rows.size() << ", partial_count=" << value.partial_count << ", partial_sum=" << value.partial_sum << ")";
+            else if constexpr (std::is_same_v<T, DistributedQueryResult>) out << "DistributedQuery(query=" << value.query_id << ", complete=" << (value.complete ? "true" : "false") << ", fragments=" << value.fragments.size() << ", rows=" << value.rows.size() << ", final_count=" << value.final_count << ", final_sum=" << value.final_sum << ")";
             else if constexpr (std::is_same_v<T, RangeRowsResult>) out << "RangeRows(table=" << value.table << ", range=" << value.range_id << ", rows=" << value.rows.size() << ")";
+            else if constexpr (std::is_same_v<T, DistributedRangeReadResult>) out << "DistributedRangeRead(table=" << value.table << ", complete=" << (value.complete ? "true" : "false") << ", ranges=" << value.range_ids.size() << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, RouteResult>) out << "RouteResult(ranges=" << value.range_ids.size() << ")";
             else if constexpr (std::is_same_v<T, RangeConfigResult>) out << "RangeConfig(num=" << value.config_num << ", ranges=" << value.range_ids.size() << ")";
             else if constexpr (std::is_same_v<T, TransactionOkResult>) out << "TransactionOk(range=" << value.range_id << ", statements=" << value.statement_count << ")";
@@ -13337,6 +13105,8 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, ClusterRejectedResult>) out << "ClusterRejected";
             else if constexpr (std::is_same_v<T, ConfigRejectedResult>) out << "ConfigRejected";
             else if constexpr (std::is_same_v<T, RouteRejectedResult>) out << "RouteRejected";
+            else if constexpr (std::is_same_v<T, ReplicaSafeTimestampResult>) out << "ReplicaSafeTimestamp(" << value.replica_id << ", safe_ts=" << hlcToString(value.safe_ts) << ", applied=" << value.applied_index << ")";
+            else if constexpr (std::is_same_v<T, FollowerReadRejectedResult>) out << "FollowerReadRejected(" << value.replica_id << ", read_ts=" << hlcToString(value.read_ts) << ", safe_ts=" << hlcToString(value.safe_ts) << ")";
             return out.str();
         },
         result);
@@ -13345,6 +13115,7 @@ std::string describeResult(const Result& result) {
 std::string indexEntryKey(const std::string& index_name,
                           const std::string& index_key,
                           const std::string& primary_key);
+Command parseSQL(const std::string& sql);
 
 class RangeTransferProtocol {
 public:
@@ -13585,6 +13356,245 @@ public:
         std::vector<std::vector<std::string>> rows;
     };
 
+    std::vector<QueryFragment> planQueryFragments(
+        const std::string& sql,
+        const std::string& start_key = "",
+        const std::string& end_key = "",
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        ProjectScan scan = parseProjectScan(sql);
+        Result ownership_result =
+            catalog_(Command{ReadRangeOwnershipCommand{scan.table, true}});
+        const auto* ownership = std::get_if<SelectAllResult>(&ownership_result);
+        if (ownership == nullptr) return {};
+
+        std::vector<ReadRangeFragment> active_ranges;
+        for (const auto& row : ownership->rows) {
+            auto table_name = valueAt(*ownership, row, "table_name");
+            auto index_name = valueAt(*ownership, row, "index_name");
+            auto range_id = valueAt(*ownership, row, "range_id");
+            auto range_start = valueAt(*ownership, row, "start_key");
+            auto range_end = valueAt(*ownership, row, "end_key");
+            auto replica_group_id =
+                valueAt(*ownership, row, "replica_group_id");
+            auto owner_version = valueAt(*ownership, row, "owner_version");
+            auto status = valueAt(*ownership, row, "status");
+            if (!table_name.has_value() || *table_name != scan.table ||
+                !index_name.has_value() || *index_name != "primary" ||
+                !range_id.has_value() || !range_start.has_value() ||
+                !range_end.has_value() || !replica_group_id.has_value() ||
+                !owner_version.has_value() || !status.has_value() ||
+                *status != "active") {
+                continue;
+            }
+            ReadRangeFragment range{
+                *range_id,
+                *range_start,
+                *range_end,
+                *replica_group_id,
+                std::stoi(*owner_version)};
+            if (rangesOverlapForRead(start_key, end_key, range)) {
+                active_ranges.push_back(std::move(range));
+            }
+        }
+        sortReadRanges(active_ranges);
+
+        std::vector<QueryFragment> fragments;
+        std::string query_id = queryIdFor(sql, start_key, end_key, read_ts);
+        for (const auto& range : active_ranges) {
+            fragments.push_back(
+                QueryFragment{
+                    query_id,
+                    fragments.size(),
+                    1,
+                    sql,
+                    scan.table,
+                    range.range_id,
+                    range.replica_group_id,
+                    start_key < range.start_key ? range.start_key : start_key,
+                    fragmentEnd(end_key, range.end_key),
+                    scan.predicate_column,
+                    scan.predicate_value,
+                    scan.aggregate_function,
+                    scan.aggregate_column,
+                    read_ts});
+        }
+        return fragments;
+    }
+
+    DistributedQueryResult explainQuery(
+        const std::string& sql,
+        const std::string& start_key = "",
+        const std::string& end_key = "",
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        std::vector<QueryFragment> fragments =
+            planQueryFragments(sql, start_key, end_key, read_ts);
+        return baseQueryResult(sql, start_key, end_key, read_ts, fragments);
+    }
+
+    DistributedQueryResult explainDistributedAggregate(
+        const std::string& sql,
+        const std::string& start_key = "",
+        const std::string& end_key = "",
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        ProjectScan scan = parseProjectScan(sql);
+        if (scan.aggregate_function.empty()) {
+            return baseQueryResult(sql, start_key, end_key, read_ts, {});
+        }
+        HybridLogicalTimestamp aggregate_read_ts =
+            read_ts.isZero() ? nextQueryReadTimestamp() : read_ts;
+        return explainQuery(sql, start_key, end_key, aggregate_read_ts);
+    }
+
+    DistributedQueryResult executeQueryFragments(
+        const std::string& sql,
+        const std::string& start_key = "",
+        const std::string& end_key = "",
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        std::vector<QueryFragment> fragments =
+            planQueryFragments(sql, start_key, end_key, read_ts);
+        std::vector<FragmentResult> fragment_results;
+        for (const auto& fragment : fragments) {
+            auto owner = replica_groups_.find(fragment.replica_group_id);
+            if (owner == replica_groups_.end()) {
+                return baseQueryResult(
+                    sql, start_key, end_key, read_ts, fragments);
+            }
+            Result executed = owner->second(
+                Command{ExecuteQueryFragmentCommand{fragment}});
+            const auto* result = std::get_if<FragmentResult>(&executed);
+            if (result == nullptr || !result->complete) {
+                return baseQueryResult(
+                    sql, start_key, end_key, read_ts, fragments);
+            }
+            fragment_results.push_back(*result);
+        }
+        return mergeQueryFragmentResults(
+            sql, start_key, end_key, read_ts, fragments, fragment_results);
+    }
+
+    DistributedQueryResult executeDistributedAggregate(
+        const std::string& sql,
+        const std::string& start_key = "",
+        const std::string& end_key = "",
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        ProjectScan scan = parseProjectScan(sql);
+        if (scan.aggregate_function.empty()) {
+            return baseQueryResult(sql, start_key, end_key, read_ts, {});
+        }
+        HybridLogicalTimestamp aggregate_read_ts =
+            read_ts.isZero() ? nextQueryReadTimestamp() : read_ts;
+        return executeQueryFragments(
+            sql, start_key, end_key, aggregate_read_ts);
+    }
+
+    DistributedQueryResult mergeQueryFragmentResults(
+        const std::string& sql,
+        const std::string& start_key,
+        const std::string& end_key,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<QueryFragment>& fragments,
+        const std::vector<FragmentResult>& fragment_results) {
+        DistributedQueryResult result =
+            baseQueryResult(sql, start_key, end_key, read_ts, fragments);
+        std::map<size_t, QueryFragment> expected;
+        for (const auto& fragment : fragments) {
+            expected[fragment.fragment_id] = fragment;
+        }
+
+        std::set<size_t> seen;
+        std::map<size_t, size_t> row_counts;
+        size_t aggregate_count = 0;
+        int64_t aggregate_sum = 0;
+        bool aggregate_query = !result.aggregate_function.empty();
+        for (const auto& fragment_result : fragment_results) {
+            auto expected_fragment =
+                expected.find(fragment_result.fragment_id);
+            if (expected_fragment == expected.end() ||
+                fragment_result.query_id != result.query_id ||
+                !fragment_result.complete) {
+                result.rows.clear();
+                result.fragment_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                return result;
+            }
+            if (!seen.insert(fragment_result.fragment_id).second) {
+                continue;
+            }
+            if (fragment_result.range_id !=
+                    expected_fragment->second.range_id ||
+                fragment_result.replica_group_id !=
+                    expected_fragment->second.replica_group_id ||
+                fragment_result.aggregate != aggregate_query ||
+                (aggregate_query &&
+                 (fragment_result.aggregate_function !=
+                      result.aggregate_function ||
+                  fragment_result.aggregate_column !=
+                      result.aggregate_column)) ||
+                (!aggregate_query &&
+                 !result.columns.empty() &&
+                 result.columns != fragment_result.columns)) {
+                result.rows.clear();
+                result.fragment_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                return result;
+            }
+            if (!aggregate_query && result.columns.empty()) {
+                result.columns = fragment_result.columns;
+            }
+            row_counts[fragment_result.fragment_id] =
+                aggregate_query ? fragment_result.partial_count
+                                : fragment_result.rows.size();
+            result.fragment_results.push_back(fragment_result);
+            if (aggregate_query) {
+                aggregate_count += fragment_result.partial_count;
+                aggregate_sum += fragment_result.partial_sum;
+            } else {
+                result.rows.insert(result.rows.end(),
+                                   fragment_result.rows.begin(),
+                                   fragment_result.rows.end());
+            }
+        }
+        if (seen.size() != fragments.size()) {
+            result.rows.clear();
+            result.fragment_results.clear();
+            result.fragment_row_counts.clear();
+            result.complete = false;
+            return result;
+        }
+        for (const auto& fragment : fragments) {
+            result.fragment_row_counts.push_back(
+                row_counts[fragment.fragment_id]);
+        }
+        if (aggregate_query) {
+            result.final_count = aggregate_count;
+            result.final_sum = aggregate_sum;
+            if (result.aggregate_function == "COUNT") {
+                result.columns = {"count"};
+                result.rows = {{std::to_string(aggregate_count)}};
+            } else if (result.aggregate_function == "SUM") {
+                result.columns = {"sum"};
+                result.rows = {{std::to_string(aggregate_sum)}};
+            } else {
+                result.rows.clear();
+                result.fragment_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                return result;
+            }
+        } else {
+            std::sort(result.rows.begin(), result.rows.end());
+        }
+        result.complete = true;
+        return result;
+    }
+
     Result applyIndexPostingToCurrentOwner(
         const std::string& index_name,
         const std::string& index_key,
@@ -13686,7 +13696,300 @@ public:
         return result;
     }
 
+    DistributedRangeReadResult readTableRange(
+        const std::string& table,
+        const std::string& start_key,
+        const std::string& end_key,
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        DistributedRangeReadResult result;
+        result.table = table;
+        result.start_key = start_key;
+        result.end_key = end_key;
+        result.read_ts = read_ts;
+
+        Result ownership_result =
+            catalog_(Command{ReadRangeOwnershipCommand{table, true}});
+        const auto* ownership = std::get_if<SelectAllResult>(&ownership_result);
+        if (ownership == nullptr) return result;
+
+        struct ReadRangeFragment {
+            std::string range_id;
+            std::string start_key;
+            std::string end_key;
+            std::string replica_group_id;
+            int owner_version = 0;
+        };
+        auto rangesOverlapForRead =
+            [](const std::string& query_start,
+               const std::string& query_end,
+               const ReadRangeFragment& range) {
+            bool left_before_right_end =
+                range.end_key.empty() || query_start < range.end_key;
+            bool right_after_left_start =
+                query_end.empty() || range.start_key < query_end;
+            return left_before_right_end && right_after_left_start;
+        };
+
+        std::vector<ReadRangeFragment> fragments;
+        for (const auto& row : ownership->rows) {
+            auto table_name = valueAt(*ownership, row, "table_name");
+            auto index_name = valueAt(*ownership, row, "index_name");
+            auto range_id = valueAt(*ownership, row, "range_id");
+            auto range_start = valueAt(*ownership, row, "start_key");
+            auto range_end = valueAt(*ownership, row, "end_key");
+            auto replica_group_id =
+                valueAt(*ownership, row, "replica_group_id");
+            auto owner_version = valueAt(*ownership, row, "owner_version");
+            auto status = valueAt(*ownership, row, "status");
+            if (!table_name.has_value() || *table_name != table ||
+                !index_name.has_value() || *index_name != "primary" ||
+                !range_id.has_value() || !range_start.has_value() ||
+                !range_end.has_value() || !replica_group_id.has_value() ||
+                !owner_version.has_value() || !status.has_value() ||
+                *status != "active") {
+                continue;
+            }
+            ReadRangeFragment range{
+                *range_id,
+                *range_start,
+                *range_end,
+                *replica_group_id,
+                std::stoi(*owner_version)};
+            if (rangesOverlapForRead(start_key, end_key, range)) {
+                fragments.push_back(std::move(range));
+            }
+        }
+        std::sort(
+            fragments.begin(),
+            fragments.end(),
+            [](const ReadRangeFragment& lhs,
+               const ReadRangeFragment& rhs) {
+                if (lhs.start_key != rhs.start_key) {
+                    return lhs.start_key < rhs.start_key;
+                }
+                if (lhs.end_key != rhs.end_key) {
+                    return lhs.end_key < rhs.end_key;
+                }
+                return lhs.range_id < rhs.range_id;
+            });
+
+        auto fragmentEnd = [](const std::string& query_end,
+                              const std::string& range_end) {
+            if (query_end.empty()) return range_end;
+            if (range_end.empty()) return query_end;
+            return query_end < range_end ? query_end : range_end;
+        };
+
+        for (const auto& fragment : fragments) {
+            result.range_ids.push_back(fragment.range_id);
+            result.replica_group_ids.push_back(fragment.replica_group_id);
+        }
+
+        for (const auto& fragment : fragments) {
+            auto owner = replica_groups_.find(fragment.replica_group_id);
+            if (owner == replica_groups_.end()) {
+                result.rows.clear();
+                result.fragment_row_counts.clear();
+                return result;
+            }
+
+            std::string fragment_start =
+                start_key < fragment.start_key ? fragment.start_key
+                                               : start_key;
+            std::string fragment_end =
+                fragmentEnd(end_key, fragment.end_key);
+            Result selected =
+                owner->second(Command{RangeReadCommand{
+                    table,
+                    fragment.range_id,
+                    fragment_start,
+                    fragment_end,
+                    read_ts}});
+            const auto* rows = std::get_if<SelectAllResult>(&selected);
+            if (rows == nullptr ||
+                (!result.columns.empty() && result.columns != rows->columns)) {
+                result.rows.clear();
+                result.fragment_row_counts.clear();
+                return result;
+            }
+            if (result.columns.empty()) result.columns = rows->columns;
+            result.fragment_row_counts.push_back(rows->rows.size());
+            result.rows.insert(result.rows.end(),
+                               rows->rows.begin(),
+                               rows->rows.end());
+        }
+        std::sort(result.rows.begin(), result.rows.end());
+        result.complete = true;
+        return result;
+    }
+
 private:
+    struct ProjectScan {
+        std::string table;
+        std::string predicate_column;
+        std::string predicate_value;
+        std::string aggregate_function;
+        std::string aggregate_column;
+    };
+
+    struct ReadRangeFragment {
+        std::string range_id;
+        std::string start_key;
+        std::string end_key;
+        std::string replica_group_id;
+        int owner_version = 0;
+    };
+
+    static ProjectScan parseProjectScan(const std::string& sql) {
+        std::smatch matches;
+        std::regex count_regex(
+            "^\\s*(PROJECT|SELECT)\\s+COUNT\\s*(?:\\(\\s*\\*\\s*\\)|\\{\\s*\\*\\s*\\})\\s+FROM\\s+"
+            "([A-Za-z_][A-Za-z0-9_]*)"
+            "(?:\\s+WHERE\\s+\\{?([A-Za-z_][A-Za-z0-9_]*)\\}?\\s*=\\s*([^\\s]+))?\\s*$",
+            std::regex_constants::icase);
+        if (std::regex_match(sql, matches, count_regex)) {
+            return ProjectScan{
+                matches[2],
+                matches[3].matched ? std::string(matches[3]) : "",
+                matches[4].matched ? std::string(matches[4]) : "",
+                "COUNT",
+                ""};
+        }
+
+        std::regex sum_regex(
+            "^\\s*(PROJECT|SELECT)\\s+SUM\\s*(?:\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\)|\\{\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\})\\s+FROM\\s+"
+            "([A-Za-z_][A-Za-z0-9_]*)"
+            "(?:\\s+WHERE\\s+\\{?([A-Za-z_][A-Za-z0-9_]*)\\}?\\s*=\\s*([^\\s]+))?\\s*$",
+            std::regex_constants::icase);
+        if (std::regex_match(sql, matches, sum_regex)) {
+            return ProjectScan{
+                matches[4],
+                matches[5].matched ? std::string(matches[5]) : "",
+                matches[6].matched ? std::string(matches[6]) : "",
+                "SUM",
+                matches[2].matched ? std::string(matches[2])
+                                   : std::string(matches[3])};
+        }
+
+        Command parsed = parseSQL(sql);
+        if (const auto* select = std::get_if<SelectAllCommand>(&parsed)) {
+            return ProjectScan{select->table, "", "", "", ""};
+        }
+        if (const auto* select =
+                std::get_if<SelectWhereCommand>(&parsed)) {
+            return ProjectScan{
+                select->table,
+                select->column,
+                select->value,
+                "",
+                ""};
+        }
+        throw std::runtime_error(
+            "distributed query fragments support PROJECT/SELECT scans only");
+    }
+
+    static bool rangesOverlapForRead(
+        const std::string& query_start,
+        const std::string& query_end,
+        const ReadRangeFragment& range) {
+        bool left_before_right_end =
+            range.end_key.empty() || query_start < range.end_key;
+        bool right_after_left_start =
+            query_end.empty() || range.start_key < query_end;
+        return left_before_right_end && right_after_left_start;
+    }
+
+    static void sortReadRanges(std::vector<ReadRangeFragment>& fragments) {
+        std::sort(
+            fragments.begin(),
+            fragments.end(),
+            [](const ReadRangeFragment& lhs,
+               const ReadRangeFragment& rhs) {
+                if (lhs.start_key != rhs.start_key) {
+                    return lhs.start_key < rhs.start_key;
+                }
+                if (lhs.end_key != rhs.end_key) {
+                    return lhs.end_key < rhs.end_key;
+                }
+                return lhs.range_id < rhs.range_id;
+            });
+    }
+
+    static std::string fragmentEnd(const std::string& query_end,
+                                   const std::string& range_end) {
+        if (query_end.empty()) return range_end;
+        if (range_end.empty()) return query_end;
+        return query_end < range_end ? query_end : range_end;
+    }
+
+    static std::string queryIdFor(
+        const std::string& sql,
+        const std::string& start_key,
+        const std::string& end_key,
+        const HybridLogicalTimestamp& read_ts) {
+        return "query|" + sql + "|" + start_key + "|" + end_key + "|" +
+               std::to_string(read_ts.physical) + "." +
+               std::to_string(read_ts.logical);
+    }
+
+    static HybridLogicalTimestamp nextQueryReadTimestamp() {
+        static HybridLogicalClock clock;
+        return clock.now();
+    }
+
+    static std::vector<std::string> explainLinesFor(
+        const std::vector<QueryFragment>& fragments) {
+        std::vector<std::string> lines;
+        for (const auto& fragment : fragments) {
+            std::ostringstream line;
+            line << "fragment " << fragment.fragment_id
+                 << " range=" << fragment.range_id
+                 << " group=" << fragment.replica_group_id
+                 << " [" << fragment.start_key << ", "
+                 << fragment.end_key << ")";
+            if (!fragment.predicate_column.empty()) {
+                line << " predicate=" << fragment.predicate_column
+                     << "=" << fragment.predicate_value;
+            }
+            if (!fragment.aggregate_function.empty()) {
+                line << " partial=" << fragment.aggregate_function;
+                if (!fragment.aggregate_column.empty()) {
+                    line << "(" << fragment.aggregate_column << ")";
+                }
+            }
+            if (!fragment.read_ts.isZero()) {
+                line << " read_ts=" << hlcToString(fragment.read_ts);
+            }
+            lines.push_back(line.str());
+        }
+        return lines;
+    }
+
+    static DistributedQueryResult baseQueryResult(
+        const std::string& sql,
+        const std::string& start_key,
+        const std::string& end_key,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<QueryFragment>& fragments) {
+        DistributedQueryResult result;
+        result.sql = sql;
+        result.start_key = start_key;
+        result.end_key = end_key;
+        result.read_ts = read_ts;
+        result.fragments = fragments;
+        result.explain_lines = explainLinesFor(fragments);
+        result.query_id = fragments.empty()
+                              ? queryIdFor(sql, start_key, end_key, read_ts)
+                              : fragments.front().query_id;
+        result.table = fragments.empty() ? parseProjectScan(sql).table
+                                         : fragments.front().table;
+        ProjectScan scan = parseProjectScan(sql);
+        result.aggregate_function = scan.aggregate_function;
+        result.aggregate_column = scan.aggregate_column;
+        return result;
+    }
+
     struct TransferRecord {
         std::string range_id;
         std::string source_group_id;
@@ -14057,7 +14360,7 @@ private:
         auto rows = readCatalogTable("__txn_participants");
         if (!rows.has_value()) return {};
 
-        std::vector<std::pair<size_t, TxnParticipantRecord>> indexed;
+        std::map<size_t, std::pair<int, TxnParticipantRecord>> indexed;
         for (const auto& row : rows->rows) {
             auto row_txn_id = valueAt(*rows, row, "txn_id");
             auto range_id = valueAt(*rows, row, "range_id");
@@ -14070,25 +14373,24 @@ private:
                 !replica_group_id.has_value() ||
                 !participant_index.has_value() ||
                 !status.has_value() ||
-                *status != "prepared") {
+                (*status != "prepared" && *status != "committed")) {
                 continue;
             }
-            indexed.push_back({
-                static_cast<size_t>(std::stoull(*participant_index)),
-                TxnParticipantRecord{
-                    *range_id,
-                    *replica_group_id,
-                    static_cast<size_t>(std::stoull(*participant_index))}});
+            size_t index = static_cast<size_t>(std::stoull(*participant_index));
+            TxnParticipantRecord record{
+                *range_id,
+                *replica_group_id,
+                index};
+            int rank = txnStatusRank(*status);
+            auto existing = indexed.find(index);
+            if (existing == indexed.end() || rank >= existing->second.first) {
+                indexed[index] = {rank, std::move(record)};
+            }
         }
-        std::sort(indexed.begin(),
-                  indexed.end(),
-                  [](const auto& lhs, const auto& rhs) {
-                      return lhs.first < rhs.first;
-                  });
         std::vector<TxnParticipantRecord> participants;
         for (const auto& [index, participant] : indexed) {
             (void)index;
-            participants.push_back(participant);
+            participants.push_back(participant.second);
         }
         return participants;
     }
@@ -19255,7 +19557,6 @@ private:
             return TableNotFoundResult{};
         }
         ensureSystemCatalogTables();
-        ensureSystemCatalogTables();
         SelectAllResult all = queryResultToSelectAll(
             command.table, db_->executeQuery("PROJECT * FROM " + command.table,
                                              nullptr, false));
@@ -19294,6 +19595,7 @@ private:
         if (!tableExists(command.table) || command.range_id.empty()) {
             return TableNotFoundResult{};
         }
+        ensureSystemCatalogTables();
         SelectAllResult all = queryResultToSelectAll(
             command.table, db_->executeQuery("PROJECT * FROM " + command.table,
                                              nullptr, false));
@@ -19346,6 +19648,7 @@ private:
         if (!tableExists(command.table) || command.range_id.empty()) {
             return TableNotFoundResult{};
         }
+        ensureSystemCatalogTables();
         Result cleared = executeOne(
             DeleteRangeRowsCommand{command.table,
                                    command.range_id,
@@ -19533,6 +19836,107 @@ private:
                                      command.read_ts);
             }
             return selectWhere(command.table, command.column, command.value);
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeOne(const RangeReadCommand& command) {
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        try {
+            SelectAllResult all =
+                command.read_ts.isZero()
+                    ? selectAll(command.table)
+                    : selectAllAt(command.table, command.read_ts);
+            SelectAllResult bounded{all.columns, {}};
+            for (const auto& row : all.rows) {
+                if (rowBelongsToRange(command.table,
+                                      all.columns,
+                                      row,
+                                      command.range_id,
+                                      command.start_key,
+                                      command.end_key)) {
+                    bounded.rows.push_back(row);
+                }
+            }
+            return bounded;
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeOne(const ExecuteQueryFragmentCommand& command) {
+        const QueryFragment& fragment = command.fragment;
+        if (!tableExists(fragment.table) || fragment.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        try {
+            SelectAllResult all =
+                fragment.read_ts.isZero()
+                    ? selectAll(fragment.table)
+                    : selectAllAt(fragment.table, fragment.read_ts);
+            std::optional<size_t> predicate_column;
+            if (!fragment.predicate_column.empty()) {
+                predicate_column =
+                    columnIndex(all.columns, fragment.predicate_column);
+                if (!predicate_column.has_value()) {
+                    return SchemaMismatchResult{};
+                }
+            }
+            std::optional<size_t> aggregate_column;
+            if (fragment.aggregate_function == "SUM") {
+                aggregate_column =
+                    columnIndex(all.columns, fragment.aggregate_column);
+                if (!aggregate_column.has_value()) {
+                    return SchemaMismatchResult{};
+                }
+            }
+
+            FragmentResult result;
+            result.complete = true;
+            result.query_id = fragment.query_id;
+            result.fragment_id = fragment.fragment_id;
+            result.attempt_id = fragment.attempt_id;
+            result.range_id = fragment.range_id;
+            result.replica_group_id = fragment.replica_group_id;
+            result.aggregate = !fragment.aggregate_function.empty();
+            result.aggregate_function = fragment.aggregate_function;
+            result.aggregate_column = fragment.aggregate_column;
+            result.columns = result.aggregate
+                                 ? std::vector<std::string>{
+                                       fragment.aggregate_function == "COUNT"
+                                           ? "count"
+                                           : "sum"}
+                                 : all.columns;
+            for (const auto& row : all.rows) {
+                if (!rowBelongsToRange(fragment.table,
+                                      all.columns,
+                                      row,
+                                      fragment.range_id,
+                                      fragment.start_key,
+                                      fragment.end_key)) {
+                    continue;
+                }
+                if (predicate_column.has_value() &&
+                    (*predicate_column >= row.size() ||
+                        row[*predicate_column] != fragment.predicate_value)) {
+                    continue;
+                }
+                if (result.aggregate) {
+                    ++result.partial_count;
+                    if (fragment.aggregate_function == "SUM") {
+                        if (!aggregate_column.has_value() ||
+                            *aggregate_column >= row.size()) {
+                            return SchemaMismatchResult{};
+                        }
+                        result.partial_sum +=
+                            std::stoll(row[*aggregate_column]);
+                    }
+                } else {
+                    result.rows.push_back(row);
+                }
+            }
+            return result;
         } catch (const std::exception&) {
             return SchemaMismatchResult{};
         }
@@ -19949,6 +20353,207 @@ private:
 
         insertSystemCatalogRows(catalog_rows);
         return StatementOkResult{};
+    }
+
+    Result executeOne(const PlanTableSplitCommand& command) {
+        ensureSystemCatalogTables();
+        if (!tableExists(command.table)) return TableNotFoundResult{};
+        if (command.table.empty() || command.target_range_count < 2) {
+            return ConfigRejectedResult{};
+        }
+
+        std::string source_range_id =
+            command.source_range_id.empty()
+                ? defaultRangeIdForTable(command.table)
+                : command.source_range_id;
+        auto source = latestRangeDescriptorById(source_range_id);
+        if (!source.has_value() || source->status != "active" ||
+            source->start_key < tableRowPrefix(command.table) ||
+            source->end_key > tableRowPrefixEnd(command.table)) {
+            return ConfigRejectedResult{};
+        }
+
+        auto records =
+            latestGlobalKeyRecordsForRange(command.table, *source);
+        if (records.size() < command.target_range_count) {
+            return ConfigRejectedResult{};
+        }
+
+        std::vector<std::string> target_groups =
+            command.target_replica_group_ids;
+        if (target_groups.empty()) {
+            std::vector<std::string> stable_groups =
+                stableReplicaGroupIds();
+            std::vector<std::string> non_source_groups;
+            for (const auto& group_id : stable_groups) {
+                if (group_id != source->replica_group_id) {
+                    non_source_groups.push_back(group_id);
+                }
+            }
+            target_groups.push_back(source->replica_group_id);
+            for (size_t i = 1; i < command.target_range_count; ++i) {
+                target_groups.push_back(
+                    non_source_groups.empty()
+                        ? source->replica_group_id
+                        : non_source_groups[(i - 1) %
+                                            non_source_groups.size()]);
+            }
+        } else if (target_groups.size() == 1) {
+            target_groups.resize(command.target_range_count,
+                                 target_groups.front());
+        } else if (target_groups.size() != command.target_range_count) {
+            return ConfigRejectedResult{};
+        }
+
+        for (const auto& group_id : target_groups) {
+            auto group = latestReplicaGroupConfig(group_id);
+            if (!group.exists || group.phase != "stable") {
+                return ConfigRejectedResult{};
+            }
+        }
+
+        int descriptor_version =
+            std::max(latestRangeConfigNumber() + 1,
+                     source->descriptor_version + 1);
+        std::vector<std::string> split_keys;
+        for (size_t i = 1; i < command.target_range_count; ++i) {
+            size_t split_index =
+                (records.size() * i) / command.target_range_count;
+            if (split_index == 0 || split_index >= records.size()) {
+                return ConfigRejectedResult{};
+            }
+            std::string split_key = records[split_index].row_key;
+            if (split_key <= source->start_key ||
+                (!source->end_key.empty() &&
+                 split_key >= source->end_key) ||
+                (!split_keys.empty() && split_key <= split_keys.back())) {
+                return ConfigRejectedResult{};
+            }
+            split_keys.push_back(std::move(split_key));
+        }
+
+        std::vector<std::string> starts;
+        std::vector<std::string> ends;
+        starts.reserve(command.target_range_count);
+        ends.reserve(command.target_range_count);
+        starts.push_back(source->start_key);
+        for (const auto& split_key : split_keys) {
+            ends.push_back(split_key);
+            starts.push_back(split_key);
+        }
+        ends.push_back(source->end_key);
+
+        std::vector<std::string> child_range_ids;
+        child_range_ids.reserve(command.target_range_count);
+        for (size_t i = 0; i < command.target_range_count; ++i) {
+            child_range_ids.push_back(
+                "range-" + keyEscape(command.table) +
+                "-split-v" + std::to_string(descriptor_version) +
+                "-part-" + std::to_string(i + 1));
+        }
+
+        for (const auto& range : latestRangeDescriptorsById(
+                 rangeDescriptors())) {
+            if (range.status != "active") continue;
+            for (const auto& child_range_id : child_range_ids) {
+                if (range.range_id == child_range_id) {
+                    return ConfigRejectedResult{};
+                }
+            }
+        }
+
+        std::vector<RangeOwnershipRecord> child_records;
+        child_records.reserve(command.target_range_count);
+        for (size_t i = 0; i < command.target_range_count; ++i) {
+            child_records.push_back(
+                RangeOwnershipRecord{
+                    command.table,
+                    "primary",
+                    child_range_ids[i],
+                    starts[i],
+                    ends[i],
+                    source->replica_group_id,
+                    descriptor_version,
+                    "active"});
+        }
+
+        std::vector<RangeTransferRecord> transfer_requests;
+        for (size_t i = 0; i < child_records.size(); ++i) {
+            if (target_groups[i] == source->replica_group_id) {
+                continue;
+            }
+            auto request = buildRangeTransferRequest(
+                child_records,
+                child_records[i].range_id,
+                target_groups[i],
+                descriptor_version);
+            if (!request.has_value()) return ConfigRejectedResult{};
+            transfer_requests.push_back(*request);
+        }
+
+        std::vector<InsertRowCommand> catalog_rows{
+            InsertRowCommand{
+                "__ranges",
+                {source->range_id,
+                 source->start_key,
+                 source->end_key,
+                 source->replica_group_id,
+                 std::to_string(descriptor_version),
+                 "superseded"}},
+            rangeOwnershipCatalogRow(
+                command.table,
+                source->range_id,
+                source->start_key,
+                source->end_key,
+                source->replica_group_id,
+                descriptor_version,
+                "superseded")};
+
+        for (const auto& record : child_records) {
+            catalog_rows.push_back(
+                InsertRowCommand{
+                    "__ranges",
+                    {record.range_id,
+                     record.start_key,
+                     record.end_key,
+                     record.replica_group_id,
+                     std::to_string(descriptor_version),
+                     "active"}});
+            catalog_rows.push_back(
+                rangeOwnershipCatalogRow(
+                    command.table,
+                    record.range_id,
+                    record.start_key,
+                    record.end_key,
+                    record.replica_group_id,
+                    descriptor_version,
+                    "active"));
+        }
+
+        for (const auto& record : records) {
+            size_t child_index = 0;
+            while (child_index + 1 < child_records.size() &&
+                   !child_records[child_index].end_key.empty() &&
+                   record.row_key >= child_records[child_index].end_key) {
+                ++child_index;
+            }
+            catalog_rows.push_back(
+                InsertRowCommand{
+                    "__global_keys",
+                    {record.table_name,
+                     record.primary_key,
+                     record.row_key,
+                     child_records[child_index].range_id,
+                     source->replica_group_id,
+                     std::to_string(descriptor_version),
+                     "active"}});
+        }
+
+        insertSystemCatalogRows(catalog_rows);
+        for (const auto& request : transfer_requests) {
+            appendRangeTransferRecord(request);
+        }
+        return rangeConfigResult(descriptor_version, child_records);
     }
 
     Result executeOne(const BootstrapClusterCommand& command) {
@@ -20614,6 +21219,10 @@ private:
         return systemCatalogTableView(command.table);
     }
 
+    Result executeOne(const ReadReplicaSafeTimestampCommand&) {
+        return ConfigRejectedResult{};
+    }
+
     std::string database_file_;
     bool owns_bundle_ = false;
     std::unique_ptr<BuzzDB> db_;
@@ -20749,6 +21358,32 @@ bool finalizesConfigWithoutReplica(const Command& command,
     if (finalize == nullptr) return false;
     auto voters = canonicalCatalogList(finalize->final_voters);
     return !catalogListContains(voters, replica.rootAddress().str());
+}
+
+std::optional<HybridLogicalTimestamp> timestampedReadTimestamp(
+    const Command& command) {
+    if (const auto* select = std::get_if<SelectAllCommand>(&command)) {
+        if (!select->read_ts.isZero()) return select->read_ts;
+    } else if (const auto* select =
+                   std::get_if<SelectWhereCommand>(&command)) {
+        if (!select->read_ts.isZero()) return select->read_ts;
+    } else if (const auto* lookup =
+                   std::get_if<ReadSecondaryIndexCommand>(&command)) {
+        if (!lookup->read_ts.isZero()) return lookup->read_ts;
+    }
+    return std::nullopt;
+}
+
+HybridLogicalTimestamp resultTimestamp(const Result& result) {
+    if (const auto* txn = std::get_if<DistributedTxnResult>(&result)) {
+        if (!txn->commit_ts.isZero()) return txn->commit_ts;
+        return txn->read_ts;
+    }
+    if (const auto* safe =
+            std::get_if<ReplicaSafeTimestampResult>(&result)) {
+        return safe->safe_ts;
+    }
+    return HybridLogicalTimestamp::zero();
 }
 
 std::string describeMessage(const Message& message) {
@@ -21649,6 +22284,7 @@ public:
         }
         sendAppendEntriesToPeers(ctx);
         resetAppendRetryTimer(ctx);
+        advanceCommitIndex(ctx);
     }
 
     std::unique_ptr<Node> clone() const override {
@@ -21658,6 +22294,7 @@ public:
     std::string roleName() const { return consensusRoleName(role_); }
     size_t majoritySize() const { return replicas_.size() / 2 + 1; }
     int commitIndex() const { return commit_index_; }
+    HybridLogicalTimestamp safeTimestamp() const { return safe_timestamp_; }
 
     Result executeReadOnlyForTest(const Command& command) const {
         return runWithSuppressedStdout([&] {
@@ -21675,6 +22312,7 @@ public:
             << ", votes=" << votes_.size()
             << ", commit=" << commit_index_
             << ", applied=" << applied_index_
+            << ", safe_ts=" << hlcToString(safe_timestamp_)
             << ", snap=(" << last_included_index_
             << "," << last_included_term_ << ")"
             << ", first=" << first_non_cleared_
@@ -21924,6 +22562,39 @@ private:
     void handleClientRequest(NodeContext& ctx,
                              const Address& client,
                              const ClientRequest& request) {
+        if (std::holds_alternative<ReadReplicaSafeTimestampCommand>(
+                request.command)) {
+            ctx.send(client, ClientReply{
+                request.client_id,
+                request.request_id,
+                safeTimestampResult()});
+            return;
+        }
+
+        auto read_ts = timestampedReadTimestamp(request.command);
+        if (role_ != ConsensusRole::Leader && read_ts.has_value()) {
+            if (canServeFollowerRead(*read_ts)) {
+                Result result = runWithSuppressedStdout([&] {
+                    BuzzDBCore copy = db_;
+                    return copy.execute(request.command);
+                });
+                ctx.send(client, ClientReply{
+                    request.client_id,
+                    request.request_id,
+                    result});
+            } else {
+                ctx.send(client, ClientReply{
+                    request.client_id,
+                    request.request_id,
+                    FollowerReadRejectedResult{
+                        address().rootAddress().str(),
+                        *read_ts,
+                        safe_timestamp_,
+                        applied_index_}});
+            }
+            return;
+        }
+
         if (role_ != ConsensusRole::Leader) {
             if (!addressEmpty(leader_) &&
                 !(leader_ == address().rootAddress())) {
@@ -22150,6 +22821,7 @@ private:
                                           snapshot.last_included_index));
         applied_index_ = std::max(applied_index_, snapshot.last_included_index);
         follower_applied_index_[address().rootAddress()] = applied_index_;
+        advanceSafeTimestamp(StatementOkResult{});
 
         auto erase_to = log_.upper_bound(last_included_index_);
         log_.erase(log_.begin(), erase_to);
@@ -22279,6 +22951,7 @@ private:
 
             applied_index_ = entry.index;
             follower_applied_index_[address().rootAddress()] = applied_index_;
+            advanceSafeTimestamp(result);
             auto pending = pending_by_index_.find(entry.index);
             if (pending != pending_by_index_.end()) {
                 ctx.send(pending->second.client, ClientReply{
@@ -22290,6 +22963,38 @@ private:
                 pending_by_index_.erase(pending);
             }
         }
+    }
+
+    ReplicaSafeTimestampResult safeTimestampResult() const {
+        return ReplicaSafeTimestampResult{
+            address().rootAddress().str(),
+            role_ == ConsensusRole::Leader,
+            safe_timestamp_,
+            applied_index_};
+    }
+
+    bool canServeFollowerRead(const HybridLogicalTimestamp& read_ts) const {
+        return !read_ts.isZero() &&
+               !safe_timestamp_.isZero() &&
+               read_ts <= safe_timestamp_;
+    }
+
+    void advanceSafeTimestamp(const Result& result) {
+        HybridLogicalTimestamp observed = resultTimestamp(result);
+        HybridLogicalTimestamp base = safe_timestamp_;
+        if (!observed.isZero() && base < observed) {
+            base = observed;
+        }
+        auto now = std::chrono::system_clock::now().time_since_epoch();
+        long long physical =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        if (physical > base.physical) {
+            safe_timestamp_ = HybridLogicalTimestamp{physical, 0};
+        } else {
+            safe_timestamp_ =
+                HybridLogicalTimestamp{base.physical, base.logical + 1};
+        }
+        safe_index_ = applied_index_;
     }
 
     std::vector<Address> replicas_;
@@ -22305,6 +23010,8 @@ private:
     int first_non_cleared_ = 1;
     int last_included_index_ = 0;
     int last_included_term_ = 0;
+    HybridLogicalTimestamp safe_timestamp_ = HybridLogicalTimestamp::zero();
+    int safe_index_ = 0;
     BuzzDBCore db_;
     std::map<int, ConsensusLogEntry> log_;
     std::map<Address, int> match_index_;
@@ -22754,12 +23461,25 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         int next_request_id = 1;
     };
 
-    auto prefixedReplicas = [](const std::string& prefix) {
+    auto prefixedReplicas = [](const std::string& prefix,
+                               size_t count = 3) {
         std::vector<Address> replicas;
-        for (size_t i = 1; i <= 3; ++i) {
+        for (size_t i = 1; i <= count; ++i) {
             replicas.emplace_back(prefix + std::to_string(i));
         }
         return replicas;
+    };
+
+    [[maybe_unused]] auto electConsensusGroupState =
+        [&](const std::vector<Address>& replicas, const Address& leader) {
+        SearchState state = consensusClusterState(replicas);
+        std::vector<Address> voters;
+        for (const auto& replica : replicas) {
+            if (!(replica.rootAddress() == leader.rootAddress())) {
+                voters.push_back(replica);
+            }
+        }
+        return electConsensusLeader(state, leader, voters);
     };
 
     auto makeGroup = [&](const std::string& group_id,
@@ -23003,15 +23723,15 @@ void printPartitionedSQLTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v142; "
-                  << "this version focuses on HLC/MVCC distributed transactions."
+        std::cerr << "--measure-restart is not available in v146; "
+                  << "this version focuses on distributed aggregation and read consistency."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v142: MVCC snapshots and serializable validation"
+    std::cout << "BuzzDB v146: distributed aggregation and read consistency"
               << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
@@ -23023,7 +23743,7 @@ int main(int argc, char* argv[]) {
 
     TestRunner tests;
 
-    auto withLocalMVCCDB = [&](auto&& fn) {
+    [[maybe_unused]] auto withLocalMVCCDB = [&](auto&& fn) {
         auto database_file = makeScratchBuzzDBFile();
         auto cleanup = [&]() {
             std::error_code ec;
@@ -23044,7 +23764,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    auto localValueFor = [](BuzzDB& db, const TxnPtr& txn) {
+    [[maybe_unused]] auto localValueFor = [](BuzzDB& db, const TxnPtr& txn) {
         QueryTable rows =
             db.executeQuery("PROJECT * FROM kv WHERE {id}=1", txn, false);
         if (rows.size() != 1 || rows.front().fields.size() < 2) {
@@ -23120,12 +23840,25 @@ int main(int argc, char* argv[]) {
             title_year_index, "title", "production_year", group_id};
     };
 
-    auto prefixedReplicas = [](const std::string& prefix) {
+    auto prefixedReplicas = [](const std::string& prefix,
+                               size_t count = 3) {
         std::vector<Address> replicas;
-        for (size_t i = 1; i <= 3; ++i) {
+        for (size_t i = 1; i <= count; ++i) {
             replicas.emplace_back(prefix + std::to_string(i));
         }
         return replicas;
+    };
+
+    auto electConsensusGroupState = [&](const std::vector<Address>& replicas,
+                                        const Address& leader) {
+        SearchState state = consensusClusterState(replicas);
+        std::vector<Address> voters;
+        for (const auto& replica : replicas) {
+            if (!(replica.rootAddress() == leader.rootAddress())) {
+                voters.push_back(replica);
+            }
+        }
+        return electConsensusLeader(state, leader, voters);
     };
 
     struct ConsensusGroupHarness {
@@ -23141,15 +23874,26 @@ int main(int argc, char* argv[]) {
     auto makeConsensusGroup =
         [&](const std::string& group_id,
             const std::string& prefix,
-            int client_id) {
+            int client_id,
+            size_t replica_count = 3) {
         ConsensusGroupHarness group;
         group.group_id = group_id;
-        group.replicas = prefixedReplicas(prefix);
+        group.replicas = prefixedReplicas(prefix, replica_count);
         group.leader = group.replicas.front();
         group.client = Address("client-" + group_id);
-        group.state = electedConsensusState(group.replicas, group.leader);
+        group.state = electConsensusGroupState(group.replicas, group.leader);
         group.client_id = client_id;
         return group;
+    };
+
+    auto followerReplicas = [](const ConsensusGroupHarness& group) {
+        std::vector<Address> followers;
+        for (const auto& replica : group.replicas) {
+            if (!(replica.rootAddress() == group.leader.rootAddress())) {
+                followers.push_back(replica);
+            }
+        }
+        return followers;
     };
 
     auto clientReplyFor = [](const SearchState& state,
@@ -23177,7 +23921,7 @@ int main(int argc, char* argv[]) {
             group.client_id,
             request_id,
             command,
-            {group.replicas[1], group.replicas[2]});
+            followerReplicas(group));
         auto reply =
             clientReplyFor(group.state, group.client_id, request_id);
         if (!reply.has_value()) {
@@ -23187,7 +23931,7 @@ int main(int argc, char* argv[]) {
         return *reply;
     };
 
-    auto commitCommandWithRequestId =
+    [[maybe_unused]] auto commitCommandWithRequestId =
         [&](ConsensusGroupHarness& group,
             int request_id,
             const Command& command) {
@@ -23200,7 +23944,7 @@ int main(int argc, char* argv[]) {
                 group.client_id,
                 request_id,
                 command,
-                {group.replicas[1], group.replicas[2]});
+                followerReplicas(group));
             auto reply =
                 clientReplyFor(group.state, group.client_id, request_id);
             if (!reply.has_value()) {
@@ -23210,7 +23954,44 @@ int main(int argc, char* argv[]) {
             return *reply;
         };
 
-    auto immediateClientCommandWithRequestId =
+    [[maybe_unused]] auto directClientCommand =
+        [&](ConsensusGroupHarness& group,
+            const Address& target,
+            const Command& command) {
+        int request_id = group.next_request_id++;
+        group.state.send(
+            group.client,
+            target,
+            ClientRequest{group.client_id, request_id, command});
+        group.state = stepRequired(
+            group.state,
+            requireMessageEvent(
+                group.state,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr &&
+                           request->client_id == group.client_id &&
+                           request->request_id == request_id &&
+                           envelope.from.rootAddress() ==
+                               group.client.rootAddress() &&
+                           envelope.to.rootAddress() ==
+                               target.rootAddress();
+                },
+                "direct client request",
+                SearchSettings{}),
+            SearchSettings{});
+        auto reply =
+            clientReplyFor(group.state, group.client_id, request_id);
+        if (!reply.has_value()) {
+            throw std::runtime_error(
+                "missing direct client reply for " +
+                describeCommand(command));
+        }
+        return *reply;
+    };
+
+    [[maybe_unused]] auto immediateClientCommandWithRequestId =
         [&](ConsensusGroupHarness& group,
             const Address& target,
             int request_id,
@@ -23256,15 +24037,16 @@ int main(int argc, char* argv[]) {
         ConsensusGroupHarness index_owner;
     };
 
-    auto buildIndexScenario = [&]() {
+    auto buildIndexScenario = [&](size_t replica_count = 3) {
         IndexScenario scenario;
         scenario.fixture = titleIndexFixture();
         scenario.catalog =
-            makeConsensusGroup("catalog", "server", 1);
+            makeConsensusGroup("catalog", "server", 1, replica_count);
         scenario.table_owner =
-            makeConsensusGroup("group-1", "table-server", 2);
+            makeConsensusGroup("group-1", "table-server", 2, replica_count);
         scenario.index_owner =
-            makeConsensusGroup(index_replica_group, "index-server", 3);
+            makeConsensusGroup(index_replica_group, "index-server", 3,
+                               replica_count);
 
         auto readSystemCatalog = [&](ConsensusGroupHarness& group,
                                      const std::string& table) {
@@ -23422,7 +24204,7 @@ int main(int argc, char* argv[]) {
         return runtime;
     };
 
-    auto participantHasStatus =
+    [[maybe_unused]] auto participantHasStatus =
         [&](const ConsensusGroupHarness& group,
             const std::string& txn_id,
             const std::string& range_id,
@@ -23434,7 +24216,7 @@ int main(int argc, char* argv[]) {
                  {"status", status}});
         };
 
-    auto participantIntentHasStatus =
+    [[maybe_unused]] auto participantIntentHasStatus =
         [&](const ConsensusGroupHarness& group,
             const std::string& txn_id,
             const std::string& range_id,
@@ -23452,8 +24234,8 @@ int main(int argc, char* argv[]) {
                values.end();
     };
 
-    auto countRowsOn = [&](const ConsensusGroupHarness& group,
-                           const std::string& table) {
+    [[maybe_unused]] auto countRowsOn =
+        [&](const ConsensusGroupHarness& group, const std::string& table) {
         Result result =
             leaderNode(group)->executeReadOnlyForTest(CountRowsCommand{table});
         const auto* count = std::get_if<CountRowsResult>(&result);
@@ -23486,6 +24268,160 @@ int main(int argc, char* argv[]) {
         return rows.rows.front()[*index];
     };
 
+    struct TitleRangeFragment {
+        std::string range_id;
+        std::string start_key;
+        std::string end_key;
+        std::string replica_group_id;
+        int owner_version = 0;
+    };
+
+    struct SplitTitleRanges {
+        TitleRangeFragment left;
+        TitleRangeFragment middle;
+        TitleRangeFragment right;
+        size_t moved_rows = 0;
+    };
+
+    auto activeTitleFragment =
+        [&](const ConsensusGroupHarness& catalog,
+            const std::string& range_id) {
+        SelectAllResult ownership =
+            catalogTableOn(catalog, catalog.leader, "__range_ownership");
+        std::optional<TitleRangeFragment> latest;
+        for (const auto& row : ownership.rows) {
+            auto table_name = selectAllValue(ownership, row, "table_name");
+            auto index_name = selectAllValue(ownership, row, "index_name");
+            auto row_range = selectAllValue(ownership, row, "range_id");
+            auto status = selectAllValue(ownership, row, "status");
+            auto owner_version =
+                selectAllValue(ownership, row, "owner_version");
+            auto start_key = selectAllValue(ownership, row, "start_key");
+            auto end_key = selectAllValue(ownership, row, "end_key");
+            auto replica_group_id =
+                selectAllValue(ownership, row, "replica_group_id");
+            if (!table_name.has_value() || *table_name != "title" ||
+                !index_name.has_value() || *index_name != "primary" ||
+                !row_range.has_value() || *row_range != range_id ||
+                !status.has_value() || *status != "active" ||
+                !owner_version.has_value() || !start_key.has_value() ||
+                !end_key.has_value() || !replica_group_id.has_value()) {
+                continue;
+            }
+            TitleRangeFragment fragment{
+                *row_range,
+                *start_key,
+                *end_key,
+                *replica_group_id,
+                std::stoi(*owner_version)};
+            if (!latest.has_value() ||
+                fragment.owner_version >= latest->owner_version) {
+                latest = fragment;
+            }
+        }
+        if (!latest.has_value()) {
+            throw std::runtime_error("missing active title fragment " +
+                                     range_id);
+        }
+        return *latest;
+    };
+
+    auto splitTitleTableAcrossThreeRanges = [&](IndexScenario& scenario) {
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(commitCommand(scenario.catalog,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "catalog should store title keys before splitting");
+        }
+
+        size_t source_rows_before =
+            countRowsOn(scenario.table_owner, "title");
+        Result plan_result =
+            commitCommand(scenario.catalog,
+                          PlanTableSplitCommand{
+                              "title",
+                              defaultRangeIdForTable("title"),
+                              3});
+        const auto* plan = std::get_if<RangeConfigResult>(&plan_result);
+        tests.check(plan != nullptr && plan->range_ids.size() == 3,
+                    "catalog should plan three title ranges from real row keys");
+        if (plan == nullptr || plan->range_ids.size() != 3) {
+            throw std::runtime_error("table split planning failed");
+        }
+
+        auto runtime = controlPlaneRuntime(scenario);
+        tests.check(runtime.runUntilIdle(12) >= 6,
+                    "control plane should execute planned range transfers");
+
+        SplitTitleRanges split{
+            activeTitleFragment(scenario.catalog, plan->range_ids[0]),
+            activeTitleFragment(scenario.catalog, plan->range_ids[1]),
+            activeTitleFragment(scenario.catalog, plan->range_ids[2]),
+            0};
+        size_t source_rows_after =
+            countRowsOn(scenario.table_owner, "title");
+        tests.check(split.left.replica_group_id ==
+                            scenario.table_owner.group_id &&
+                        split.middle.replica_group_id ==
+                            scenario.index_owner.group_id &&
+                        split.right.replica_group_id ==
+                            scenario.index_owner.group_id,
+                    "committed transfer protocol should publish the final split ownership");
+        split.moved_rows =
+            source_rows_before >= source_rows_after
+                ? source_rows_before - source_rows_after
+                : 0;
+        return split;
+    };
+
+    auto titleRowsInKeyRange = [](const IndexScenario& scenario,
+                                  const std::string& start_key,
+                                  const std::string& end_key) {
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            std::string row_key = tableRowKey("title", row.values.front());
+            if (row_key >= start_key &&
+                (end_key.empty() || row_key < end_key)) {
+                rows.push_back(row.values);
+            }
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
+
+    auto titleRowsSortedByKey = [](std::vector<TitleRowFixture> rows) {
+        std::sort(
+            rows.begin(),
+            rows.end(),
+            [](const TitleRowFixture& lhs, const TitleRowFixture& rhs) {
+                return tableRowKey("title", lhs.values.front()) <
+                       tableRowKey("title", rhs.values.front());
+            });
+        return rows;
+    };
+
+    auto splitRangeIds = [](const SplitTitleRanges& split) {
+        return std::vector<std::string>{
+            split.left.range_id,
+            split.middle.range_id,
+            split.right.range_id};
+    };
+
+    auto splitReplicaGroupIds = [](const SplitTitleRanges& split) {
+        return std::vector<std::string>{
+            split.left.replica_group_id,
+            split.middle.replica_group_id,
+            split.right.replica_group_id};
+    };
+
+    auto fragmentRowTotal = [](const DistributedRangeReadResult& read) {
+        size_t total = 0;
+        for (size_t count : read.fragment_row_counts) {
+            total += count;
+        }
+        return total;
+    };
+
     auto runPrepare = [&](ConsensusGroupHarness& group,
                           const std::string& txn_id,
                           const std::vector<std::string>& statements) {
@@ -23499,16 +24435,17 @@ int main(int argc, char* argv[]) {
         return *prepared;
     };
 
-    auto commitPrepared = [&](ConsensusGroupHarness& group,
-                              const std::string& txn_id,
-                              bool apply) {
+    [[maybe_unused]] auto commitPrepared =
+        [&](ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            bool apply) {
         return commitCommand(
             group,
             CommitPreparedDistributedTransactionCommand{txn_id, apply});
     };
 
-    auto abortPrepared = [&](ConsensusGroupHarness& group,
-                             const std::string& txn_id) {
+    [[maybe_unused]] auto abortPrepared =
+        [&](ConsensusGroupHarness& group, const std::string& txn_id) {
         return commitCommand(
             group,
             AbortPreparedDistributedTransactionCommand{txn_id});
@@ -23522,7 +24459,7 @@ int main(int argc, char* argv[]) {
             {{"txn_id", txn_id}, {"status", status}});
     };
 
-    auto txnHasLivenessStatus =
+    [[maybe_unused]] auto txnHasLivenessStatus =
         [&](const ConsensusGroupHarness& group,
             const std::string& txn_id,
             const std::string& status) {
@@ -23533,7 +24470,7 @@ int main(int argc, char* argv[]) {
                  {"status", status}});
         };
 
-    auto catalogHasTxnRow =
+    [[maybe_unused]] auto catalogHasTxnRow =
         [&](const ConsensusGroupHarness& group,
             const std::string& table,
             const std::string& txn_id) {
@@ -23555,8 +24492,9 @@ int main(int argc, char* argv[]) {
         std::string status;
     };
 
-    auto latestTransferOn = [&](const ConsensusGroupHarness& group,
-                                const std::string& range_id)
+    [[maybe_unused]] auto latestTransferOn =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& range_id)
         -> std::optional<RangeTransferView> {
         SelectAllResult transfers =
             catalogTableOn(group, group.leader, "__range_transfers");
@@ -23601,8 +24539,9 @@ int main(int argc, char* argv[]) {
         return latest;
     };
 
-    auto physicalIndexEntryCount = [&](const ConsensusGroupHarness& group,
-                                       const std::string& range_id) {
+    [[maybe_unused]] auto physicalIndexEntryCount =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& range_id) {
         SelectAllResult rows =
             catalogTableOn(group, group.leader, "__index_entries");
         auto range_column = catalogColumnIndex(rows, "range_id");
@@ -23622,8 +24561,9 @@ int main(int argc, char* argv[]) {
         return count;
     };
 
-    auto indexRouteGroupOnCatalog = [&](const ConsensusGroupHarness& catalog,
-                                        const std::string& year) {
+    [[maybe_unused]] auto indexRouteGroupOnCatalog =
+        [&](const ConsensusGroupHarness& catalog,
+            const std::string& year) {
         Result route_result =
             leaderNode(catalog)->executeReadOnlyForTest(
                 ExplainIndexLookupCommand{title_year_index, year});
@@ -23641,7 +24581,7 @@ int main(int argc, char* argv[]) {
         ConsensusGroupHarness target;
     };
 
-    auto buildIndexMovementScenario = [&]() {
+    [[maybe_unused]] auto buildIndexMovementScenario = [&]() {
         IndexMovementScenario scenario;
         scenario.fixture = titleIndexFixture();
         scenario.catalog =
@@ -23709,308 +24649,285 @@ int main(int argc, char* argv[]) {
         return scenario;
     };
 
+    struct RuntimeDriveResult {
+        size_t ticks = 0;
+        bool ended = false;
+        std::string trace;
+    };
+
+    auto driveTxnToEnd = [&](ControlPlaneRuntime& runtime,
+                             ConsensusGroupHarness& catalog,
+                             const std::string& txn_id,
+                             size_t max_ticks) {
+        RuntimeDriveResult driven;
+        for (size_t i = 0; i < max_ticks; ++i) {
+            if (txnHasStatus(catalog, txn_id, "ended")) {
+                driven.ended = true;
+                return driven;
+            }
+            auto step = runtime.tick();
+            if (!driven.trace.empty()) driven.trace += "; ";
+            driven.trace += step.status_before + "->" +
+                            step.status_after + ":" +
+                            describeResult(step.result);
+            if (!step.advanced) {
+                driven.ended = txnHasStatus(catalog, txn_id, "ended");
+                return driven;
+            }
+            ++driven.ticks;
+        }
+        driven.ended = txnHasStatus(catalog, txn_id, "ended");
+        return driven;
+    };
 
 
 
+    auto rowsWithProductionYear =
+        [](const IndexScenario& scenario, const std::string& year) {
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            if (row.values.size() >= 4 && row.values[3] == year) {
+                rows.push_back(row.values);
+            }
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
 
-    tests.test("Cross-range snapshot read uses one HLC timestamp", [&] {
-        auto scenario = buildIndexScenario();
-        const auto& row = scenario.fixture.initial_rows[0];
-        std::string old_year = row.values[3];
-        std::string new_year = replacementProductionYear(old_year);
-        std::string snapshot_txn = "zz-snapshot-reader";
-        std::string writer_txn = "aa-snapshot-writer";
-        std::string table_range = defaultRangeIdForTable("title");
-        std::vector<std::string> snapshot_statements{
-            "SELECT * FROM title WHERE id=" + row.values[0]};
+    auto sumIds = [](const std::vector<std::vector<std::string>>& rows) {
+        int64_t sum = 0;
+        for (const auto& row : rows) {
+            if (!row.empty()) sum += std::stoll(row.front());
+        }
+        return sum;
+    };
 
-        DistributedTxnResult snapshot =
-            runPrepare(
-                scenario.catalog,
-                snapshot_txn,
-                snapshot_statements);
-        tests.check(!snapshot.read_ts.isZero() &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.table_owner,
-                                PrepareTxnParticipantCommand{
-                                    snapshot_txn,
-                                    table_range,
-                                    scenario.table_owner.group_id,
-                                    snapshot_statements,
-                                    snapshot.read_ts})) &&
-                        selectAllHasRow(
-                            catalogTableOn(scenario.table_owner,
-                                           scenario.table_owner.leader,
-                                           "__txn_read_set"),
-                            {{"txn_id", snapshot_txn},
-                             {"read_kind", "point"},
-                             {"status", "prepared"}}),
-                    "snapshot prepare should durably allocate a read timestamp and a participant-local read set");
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            AbortTxnParticipantCommand{
-                                snapshot_txn,
-                                table_range,
-                                scenario.table_owner.group_id})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                        abortPrepared(scenario.catalog, snapshot_txn)),
-                    "timestamp holder should be aborted after its snapshot is captured");
+    auto allFragmentsUseReadTimestamp =
+        [](const DistributedQueryResult& result) {
+        if (result.read_ts.isZero()) return false;
+        for (const auto& fragment : result.fragments) {
+            if (fragment.read_ts != result.read_ts) return false;
+        }
+        return true;
+    };
 
+    tests.test("Distributed count and sum equal reference aggregates", [&] {
+        auto scenario = buildIndexScenario(3);
+        SplitTitleRanges split = splitTitleTableAcrossThreeRanges(scenario);
         auto runtime = controlPlaneRuntime(scenario);
-        runPrepare(
-            scenario.catalog,
-            writer_txn,
-            {"UPDATE title SET production_year=" + new_year +
-             " WHERE id=" + row.values[0]});
-        tests.check(runtime.tick().advanced &&
-                        txnHasStatus(scenario.catalog,
-                                     writer_txn,
-                                     "committed"),
-                    "writer should first reach a durable commit decision");
-        tests.check(runtime.tick().advanced &&
-                        txnHasStatus(scenario.catalog,
-                                     writer_txn,
-                                     "ended"),
-                    "writer participants should publish MVCC versions");
 
-        auto rowSetHasYear = [&](const auto& read,
-                                  const std::string& expected_year) {
-            auto id_column = std::find(read.columns.begin(),
-                                       read.columns.end(),
-                                       "id");
-            auto year_column = std::find(read.columns.begin(),
-                                         read.columns.end(),
-                                         "production_year");
-            if (id_column == read.columns.end() ||
-                year_column == read.columns.end()) {
-                return false;
+        DistributedQueryResult count =
+            runtime.executeDistributedAggregate(
+                "PROJECT COUNT(*) FROM title");
+        DistributedQueryResult sum =
+            runtime.executeDistributedAggregate(
+                "PROJECT SUM{id} FROM title");
+        auto expected_rows = titleRowsInKeyRange(scenario, "", "");
+
+        tests.check(count.complete &&
+                        count.aggregate_function == "COUNT" &&
+                        count.final_count == expected_rows.size() &&
+                        count.rows ==
+                            std::vector<std::vector<std::string>>{
+                                {std::to_string(expected_rows.size())}} &&
+                        count.fragments.size() == splitRangeIds(split).size() &&
+                        allFragmentsUseReadTimestamp(count),
+                    "distributed COUNT should use all fragments at one read timestamp");
+        tests.check(sum.complete &&
+                        sum.aggregate_function == "SUM" &&
+                        sum.aggregate_column == "id" &&
+                        sum.final_sum == sumIds(expected_rows) &&
+                        sum.rows ==
+                            std::vector<std::vector<std::string>>{
+                                {std::to_string(sumIds(expected_rows))}} &&
+                        allFragmentsUseReadTimestamp(sum),
+                    "distributed SUM should equal the reference row-id sum");
+    });
+
+    tests.test("Filtered distributed aggregate pushes predicate to fragments", [&] {
+        auto scenario = buildIndexScenario(3);
+        splitTitleTableAcrossThreeRanges(scenario);
+        std::string year = scenario.fixture.duplicate_year;
+        std::string sql =
+            "PROJECT COUNT(*) FROM title WHERE {production_year}=" + year;
+        size_t fragment_commands = 0;
+        bool pushed = true;
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
             }
-            size_t id_index = static_cast<size_t>(
-                std::distance(read.columns.begin(), id_column));
-            size_t year_index = static_cast<size_t>(
-                std::distance(read.columns.begin(), year_column));
-            for (const auto& values : read.rows) {
-                if (id_index < values.size() &&
-                    year_index < values.size() &&
-                    values[id_index] == row.values[0] &&
-                    values[year_index] == expected_year) {
-                    return true;
-                }
-            }
-            return false;
         };
+        auto registerGroup = [&](ConsensusGroupHarness& group) {
+            runtime.registerReplicaGroup(
+                group.group_id,
+                [&](const Command& command) {
+                    if (const auto* fragment =
+                            std::get_if<ExecuteQueryFragmentCommand>(
+                                &command)) {
+                        ++fragment_commands;
+                        pushed = pushed &&
+                            fragment->fragment.predicate_column ==
+                                "production_year" &&
+                            fragment->fragment.predicate_value == year &&
+                            fragment->fragment.aggregate_function == "COUNT" &&
+                            fragment->fragment.read_ts !=
+                                HybridLogicalTimestamp::zero();
+                    }
+                    return commitCommand(group, command);
+                });
+        };
+        registerGroup(scenario.table_owner);
+        registerGroup(scenario.index_owner);
 
-        auto old_snapshot = runtime.readIndexRows(
-            title_year_index, old_year, "title", "id", snapshot.read_ts);
-        auto new_snapshot = runtime.readIndexRows(
-            title_year_index, new_year, "title", "id", snapshot.read_ts);
-        auto old_latest = runtime.readIndexRows(
-            title_year_index, old_year, "title", "id");
-        auto new_latest = runtime.readIndexRows(
-            title_year_index, new_year, "title", "id");
+        auto expected = rowsWithProductionYear(scenario, year);
+        DistributedQueryResult count =
+            runtime.executeDistributedAggregate(sql);
 
-        tests.check(old_snapshot.complete &&
-                        containsText(old_snapshot.index.primary_keys,
-                                     row.values[0]) &&
-                        rowSetHasYear(old_snapshot, old_year) &&
-                        new_snapshot.complete &&
-                        !containsText(new_snapshot.index.primary_keys,
-                                      row.values[0]),
-                    "snapshot read should see the old index and old base row across ranges");
-        tests.check(old_latest.complete &&
-                        !containsText(old_latest.index.primary_keys,
-                                      row.values[0]) &&
-                        new_latest.complete &&
-                        containsText(new_latest.index.primary_keys,
-                                     row.values[0]) &&
-                        rowSetHasYear(new_latest, new_year),
-                    "latest read should see the writer after the same transaction finishes");
+        tests.check(count.complete &&
+                        count.final_count == expected.size() &&
+                        fragment_commands == count.fragments.size() &&
+                        pushed,
+                    "filtered aggregate should push predicate and aggregate metadata to every fragment");
     });
 
-    tests.test("Serializable validation aborts stale cross-range transaction", [&] {
-        auto scenario = buildIndexScenario();
-        const auto& read_row = scenario.fixture.initial_rows[0];
-        const auto& write_row = scenario.fixture.initial_rows[1];
-        std::string read_old_year = read_row.values[3];
-        std::string read_new_year = replacementProductionYear(read_old_year);
-        std::string write_old_year = write_row.values[3];
-        std::string write_new_year = replacementProductionYear(write_old_year);
-        std::string stale_txn = "zz-serializable-stale";
-        std::string writer_txn = "aa-serializable-writer";
-        std::string table_range = defaultRangeIdForTable("title");
-        std::string index_range = defaultRangeIdForIndex(title_year_index);
-        std::vector<std::string> stale_statements{
-            "SELECT * FROM title WHERE id=" + read_row.values[0],
-            "UPDATE title SET production_year=" + write_new_year +
-                " WHERE id=" + write_row.values[0]};
+    tests.test("Aggregate over moved range uses new owner and one timestamp", [&] {
+        auto scenario = buildIndexScenario(3);
+        SplitTitleRanges split = splitTitleTableAcrossThreeRanges(scenario);
+        size_t table_fragments = 0;
+        size_t index_fragments = 0;
+        std::vector<HybridLogicalTimestamp> observed_read_ts;
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            }
+        };
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                if (const auto* fragment =
+                        std::get_if<ExecuteQueryFragmentCommand>(&command)) {
+                    ++table_fragments;
+                    observed_read_ts.push_back(fragment->fragment.read_ts);
+                }
+                return commitCommand(scenario.table_owner, command);
+            });
+        runtime.registerReplicaGroup(
+            scenario.index_owner.group_id,
+            [&](const Command& command) {
+                if (const auto* fragment =
+                        std::get_if<ExecuteQueryFragmentCommand>(&command)) {
+                    ++index_fragments;
+                    observed_read_ts.push_back(fragment->fragment.read_ts);
+                }
+                return commitCommand(scenario.index_owner, command);
+            });
 
-        DistributedTxnResult stale_prepare = runPrepare(
-            scenario.catalog,
-            stale_txn,
-            stale_statements);
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            PrepareTxnParticipantCommand{
-                                stale_txn,
-                                table_range,
-                                scenario.table_owner.group_id,
-                                stale_statements,
-                                stale_prepare.read_ts})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.index_owner,
-                                PrepareTxnParticipantCommand{
-                                    stale_txn,
-                                    index_range,
-                                    scenario.index_owner.group_id,
-                                    stale_statements,
-                                    stale_prepare.read_ts})) &&
-                        selectAllHasRow(
-                        catalogTableOn(scenario.table_owner,
-                                       scenario.table_owner.leader,
-                                       "__txn_read_set"),
-                        {{"txn_id", stale_txn},
-                         {"read_kind", "point"},
-                         {"status", "prepared"}}) &&
-                        selectAllHasRow(
-                            catalogTableOn(scenario.table_owner,
-                                           scenario.table_owner.leader,
-                                           "__txn_write_set"),
-                            {{"txn_id", stale_txn},
-                             {"write_key",
-                              tableRowKey("title", write_row.values[0])},
-                             {"status", "prepared"}}),
-                    "stale transaction should durably record range-local read and write sets");
+        auto expected_rows =
+            titleRowsInKeyRange(scenario,
+                                split.middle.start_key,
+                                split.middle.end_key);
+        DistributedQueryResult sum =
+            runtime.executeDistributedAggregate(
+                "PROJECT SUM{id} FROM title",
+                split.middle.start_key,
+                split.middle.end_key);
 
-        std::vector<std::string> writer_statements{
-            "UPDATE title SET production_year=" + read_new_year +
-            " WHERE id=" + read_row.values[0]};
-        DistributedTxnResult writer_prepare = runPrepare(
-            scenario.catalog,
-            writer_txn,
-            writer_statements);
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            PrepareTxnParticipantCommand{
-                                writer_txn,
-                                table_range,
-                                scenario.table_owner.group_id,
-                                writer_statements,
-                                writer_prepare.read_ts})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.index_owner,
-                                PrepareTxnParticipantCommand{
-                                    writer_txn,
-                                    index_range,
-                                    scenario.index_owner.group_id,
-                                    writer_statements,
-                                    writer_prepare.read_ts})),
-                    "conflicting writer participants should prepare through real groups");
-        Result writer_decision_result =
-            commitPrepared(scenario.catalog, writer_txn, false);
-        const auto* writer_decision =
-            std::get_if<DistributedTxnResult>(&writer_decision_result);
-        tests.check(writer_decision != nullptr &&
-                        writer_decision->status == "committed" &&
-                        !writer_decision->commit_ts.isZero(),
-                    "conflicting writer should publish a durable commit decision");
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            CommitTxnParticipantCommand{
-                                writer_txn,
-                                table_range,
-                                scenario.table_owner.group_id,
-                                writer_decision != nullptr
-                                    ? writer_decision->commit_ts
-                                    : HybridLogicalTimestamp::zero()})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.index_owner,
-                                CommitTxnParticipantCommand{
-                                    writer_txn,
-                                    index_range,
-                                    scenario.index_owner.group_id,
-                                    writer_decision != nullptr
-                                        ? writer_decision->commit_ts
-                                        : HybridLogicalTimestamp::zero()})),
-                    "conflicting writer should publish participant versions");
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitPrepared(scenario.catalog, writer_txn, true)) &&
-                        txnHasStatus(scenario.catalog,
-                                     writer_txn,
-                                     "ended"),
-                    "conflicting writer should end through the coordinator");
-        tests.check(selectAllHasRow(
-                        catalogTableOn(scenario.table_owner,
-                                       scenario.table_owner.leader,
-                                       "__txn_write_set"),
-                        {{"txn_id", writer_txn},
-                         {"write_key",
-                          tableRowKey("title", read_row.values[0])},
-                         {"status", "committed"}}),
-                    "writer commit should publish a durable range-local write set");
+        bool same_ts = !observed_read_ts.empty();
+        for (const auto& ts : observed_read_ts) {
+            same_ts = same_ts && ts == sum.read_ts && !ts.isZero();
+        }
+        tests.check(sum.complete &&
+                        sum.fragments.size() == 1 &&
+                        sum.fragments.front().range_id ==
+                            split.middle.range_id &&
+                        table_fragments == 0 &&
+                        index_fragments == 1 &&
+                        same_ts,
+                    "moved range aggregate should execute only at the new owner with one read timestamp");
+        tests.check(sum.final_sum == sumIds(expected_rows),
+                    "moved range aggregate should match reference rows");
+    });
 
+    tests.test("Empty aggregate fragment contributes zero", [&] {
+        auto scenario = buildIndexScenario(3);
+        SplitTitleRanges split = splitTitleTableAcrossThreeRanges(scenario);
+        auto sorted_rows =
+            titleRowsSortedByKey(scenario.fixture.initial_rows);
+        const std::string start_key =
+            tableRowKey("title", sorted_rows.back().values.front()) + "\x7F";
+        const std::string end_key = tableRowPrefixEnd("title");
         auto runtime = controlPlaneRuntime(scenario);
-        auto validation = runtime.tick();
-        tests.check(validation.advanced &&
-                        validation.range_id == stale_txn &&
-                        validation.status_after == "aborted" &&
-                        txnHasStatus(scenario.catalog,
-                                     stale_txn,
-                                     "aborted"),
-                    "serializable validation should abort the stale read transaction");
-        tests.check(runtime.runUntilIdle() >= 1,
-                    "runtime should drive validation abort to real participants");
-        tests.check(participantHasStatus(scenario.table_owner,
-                                         stale_txn,
-                                         table_range,
-                                         "aborted") &&
-                        participantHasStatus(scenario.index_owner,
-                                             stale_txn,
-                                             index_range,
-                                             "aborted"),
-                    "participant groups should durably abort the stale transaction");
-        tests.check(firstRowValue(
-                        selectTitleById(scenario.table_owner,
-                                        read_row.values[0]),
-                        "production_year") == read_new_year &&
-                        firstRowValue(
-                            selectTitleById(scenario.table_owner,
-                                            write_row.values[0]),
-                            "production_year") == write_old_year,
-                    "only the conflicting writer should be visible in base rows");
-        tests.check(containsText(
-                        readIndexOn(scenario.index_owner,
-                                    scenario.index_owner.leader,
-                                    write_old_year).primary_keys,
-                        write_row.values[0]) &&
-                        !containsText(
-                            readIndexOn(scenario.index_owner,
-                                        scenario.index_owner.leader,
-                                        write_new_year).primary_keys,
-                            write_row.values[0]),
-                    "aborted stale transaction should not publish index writes");
+
+        DistributedQueryResult count =
+            runtime.executeDistributedAggregate(
+                "PROJECT COUNT(*) FROM title", start_key, end_key);
+
+        tests.check(count.complete &&
+                        count.fragments.size() == 1 &&
+                        count.fragments.front().range_id ==
+                            split.right.range_id &&
+                        count.fragment_results.size() == 1 &&
+                        count.fragment_results.front().partial_count == 0 &&
+                        count.final_count == 0 &&
+                        count.rows ==
+                            std::vector<std::vector<std::string>>{{"0"}},
+                    "empty overlapping fragment should contribute zero to final aggregate");
     });
 
+    tests.test("Unavailable partial aggregate fails whole query", [&] {
+        auto scenario = buildIndexScenario(3);
+        SplitTitleRanges split = splitTitleTableAcrossThreeRanges(scenario);
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            }
+        };
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
 
+        DistributedQueryResult count =
+            runtime.executeDistributedAggregate(
+                "PROJECT COUNT(*) FROM title");
+        tests.check(!count.complete &&
+                        count.rows.empty() &&
+                        count.fragment_results.empty() &&
+                        count.fragments.size() == splitRangeIds(split).size() &&
+                        allFragmentsUseReadTimestamp(count),
+                    "missing partial aggregate should fail safely without partial output");
+    });
 
+    tests.test("Duplicate partial aggregate result does not double count", [&] {
+        auto scenario = buildIndexScenario(3);
+        splitTitleTableAcrossThreeRanges(scenario);
+        auto runtime = controlPlaneRuntime(scenario);
+        DistributedQueryResult count =
+            runtime.executeDistributedAggregate(
+                "PROJECT COUNT(*) FROM title");
+        std::vector<FragmentResult> duplicated = count.fragment_results;
+        duplicated.push_back(count.fragment_results.front());
 
+        DistributedQueryResult merged =
+            runtime.mergeQueryFragmentResults(
+                "PROJECT COUNT(*) FROM title",
+                "",
+                "",
+                count.read_ts,
+                count.fragments,
+                duplicated);
 
-
-
-
-
-
-
-
-
-
+        tests.check(count.complete &&
+                        merged.complete &&
+                        merged.final_count == count.final_count &&
+                        merged.rows == count.rows &&
+                        merged.fragment_results.size() ==
+                            count.fragment_results.size() &&
+                        merged.fragment_row_counts ==
+                            count.fragment_row_counts,
+                    "coordinator should ignore duplicate partial aggregate results");
+    });
 
 
 

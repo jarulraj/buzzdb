@@ -15004,6 +15004,29 @@ private:
         return status;
     }
 
+    std::string latestParticipantApplyStatus(
+        const std::string& txn_id,
+        const std::string& range_id,
+        const std::string& replica_group_id) {
+        SelectAllResult rows = selectSystemCatalogTable("__txn_participants");
+        std::string status;
+        int best_rank = 0;
+        for (const auto& row : rows.rows) {
+            if (row.size() < 5 ||
+                row[0] != txn_id ||
+                row[1] != range_id ||
+                row[2] != replica_group_id) {
+                continue;
+            }
+            int rank = distributedTxnStatusRank(row[4]);
+            if (rank >= best_rank) {
+                status = row[4];
+                best_rank = rank;
+            }
+        }
+        return status;
+    }
+
     std::optional<size_t> latestDistributedTxnStatementCount(
         const std::string& txn_id) {
         SelectAllResult rows = selectSystemCatalogTable("__distributed_txns");
@@ -15429,7 +15452,9 @@ private:
         }
 
         std::string existing_status =
-            latestDistributedTxnStatus(command.txn_id);
+            latestParticipantApplyStatus(command.txn_id,
+                                         command.participant_range_id,
+                                         command.participant_replica_group_id);
         if (existing_status == "committed" || existing_status == "ended") {
             DistributedTxnResult result;
             result.txn_id = command.txn_id;
@@ -15484,11 +15509,15 @@ private:
         auto txn = db_->beginLoggedTxn("distributed-" + command.txn_id +
                                        "-" + command.participant_range_id);
         std::set<std::string> touched_tables;
+        std::vector<TxnParticipant> local_participant{
+            TxnParticipant{
+                command.participant_range_id,
+                command.participant_replica_group_id}};
         try {
             executeSystemCatalogRowsInTxn(
                 distributedTxnCatalogRows(command.txn_id,
                                           "prepared",
-                                          participants,
+                                          local_participant,
                                           command.statements.size()),
                 txn);
             for (const auto& parsed_command : parsed) {
@@ -15508,7 +15537,7 @@ private:
             executeSystemCatalogRowsInTxn(
                 distributedTxnCatalogRows(command.txn_id,
                                           "committed",
-                                          participants,
+                                          local_participant,
                                           command.statements.size()),
                 txn);
             db_->commit(txn);
@@ -15809,6 +15838,35 @@ private:
                                    command.start_key,
                                    command.end_key});
         if (!std::holds_alternative<DeleteRowsResult>(cleared)) return cleared;
+
+        if (!isSystemCatalogTable(command.table)) {
+            ensureSystemCatalogTables();
+            int descriptor_version = latestRangeConfigNumber() + 1;
+            auto existing = latestRangeDescriptorById(command.range_id);
+            if (existing.has_value()) {
+                descriptor_version =
+                    std::max(descriptor_version,
+                             existing->descriptor_version + 1);
+            }
+            insertSystemCatalogRows({
+                InsertRowCommand{
+                    "__ranges",
+                    {command.range_id,
+                     command.start_key,
+                     command.end_key,
+                     command.target_replica_group_id,
+                     std::to_string(descriptor_version),
+                     "active"}},
+                rangeOwnershipCatalogRow(
+                    command.table,
+                    command.range_id,
+                    command.start_key,
+                    command.end_key,
+                    command.target_replica_group_id,
+                    descriptor_version,
+                    "active")
+            });
+        }
 
         std::vector<std::string> columns = columnNames(command.table);
         auto range_column = columnIndex(columns, "range_id");
@@ -19659,6 +19717,19 @@ int main(int argc, char* argv[]) {
         return count->count;
     };
 
+    auto latestOwnershipVersion = [&](const ConsensusGroupHarness& group) {
+        SelectAllResult ownership =
+            catalogTableOn(group, group.leader, "__range_ownership");
+        int latest = 0;
+        for (const auto& row : ownership.rows) {
+            auto version = selectAllValue(ownership, row, "owner_version");
+            if (version.has_value()) {
+                latest = std::max(latest, std::stoi(*version));
+            }
+        }
+        return latest;
+    };
+
     auto selectTitleById = [&](const ConsensusGroupHarness& group,
                                const std::string& id) {
         Result result =
@@ -19935,6 +20006,131 @@ int main(int argc, char* argv[]) {
                         containsText(lookup.primary_keys,
                                      expected_primary_key),
                     "target physical HashIndex should answer moved lookup");
+    });
+
+    tests.test("Distributed transaction commits after table range movement", [&] {
+        auto scenario = buildIndexScenario();
+        const std::string left_range = "range-title-v136-left";
+        const std::string right_range = "range-title-v136-right";
+
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(commitCommand(scenario.catalog,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "catalog should know title keys before split");
+        }
+
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        SplitTableCommand{
+                            "title",
+                            defaultRangeIdForTable("title"),
+                            left_range,
+                            right_range,
+                            latestOwnershipVersion(scenario.catalog) + 1,
+                            scenario.table_owner.group_id,
+                            scenario.table_owner.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "catalog should split title ownership before movement");
+        tests.check(commitCommand(
+                        scenario.table_owner,
+                        SplitTableCommand{
+                            "title",
+                            defaultRangeIdForTable("title"),
+                            left_range,
+                            right_range,
+                            latestOwnershipVersion(scenario.table_owner) + 1,
+                            scenario.table_owner.group_id,
+                            scenario.table_owner.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "source participant should install matching child range metadata");
+        tests.check(commitCommand(
+                        scenario.catalog,
+                        MoveRangeCommand{right_range,
+                                         scenario.index_owner.group_id}) ==
+                        Result{StatementOkResult{}},
+                    "catalog should request movement for the right child range");
+
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
+            }
+        };
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        runtime.registerReplicaGroup(
+            scenario.index_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.index_owner, command);
+            });
+        tests.check(runtime.runUntilIdle(8) == 3,
+                    "control plane should prepare, catch up, and commit the table range move");
+
+        std::string moved_id;
+        std::string old_year;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            Result route_result =
+                leaderNode(scenario.catalog)->executeReadOnlyForTest(
+                    ExplainRouteCommand{"title", row.values[0], false});
+            const auto* route = std::get_if<RouteResult>(&route_result);
+            if (route != nullptr &&
+                route->range_ids == std::vector<std::string>{right_range} &&
+                route->replica_group_ids ==
+                    std::vector<std::string>{scenario.index_owner.group_id}) {
+                moved_id = row.values[0];
+                old_year = row.values[3];
+                break;
+            }
+        }
+        if (moved_id.empty()) {
+            throw std::runtime_error("missing moved title row");
+        }
+        tests.check(selectTitleById(scenario.table_owner, moved_id).rows.empty() &&
+                        !selectTitleById(scenario.index_owner, moved_id).rows.empty(),
+                    "moved title row should physically live only on the new owner");
+        Result target_route_result =
+            leaderNode(scenario.index_owner)->executeReadOnlyForTest(
+                ExplainRouteCommand{"title", moved_id, false});
+        const auto* target_route =
+            std::get_if<RouteResult>(&target_route_result);
+        tests.check(target_route != nullptr &&
+                        containsText(target_route->range_ids, right_range) &&
+                        containsText(target_route->replica_group_ids,
+                                     scenario.index_owner.group_id),
+                    "target owner should expose the imported child range descriptor");
+
+        std::string new_year = replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + moved_id};
+
+        DistributedTxnResult committed =
+            runDistributed(scenario,
+                           "txn-post-table-move",
+                           statements);
+        tests.check(committed.status == "committed" &&
+                        containsText(committed.participant_range_ids,
+                                     right_range) &&
+                        containsText(committed.participant_replica_group_ids,
+                                     scenario.index_owner.group_id),
+                    "coordinator should target the moved table range owner");
+        tests.check(firstRowValue(selectTitleById(scenario.index_owner,
+                                                  moved_id),
+                                  "production_year") == new_year,
+                    "moved range owner should apply the distributed update");
+
+        Result stale_apply = commitCommand(
+            scenario.table_owner,
+            ApplyParticipantTransactionCommand{
+                "txn-stale-old-owner",
+                right_range,
+                scenario.index_owner.group_id,
+                statements});
+        tests.check(stale_apply == Result{RouteRejectedResult{}},
+                    "old owner should reject stale participant apply for moved range");
     });
 
     tests.test("Routed transaction rejects indexed multi-range write", [&] {

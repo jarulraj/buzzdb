@@ -49,8 +49,6 @@ void printThreadSafe(const std::string& line) {
     std::cout << line << std::endl;
 }
 
-static constexpr int RECOVERY_TXN_ID = -1;
-
 struct HybridLogicalTimestamp {
     int64_t physical = 0;
     int32_t logical = 0;
@@ -1538,12 +1536,8 @@ private:
     size_t log_force_skips = 0;
     size_t checkpoints_written = 0;
     size_t checkpoint_analysis_start_lsn = 0;
-    size_t restart_undo_locks_reacquired = 0;
-    size_t restart_undo_deadlocks_resolved = 0;
     std::map<int, TxnTableEntry> active_transaction_table;
     std::map<int, TxnRecoveryState> txn_states;
-    std::function<bool(TableId, PageID, size_t)> restart_undo_lock_callback;
-    std::function<void()> restart_undo_release_callback;
 
     static std::string txnStatusName(TxnStatus status) {
         switch (status) {
@@ -1698,13 +1692,6 @@ public:
     void checkpoint();
     void createFuzzyImageCopy();
     void recover();
-    void setRestartUndoLockCallback(
-        std::function<bool(TableId, PageID, size_t)> callback) {
-        restart_undo_lock_callback = std::move(callback);
-    }
-    void setRestartUndoReleaseCallback(std::function<void()> callback) {
-        restart_undo_release_callback = std::move(callback);
-    }
     LSN logUpdate(TableId table_id,
                    PageID page_id,
                    size_t slot_id,
@@ -4131,18 +4118,6 @@ void RecoveryManager::recover() {
             }
             auto& metadata = catalog.getTable(record->second->table_id);
             TableHeap table(metadata, buffer_manager);
-            if (restart_undo_lock_callback) {
-                // Early availability: recovery must lock rows before undoing them.
-                bool resolved_deadlock = restart_undo_lock_callback(
-                    record->second->table_id,
-                    record->second->page_id,
-                    record->second->slot_id
-                );
-                restart_undo_locks_reacquired++;
-                if (resolved_deadlock) {
-                    restart_undo_deadlocks_resolved++;
-                }
-            }
             PageUpdateLogRecord undo_record;
             undo_record.kind = record->second->kind;
             undo_record.lsn = record->second->lsn;
@@ -4212,10 +4187,6 @@ void RecoveryManager::recover() {
                   << " LSN " << end_lsn
                   << " prevLSN " << entry.second.last_lsn
                   << " during restart" << std::endl;
-    }
-
-    if (restart_undo_release_callback) {
-        restart_undo_release_callback();
     }
 
     restart_redo_records += redone;
@@ -4941,299 +4912,6 @@ public:
     }
 };
 
-class DirectedGraph {
-public:
-    void setOutgoingEdges(int from, const std::vector<int>& to_nodes) {
-        adjacency[from] = to_nodes;
-        for (int to : to_nodes) {
-            adjacency[to];
-        }
-    }
-
-    void removeNode(int node) {
-        adjacency.erase(node);
-        for (auto& entry : adjacency) {
-            auto& edges = entry.second;
-            edges.erase(
-                std::remove(edges.begin(), edges.end(), node),
-                edges.end()
-            );
-        }
-    }
-
-    std::vector<int> cycleFrom(int node) const {
-        std::vector<int> path;
-        std::map<int, bool> visited;
-        if (findCycleToTarget(node, node, visited, path)) {
-            path.push_back(node);
-            return path;
-        }
-        return {};
-    }
-
-private:
-    std::map<int, std::vector<int>> adjacency;
-
-    bool findCycleToTarget(int current,
-                           int target,
-                           std::map<int, bool>& visited,
-                           std::vector<int>& path) const {
-        visited[current] = true;
-        path.push_back(current);
-
-        auto it = adjacency.find(current);
-        if (it != adjacency.end()) {
-            for (int next : it->second) {
-                if (next == target) {
-                    return true;
-                }
-                if (!visited[next] &&
-                    findCycleToTarget(next, target, visited, path)) {
-                    return true;
-                }
-            }
-        }
-
-        path.pop_back();
-        return false;
-    }
-};
-
-enum class LockMode { S, X };
-
-class LockManager {
-    struct LockGrant {
-        int txn_id;
-        LockMode mode;
-    };
-
-    struct LockState {
-        std::vector<LockGrant> grants;
-    };
-
-public:
-    struct LockRequestResult {
-        bool granted = false;
-        bool deadlock = false;
-        bool timed_out = false;
-        bool canceled = false;
-        std::string reason;
-        std::vector<int> blockers;
-        std::vector<int> cycle;
-    };
-
-    void setWaitObserver(
-        std::function<void(int, const std::vector<int>&)> observer) {
-        wait_observer = std::move(observer);
-    }
-
-    static std::string modeName(LockMode mode) {
-        switch (mode) {
-            case LockMode::S:
-                return "S";
-            case LockMode::X:
-                return "X";
-        }
-        throw std::runtime_error("Unknown lock mode.");
-    }
-
-    LockRequestResult waitFor(int txn_id,
-                              const std::string& resource,
-                              LockMode mode,
-                              std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> guard(latch);
-        LockRequestResult result;
-        if (canceled_txns.find(txn_id) != canceled_txns.end()) {
-            result.canceled = true;
-            result.reason = "transaction was canceled to resolve a deadlock";
-            return result;
-        }
-        while (!canGrant(txn_id, resource, mode)) {
-            if (canceled_txns.find(txn_id) != canceled_txns.end()) {
-                result.canceled = true;
-                result.reason = "transaction was canceled to resolve a deadlock";
-                removeWaitEdges(txn_id);
-                return result;
-            }
-            auto blockers = blockersFor(txn_id, resource, mode);
-            setWaitEdges(txn_id, blockers);
-            notifyWaitObserver(txn_id, blockers);
-            result.blockers = blockers;
-            result.cycle = findCycleFrom(txn_id);
-            if (!result.cycle.empty()) {
-                result.deadlock = true;
-                result.reason = "waits-for cycle detected";
-                removeWaitEdges(txn_id);
-                return result;
-            }
-
-            if (lock_cv.wait_for(guard, timeout) == std::cv_status::timeout) {
-                result.timed_out = true;
-                result.reason = incompatibleHolderLabel(
-                    locks[resource], txn_id, mode
-                );
-                removeWaitEdges(txn_id);
-                return result;
-            }
-        }
-
-        removeWaitEdges(txn_id);
-        grantLock(locks[resource], txn_id, mode);
-        result.granted = true;
-        return result;
-    }
-
-    bool cancel(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        bool released = false;
-        canceled_txns.insert(txn_id);
-        removeWaitEdges(txn_id);
-        for (auto& entry : locks) {
-            auto& state = entry.second;
-            auto old_size = state.grants.size();
-            state.grants.erase(
-                std::remove_if(state.grants.begin(),
-                               state.grants.end(),
-                               [txn_id](const LockGrant& grant) {
-                                   return grant.txn_id == txn_id;
-                               }),
-                state.grants.end()
-            );
-            released = released || old_size != state.grants.size();
-        }
-        lock_cv.notify_all();
-        return released;
-    }
-
-    bool releaseAll(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        bool released = false;
-        removeWaitEdges(txn_id);
-        for (auto& entry : locks) {
-            auto& state = entry.second;
-            auto old_size = state.grants.size();
-            state.grants.erase(
-                std::remove_if(state.grants.begin(),
-                               state.grants.end(),
-                               [txn_id](const LockGrant& grant) {
-                                   return grant.txn_id == txn_id;
-                               }),
-                state.grants.end()
-            );
-            released = released || old_size != state.grants.size();
-        }
-        if (released) {
-            lock_cv.notify_all();
-        }
-        return released;
-    }
-
-private:
-    std::mutex latch;
-    std::condition_variable lock_cv;
-    std::map<std::string, LockState> locks;
-    DirectedGraph waits_for;
-    std::set<int> canceled_txns;
-    std::function<void(int, const std::vector<int>&)> wait_observer;
-
-    bool canGrant(int txn_id, const std::string& resource, LockMode mode) {
-        auto& state = locks[resource];
-        return std::all_of(
-            state.grants.begin(),
-            state.grants.end(),
-            [txn_id, mode](const LockGrant& grant) {
-                return grant.txn_id == txn_id ||
-                       compatible(mode, grant.mode);
-            }
-        );
-    }
-
-    std::vector<int> blockersFor(int txn_id,
-                                 const std::string& resource,
-                                 LockMode mode) {
-        std::vector<int> blockers;
-        auto& state = locks[resource];
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id != txn_id &&
-                !compatible(mode, grant.mode) &&
-                std::find(blockers.begin(), blockers.end(), grant.txn_id) ==
-                    blockers.end()) {
-                blockers.push_back(grant.txn_id);
-            }
-        }
-        return blockers;
-    }
-
-    void setWaitEdges(int txn_id, const std::vector<int>& blockers) {
-        waits_for.setOutgoingEdges(txn_id, blockers);
-    }
-
-    void notifyWaitObserver(int txn_id, const std::vector<int>& blockers) {
-        if (wait_observer) {
-            wait_observer(txn_id, blockers);
-        }
-    }
-
-    void removeWaitEdges(int txn_id) {
-        waits_for.removeNode(txn_id);
-    }
-
-    std::vector<int> findCycleFrom(int txn_id) const {
-        return waits_for.cycleFrom(txn_id);
-    }
-
-    static bool compatible(LockMode requested, LockMode held) {
-        if (requested == LockMode::S) {
-            return held == LockMode::S;
-        }
-        return false;
-    }
-
-    static bool strongerOrEqual(LockMode held, LockMode requested) {
-        if (held == requested || held == LockMode::X) {
-            return true;
-        }
-        return false;
-    }
-
-    static void grantLock(LockState& state, int txn_id, LockMode mode) {
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id == txn_id &&
-                strongerOrEqual(grant.mode, mode)) {
-                return;
-            }
-        }
-
-        state.grants.erase(
-            std::remove_if(state.grants.begin(),
-                           state.grants.end(),
-                           [txn_id, mode](const LockGrant& grant) {
-                               return grant.txn_id == txn_id &&
-                                      strongerOrEqual(mode, grant.mode);
-                           }),
-            state.grants.end()
-        );
-        state.grants.push_back({txn_id, mode});
-    }
-
-    static std::string incompatibleHolderLabel(const LockState& state,
-                                               int txn_id,
-                                               LockMode mode) {
-        std::string label;
-        for (const auto& grant : state.grants) {
-            if (grant.txn_id == txn_id || compatible(mode, grant.mode)) {
-                continue;
-            }
-            if (!label.empty()) {
-                label += ", ";
-            }
-            label += modeName(grant.mode) + " lock is held by T" +
-                     std::to_string(grant.txn_id);
-        }
-        return label.empty() ? "lock is not compatible" : label;
-    }
-};
-
 enum class AccessType { Read, Write };
 
 struct ConcurrencyControlResource {
@@ -5251,10 +4929,7 @@ struct ConcurrencyControlRequest {
 
 struct ConcurrencyControlResult {
     bool granted = true;
-    bool deadlock = false;
-    bool canceled = false;
     std::string reason;
-    std::vector<int> cycle;
 };
 
 class ConcurrencyControlPolicy {
@@ -5266,72 +4941,6 @@ public:
     virtual void commit(int txn_id) = 0;
     virtual void abort(int txn_id) = 0;
     virtual bool cancel(int txn_id) = 0;
-};
-
-class TwoPhaseLockingPolicy : public ConcurrencyControlPolicy {
-    LockManager& lock_manager;
-    std::function<void(const std::string&)> log;
-    std::function<std::string(const std::vector<int>&)> path_label;
-
-    static LockMode modeFor(AccessType type) {
-        return type == AccessType::Read ? LockMode::S : LockMode::X;
-    }
-
-public:
-    TwoPhaseLockingPolicy(
-        LockManager& lock_manager,
-        std::function<void(const std::string&)> log,
-        std::function<std::string(const std::vector<int>&)> path_label)
-        : lock_manager(lock_manager),
-          log(std::move(log)),
-          path_label(std::move(path_label)) {}
-
-    ConcurrencyControlResult beforeAccess(
-        const ConcurrencyControlRequest& request) override {
-        LockMode mode = modeFor(request.type);
-        auto mode_name = LockManager::modeName(mode);
-        for (const auto& resource : request.resources) {
-            log(request.txn_label + " inferred " + mode_name +
-                " lock on " + resource.label + " for " + request.reason);
-            auto result = lock_manager.waitFor(
-                request.txn_id,
-                resource.key,
-                mode,
-                std::chrono::milliseconds(500)
-            );
-
-            if (result.granted) {
-                continue;
-            }
-            if (result.deadlock) {
-                return {false, true, false,
-                        "waits-for graph cycle: " + path_label(result.cycle),
-                        result.cycle};
-            }
-            if (result.canceled) {
-                return {false, false, true, result.reason, result.cycle};
-            }
-            return {false, false, false, result.reason, result.cycle};
-        }
-        return {};
-    }
-
-    void begin(int txn_id, const std::string& txn_label) override {
-        (void)txn_id;
-        (void)txn_label;
-    }
-
-    void commit(int txn_id) override {
-        lock_manager.releaseAll(txn_id);
-    }
-
-    void abort(int txn_id) override {
-        lock_manager.releaseAll(txn_id);
-    }
-
-    bool cancel(int txn_id) override {
-        return lock_manager.cancel(txn_id);
-    }
 };
 
 class HLCMVCCPolicy : public ConcurrencyControlPolicy {
@@ -5364,9 +4973,7 @@ public:
         std::lock_guard<std::mutex> guard(latch);
         auto txn_it = txns.find(request.txn_id);
         if (txn_it == txns.end()) {
-            return {false, false, false,
-                    "transaction has no HLC/MVCC state",
-                    {}};
+            return {false, "transaction has no HLC/MVCC state"};
         }
 
         if (request.type == AccessType::Write) {
@@ -11140,7 +10747,6 @@ public:
     Catalog catalog;
     RecoveryManager recovery_manager;
     TransactionManager txn_manager;
-    LockManager concurrency_control_lock_manager;
     std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
     std::mutex execution_latch;
     std::mutex txn_label_latch;
@@ -11154,16 +10760,6 @@ public:
           recovery_manager(buffer_manager, catalog) {
         concurrency_control_policy = std::make_unique<HLCMVCCPolicy>(
             [this](const std::string& line) { logConcurrencyControl(line); }
-        );
-        recovery_manager.setRestartUndoLockCallback(
-            [this](TableId table_id, PageID page_id, size_t slot_id) {
-                return acquireRestartUndoLock(table_id, page_id, slot_id);
-            }
-        );
-        recovery_manager.setRestartUndoReleaseCallback(
-            [this]() {
-                releaseRestartUndoLocks();
-            }
         );
         catalog.bootstrap();
         if (catalog.isNewDatabase()) {
@@ -11435,28 +11031,6 @@ public:
             txn->label;
     }
 
-    std::string txnIdLabel(int txn_id) {
-        if (txn_id == RECOVERY_TXN_ID) {
-            return "RECOVERY";
-        }
-        std::lock_guard<std::mutex> guard(txn_label_latch);
-        auto it = txn_labels.find(txn_id);
-        return it == txn_labels.end() ?
-            "T" + std::to_string(txn_id) :
-            it->second;
-    }
-
-    std::string txnPathLabel(const std::vector<int>& path) {
-        std::string label;
-        for (int txn_id : path) {
-            if (!label.empty()) {
-                label += " -> ";
-            }
-            label += txnIdLabel(txn_id);
-        }
-        return label.empty() ? "none" : label;
-    }
-
     static std::string tableResourceKey(const std::string& table_name) {
         return "table:" + table_name;
     }
@@ -11470,13 +11044,6 @@ public:
         return {tableResourceKey(table_name), tableResourceLabel(table_name)};
     }
 
-    static std::string tupleResourceKey(TableId table_id,
-                                        PageID page_id,
-                                        size_t slot_id) {
-        return "tuple:" + std::to_string(table_id) + ":" +
-               std::to_string(page_id) + ":" + std::to_string(slot_id);
-    }
-
     static std::string statementTypeName(StatementType type) {
         switch (type) {
             case StatementType::INSERT:
@@ -11486,7 +11053,8 @@ public:
             case StatementType::DELETE:
                 return "DELETE";
             default:
-                throw std::runtime_error("Statement type does not need a table lock.");
+                throw std::runtime_error(
+                    "Statement type does not need tracked write access.");
         }
     }
 
@@ -11518,64 +11086,9 @@ public:
             }
             return true;
         }
-        if (result.deadlock) {
-            logConcurrencyControl("deadlock detected; " + result.reason);
-            abort(txn);
-            return false;
-        }
-        if (result.canceled) {
-            logConcurrencyControl(txnLabel(txn) + " access canceled; " + result.reason);
-            txn_manager.abort(*txn);
-            return false;
-        }
-
-        logConcurrencyControl(txnLabel(txn) + " access blocked; " + result.reason);
+        logConcurrencyControl(txnLabel(txn) + " access rejected; " +
+                              result.reason);
         return false;
-    }
-
-    bool acquireRestartUndoLock(TableId table_id, PageID page_id, size_t slot_id) {
-        ConcurrencyControlResource resource{
-            tupleResourceKey(table_id, page_id, slot_id),
-            "tuple " + std::to_string(table_id) + "." +
-            std::to_string(page_id) + "." + std::to_string(slot_id)
-        };
-        auto result = concurrency_control_policy->beforeAccess({
-            RECOVERY_TXN_ID,
-            "RECOVERY",
-            AccessType::Write,
-            {resource},
-            "physiological restart undo"
-        });
-        if (result.granted) {
-            return false;
-        }
-        if (!result.deadlock) {
-            throw std::runtime_error(
-                "Recovery could not reacquire restart undo lock: " + result.reason
-            );
-        }
-
-        logConcurrencyControl("deadlock during restart undo; " + result.reason);
-        for (int txn_id : result.cycle) {
-            if (txn_id > 0) {
-                concurrency_control_policy->cancel(txn_id);
-            }
-        }
-        auto retry = concurrency_control_policy->beforeAccess({
-            RECOVERY_TXN_ID,
-            "RECOVERY",
-            AccessType::Write,
-            {resource},
-            "physiological restart undo"
-        });
-        if (!retry.granted) {
-            throw std::runtime_error("Recovery lock retry failed after deadlock.");
-        }
-        return true;
-    }
-
-    void releaseRestartUndoLocks() {
-        concurrency_control_policy->abort(RECOVERY_TXN_ID);
     }
 
     std::vector<std::string> queryTableNames(const QueryComponents& components) {
@@ -11589,8 +11102,8 @@ public:
         return table_names;
     }
 
-    bool acquireStatementLocks(const TxnPtr& txn,
-                               const StatementComponents& components) {
+    bool acquireStatementAccess(const TxnPtr& txn,
+                                const StatementComponents& components) {
         if (!txn || (components.type != StatementType::INSERT &&
                      components.type != StatementType::UPDATE &&
                      components.type != StatementType::DELETE)) {
@@ -11604,8 +11117,8 @@ public:
         );
     }
 
-    bool acquireQueryLocks(const TxnPtr& txn,
-                           const QueryComponents& components) {
+    bool acquireQueryAccess(const TxnPtr& txn,
+                            const QueryComponents& components) {
         if (!txn) {
             return true;
         }
@@ -11796,7 +11309,7 @@ public:
         }
 
         if (acquire_concurrency_control &&
-            !acquireStatementLocks(txn, components)) {
+            !acquireStatementAccess(txn, components)) {
             return;
         }
 
@@ -12048,7 +11561,7 @@ public:
                             const std::vector<size_t>& final_sort_attrs = {}) {
         auto components = parseQuery(query);
         resolveQueryColumns(components, catalog);
-        if (!acquireQueryLocks(txn, components)) {
+        if (!acquireQueryAccess(txn, components)) {
             return {};
         }
 
@@ -12523,6 +12036,8 @@ struct QueryRangeConfigCommand {
 
 struct ReadSystemCatalogCommand { std::string table; };
 
+struct ReadReplicaSafeTimestampCommand {};
+
 using Command = std::variant<
     CreateTableCommand,
     InsertRowCommand,
@@ -12574,7 +12089,8 @@ using Command = std::variant<
     ExplainIndexLookupCommand,
     ReadSecondaryIndexCommand,
     QueryRangeConfigCommand,
-    ReadSystemCatalogCommand>;
+    ReadSystemCatalogCommand,
+    ReadReplicaSafeTimestampCommand>;
 
 bool operator==(const CreateTableCommand& lhs, const CreateTableCommand& rhs) {
     return lhs.table == rhs.table && lhs.columns == rhs.columns;
@@ -12843,6 +12359,10 @@ bool operator==(const ReadSystemCatalogCommand& lhs,
                 const ReadSystemCatalogCommand& rhs) {
     return lhs.table == rhs.table;
 }
+bool operator==(const ReadReplicaSafeTimestampCommand&,
+                const ReadReplicaSafeTimestampCommand&) {
+    return true;
+}
 
 bool operator==(const Command& lhs, const Command& rhs) {
     return lhs.index() == rhs.index() &&
@@ -12938,6 +12458,18 @@ struct InvalidSchemaResult {};
 struct ClusterRejectedResult {};
 struct ConfigRejectedResult {};
 struct RouteRejectedResult {};
+struct ReplicaSafeTimestampResult {
+    std::string replica_id;
+    bool leader = false;
+    HybridLogicalTimestamp safe_ts = HybridLogicalTimestamp::zero();
+    int applied_index = 0;
+};
+struct FollowerReadRejectedResult {
+    std::string replica_id;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+    HybridLogicalTimestamp safe_ts = HybridLogicalTimestamp::zero();
+    int applied_index = 0;
+};
 
 using Result = std::variant<
     CreateTableOkResult,
@@ -12962,7 +12494,9 @@ using Result = std::variant<
     InvalidSchemaResult,
     ClusterRejectedResult,
     ConfigRejectedResult,
-    RouteRejectedResult>;
+    RouteRejectedResult,
+    ReplicaSafeTimestampResult,
+    FollowerReadRejectedResult>;
 
 bool operator==(const CreateTableOkResult&, const CreateTableOkResult&) { return true; }
 bool operator==(const InsertOkResult&, const InsertOkResult&) { return true; }
@@ -13042,6 +12576,20 @@ bool operator==(const InvalidSchemaResult&, const InvalidSchemaResult&) { return
 bool operator==(const ClusterRejectedResult&, const ClusterRejectedResult&) { return true; }
 bool operator==(const ConfigRejectedResult&, const ConfigRejectedResult&) { return true; }
 bool operator==(const RouteRejectedResult&, const RouteRejectedResult&) { return true; }
+bool operator==(const ReplicaSafeTimestampResult& lhs,
+                const ReplicaSafeTimestampResult& rhs) {
+    return lhs.replica_id == rhs.replica_id &&
+           lhs.leader == rhs.leader &&
+           lhs.safe_ts == rhs.safe_ts &&
+           lhs.applied_index == rhs.applied_index;
+}
+bool operator==(const FollowerReadRejectedResult& lhs,
+                const FollowerReadRejectedResult& rhs) {
+    return lhs.replica_id == rhs.replica_id &&
+           lhs.read_ts == rhs.read_ts &&
+           lhs.safe_ts == rhs.safe_ts &&
+           lhs.applied_index == rhs.applied_index;
+}
 
 bool operator==(const Result& lhs, const Result& rhs) {
     return lhs.index() == rhs.index() &&
@@ -13303,6 +12851,8 @@ std::string describeCommand(const Command& command) {
                 out << "QueryRangeConfig(" << value.config_num << ")";
             } else if constexpr (std::is_same_v<T, ReadSystemCatalogCommand>) {
                 out << "ReadSystemCatalog(" << value.table << ")";
+            } else if constexpr (std::is_same_v<T, ReadReplicaSafeTimestampCommand>) {
+                out << "ReadReplicaSafeTimestamp";
             }
             return out.str();
         },
@@ -13337,6 +12887,8 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, ClusterRejectedResult>) out << "ClusterRejected";
             else if constexpr (std::is_same_v<T, ConfigRejectedResult>) out << "ConfigRejected";
             else if constexpr (std::is_same_v<T, RouteRejectedResult>) out << "RouteRejected";
+            else if constexpr (std::is_same_v<T, ReplicaSafeTimestampResult>) out << "ReplicaSafeTimestamp(" << value.replica_id << ", safe_ts=" << hlcToString(value.safe_ts) << ", applied=" << value.applied_index << ")";
+            else if constexpr (std::is_same_v<T, FollowerReadRejectedResult>) out << "FollowerReadRejected(" << value.replica_id << ", read_ts=" << hlcToString(value.read_ts) << ", safe_ts=" << hlcToString(value.safe_ts) << ")";
             return out.str();
         },
         result);
@@ -14057,7 +13609,7 @@ private:
         auto rows = readCatalogTable("__txn_participants");
         if (!rows.has_value()) return {};
 
-        std::vector<std::pair<size_t, TxnParticipantRecord>> indexed;
+        std::map<size_t, std::pair<int, TxnParticipantRecord>> indexed;
         for (const auto& row : rows->rows) {
             auto row_txn_id = valueAt(*rows, row, "txn_id");
             auto range_id = valueAt(*rows, row, "range_id");
@@ -14070,25 +13622,24 @@ private:
                 !replica_group_id.has_value() ||
                 !participant_index.has_value() ||
                 !status.has_value() ||
-                *status != "prepared") {
+                (*status != "prepared" && *status != "committed")) {
                 continue;
             }
-            indexed.push_back({
-                static_cast<size_t>(std::stoull(*participant_index)),
-                TxnParticipantRecord{
-                    *range_id,
-                    *replica_group_id,
-                    static_cast<size_t>(std::stoull(*participant_index))}});
+            size_t index = static_cast<size_t>(std::stoull(*participant_index));
+            TxnParticipantRecord record{
+                *range_id,
+                *replica_group_id,
+                index};
+            int rank = txnStatusRank(*status);
+            auto existing = indexed.find(index);
+            if (existing == indexed.end() || rank >= existing->second.first) {
+                indexed[index] = {rank, std::move(record)};
+            }
         }
-        std::sort(indexed.begin(),
-                  indexed.end(),
-                  [](const auto& lhs, const auto& rhs) {
-                      return lhs.first < rhs.first;
-                  });
         std::vector<TxnParticipantRecord> participants;
         for (const auto& [index, participant] : indexed) {
             (void)index;
-            participants.push_back(participant);
+            participants.push_back(participant.second);
         }
         return participants;
     }
@@ -19255,7 +18806,6 @@ private:
             return TableNotFoundResult{};
         }
         ensureSystemCatalogTables();
-        ensureSystemCatalogTables();
         SelectAllResult all = queryResultToSelectAll(
             command.table, db_->executeQuery("PROJECT * FROM " + command.table,
                                              nullptr, false));
@@ -19294,6 +18844,7 @@ private:
         if (!tableExists(command.table) || command.range_id.empty()) {
             return TableNotFoundResult{};
         }
+        ensureSystemCatalogTables();
         SelectAllResult all = queryResultToSelectAll(
             command.table, db_->executeQuery("PROJECT * FROM " + command.table,
                                              nullptr, false));
@@ -19346,6 +18897,7 @@ private:
         if (!tableExists(command.table) || command.range_id.empty()) {
             return TableNotFoundResult{};
         }
+        ensureSystemCatalogTables();
         Result cleared = executeOne(
             DeleteRangeRowsCommand{command.table,
                                    command.range_id,
@@ -20614,6 +20166,10 @@ private:
         return systemCatalogTableView(command.table);
     }
 
+    Result executeOne(const ReadReplicaSafeTimestampCommand&) {
+        return ConfigRejectedResult{};
+    }
+
     std::string database_file_;
     bool owns_bundle_ = false;
     std::unique_ptr<BuzzDB> db_;
@@ -20749,6 +20305,32 @@ bool finalizesConfigWithoutReplica(const Command& command,
     if (finalize == nullptr) return false;
     auto voters = canonicalCatalogList(finalize->final_voters);
     return !catalogListContains(voters, replica.rootAddress().str());
+}
+
+std::optional<HybridLogicalTimestamp> timestampedReadTimestamp(
+    const Command& command) {
+    if (const auto* select = std::get_if<SelectAllCommand>(&command)) {
+        if (!select->read_ts.isZero()) return select->read_ts;
+    } else if (const auto* select =
+                   std::get_if<SelectWhereCommand>(&command)) {
+        if (!select->read_ts.isZero()) return select->read_ts;
+    } else if (const auto* lookup =
+                   std::get_if<ReadSecondaryIndexCommand>(&command)) {
+        if (!lookup->read_ts.isZero()) return lookup->read_ts;
+    }
+    return std::nullopt;
+}
+
+HybridLogicalTimestamp resultTimestamp(const Result& result) {
+    if (const auto* txn = std::get_if<DistributedTxnResult>(&result)) {
+        if (!txn->commit_ts.isZero()) return txn->commit_ts;
+        return txn->read_ts;
+    }
+    if (const auto* safe =
+            std::get_if<ReplicaSafeTimestampResult>(&result)) {
+        return safe->safe_ts;
+    }
+    return HybridLogicalTimestamp::zero();
 }
 
 std::string describeMessage(const Message& message) {
@@ -21649,6 +21231,7 @@ public:
         }
         sendAppendEntriesToPeers(ctx);
         resetAppendRetryTimer(ctx);
+        advanceCommitIndex(ctx);
     }
 
     std::unique_ptr<Node> clone() const override {
@@ -21658,6 +21241,7 @@ public:
     std::string roleName() const { return consensusRoleName(role_); }
     size_t majoritySize() const { return replicas_.size() / 2 + 1; }
     int commitIndex() const { return commit_index_; }
+    HybridLogicalTimestamp safeTimestamp() const { return safe_timestamp_; }
 
     Result executeReadOnlyForTest(const Command& command) const {
         return runWithSuppressedStdout([&] {
@@ -21675,6 +21259,7 @@ public:
             << ", votes=" << votes_.size()
             << ", commit=" << commit_index_
             << ", applied=" << applied_index_
+            << ", safe_ts=" << hlcToString(safe_timestamp_)
             << ", snap=(" << last_included_index_
             << "," << last_included_term_ << ")"
             << ", first=" << first_non_cleared_
@@ -21924,6 +21509,39 @@ private:
     void handleClientRequest(NodeContext& ctx,
                              const Address& client,
                              const ClientRequest& request) {
+        if (std::holds_alternative<ReadReplicaSafeTimestampCommand>(
+                request.command)) {
+            ctx.send(client, ClientReply{
+                request.client_id,
+                request.request_id,
+                safeTimestampResult()});
+            return;
+        }
+
+        auto read_ts = timestampedReadTimestamp(request.command);
+        if (role_ != ConsensusRole::Leader && read_ts.has_value()) {
+            if (canServeFollowerRead(*read_ts)) {
+                Result result = runWithSuppressedStdout([&] {
+                    BuzzDBCore copy = db_;
+                    return copy.execute(request.command);
+                });
+                ctx.send(client, ClientReply{
+                    request.client_id,
+                    request.request_id,
+                    result});
+            } else {
+                ctx.send(client, ClientReply{
+                    request.client_id,
+                    request.request_id,
+                    FollowerReadRejectedResult{
+                        address().rootAddress().str(),
+                        *read_ts,
+                        safe_timestamp_,
+                        applied_index_}});
+            }
+            return;
+        }
+
         if (role_ != ConsensusRole::Leader) {
             if (!addressEmpty(leader_) &&
                 !(leader_ == address().rootAddress())) {
@@ -22150,6 +21768,7 @@ private:
                                           snapshot.last_included_index));
         applied_index_ = std::max(applied_index_, snapshot.last_included_index);
         follower_applied_index_[address().rootAddress()] = applied_index_;
+        advanceSafeTimestamp(StatementOkResult{});
 
         auto erase_to = log_.upper_bound(last_included_index_);
         log_.erase(log_.begin(), erase_to);
@@ -22279,6 +21898,7 @@ private:
 
             applied_index_ = entry.index;
             follower_applied_index_[address().rootAddress()] = applied_index_;
+            advanceSafeTimestamp(result);
             auto pending = pending_by_index_.find(entry.index);
             if (pending != pending_by_index_.end()) {
                 ctx.send(pending->second.client, ClientReply{
@@ -22290,6 +21910,38 @@ private:
                 pending_by_index_.erase(pending);
             }
         }
+    }
+
+    ReplicaSafeTimestampResult safeTimestampResult() const {
+        return ReplicaSafeTimestampResult{
+            address().rootAddress().str(),
+            role_ == ConsensusRole::Leader,
+            safe_timestamp_,
+            applied_index_};
+    }
+
+    bool canServeFollowerRead(const HybridLogicalTimestamp& read_ts) const {
+        return !read_ts.isZero() &&
+               !safe_timestamp_.isZero() &&
+               read_ts <= safe_timestamp_;
+    }
+
+    void advanceSafeTimestamp(const Result& result) {
+        HybridLogicalTimestamp observed = resultTimestamp(result);
+        HybridLogicalTimestamp base = safe_timestamp_;
+        if (!observed.isZero() && base < observed) {
+            base = observed;
+        }
+        auto now = std::chrono::system_clock::now().time_since_epoch();
+        long long physical =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        if (physical > base.physical) {
+            safe_timestamp_ = HybridLogicalTimestamp{physical, 0};
+        } else {
+            safe_timestamp_ =
+                HybridLogicalTimestamp{base.physical, base.logical + 1};
+        }
+        safe_index_ = applied_index_;
     }
 
     std::vector<Address> replicas_;
@@ -22305,6 +21957,8 @@ private:
     int first_non_cleared_ = 1;
     int last_included_index_ = 0;
     int last_included_term_ = 0;
+    HybridLogicalTimestamp safe_timestamp_ = HybridLogicalTimestamp::zero();
+    int safe_index_ = 0;
     BuzzDBCore db_;
     std::map<int, ConsensusLogEntry> log_;
     std::map<Address, int> match_index_;
@@ -22754,12 +22408,25 @@ void printPartitionedSQLTrace(const std::string& data_file) {
         int next_request_id = 1;
     };
 
-    auto prefixedReplicas = [](const std::string& prefix) {
+    auto prefixedReplicas = [](const std::string& prefix,
+                               size_t count = 3) {
         std::vector<Address> replicas;
-        for (size_t i = 1; i <= 3; ++i) {
+        for (size_t i = 1; i <= count; ++i) {
             replicas.emplace_back(prefix + std::to_string(i));
         }
         return replicas;
+    };
+
+    [[maybe_unused]] auto electConsensusGroupState =
+        [&](const std::vector<Address>& replicas, const Address& leader) {
+        SearchState state = consensusClusterState(replicas);
+        std::vector<Address> voters;
+        for (const auto& replica : replicas) {
+            if (!(replica.rootAddress() == leader.rootAddress())) {
+                voters.push_back(replica);
+            }
+        }
+        return electConsensusLeader(state, leader, voters);
     };
 
     auto makeGroup = [&](const std::string& group_id,
@@ -23003,15 +22670,15 @@ void printPartitionedSQLTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v142; "
-                  << "this version focuses on HLC/MVCC distributed transactions."
+        std::cerr << "--measure-restart is not available in v144; "
+                  << "this version focuses on sharded transaction stress."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v142: MVCC snapshots and serializable validation"
+    std::cout << "BuzzDB v144: sharded transaction stress coverage"
               << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
@@ -23023,7 +22690,7 @@ int main(int argc, char* argv[]) {
 
     TestRunner tests;
 
-    auto withLocalMVCCDB = [&](auto&& fn) {
+    [[maybe_unused]] auto withLocalMVCCDB = [&](auto&& fn) {
         auto database_file = makeScratchBuzzDBFile();
         auto cleanup = [&]() {
             std::error_code ec;
@@ -23044,7 +22711,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    auto localValueFor = [](BuzzDB& db, const TxnPtr& txn) {
+    [[maybe_unused]] auto localValueFor = [](BuzzDB& db, const TxnPtr& txn) {
         QueryTable rows =
             db.executeQuery("PROJECT * FROM kv WHERE {id}=1", txn, false);
         if (rows.size() != 1 || rows.front().fields.size() < 2) {
@@ -23120,12 +22787,25 @@ int main(int argc, char* argv[]) {
             title_year_index, "title", "production_year", group_id};
     };
 
-    auto prefixedReplicas = [](const std::string& prefix) {
+    auto prefixedReplicas = [](const std::string& prefix,
+                               size_t count = 3) {
         std::vector<Address> replicas;
-        for (size_t i = 1; i <= 3; ++i) {
+        for (size_t i = 1; i <= count; ++i) {
             replicas.emplace_back(prefix + std::to_string(i));
         }
         return replicas;
+    };
+
+    auto electConsensusGroupState = [&](const std::vector<Address>& replicas,
+                                        const Address& leader) {
+        SearchState state = consensusClusterState(replicas);
+        std::vector<Address> voters;
+        for (const auto& replica : replicas) {
+            if (!(replica.rootAddress() == leader.rootAddress())) {
+                voters.push_back(replica);
+            }
+        }
+        return electConsensusLeader(state, leader, voters);
     };
 
     struct ConsensusGroupHarness {
@@ -23141,15 +22821,26 @@ int main(int argc, char* argv[]) {
     auto makeConsensusGroup =
         [&](const std::string& group_id,
             const std::string& prefix,
-            int client_id) {
+            int client_id,
+            size_t replica_count = 3) {
         ConsensusGroupHarness group;
         group.group_id = group_id;
-        group.replicas = prefixedReplicas(prefix);
+        group.replicas = prefixedReplicas(prefix, replica_count);
         group.leader = group.replicas.front();
         group.client = Address("client-" + group_id);
-        group.state = electedConsensusState(group.replicas, group.leader);
+        group.state = electConsensusGroupState(group.replicas, group.leader);
         group.client_id = client_id;
         return group;
+    };
+
+    auto followerReplicas = [](const ConsensusGroupHarness& group) {
+        std::vector<Address> followers;
+        for (const auto& replica : group.replicas) {
+            if (!(replica.rootAddress() == group.leader.rootAddress())) {
+                followers.push_back(replica);
+            }
+        }
+        return followers;
     };
 
     auto clientReplyFor = [](const SearchState& state,
@@ -23177,7 +22868,7 @@ int main(int argc, char* argv[]) {
             group.client_id,
             request_id,
             command,
-            {group.replicas[1], group.replicas[2]});
+            followerReplicas(group));
         auto reply =
             clientReplyFor(group.state, group.client_id, request_id);
         if (!reply.has_value()) {
@@ -23187,7 +22878,7 @@ int main(int argc, char* argv[]) {
         return *reply;
     };
 
-    auto commitCommandWithRequestId =
+    [[maybe_unused]] auto commitCommandWithRequestId =
         [&](ConsensusGroupHarness& group,
             int request_id,
             const Command& command) {
@@ -23200,7 +22891,7 @@ int main(int argc, char* argv[]) {
                 group.client_id,
                 request_id,
                 command,
-                {group.replicas[1], group.replicas[2]});
+                followerReplicas(group));
             auto reply =
                 clientReplyFor(group.state, group.client_id, request_id);
             if (!reply.has_value()) {
@@ -23210,7 +22901,44 @@ int main(int argc, char* argv[]) {
             return *reply;
         };
 
-    auto immediateClientCommandWithRequestId =
+    [[maybe_unused]] auto directClientCommand =
+        [&](ConsensusGroupHarness& group,
+            const Address& target,
+            const Command& command) {
+        int request_id = group.next_request_id++;
+        group.state.send(
+            group.client,
+            target,
+            ClientRequest{group.client_id, request_id, command});
+        group.state = stepRequired(
+            group.state,
+            requireMessageEvent(
+                group.state,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr &&
+                           request->client_id == group.client_id &&
+                           request->request_id == request_id &&
+                           envelope.from.rootAddress() ==
+                               group.client.rootAddress() &&
+                           envelope.to.rootAddress() ==
+                               target.rootAddress();
+                },
+                "direct client request",
+                SearchSettings{}),
+            SearchSettings{});
+        auto reply =
+            clientReplyFor(group.state, group.client_id, request_id);
+        if (!reply.has_value()) {
+            throw std::runtime_error(
+                "missing direct client reply for " +
+                describeCommand(command));
+        }
+        return *reply;
+    };
+
+    [[maybe_unused]] auto immediateClientCommandWithRequestId =
         [&](ConsensusGroupHarness& group,
             const Address& target,
             int request_id,
@@ -23256,15 +22984,16 @@ int main(int argc, char* argv[]) {
         ConsensusGroupHarness index_owner;
     };
 
-    auto buildIndexScenario = [&]() {
+    auto buildIndexScenario = [&](size_t replica_count = 3) {
         IndexScenario scenario;
         scenario.fixture = titleIndexFixture();
         scenario.catalog =
-            makeConsensusGroup("catalog", "server", 1);
+            makeConsensusGroup("catalog", "server", 1, replica_count);
         scenario.table_owner =
-            makeConsensusGroup("group-1", "table-server", 2);
+            makeConsensusGroup("group-1", "table-server", 2, replica_count);
         scenario.index_owner =
-            makeConsensusGroup(index_replica_group, "index-server", 3);
+            makeConsensusGroup(index_replica_group, "index-server", 3,
+                               replica_count);
 
         auto readSystemCatalog = [&](ConsensusGroupHarness& group,
                                      const std::string& table) {
@@ -23422,7 +23151,7 @@ int main(int argc, char* argv[]) {
         return runtime;
     };
 
-    auto participantHasStatus =
+    [[maybe_unused]] auto participantHasStatus =
         [&](const ConsensusGroupHarness& group,
             const std::string& txn_id,
             const std::string& range_id,
@@ -23434,7 +23163,7 @@ int main(int argc, char* argv[]) {
                  {"status", status}});
         };
 
-    auto participantIntentHasStatus =
+    [[maybe_unused]] auto participantIntentHasStatus =
         [&](const ConsensusGroupHarness& group,
             const std::string& txn_id,
             const std::string& range_id,
@@ -23452,8 +23181,8 @@ int main(int argc, char* argv[]) {
                values.end();
     };
 
-    auto countRowsOn = [&](const ConsensusGroupHarness& group,
-                           const std::string& table) {
+    [[maybe_unused]] auto countRowsOn =
+        [&](const ConsensusGroupHarness& group, const std::string& table) {
         Result result =
             leaderNode(group)->executeReadOnlyForTest(CountRowsCommand{table});
         const auto* count = std::get_if<CountRowsResult>(&result);
@@ -23499,16 +23228,17 @@ int main(int argc, char* argv[]) {
         return *prepared;
     };
 
-    auto commitPrepared = [&](ConsensusGroupHarness& group,
-                              const std::string& txn_id,
-                              bool apply) {
+    [[maybe_unused]] auto commitPrepared =
+        [&](ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            bool apply) {
         return commitCommand(
             group,
             CommitPreparedDistributedTransactionCommand{txn_id, apply});
     };
 
-    auto abortPrepared = [&](ConsensusGroupHarness& group,
-                             const std::string& txn_id) {
+    [[maybe_unused]] auto abortPrepared =
+        [&](ConsensusGroupHarness& group, const std::string& txn_id) {
         return commitCommand(
             group,
             AbortPreparedDistributedTransactionCommand{txn_id});
@@ -23522,7 +23252,7 @@ int main(int argc, char* argv[]) {
             {{"txn_id", txn_id}, {"status", status}});
     };
 
-    auto txnHasLivenessStatus =
+    [[maybe_unused]] auto txnHasLivenessStatus =
         [&](const ConsensusGroupHarness& group,
             const std::string& txn_id,
             const std::string& status) {
@@ -23533,7 +23263,7 @@ int main(int argc, char* argv[]) {
                  {"status", status}});
         };
 
-    auto catalogHasTxnRow =
+    [[maybe_unused]] auto catalogHasTxnRow =
         [&](const ConsensusGroupHarness& group,
             const std::string& table,
             const std::string& txn_id) {
@@ -23555,8 +23285,9 @@ int main(int argc, char* argv[]) {
         std::string status;
     };
 
-    auto latestTransferOn = [&](const ConsensusGroupHarness& group,
-                                const std::string& range_id)
+    [[maybe_unused]] auto latestTransferOn =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& range_id)
         -> std::optional<RangeTransferView> {
         SelectAllResult transfers =
             catalogTableOn(group, group.leader, "__range_transfers");
@@ -23601,8 +23332,9 @@ int main(int argc, char* argv[]) {
         return latest;
     };
 
-    auto physicalIndexEntryCount = [&](const ConsensusGroupHarness& group,
-                                       const std::string& range_id) {
+    [[maybe_unused]] auto physicalIndexEntryCount =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& range_id) {
         SelectAllResult rows =
             catalogTableOn(group, group.leader, "__index_entries");
         auto range_column = catalogColumnIndex(rows, "range_id");
@@ -23622,8 +23354,9 @@ int main(int argc, char* argv[]) {
         return count;
     };
 
-    auto indexRouteGroupOnCatalog = [&](const ConsensusGroupHarness& catalog,
-                                        const std::string& year) {
+    [[maybe_unused]] auto indexRouteGroupOnCatalog =
+        [&](const ConsensusGroupHarness& catalog,
+            const std::string& year) {
         Result route_result =
             leaderNode(catalog)->executeReadOnlyForTest(
                 ExplainIndexLookupCommand{title_year_index, year});
@@ -23641,7 +23374,7 @@ int main(int argc, char* argv[]) {
         ConsensusGroupHarness target;
     };
 
-    auto buildIndexMovementScenario = [&]() {
+    [[maybe_unused]] auto buildIndexMovementScenario = [&]() {
         IndexMovementScenario scenario;
         scenario.fixture = titleIndexFixture();
         scenario.catalog =
@@ -23709,308 +23442,174 @@ int main(int argc, char* argv[]) {
         return scenario;
     };
 
+    struct RuntimeDriveResult {
+        size_t ticks = 0;
+        bool ended = false;
+        std::string trace;
+    };
+
+    auto driveTxnToEnd = [&](ControlPlaneRuntime& runtime,
+                             ConsensusGroupHarness& catalog,
+                             const std::string& txn_id,
+                             size_t max_ticks) {
+        RuntimeDriveResult driven;
+        for (size_t i = 0; i < max_ticks; ++i) {
+            if (txnHasStatus(catalog, txn_id, "ended")) {
+                driven.ended = true;
+                return driven;
+            }
+            auto step = runtime.tick();
+            if (!driven.trace.empty()) driven.trace += "; ";
+            driven.trace += step.status_before + "->" +
+                            step.status_after + ":" +
+                            describeResult(step.result);
+            if (!step.advanced) {
+                driven.ended = txnHasStatus(catalog, txn_id, "ended");
+                return driven;
+            }
+            ++driven.ticks;
+        }
+        driven.ended = txnHasStatus(catalog, txn_id, "ended");
+        return driven;
+    };
 
 
 
-
-    tests.test("Cross-range snapshot read uses one HLC timestamp", [&] {
-        auto scenario = buildIndexScenario();
+    tests.test("Bounded sharded transaction search commits one routed update", [&] {
+        auto scenario = buildIndexScenario(3);
+        auto runtime = controlPlaneRuntime(scenario);
         const auto& row = scenario.fixture.initial_rows[0];
-        std::string old_year = row.values[3];
-        std::string new_year = replacementProductionYear(old_year);
-        std::string snapshot_txn = "zz-snapshot-reader";
-        std::string writer_txn = "aa-snapshot-writer";
-        std::string table_range = defaultRangeIdForTable("title");
-        std::vector<std::string> snapshot_statements{
-            "SELECT * FROM title WHERE id=" + row.values[0]};
+        const std::string primary_key = row.values[0];
+        const std::string old_year = row.values[3];
+        const std::string expected_new_year =
+            replacementProductionYear(old_year);
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + expected_new_year +
+            " WHERE id=" + primary_key};
 
-        DistributedTxnResult snapshot =
-            runPrepare(
-                scenario.catalog,
-                snapshot_txn,
-                snapshot_statements);
-        tests.check(!snapshot.read_ts.isZero() &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.table_owner,
-                                PrepareTxnParticipantCommand{
-                                    snapshot_txn,
-                                    table_range,
-                                    scenario.table_owner.group_id,
-                                    snapshot_statements,
-                                    snapshot.read_ts})) &&
-                        selectAllHasRow(
-                            catalogTableOn(scenario.table_owner,
-                                           scenario.table_owner.leader,
-                                           "__txn_read_set"),
-                            {{"txn_id", snapshot_txn},
-                             {"read_kind", "point"},
-                             {"status", "prepared"}}),
-                    "snapshot prepare should durably allocate a read timestamp and a participant-local read set");
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            AbortTxnParticipantCommand{
-                                snapshot_txn,
-                                table_range,
-                                scenario.table_owner.group_id})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                        abortPrepared(scenario.catalog, snapshot_txn)),
-                    "timestamp holder should be aborted after its snapshot is captured");
+        std::string txn_id = "txn-search-routed-update";
+        DistributedTxnResult prepared =
+            runPrepare(scenario.catalog, txn_id, statements);
+        DistributedTxnResult duplicate_prepare =
+            runPrepare(scenario.catalog, txn_id, statements);
+        tests.check(prepared.status == "prepared" &&
+                        duplicate_prepare.status == "prepared" &&
+                        prepared.participant_range_ids ==
+                            duplicate_prepare.participant_range_ids &&
+                        prepared.participant_replica_group_ids ==
+                            duplicate_prepare.participant_replica_group_ids,
+                    "duplicate coordinator prepare should be idempotent during bounded search");
+        tests.check(prepared.participant_range_ids.size() == 2,
+                    "bounded search should use a real sharded transaction plan");
 
-        auto runtime = controlPlaneRuntime(scenario);
-        runPrepare(
-            scenario.catalog,
-            writer_txn,
-            {"UPDATE title SET production_year=" + new_year +
-             " WHERE id=" + row.values[0]});
-        tests.check(runtime.tick().advanced &&
-                        txnHasStatus(scenario.catalog,
-                                     writer_txn,
-                                     "committed"),
-                    "writer should first reach a durable commit decision");
-        tests.check(runtime.tick().advanced &&
-                        txnHasStatus(scenario.catalog,
-                                     writer_txn,
-                                     "ended"),
-                    "writer participants should publish MVCC versions");
+        RuntimeDriveResult driven =
+            driveTxnToEnd(runtime, scenario.catalog, txn_id, 16);
+        tests.check(driven.ticks > 0 && driven.ended,
+                    "runtime should finish the bounded sharded transaction");
 
-        auto rowSetHasYear = [&](const auto& read,
-                                  const std::string& expected_year) {
-            auto id_column = std::find(read.columns.begin(),
-                                       read.columns.end(),
-                                       "id");
-            auto year_column = std::find(read.columns.begin(),
-                                         read.columns.end(),
-                                         "production_year");
-            if (id_column == read.columns.end() ||
-                year_column == read.columns.end()) {
-                return false;
-            }
-            size_t id_index = static_cast<size_t>(
-                std::distance(read.columns.begin(), id_column));
-            size_t year_index = static_cast<size_t>(
-                std::distance(read.columns.begin(), year_column));
-            for (const auto& values : read.rows) {
-                if (id_index < values.size() &&
-                    year_index < values.size() &&
-                    values[id_index] == row.values[0] &&
-                    values[year_index] == expected_year) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        auto old_snapshot = runtime.readIndexRows(
-            title_year_index, old_year, "title", "id", snapshot.read_ts);
-        auto new_snapshot = runtime.readIndexRows(
-            title_year_index, new_year, "title", "id", snapshot.read_ts);
-        auto old_latest = runtime.readIndexRows(
-            title_year_index, old_year, "title", "id");
-        auto new_latest = runtime.readIndexRows(
-            title_year_index, new_year, "title", "id");
-
-        tests.check(old_snapshot.complete &&
-                        containsText(old_snapshot.index.primary_keys,
-                                     row.values[0]) &&
-                        rowSetHasYear(old_snapshot, old_year) &&
-                        new_snapshot.complete &&
-                        !containsText(new_snapshot.index.primary_keys,
-                                      row.values[0]),
-                    "snapshot read should see the old index and old base row across ranges");
-        tests.check(old_latest.complete &&
-                        !containsText(old_latest.index.primary_keys,
-                                      row.values[0]) &&
-                        new_latest.complete &&
-                        containsText(new_latest.index.primary_keys,
-                                     row.values[0]) &&
-                        rowSetHasYear(new_latest, new_year),
-                    "latest read should see the writer after the same transaction finishes");
-    });
-
-    tests.test("Serializable validation aborts stale cross-range transaction", [&] {
-        auto scenario = buildIndexScenario();
-        const auto& read_row = scenario.fixture.initial_rows[0];
-        const auto& write_row = scenario.fixture.initial_rows[1];
-        std::string read_old_year = read_row.values[3];
-        std::string read_new_year = replacementProductionYear(read_old_year);
-        std::string write_old_year = write_row.values[3];
-        std::string write_new_year = replacementProductionYear(write_old_year);
-        std::string stale_txn = "zz-serializable-stale";
-        std::string writer_txn = "aa-serializable-writer";
-        std::string table_range = defaultRangeIdForTable("title");
-        std::string index_range = defaultRangeIdForIndex(title_year_index);
-        std::vector<std::string> stale_statements{
-            "SELECT * FROM title WHERE id=" + read_row.values[0],
-            "UPDATE title SET production_year=" + write_new_year +
-                " WHERE id=" + write_row.values[0]};
-
-        DistributedTxnResult stale_prepare = runPrepare(
-            scenario.catalog,
-            stale_txn,
-            stale_statements);
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            PrepareTxnParticipantCommand{
-                                stale_txn,
-                                table_range,
-                                scenario.table_owner.group_id,
-                                stale_statements,
-                                stale_prepare.read_ts})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.index_owner,
-                                PrepareTxnParticipantCommand{
-                                    stale_txn,
-                                    index_range,
-                                    scenario.index_owner.group_id,
-                                    stale_statements,
-                                    stale_prepare.read_ts})) &&
-                        selectAllHasRow(
-                        catalogTableOn(scenario.table_owner,
-                                       scenario.table_owner.leader,
-                                       "__txn_read_set"),
-                        {{"txn_id", stale_txn},
-                         {"read_kind", "point"},
-                         {"status", "prepared"}}) &&
-                        selectAllHasRow(
-                            catalogTableOn(scenario.table_owner,
-                                           scenario.table_owner.leader,
-                                           "__txn_write_set"),
-                            {{"txn_id", stale_txn},
-                             {"write_key",
-                              tableRowKey("title", write_row.values[0])},
-                             {"status", "prepared"}}),
-                    "stale transaction should durably record range-local read and write sets");
-
-        std::vector<std::string> writer_statements{
-            "UPDATE title SET production_year=" + read_new_year +
-            " WHERE id=" + read_row.values[0]};
-        DistributedTxnResult writer_prepare = runPrepare(
-            scenario.catalog,
-            writer_txn,
-            writer_statements);
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            PrepareTxnParticipantCommand{
-                                writer_txn,
-                                table_range,
-                                scenario.table_owner.group_id,
-                                writer_statements,
-                                writer_prepare.read_ts})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.index_owner,
-                                PrepareTxnParticipantCommand{
-                                    writer_txn,
-                                    index_range,
-                                    scenario.index_owner.group_id,
-                                    writer_statements,
-                                    writer_prepare.read_ts})),
-                    "conflicting writer participants should prepare through real groups");
-        Result writer_decision_result =
-            commitPrepared(scenario.catalog, writer_txn, false);
-        const auto* writer_decision =
-            std::get_if<DistributedTxnResult>(&writer_decision_result);
-        tests.check(writer_decision != nullptr &&
-                        writer_decision->status == "committed" &&
-                        !writer_decision->commit_ts.isZero(),
-                    "conflicting writer should publish a durable commit decision");
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitCommand(
-                            scenario.table_owner,
-                            CommitTxnParticipantCommand{
-                                writer_txn,
-                                table_range,
-                                scenario.table_owner.group_id,
-                                writer_decision != nullptr
-                                    ? writer_decision->commit_ts
-                                    : HybridLogicalTimestamp::zero()})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            commitCommand(
-                                scenario.index_owner,
-                                CommitTxnParticipantCommand{
-                                    writer_txn,
-                                    index_range,
-                                    scenario.index_owner.group_id,
-                                    writer_decision != nullptr
-                                        ? writer_decision->commit_ts
-                                        : HybridLogicalTimestamp::zero()})),
-                    "conflicting writer should publish participant versions");
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        commitPrepared(scenario.catalog, writer_txn, true)) &&
-                        txnHasStatus(scenario.catalog,
-                                     writer_txn,
-                                     "ended"),
-                    "conflicting writer should end through the coordinator");
-        tests.check(selectAllHasRow(
-                        catalogTableOn(scenario.table_owner,
-                                       scenario.table_owner.leader,
-                                       "__txn_write_set"),
-                        {{"txn_id", writer_txn},
-                         {"write_key",
-                          tableRowKey("title", read_row.values[0])},
-                         {"status", "committed"}}),
-                    "writer commit should publish a durable range-local write set");
-
-        auto runtime = controlPlaneRuntime(scenario);
-        auto validation = runtime.tick();
-        tests.check(validation.advanced &&
-                        validation.range_id == stale_txn &&
-                        validation.status_after == "aborted" &&
-                        txnHasStatus(scenario.catalog,
-                                     stale_txn,
-                                     "aborted"),
-                    "serializable validation should abort the stale read transaction");
-        tests.check(runtime.runUntilIdle() >= 1,
-                    "runtime should drive validation abort to real participants");
-        tests.check(participantHasStatus(scenario.table_owner,
-                                         stale_txn,
-                                         table_range,
-                                         "aborted") &&
-                        participantHasStatus(scenario.index_owner,
-                                             stale_txn,
-                                             index_range,
-                                             "aborted"),
-                    "participant groups should durably abort the stale transaction");
-        tests.check(firstRowValue(
-                        selectTitleById(scenario.table_owner,
-                                        read_row.values[0]),
-                        "production_year") == read_new_year &&
-                        firstRowValue(
-                            selectTitleById(scenario.table_owner,
-                                            write_row.values[0]),
-                            "production_year") == write_old_year,
-                    "only the conflicting writer should be visible in base rows");
+        SelectAllResult selected =
+            selectTitleById(scenario.table_owner, primary_key);
+        tests.check(firstRowValue(selected, "production_year") ==
+                        expected_new_year,
+                    "base table should show the committed sharded production_year update");
         tests.check(containsText(
                         readIndexOn(scenario.index_owner,
                                     scenario.index_owner.leader,
-                                    write_old_year).primary_keys,
-                        write_row.values[0]) &&
+                                    expected_new_year).primary_keys,
+                        primary_key),
+                    "secondary index should contain the committed sharded update");
+        tests.check(!containsText(
+                        readIndexOn(scenario.index_owner,
+                                    scenario.index_owner.leader,
+                                    old_year).primary_keys,
+                        primary_key),
+                    "secondary index should remove the old posting for the updated row");
+    });
+
+    tests.test("Unavailable participant waits then heals without partial result", [&] {
+        auto scenario = buildIndexScenario(3);
+        auto makeRuntime = [&](bool table_available,
+                               bool index_available) {
+            ControlPlaneRuntime runtime{
+                [&](const Command& command) {
+                    return commitCommand(scenario.catalog, command);
+                }};
+            if (table_available) {
+                runtime.registerReplicaGroup(
+                    scenario.table_owner.group_id,
+                    [&](const Command& command) {
+                        return commitCommand(scenario.table_owner, command);
+                    });
+            }
+            if (index_available) {
+                runtime.registerReplicaGroup(
+                    scenario.index_owner.group_id,
+                    [&](const Command& command) {
+                        return commitCommand(scenario.index_owner, command);
+                    });
+            }
+            return runtime;
+        };
+
+        const auto& row = scenario.fixture.initial_rows[0];
+        const std::string primary_key = row.values[0];
+        const std::string old_year = row.values[3];
+        const std::string new_year = replacementProductionYear(old_year);
+        const std::string txn_id = "txn-unavailable-heals";
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + primary_key};
+
+        DistributedTxnResult prepared =
+            runPrepare(scenario.catalog, txn_id, statements);
+        tests.check(prepared.status == "prepared" &&
+                        prepared.participant_range_ids.size() == 2,
+                    "unavailable participant case should create a real two-participant transaction");
+
+        auto partitioned_runtime = makeRuntime(true, false);
+        auto partitioned_step = partitioned_runtime.tick();
+        tests.check(partitioned_step.advanced &&
+                        partitioned_step.status_after == "waiting" &&
+                        txnHasStatus(scenario.catalog, txn_id, "prepared"),
+                    "missing participant group should leave the coordinator safely waiting");
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner,
+                                        primary_key),
+                        "production_year") == old_year &&
                         !containsText(
                             readIndexOn(scenario.index_owner,
                                         scenario.index_owner.leader,
-                                        write_new_year).primary_keys,
-                            write_row.values[0]),
-                    "aborted stale transaction should not publish index writes");
+                                        new_year).primary_keys,
+                            primary_key),
+                    "prepared work under participant outage should not leak a partial base/index result");
+
+        auto healed_runtime = makeRuntime(true, true);
+        auto duplicate_wait = healed_runtime.tick();
+        tests.check(duplicate_wait.advanced,
+                    "healed runtime should make progress after the participant outage");
+        RuntimeDriveResult healed =
+            driveTxnToEnd(healed_runtime, scenario.catalog, txn_id, 16);
+        tests.check(healed.ticks >= 1 && healed.ended,
+                    "healed runtime should finish the unavailable participant transaction");
+        (void)driveTxnToEnd(healed_runtime, scenario.catalog, txn_id, 4);
+
+        tests.check(firstRowValue(
+                        selectTitleById(scenario.table_owner,
+                                        primary_key),
+                        "production_year") == new_year,
+                    "base row should show exactly the healed committed value");
+        tests.check(containsText(
+                        readIndexOn(scenario.index_owner,
+                                    scenario.index_owner.leader,
+                                    new_year).primary_keys,
+                        primary_key) &&
+                        !containsText(
+                            readIndexOn(scenario.index_owner,
+                                        scenario.index_owner.leader,
+                                        old_year).primary_keys,
+                            primary_key),
+                    "index owner should converge to the same healed committed value");
     });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
