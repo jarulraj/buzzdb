@@ -480,6 +480,12 @@ std::string log_filename = "buzzdb.log";
 std::string master_record_filename = "buzzdb.master";
 std::string image_copy_filename = "buzzdb.image.dat";
 std::string image_copy_metadata_filename = "buzzdb.image.meta";
+std::string database_filename = "buzzdb.dat";
+
+std::string buzzdbCompanionFilename(const std::string& database_file,
+                                    const std::string& extension);
+std::string buzzdbImageFilename(const std::string& database_file);
+std::string buzzdbImageMetadataFilename(const std::string& database_file);
 
 void forceFileToStableStorage(const std::string& filename,
                               const std::string& description) {
@@ -551,17 +557,877 @@ struct ImageCopyMetadata {
     size_t page_count = 0;
 };
 
-void writeImageCopyMetadata(const ImageCopyMetadata& metadata) {
+struct NamespaceId {
+    uint64_t value = 0;
+};
+
+struct FileId {
+    uint32_t value = 0;
+};
+
+struct PageId {
+    uint64_t value = 0;
+};
+
+struct Lsn {
+    uint64_t value = 0;
+};
+
+struct PageKey {
+    FileId file;
+    PageId page;
+};
+
+struct PageImage {
+    PageKey key;
+    Lsn page_lsn;
+    std::array<char, PAGE_SIZE> bytes{};
+};
+
+struct LogRecordBytes {
+    Lsn lsn;
+    std::vector<uint8_t> bytes;
+    uint32_t crc = 0;
+};
+
+struct StorageManifest {
+    NamespaceId namespace_id;
+    Lsn durable_lsn;
+    size_t durable_offset = 0;
+    uint64_t epoch = 0;
+    Lsn durable_log_lsn;
+    uint64_t lease_epoch = 0;
+    uint64_t writer_node_id = 0;
+};
+
+struct ComputeNodeId {
+    uint64_t value = 0;
+};
+
+struct LeaseEpoch {
+    uint64_t value = 0;
+};
+
+enum class AttachMode {
+    ReadOnly,
+    ReadWrite
+};
+
+enum class AttachStatus {
+    Attached,
+    ReadWriteLeaseHeld,
+    InvalidNamespace
+};
+
+struct ComputeLease {
+    NamespaceId namespace_id;
+    ComputeNodeId holder;
+    LeaseEpoch epoch;
+    Lsn fencing_lsn;
+    bool write_enabled = false;
+};
+
+struct AttachResult {
+    AttachStatus status = AttachStatus::InvalidNamespace;
+    ComputeLease lease;
+};
+
+struct StorageNamespaceFiles {
+    std::string data_file;
+    std::string log_file;
+    std::string manifest_file;
+    std::string image_file;
+    std::string image_metadata_file;
+};
+
+struct StorageTraceEvent {
+    std::string operation;
+    NamespaceId namespace_id;
+    FileId file;
+    PageId page;
+    Lsn lsn;
+    size_t bytes = 0;
+    uint64_t epoch = 0;
+};
+
+constexpr FileId STORAGE_DATA_FILE{1};
+constexpr FileId STORAGE_LOG_FILE{2};
+constexpr FileId STORAGE_MANIFEST_FILE{3};
+constexpr FileId STORAGE_IMAGE_FILE{4};
+constexpr FileId STORAGE_IMAGE_METADATA_FILE{5};
+
+uint32_t storageCrc(const std::vector<uint8_t>& bytes) {
+    uint32_t checksum = 2166136261u;
+    for (uint8_t byte : bytes) {
+        checksum ^= byte;
+        checksum *= 16777619u;
+    }
+    return checksum;
+}
+
+uint64_t storageNamespaceHash(const std::string& value) {
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+NamespaceId currentStorageNamespace() {
+    std::filesystem::path path(database_filename.empty()
+                                   ? std::string("buzzdb.dat")
+                                   : database_filename);
+    return NamespaceId{
+        storageNamespaceHash(std::filesystem::absolute(path).string())};
+}
+
+NamespaceId storageNamespaceForDatabaseFile(const std::string& database_file) {
+    return NamespaceId{
+        storageNamespaceHash(
+            std::filesystem::absolute(std::filesystem::path(database_file))
+                .string())};
+}
+
+StorageNamespaceFiles storageFilesForDatabaseFile(
+    const std::string& database_file) {
+    std::string absolute =
+        std::filesystem::absolute(std::filesystem::path(database_file))
+            .string();
+    return StorageNamespaceFiles{
+        absolute,
+        buzzdbCompanionFilename(absolute, ".log"),
+        buzzdbCompanionFilename(absolute, ".master"),
+        buzzdbImageFilename(absolute),
+        buzzdbImageMetadataFilename(absolute)};
+}
+
+ComputeNodeId nextComputeNodeId() {
+    static uint64_t next_id = 1;
+    return ComputeNodeId{next_id++};
+}
+
+std::vector<uint8_t> bytesFromString(const std::string& value) {
+    return std::vector<uint8_t>(value.begin(), value.end());
+}
+
+std::string stringFromBytes(const std::vector<uint8_t>& bytes) {
+    return std::string(bytes.begin(), bytes.end());
+}
+
+class StorageService {
+public:
+    virtual ~StorageService() = default;
+
+    virtual void bindNamespace(NamespaceId ns,
+                               const StorageNamespaceFiles& files) = 0;
+    virtual AttachResult attachCompute(NamespaceId ns,
+                                       ComputeNodeId node_id,
+                                       AttachMode mode) = 0;
+    virtual void detachCompute(NamespaceId ns,
+                               const ComputeLease& lease) = 0;
+    virtual void validateWriteLease(NamespaceId ns,
+                                    const ComputeLease& lease) const = 0;
+    virtual ComputeLease currentWriteLease(NamespaceId ns) const = 0;
+
+    virtual PageImage readPage(NamespaceId ns, PageKey key) = 0;
+    virtual void writePage(NamespaceId ns,
+                           const ComputeLease& lease,
+                           const PageImage& image) = 0;
+
+    virtual Lsn appendLog(NamespaceId ns,
+                          const ComputeLease& lease,
+                          const LogRecordBytes& record) = 0;
+    virtual Lsn forceLog(NamespaceId ns,
+                         const ComputeLease& lease,
+                         Lsn through_lsn) = 0;
+    virtual std::vector<LogRecordBytes> readLogFrom(NamespaceId ns,
+                                                    Lsn start_lsn) = 0;
+    virtual std::vector<LogRecordBytes> readLogFromOffset(
+        NamespaceId ns,
+        size_t start_offset) = 0;
+
+    virtual StorageManifest readManifest(NamespaceId ns) = 0;
+    virtual void writeManifest(NamespaceId ns,
+                               const ComputeLease& lease,
+                               const StorageManifest& manifest) = 0;
+
+    virtual size_t fileSize(NamespaceId ns, FileId file) = 0;
+    virtual void ensureFile(NamespaceId ns,
+                            const ComputeLease& lease,
+                            FileId file) = 0;
+    virtual void truncateFile(NamespaceId ns,
+                              const ComputeLease& lease,
+                              FileId file) = 0;
+    virtual void removeFile(NamespaceId ns,
+                            const ComputeLease& lease,
+                            FileId file) = 0;
+    virtual void forceFile(NamespaceId ns,
+                           const ComputeLease& lease,
+                           FileId file,
+                           const std::string& description) = 0;
+    virtual void copyFile(NamespaceId ns,
+                          const ComputeLease& lease,
+                          FileId source,
+                          FileId target,
+                          const std::string& description) = 0;
+    virtual void writeBytes(NamespaceId ns,
+                            const ComputeLease& lease,
+                            FileId file,
+                            const std::vector<uint8_t>& bytes,
+                            const std::string& description) = 0;
+    virtual std::vector<StorageTraceEvent> trace() const = 0;
+    virtual void clearTrace() = 0;
+};
+
+class LocalStorageService : public StorageService {
+public:
+    void bindNamespace(NamespaceId ns,
+                       const StorageNamespaceFiles& files) override {
+        std::lock_guard<std::mutex> guard(latch_);
+        namespace_files_[ns.value] = files;
+    }
+
+    AttachResult attachCompute(NamespaceId ns,
+                               ComputeNodeId node_id,
+                               AttachMode mode) override {
+        AttachResult result;
+        StorageTraceEvent event;
+        {
+            std::lock_guard<std::mutex> guard(latch_);
+            if (namespace_files_.find(ns.value) == namespace_files_.end()) {
+                result.status = AttachStatus::InvalidNamespace;
+                return result;
+            }
+            StorageManifest manifest = readManifestForFenceUnlocked(ns);
+            if (mode == AttachMode::ReadOnly) {
+                result.status = AttachStatus::Attached;
+                result.lease = ComputeLease{
+                    ns,
+                    node_id,
+                    LeaseEpoch{manifest.lease_epoch},
+                    manifest.durable_log_lsn,
+                    false};
+                event = {"AttachReadOnly",
+                         ns,
+                         FileId{0},
+                         PageId{0},
+                         result.lease.fencing_lsn,
+                         0,
+                         result.lease.epoch.value};
+            } else {
+                manifest.lease_epoch += 1;
+                manifest.writer_node_id = node_id.value;
+                writeManifestToDiskUnlocked(ns, manifest);
+                ComputeLease lease{
+                    ns,
+                    node_id,
+                    LeaseEpoch{manifest.lease_epoch},
+                    manifest.durable_log_lsn,
+                    true};
+                write_leases_[ns.value] = lease;
+                result.status = AttachStatus::Attached;
+                result.lease = lease;
+                event = {"AttachReadWrite",
+                         ns,
+                         FileId{0},
+                         PageId{0},
+                         lease.fencing_lsn,
+                         0,
+                         lease.epoch.value};
+            }
+        }
+        record(event);
+        return result;
+    }
+
+    void detachCompute(NamespaceId ns,
+                       const ComputeLease& lease) override {
+        StorageTraceEvent event{
+            "DetachCompute",
+            ns,
+            FileId{0},
+            PageId{0},
+            lease.fencing_lsn,
+            0,
+            lease.epoch.value};
+        {
+            std::lock_guard<std::mutex> guard(latch_);
+            auto it = write_leases_.find(ns.value);
+            if (it != write_leases_.end() &&
+                it->second.holder.value == lease.holder.value &&
+                it->second.epoch.value == lease.epoch.value) {
+                it->second.write_enabled = false;
+            }
+            StorageManifest manifest = readManifestForFenceUnlocked(ns);
+            if (manifest.writer_node_id == lease.holder.value &&
+                manifest.lease_epoch == lease.epoch.value) {
+                manifest.writer_node_id = 0;
+                writeManifestToDiskUnlocked(ns, manifest);
+            }
+        }
+        record(event);
+    }
+
+    void validateWriteLease(NamespaceId ns,
+                            const ComputeLease& lease) const override {
+        std::lock_guard<std::mutex> guard(latch_);
+        validateWriteLeaseUnlocked(ns, lease);
+    }
+
+    ComputeLease currentWriteLease(NamespaceId ns) const override {
+        std::lock_guard<std::mutex> guard(latch_);
+        return currentWriteLeaseUnlocked(ns);
+    }
+
+    PageImage readPage(NamespaceId ns, PageKey key) override {
+        if (key.file.value != STORAGE_DATA_FILE.value) {
+            throw std::runtime_error("readPage requires the data file.");
+        }
+        std::ifstream input(pathFor(ns, key.file), std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("Unable to read database page.");
+        }
+        input.seekg(static_cast<std::streamoff>(key.page.value * PAGE_SIZE),
+                    std::ios::beg);
+        PageImage image;
+        image.key = key;
+        input.read(image.bytes.data(), PAGE_SIZE);
+        if (!input) {
+            throw std::runtime_error("Unable to read database page bytes.");
+        }
+        record({"ReadPage", ns, key.file, key.page, Lsn{0}, PAGE_SIZE, 0});
+        return image;
+    }
+
+    void writePage(NamespaceId ns,
+                   const ComputeLease& lease,
+                   const PageImage& image) override {
+        {
+            std::lock_guard<std::mutex> guard(latch_);
+            validateWriteLeaseUnlocked(ns, lease);
+            StorageManifest manifest = readManifestForFenceUnlocked(ns);
+            if (image.page_lsn.value > manifest.durable_log_lsn.value) {
+                throw std::runtime_error(
+                    "page write is ahead of durable log fence");
+            }
+        }
+        ensureFile(ns, lease, image.key.file);
+        std::fstream output(pathFor(ns, image.key.file),
+                            std::ios::in | std::ios::out | std::ios::binary);
+        if (!output) {
+            throw std::runtime_error("Unable to write database page.");
+        }
+        output.seekp(static_cast<std::streamoff>(
+                         image.key.page.value * PAGE_SIZE),
+                     std::ios::beg);
+        output.write(image.bytes.data(), PAGE_SIZE);
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Unable to write database page bytes.");
+        }
+        record({"WritePage",
+                ns,
+                image.key.file,
+                image.key.page,
+                image.page_lsn,
+                PAGE_SIZE,
+                lease.epoch.value});
+    }
+
+    Lsn appendLog(NamespaceId ns,
+                  const ComputeLease& lease,
+                  const LogRecordBytes& record_bytes) override {
+        validateWriteLease(ns, lease);
+        ensureFile(ns, lease, STORAGE_LOG_FILE);
+        std::ofstream output(pathFor(ns, STORAGE_LOG_FILE),
+                             std::ios::binary | std::ios::app);
+        if (!output) {
+            throw std::runtime_error("Unable to append storage log.");
+        }
+        output.write(
+            reinterpret_cast<const char*>(record_bytes.bytes.data()),
+            static_cast<std::streamsize>(record_bytes.bytes.size()));
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Unable to append storage log bytes.");
+        }
+        record({"AppendLog",
+                ns,
+                STORAGE_LOG_FILE,
+                PageId{0},
+                record_bytes.lsn,
+                record_bytes.bytes.size(),
+                lease.epoch.value});
+        return record_bytes.lsn;
+    }
+
+    Lsn forceLog(NamespaceId ns,
+                 const ComputeLease& lease,
+                 Lsn through_lsn) override {
+        Lsn durable_lsn{0};
+        {
+            std::lock_guard<std::mutex> guard(latch_);
+            validateWriteLeaseUnlocked(ns, lease);
+            ensureParent(pathForUnlocked(ns, STORAGE_LOG_FILE));
+            forceFileToStableStorage(pathForUnlocked(ns, STORAGE_LOG_FILE),
+                                     "recovery log");
+            StorageManifest manifest = readManifestForFenceUnlocked(ns);
+            Lsn observed = lastLogLsnUnlocked(ns);
+            if (through_lsn.value > observed.value) {
+                throw std::runtime_error(
+                    "cannot force log beyond appended records");
+            }
+            durable_lsn =
+                Lsn{std::max(manifest.durable_log_lsn.value,
+                             through_lsn.value)};
+            manifest.durable_log_lsn = durable_lsn;
+            manifest.lease_epoch = lease.epoch.value;
+            manifest.writer_node_id = lease.holder.value;
+            writeManifestToDiskUnlocked(ns, manifest);
+        }
+        record({"ForceLog",
+                ns,
+                STORAGE_LOG_FILE,
+                PageId{0},
+                durable_lsn,
+                0,
+                lease.epoch.value});
+        return durable_lsn;
+    }
+
+    std::vector<LogRecordBytes> readLogFrom(NamespaceId ns,
+                                            Lsn start_lsn) override {
+        std::vector<LogRecordBytes> all = readLogFromOffset(ns, 0);
+        std::vector<LogRecordBytes> filtered;
+        for (auto& record_bytes : all) {
+            if (record_bytes.lsn.value >= start_lsn.value) {
+                filtered.push_back(std::move(record_bytes));
+            }
+        }
+        return filtered;
+    }
+
+    std::vector<LogRecordBytes> readLogFromOffset(
+        NamespaceId ns,
+        size_t start_offset) override {
+        std::ifstream input(pathFor(ns, STORAGE_LOG_FILE), std::ios::binary);
+        std::vector<LogRecordBytes> records;
+        if (!input) {
+            record({"ReadLog", ns, STORAGE_LOG_FILE, PageId{0}, Lsn{0}, 0, 0});
+            return records;
+        }
+        if (start_offset != 0) {
+            input.seekg(static_cast<std::streamoff>(start_offset),
+                        std::ios::beg);
+            if (!input) {
+                throw std::runtime_error("Unable to seek storage log.");
+            }
+        }
+        std::string line;
+        size_t bytes_read = 0;
+        Lsn last_lsn{0};
+        while (std::getline(input, line)) {
+            if (line.empty()) {
+                bytes_read += 1;
+                continue;
+            }
+            std::istringstream line_input(line);
+            uint64_t lsn_value = 0;
+            line_input >> lsn_value;
+            std::vector<uint8_t> bytes = bytesFromString(line);
+            last_lsn = Lsn{lsn_value};
+            records.push_back(
+                LogRecordBytes{last_lsn, bytes, storageCrc(bytes)});
+            bytes_read += line.size() + 1;
+        }
+        record({"ReadLog",
+                ns,
+                STORAGE_LOG_FILE,
+                PageId{0},
+                last_lsn,
+                bytes_read,
+                0});
+        return records;
+    }
+
+    StorageManifest readManifest(NamespaceId ns) override {
+        StorageManifest manifest;
+        {
+            std::lock_guard<std::mutex> guard(latch_);
+            manifest = readManifestForFenceUnlocked(ns);
+        }
+        record({"ReadManifest",
+                ns,
+                STORAGE_MANIFEST_FILE,
+                PageId{0},
+                manifest.durable_lsn,
+                manifest.durable_offset,
+                manifest.epoch});
+        return manifest;
+    }
+
+    void writeManifest(NamespaceId ns,
+                       const ComputeLease& lease,
+                       const StorageManifest& manifest) override {
+        StorageManifest persisted = manifest;
+        {
+            std::lock_guard<std::mutex> guard(latch_);
+            validateWriteLeaseUnlocked(ns, lease);
+            StorageManifest current = readManifestForFenceUnlocked(ns);
+            persisted.namespace_id = ns;
+            persisted.durable_log_lsn =
+                Lsn{std::max(manifest.durable_log_lsn.value,
+                             current.durable_log_lsn.value)};
+            persisted.lease_epoch =
+                manifest.lease_epoch == 0
+                    ? current.lease_epoch
+                    : manifest.lease_epoch;
+            persisted.writer_node_id =
+                manifest.writer_node_id == 0
+                    ? current.writer_node_id
+                    : manifest.writer_node_id;
+            writeManifestToDiskUnlocked(ns, persisted);
+        }
+        record({"WriteManifest",
+                ns,
+                STORAGE_MANIFEST_FILE,
+                PageId{0},
+                persisted.durable_lsn,
+                persisted.durable_offset,
+                lease.epoch.value});
+    }
+
+    size_t fileSize(NamespaceId ns, FileId file) override {
+        std::error_code ec;
+        auto path = pathFor(ns, file);
+        if (!std::filesystem::exists(path, ec)) {
+            return 0;
+        }
+        return static_cast<size_t>(std::filesystem::file_size(path, ec));
+    }
+
+    void ensureFile(NamespaceId ns,
+                    const ComputeLease& lease,
+                    FileId file) override {
+        auto path = pathFor(ns, file);
+        if (!std::filesystem::exists(path)) {
+            validateWriteLease(ns, lease);
+        }
+        ensureParent(path);
+        std::fstream stream(path, std::ios::in | std::ios::out | std::ios::binary);
+        if (!stream) {
+            std::ofstream create(path, std::ios::binary);
+            if (!create) {
+                throw std::runtime_error("Unable to create storage file.");
+            }
+        }
+    }
+
+    void truncateFile(NamespaceId ns,
+                      const ComputeLease& lease,
+                      FileId file) override {
+        validateWriteLease(ns, lease);
+        ensureParent(pathFor(ns, file));
+        std::ofstream output(pathFor(ns, file),
+                             std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to truncate storage file.");
+        }
+        record({"TruncateFile", ns, file, PageId{0}, Lsn{0}, 0,
+                lease.epoch.value});
+    }
+
+    void removeFile(NamespaceId ns,
+                    const ComputeLease& lease,
+                    FileId file) override {
+        validateWriteLease(ns, lease);
+        std::error_code ec;
+        std::filesystem::remove(pathFor(ns, file), ec);
+        record({"RemoveFile", ns, file, PageId{0}, Lsn{0}, 0,
+                lease.epoch.value});
+    }
+
+    void forceFile(NamespaceId ns,
+                   const ComputeLease& lease,
+                   FileId file,
+                   const std::string& description) override {
+        validateWriteLease(ns, lease);
+        forceFileToStableStorage(pathFor(ns, file), description);
+        record({"ForceFile", ns, file, PageId{0}, Lsn{0}, 0,
+                lease.epoch.value});
+    }
+
+    void copyFile(NamespaceId ns,
+                  const ComputeLease& lease,
+                  FileId source,
+                  FileId target,
+                  const std::string& description) override {
+        validateWriteLease(ns, lease);
+        copyFileDurably(pathFor(ns, source), pathFor(ns, target), description);
+        record({"CopyFile", ns, target, PageId{0}, Lsn{0},
+                fileSize(ns, target), lease.epoch.value});
+    }
+
+    void writeBytes(NamespaceId ns,
+                    const ComputeLease& lease,
+                    FileId file,
+                    const std::vector<uint8_t>& bytes,
+                    const std::string& description) override {
+        validateWriteLease(ns, lease);
+        ensureParent(pathFor(ns, file));
+        std::ofstream output(pathFor(ns, file), std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to write storage bytes.");
+        }
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Unable to write storage bytes.");
+        }
+        output.close();
+        forceFile(ns, lease, file, description);
+        record({"WriteFile", ns, file, PageId{0}, Lsn{0}, bytes.size(),
+                lease.epoch.value});
+    }
+
+    std::vector<StorageTraceEvent> trace() const override {
+        std::lock_guard<std::mutex> guard(latch_);
+        return trace_;
+    }
+
+    void clearTrace() override {
+        std::lock_guard<std::mutex> guard(latch_);
+        trace_.clear();
+    }
+
+private:
+    StorageNamespaceFiles filesForUnlocked(NamespaceId ns) const {
+        auto it = namespace_files_.find(ns.value);
+        if (it != namespace_files_.end()) {
+            return it->second;
+        }
+        return StorageNamespaceFiles{
+            database_filename,
+            log_filename,
+            master_record_filename,
+            image_copy_filename,
+            image_copy_metadata_filename};
+    }
+
+    StorageNamespaceFiles filesFor(NamespaceId ns) const {
+        std::lock_guard<std::mutex> guard(latch_);
+        return filesForUnlocked(ns);
+    }
+
+    std::string pathForFile(const StorageNamespaceFiles& files,
+                            FileId file) const {
+        if (file.value == STORAGE_DATA_FILE.value) return files.data_file;
+        if (file.value == STORAGE_LOG_FILE.value) return files.log_file;
+        if (file.value == STORAGE_MANIFEST_FILE.value) {
+            return files.manifest_file;
+        }
+        if (file.value == STORAGE_IMAGE_FILE.value) return files.image_file;
+        if (file.value == STORAGE_IMAGE_METADATA_FILE.value) {
+            return files.image_metadata_file;
+        }
+        throw std::runtime_error("Unknown storage file id.");
+    }
+
+    std::string pathForUnlocked(NamespaceId ns, FileId file) const {
+        return pathForFile(filesForUnlocked(ns), file);
+    }
+
+    std::string pathFor(NamespaceId ns, FileId file) const {
+        return pathForFile(filesFor(ns), file);
+    }
+
+    Lsn lastLogLsnUnlocked(NamespaceId ns) const {
+        std::ifstream input(pathForUnlocked(ns, STORAGE_LOG_FILE),
+                            std::ios::binary);
+        if (!input) {
+            return Lsn{0};
+        }
+        std::string line;
+        Lsn last_lsn{0};
+        while (std::getline(input, line)) {
+            if (line.empty()) continue;
+            std::istringstream line_input(line);
+            uint64_t lsn_value = 0;
+            line_input >> lsn_value;
+            last_lsn = Lsn{lsn_value};
+        }
+        return last_lsn;
+    }
+
+    StorageManifest readManifestFromDiskUnlocked(NamespaceId ns) const {
+        std::ifstream input(pathForUnlocked(ns, STORAGE_MANIFEST_FILE));
+        StorageManifest manifest{ns, Lsn{0}, 0, 0};
+        if (!input) {
+            return manifest;
+        }
+        std::string key;
+        while (input >> key) {
+            if (key == "checkpoint_lsn") {
+                input >> manifest.durable_lsn.value;
+            } else if (key == "checkpoint_offset") {
+                input >> manifest.durable_offset;
+            } else if (key == "manifest_epoch") {
+                input >> manifest.epoch;
+            } else if (key == "durable_log_lsn") {
+                input >> manifest.durable_log_lsn.value;
+            } else if (key == "lease_epoch") {
+                input >> manifest.lease_epoch;
+            } else if (key == "writer_node_id") {
+                input >> manifest.writer_node_id;
+            } else {
+                std::string ignored;
+                input >> ignored;
+            }
+        }
+        return manifest;
+    }
+
+    StorageManifest readManifestForFenceUnlocked(NamespaceId ns) const {
+        StorageManifest manifest = readManifestFromDiskUnlocked(ns);
+        manifest.namespace_id = ns;
+        return manifest;
+    }
+
+    void writeManifestToDiskUnlocked(
+        NamespaceId ns,
+        const StorageManifest& manifest) const {
+        std::string filename = pathForUnlocked(ns, STORAGE_MANIFEST_FILE);
+        ensureParent(filename);
+        std::ofstream output(filename, std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to write storage manifest.");
+        }
+        output << "checkpoint_lsn " << manifest.durable_lsn.value << "\n"
+               << "checkpoint_offset " << manifest.durable_offset << "\n"
+               << "manifest_epoch " << manifest.epoch << "\n"
+               << "durable_log_lsn " << manifest.durable_log_lsn.value << "\n"
+               << "lease_epoch " << manifest.lease_epoch << "\n"
+               << "writer_node_id " << manifest.writer_node_id << "\n";
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Unable to write storage manifest bytes.");
+        }
+        output.close();
+        forceFileToStableStorage(filename, "storage manifest");
+    }
+
+    ComputeLease currentWriteLeaseUnlocked(NamespaceId ns) const {
+        StorageManifest manifest = readManifestForFenceUnlocked(ns);
+        if (manifest.writer_node_id == 0) {
+            return ComputeLease{
+                ns,
+                ComputeNodeId{0},
+                LeaseEpoch{manifest.lease_epoch},
+                manifest.durable_log_lsn,
+                false};
+        }
+        return ComputeLease{
+            ns,
+            ComputeNodeId{manifest.writer_node_id},
+            LeaseEpoch{manifest.lease_epoch},
+            manifest.durable_log_lsn,
+            true};
+    }
+
+    void validateWriteLeaseUnlocked(NamespaceId ns,
+                                    const ComputeLease& lease) const {
+        if (!lease.write_enabled ||
+            lease.namespace_id.value != ns.value) {
+            throw std::runtime_error("invalid compute write lease");
+        }
+        StorageManifest manifest = readManifestForFenceUnlocked(ns);
+        if (manifest.writer_node_id != lease.holder.value ||
+            manifest.lease_epoch != lease.epoch.value) {
+            throw std::runtime_error("stale compute write lease");
+        }
+    }
+
+    static void ensureParent(const std::string& filename) {
+        std::filesystem::path parent =
+            std::filesystem::path(filename).parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+    }
+
+    void record(StorageTraceEvent event) const {
+        std::lock_guard<std::mutex> guard(latch_);
+        trace_.push_back(std::move(event));
+    }
+
+    mutable std::mutex latch_;
+    mutable std::vector<StorageTraceEvent> trace_;
+    std::map<uint64_t, StorageNamespaceFiles> namespace_files_;
+    std::map<uint64_t, ComputeLease> write_leases_;
+};
+
+std::shared_ptr<StorageService> defaultStorageService() {
+    static std::shared_ptr<StorageService> service =
+        std::make_shared<LocalStorageService>();
+    return service;
+}
+
+struct StorageContext {
+    NamespaceId namespace_id;
+    std::shared_ptr<StorageService> storage;
+    ComputeLease lease;
+};
+
+StorageContext attachStorageContextForDatabaseFile(
+    const std::string& database_file,
+    ComputeNodeId node_id,
+    AttachMode mode,
+    const std::shared_ptr<StorageService>& storage = defaultStorageService()) {
+    NamespaceId namespace_id = storageNamespaceForDatabaseFile(database_file);
+    storage->bindNamespace(namespace_id,
+                           storageFilesForDatabaseFile(database_file));
+    AttachResult attached =
+        storage->attachCompute(namespace_id, node_id, mode);
+    if (attached.status != AttachStatus::Attached) {
+        throw std::runtime_error("unable to attach compute to storage namespace");
+    }
+    return StorageContext{namespace_id, storage, attached.lease};
+}
+
+StorageContext defaultStorageContextForCurrentBundle() {
+    return attachStorageContextForDatabaseFile(
+        database_filename,
+        nextComputeNodeId(),
+        AttachMode::ReadWrite);
+}
+
+std::vector<StorageTraceEvent> storageTraceSnapshot() {
+    return defaultStorageService()->trace();
+}
+
+void clearStorageTrace() {
+    defaultStorageService()->clearTrace();
+}
+
+void writeImageCopyMetadata(const ImageCopyMetadata& metadata,
+                            const StorageContext& storage_context) {
     std::stringstream output;
     output << "master_lsn " << metadata.master_lsn << "\n"
            << "master_offset " << metadata.master_offset << "\n"
            << "image_copy_lsn " << metadata.image_copy_lsn << "\n"
            << "page_count " << metadata.page_count << "\n";
-    writeDurableTextFile(
-        image_copy_metadata_filename,
-        output.str(),
-        "database image copy metadata"
-    );
+    storage_context.storage->writeBytes(
+        storage_context.namespace_id,
+        storage_context.lease,
+        STORAGE_IMAGE_METADATA_FILE,
+        bytesFromString(output.str()),
+        "database image copy metadata");
+}
+
+void writeImageCopyMetadata(const ImageCopyMetadata& metadata) {
+    writeImageCopyMetadata(metadata, defaultStorageContextForCurrentBundle());
 }
 
 // Page 0 stores two catalog roots; the highest valid version wins.
@@ -853,12 +1719,10 @@ public:
     }
 };
 
-std::string database_filename = "buzzdb.dat";
 constexpr bool TRACE_STORAGE = false;
 
 class StorageManager {
 public:
-    std::fstream fileStream;
     size_t num_pages = 0;
     size_t stable_storage_forces = 0;
     size_t deferred_stable_storage_requests = 0;
@@ -866,16 +1730,15 @@ public:
     bool defer_stable_storage_forces = false;
 
     void forceDatabaseFileToStableStorage() {
-        fileStream.flush();
-        if (!fileStream) {
-            throw std::runtime_error("Unable to flush database file stream.");
-        }
         if (defer_stable_storage_forces) {
             deferred_stable_storage_requests++;
             total_deferred_stable_storage_requests++;
             return;
         }
-        forceFileToStableStorage(database_filename, "database file");
+        storage_service->forceFile(namespace_id,
+                                   lease,
+                                   STORAGE_DATA_FILE,
+                                   "database file");
         stable_storage_forces++;
     }
 
@@ -887,28 +1750,26 @@ public:
         if (deferred_stable_storage_requests == 0) {
             return;
         }
-        fileStream.flush();
-        if (!fileStream) {
-            throw std::runtime_error("Unable to flush database file stream.");
-        }
-        forceFileToStableStorage(database_filename, "database file");
+        storage_service->forceFile(namespace_id,
+                                   lease,
+                                   STORAGE_DATA_FILE,
+                                   "database file");
         stable_storage_forces++;
         deferred_stable_storage_requests = 0;
     }
 
 public:
-    StorageManager(){
-        fileStream.open(database_filename, std::ios::in | std::ios::out);
-        if (!fileStream) {
-            // If file does not exist, create it
-            fileStream.clear(); // Reset the state
-            fileStream.open(database_filename, std::ios::out);
-        }
-        fileStream.close();
-        fileStream.open(database_filename, std::ios::in | std::ios::out);
+    StorageManager()
+        : StorageManager(defaultStorageContextForCurrentBundle()) {}
 
-        fileStream.seekg(0, std::ios::end);
-        num_pages = fileStream.tellg() / PAGE_SIZE;
+    explicit StorageManager(StorageContext storage_context)
+        : namespace_id(storage_context.namespace_id),
+          lease(storage_context.lease),
+          storage_service(std::move(storage_context.storage)) {
+        storage_service->ensureFile(namespace_id, lease, STORAGE_DATA_FILE);
+        num_pages =
+            storage_service->fileSize(namespace_id, STORAGE_DATA_FILE) /
+            PAGE_SIZE;
 
         if (TRACE_STORAGE) {
             std::cout << "Storage Manager :: Num pages: " << num_pages << "\n";
@@ -916,34 +1777,25 @@ public:
 
     }
 
-    ~StorageManager() {
-        if (fileStream.is_open()) {
-            fileStream.close();
-        }
-    }
+    ~StorageManager() = default;
 
     // Read a page from disk
     std::unique_ptr<SlottedPage> load(uint16_t page_id) {
-        fileStream.seekg(page_id * PAGE_SIZE, std::ios::beg);
+        PageImage image = storage_service->readPage(
+            namespace_id,
+            PageKey{STORAGE_DATA_FILE, PageId{page_id}});
         auto page = std::make_unique<SlottedPage>();
-        // Read the content of the file into the page
-        if(fileStream.read(page->page_data.get(), PAGE_SIZE)){
-            //std::cout << "Page read successfully from file." << std::endl;
-        }
-        else{
-            std::cerr << "Error: Unable to read data from the file. \n";
-            exit(-1);
-        }
+        std::memcpy(page->page_data.get(), image.bytes.data(), PAGE_SIZE);
         return page;
     }
 
     // Write a page to disk
     void flush(uint16_t page_id, const std::unique_ptr<SlottedPage>& page) {
-        size_t page_offset = page_id * PAGE_SIZE;
-
-        // Move the write pointer
-        fileStream.seekp(page_offset, std::ios::beg);
-        fileStream.write(page->page_data.get(), PAGE_SIZE);
+        PageImage image;
+        image.key = PageKey{STORAGE_DATA_FILE, PageId{page_id}};
+        image.page_lsn = Lsn{page->getPageLSN()};
+        std::memcpy(image.bytes.data(), page->page_data.get(), PAGE_SIZE);
+        storage_service->writePage(namespace_id, lease, image);
         forceDatabaseFileToStableStorage();
     }
 
@@ -956,15 +1808,14 @@ public:
         // Create a slotted page
         auto empty_slotted_page = std::make_unique<SlottedPage>();
 
-        // Move the write pointer
-        fileStream.seekp(0, std::ios::end);
-
+        PageImage image;
+        image.key = PageKey{STORAGE_DATA_FILE, PageId{num_pages}};
+        image.page_lsn = Lsn{empty_slotted_page->getPageLSN()};
+        std::memcpy(image.bytes.data(),
+                    empty_slotted_page->page_data.get(),
+                    PAGE_SIZE);
         // Extend the file; callers decide when the initialized page is durable.
-        fileStream.write(empty_slotted_page->page_data.get(), PAGE_SIZE);
-        fileStream.flush();
-        if (!fileStream) {
-            throw std::runtime_error("Unable to extend database file.");
-        }
+        storage_service->writePage(namespace_id, lease, image);
 
         // Update number of pages
         num_pages += 1;
@@ -973,9 +1824,17 @@ public:
     void createImageCopy() {
         /* Fuzzy copy: force existing file writes, but do not flush buffer pages. */
         forceDatabaseFileToStableStorage();
-        copyFileDurably(database_filename, image_copy_filename, "database image copy");
+        storage_service->copyFile(namespace_id,
+                                  lease,
+                                  STORAGE_DATA_FILE,
+                                  STORAGE_IMAGE_FILE,
+                                  "database image copy");
     }
 
+private:
+    NamespaceId namespace_id;
+    ComputeLease lease;
+    std::shared_ptr<StorageService> storage_service;
 };
 
 class Policy {
@@ -1079,8 +1938,12 @@ private:
     }
 
 public:
-    BufferManager():
-    policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
+    BufferManager()
+        : BufferManager(defaultStorageContextForCurrentBundle()) {}
+
+    explicit BufferManager(StorageContext storage_context)
+        : storage_manager(std::move(storage_context)),
+          policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
     void setWalForceCallback(std::function<bool(LSN)> callback) {
         wal_force_callback = std::move(callback);
@@ -1296,19 +2159,34 @@ private:
     size_t bytes_written = 0;
     size_t stable_log_forces = 0;
     size_t stable_master_forces = 0;
+    NamespaceId namespace_id;
+    ComputeLease lease;
+    std::shared_ptr<StorageService> storage_service;
 
     size_t durableLogSize() const {
-        std::ifstream input(log_filename, std::ios::binary | std::ios::ate);
-        if (!input) {
-            return 0;
-        }
-        return static_cast<size_t>(input.tellg());
+        return storage_service->fileSize(namespace_id, STORAGE_LOG_FILE);
     }
 
 public:
+    LogManager()
+        : LogManager(defaultStorageContextForCurrentBundle()) {}
+
+    explicit LogManager(StorageContext storage_context)
+        : namespace_id(storage_context.namespace_id),
+          lease(storage_context.lease),
+          storage_service(std::move(storage_context.storage)) {}
+
     void reset() {
-        std::ofstream output(log_filename, std::ios::trunc);
-        std::remove(master_record_filename.c_str());
+        storage_service->truncateFile(namespace_id, lease, STORAGE_LOG_FILE);
+        StorageManifest manifest = storage_service->readManifest(namespace_id);
+        manifest.namespace_id = namespace_id;
+        manifest.durable_lsn = Lsn{0};
+        manifest.durable_offset = 0;
+        manifest.epoch = 0;
+        manifest.durable_log_lsn = Lsn{0};
+        manifest.lease_epoch = lease.epoch.value;
+        manifest.writer_node_id = lease.holder.value;
+        storage_service->writeManifest(namespace_id, lease, manifest);
         pending_records.clear();
         log_offsets.clear();
         next_lsn = 1;
@@ -1336,28 +2214,27 @@ public:
             return false;
         }
 
-        std::ofstream output(log_filename, std::ios::app);
-        if (!output) {
-            throw std::runtime_error("Unable to force recovery log.");
-        }
-
         size_t records_to_remove = 0;
         LSN durable_lsn = flushed_lsn;
         while (records_to_remove < pending_records.size() &&
                pending_records[records_to_remove].lsn <= lsn) {
-            output << pending_records[records_to_remove].record << "\n";
+            std::string line =
+                pending_records[records_to_remove].record + "\n";
+            std::vector<uint8_t> bytes = bytesFromString(line);
+            storage_service->appendLog(
+                namespace_id,
+                lease,
+                LogRecordBytes{
+                    Lsn{pending_records[records_to_remove].lsn},
+                    bytes,
+                    storageCrc(bytes)});
             durable_lsn = pending_records[records_to_remove].lsn;
             records_to_remove++;
         }
-        output.flush();
-        if (!output) {
-            throw std::runtime_error("Unable to write recovery log.");
-        }
-        output.close();
         if (records_to_remove == 0) {
             return false;
         }
-        forceFileToStableStorage(log_filename, "recovery log");
+        storage_service->forceLog(namespace_id, lease, Lsn{durable_lsn});
         stable_log_forces++;
         flushed_lsn = durable_lsn;
         pending_records.erase(
@@ -1368,22 +2245,14 @@ public:
     }
 
     std::vector<std::string> readFromOffset(size_t start_offset) {
-        std::ifstream input(log_filename, std::ios::binary);
         std::vector<std::string> records;
         next_log_offset = std::max(next_log_offset, durableLogSize());
-        if (!input) {
-            return records;
-        }
-        if (start_offset != 0) {
-            input.seekg(static_cast<std::streamoff>(start_offset), std::ios::beg);
-            if (!input) {
-                throw std::runtime_error("Unable to seek to ARIES log offset.");
-            }
-        }
-        std::string line;
+        auto durable_records =
+            storage_service->readLogFromOffset(namespace_id, start_offset);
         LSN durable_lsn = flushed_lsn;
         size_t line_offset = start_offset;
-        while (std::getline(input, line)) {
+        for (const auto& durable_record : durable_records) {
+            std::string line = stringFromBytes(durable_record.bytes);
             if (!line.empty()) {
                 std::istringstream record_input(line);
                 LSN lsn;
@@ -1416,35 +2285,26 @@ public:
     }
 
     void writeMasterRecord(LSN checkpoint_begin_lsn) {
-        std::ofstream output(master_record_filename, std::ios::trunc);
-        if (!output) {
-            throw std::runtime_error("Unable to write ARIES master record.");
-        }
-        output << "checkpoint_lsn " << checkpoint_begin_lsn << "\n"
-               << "checkpoint_offset " << getLogOffset(checkpoint_begin_lsn) << "\n";
-        output.flush();
-        if (!output) {
-            throw std::runtime_error("Unable to write ARIES master record.");
-        }
-        output.close();
-        forceFileToStableStorage(master_record_filename, "ARIES master record");
+        StorageManifest manifest = storage_service->readManifest(namespace_id);
+        manifest.namespace_id = namespace_id;
+        manifest.durable_lsn = Lsn{checkpoint_begin_lsn};
+        manifest.durable_offset = getLogOffset(checkpoint_begin_lsn);
+        manifest.epoch = stable_master_forces + 1;
+        manifest.lease_epoch = lease.epoch.value;
+        manifest.writer_node_id = lease.holder.value;
+        storage_service->writeManifest(
+            namespace_id,
+            lease,
+            manifest);
         stable_master_forces++;
     }
 
     MasterRecord readMasterRecord() const {
-        std::ifstream input(master_record_filename);
         MasterRecord master_record;
-        if (input) {
-            std::string key;
-            input >> key >> master_record.checkpoint_begin_lsn;
-            if (key != "checkpoint_lsn") {
-                throw std::runtime_error("Malformed ARIES master record.");
-            }
-            input >> key >> master_record.checkpoint_begin_offset;
-            if (key != "checkpoint_offset") {
-                throw std::runtime_error("Malformed ARIES master record.");
-            }
-        }
+        StorageManifest manifest =
+            storage_service->readManifest(namespace_id);
+        master_record.checkpoint_begin_lsn = manifest.durable_lsn.value;
+        master_record.checkpoint_begin_offset = manifest.durable_offset;
         return master_record;
     }
 };
@@ -1491,6 +2351,7 @@ private:
     // Shared storage, catalog, and WAL components used by recovery.
     BufferManager& buffer_manager;
     Catalog& catalog;
+    StorageContext storage_context;
     LogManager log_manager;
     std::mutex recovery_latch;
     // Current transaction state and ARIES lastLSN chain.
@@ -1666,7 +2527,17 @@ private:
 
 public:
     RecoveryManager(BufferManager& buffer_manager, Catalog& catalog)
-        : buffer_manager(buffer_manager), catalog(catalog) {
+        : RecoveryManager(buffer_manager,
+                          catalog,
+                          defaultStorageContextForCurrentBundle()) {}
+
+    RecoveryManager(BufferManager& buffer_manager,
+                    Catalog& catalog,
+                    StorageContext storage_context)
+        : buffer_manager(buffer_manager),
+          catalog(catalog),
+          storage_context(storage_context),
+          log_manager(std::move(storage_context)) {
         this->buffer_manager.setWalForceCallback([this](LSN lsn) {
             return forceLogUpTo(lsn);
         });
@@ -3667,7 +4538,7 @@ void RecoveryManager::createFuzzyImageCopy() {
         image_copy_lsn,
         buffer_manager.getNumPages()
     };
-    writeImageCopyMetadata(metadata);
+    writeImageCopyMetadata(metadata, storage_context);
     std::cout << "  media: fuzzy image copy saved "
               << metadata.page_count << " page(s)" << std::endl;
     std::cout << "  media: restore will start analysis from checkpoint LSN "
@@ -7027,6 +7898,79 @@ struct LogicalPlanNode {
     std::vector<std::unique_ptr<LogicalPlanNode>> inputs;
 };
 
+enum class DistributionKind {
+    SingleNode,
+    RangePartitioned,
+    HashPartitioned,
+    Replicated,
+    Gathered,
+    Unknown
+};
+
+std::string distributionKindName(DistributionKind kind) {
+    switch (kind) {
+        case DistributionKind::SingleNode:
+            return "single";
+        case DistributionKind::RangePartitioned:
+            return "range-partitioned";
+        case DistributionKind::HashPartitioned:
+            return "hash-partitioned";
+        case DistributionKind::Replicated:
+            return "replicated";
+        case DistributionKind::Gathered:
+            return "gathered";
+        case DistributionKind::Unknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+struct DistributionTrait {
+    DistributionKind kind = DistributionKind::Unknown;
+    std::string partition_table;
+    std::string partition_key;
+    std::vector<std::string> range_ids;
+    std::vector<std::string> replica_group_ids;
+
+    std::string describe() const {
+        std::ostringstream out;
+        out << distributionKindName(kind);
+        if (!partition_table.empty()) {
+            out << "(" << partition_table;
+            if (!partition_key.empty()) out << "." << partition_key;
+            out << ")";
+        }
+        if (!replica_group_ids.empty()) {
+            out << "@";
+            for (size_t i = 0; i < replica_group_ids.size(); ++i) {
+                if (i != 0) out << ",";
+                out << replica_group_ids[i];
+            }
+        }
+        return out.str();
+    }
+};
+
+struct DistributedCost {
+    double local_cpu = 0.0;
+    double local_io = 0.0;
+    double network_latency_ms = 0.0;
+    size_t remote_bytes = 0;
+    size_t broadcast_bytes = 0;
+    size_t repartition_bytes = 0;
+    size_t scan_fragments = 0;
+    size_t exchange_fragments = 0;
+    size_t fragment_count = 0;
+
+    double total() const {
+        return local_cpu + local_io + network_latency_ms +
+               static_cast<double>(remote_bytes + broadcast_bytes +
+                                   repartition_bytes) / 1024.0 +
+               static_cast<double>(fragment_count + scan_fragments +
+                                   exchange_fragments);
+    }
+};
+
 struct PhysicalPlanNode {
     enum class Kind {
         SCAN,
@@ -7036,13 +7980,26 @@ struct PhysicalPlanNode {
         NESTED_LOOP_JOIN,
         HASH_JOIN,
         SORT_MERGE_JOIN,
-        SORT
+        SORT,
+        DISTRIBUTED_RANGE_SCAN,
+        PARTIAL_HASH_AGGREGATE,
+        FINAL_HASH_AGGREGATE,
+        GATHER_EXCHANGE,
+        BROADCAST_EXCHANGE,
+        BROADCAST_HASH_JOIN,
+        REPARTITION_EXCHANGE,
+        REPARTITION_HASH_JOIN,
+        UNSUPPORTED_REPARTITION_JOIN
     };
 
     Kind kind = Kind::SCAN;
     std::string tableName;
+    std::string detail;
+    std::string rejectedReason;
     JoinClause join;
     std::vector<ColumnRef> sortColumns;
+    DistributionTrait distribution;
+    DistributedCost distributedCost;
     double rows = 0.0;
     double cost = 0.0;
     std::vector<std::shared_ptr<PhysicalPlanNode>> inputs;
@@ -7082,6 +8039,24 @@ std::string physicalNodeName(PhysicalPlanNode::Kind kind) {
             return "SortMergeJoin";
         case PhysicalPlanNode::Kind::SORT:
             return "Sort";
+        case PhysicalPlanNode::Kind::DISTRIBUTED_RANGE_SCAN:
+            return "DistributedRangeScan";
+        case PhysicalPlanNode::Kind::PARTIAL_HASH_AGGREGATE:
+            return "PartialHashAggregate";
+        case PhysicalPlanNode::Kind::FINAL_HASH_AGGREGATE:
+            return "FinalHashAggregate";
+        case PhysicalPlanNode::Kind::GATHER_EXCHANGE:
+            return "GatherExchange";
+        case PhysicalPlanNode::Kind::BROADCAST_EXCHANGE:
+            return "BroadcastExchange";
+        case PhysicalPlanNode::Kind::BROADCAST_HASH_JOIN:
+            return "BroadcastHashJoin";
+        case PhysicalPlanNode::Kind::REPARTITION_EXCHANGE:
+            return "RepartitionExchange";
+        case PhysicalPlanNode::Kind::REPARTITION_HASH_JOIN:
+            return "RepartitionHashJoin";
+        case PhysicalPlanNode::Kind::UNSUPPORTED_REPARTITION_JOIN:
+            return "UnsupportedRepartitionJoin";
     }
     return "PhysicalUnknown";
 }
@@ -8790,7 +9765,8 @@ std::string physicalPlanExpression(const std::shared_ptr<PhysicalPlanNode>& node
         return "";
     }
     auto name = physicalNodeName(node->kind);
-    if (node->kind == PhysicalPlanNode::Kind::SCAN) {
+    if (node->kind == PhysicalPlanNode::Kind::SCAN ||
+        node->kind == PhysicalPlanNode::Kind::DISTRIBUTED_RANGE_SCAN) {
         return name + "(" + node->tableName + ")";
     }
     if (node->inputs.empty()) {
@@ -8811,8 +9787,15 @@ void appendPhysicalPlanTree(const std::shared_ptr<PhysicalPlanNode>& node,
         return;
     }
     out << indent << physicalNodeName(node->kind);
-    if (node->kind == PhysicalPlanNode::Kind::SCAN) {
+    if (node->kind == PhysicalPlanNode::Kind::SCAN ||
+        node->kind == PhysicalPlanNode::Kind::DISTRIBUTED_RANGE_SCAN) {
         out << "(" << node->tableName << ")";
+    }
+    if (!node->detail.empty()) {
+        out << " [" << node->detail << "]";
+    }
+    if (node->distribution.kind != DistributionKind::Unknown) {
+        out << " dist=" << node->distribution.describe();
     }
     if (node->kind == PhysicalPlanNode::Kind::SORT &&
         !node->sortColumns.empty()) {
@@ -8821,6 +9804,20 @@ void appendPhysicalPlanTree(const std::shared_ptr<PhysicalPlanNode>& node,
     if (node->rows > 0.0 || node->cost > 0.0) {
         out << "  # rows=" << formatEstimate(node->rows)
             << " cost=" << formatEstimate(node->cost);
+    }
+    if (node->distributedCost.fragment_count > 0 ||
+        node->distributedCost.remote_bytes > 0 ||
+        node->distributedCost.broadcast_bytes > 0 ||
+        node->distributedCost.network_latency_ms > 0.0) {
+        out << " net{fragments=" << node->distributedCost.fragment_count
+            << ", remote_bytes=" << node->distributedCost.remote_bytes
+            << ", broadcast_bytes=" << node->distributedCost.broadcast_bytes
+            << ", latency_ms="
+            << formatEstimate(node->distributedCost.network_latency_ms)
+            << "}";
+    }
+    if (!node->rejectedReason.empty()) {
+        out << " rejected=" << node->rejectedReason;
     }
     out << "\n";
     for (const auto& input : node->inputs) {
@@ -10755,9 +11752,12 @@ public:
     std::map<std::string, PlannedQuery> planned_query_cache;
 
     BuzzDB()
-        : buffer_manager(),
+        : BuzzDB(defaultStorageContextForCurrentBundle()) {}
+
+    explicit BuzzDB(StorageContext storage_context)
+        : buffer_manager(storage_context),
           catalog(buffer_manager),
-          recovery_manager(buffer_manager, catalog) {
+          recovery_manager(buffer_manager, catalog, std::move(storage_context)) {
         concurrency_control_policy = std::make_unique<HLCMVCCPolicy>(
             [this](const std::string& line) { logConcurrencyControl(line); }
         );
@@ -11785,6 +12785,7 @@ struct SelectWhereCommand {
 struct RangeReadCommand {
     std::string table;
     std::string range_id;
+    std::string replica_group_id;
     std::string start_key;
     std::string end_key;
     HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
@@ -11809,6 +12810,221 @@ struct QueryFragment {
 
 struct ExecuteQueryFragmentCommand {
     QueryFragment fragment;
+};
+
+struct JoinFragment {
+    std::string query_id;
+    size_t fragment_id = 0;
+    size_t attempt_id = 1;
+    std::string sql;
+    std::string large_table;
+    std::string small_table;
+    std::string large_join_column;
+    std::string small_join_column;
+    std::string range_id;
+    std::string replica_group_id;
+    std::string start_key;
+    std::string end_key;
+    std::string predicate_table;
+    std::string predicate_column;
+    std::string predicate_value;
+    std::vector<std::string> small_columns;
+    std::vector<std::vector<std::string>> small_rows;
+    std::vector<std::string> projection_tables;
+    std::vector<std::string> projection_columns;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+};
+
+struct ExecuteJoinFragmentCommand {
+    JoinFragment fragment;
+};
+
+struct QueryId {
+    uint64_t value = 0;
+};
+
+struct ExchangeId {
+    uint32_t value = 0;
+};
+
+struct FragmentId {
+    uint32_t value = 0;
+};
+
+struct AttemptId {
+    uint32_t value = 1;
+};
+
+struct BucketId {
+    uint32_t value = 0;
+};
+
+bool operator==(const QueryId& lhs, const QueryId& rhs) {
+    return lhs.value == rhs.value;
+}
+bool operator==(const ExchangeId& lhs, const ExchangeId& rhs) {
+    return lhs.value == rhs.value;
+}
+bool operator==(const FragmentId& lhs, const FragmentId& rhs) {
+    return lhs.value == rhs.value;
+}
+bool operator==(const AttemptId& lhs, const AttemptId& rhs) {
+    return lhs.value == rhs.value;
+}
+bool operator==(const BucketId& lhs, const BucketId& rhs) {
+    return lhs.value == rhs.value;
+}
+bool operator!=(const QueryId& lhs, const QueryId& rhs) {
+    return !(lhs == rhs);
+}
+bool operator!=(const ExchangeId& lhs, const ExchangeId& rhs) {
+    return !(lhs == rhs);
+}
+bool operator!=(const FragmentId& lhs, const FragmentId& rhs) {
+    return !(lhs == rhs);
+}
+bool operator!=(const AttemptId& lhs, const AttemptId& rhs) {
+    return !(lhs == rhs);
+}
+bool operator!=(const BucketId& lhs, const BucketId& rhs) {
+    return !(lhs == rhs);
+}
+bool operator<(const BucketId& lhs, const BucketId& rhs) {
+    return lhs.value < rhs.value;
+}
+
+struct ExchangeKey {
+    QueryId query_id;
+    ExchangeId exchange_id;
+    BucketId bucket_id;
+    AttemptId attempt_id;
+};
+
+bool operator==(const ExchangeKey& lhs, const ExchangeKey& rhs) {
+    return lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.bucket_id == rhs.bucket_id &&
+           lhs.attempt_id == rhs.attempt_id;
+}
+
+struct RepartitionScanFragment {
+    QueryId query_id;
+    ExchangeId exchange_id;
+    FragmentId fragment_id;
+    AttemptId attempt_id;
+    std::string table;
+    std::string join_column;
+    std::string range_id;
+    std::string replica_group_id;
+    std::string start_key;
+    std::string end_key;
+    std::string predicate_column;
+    std::string predicate_value;
+    uint32_t bucket_count = 1;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+};
+
+struct ExecuteRepartitionScanCommand {
+    RepartitionScanFragment fragment;
+};
+
+struct RepartitionBucketResult {
+    bool complete = false;
+    ExchangeKey key;
+    std::string source_table;
+    std::string join_column;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
+
+struct RepartitionScanResult {
+    bool complete = false;
+    QueryId query_id;
+    ExchangeId exchange_id;
+    FragmentId fragment_id;
+    AttemptId attempt_id;
+    std::string table;
+    std::vector<RepartitionBucketResult> buckets;
+};
+
+struct ExecuteBucketHashJoinCommand {
+    QueryId query_id;
+    ExchangeId exchange_id;
+    BucketId bucket_id;
+    AttemptId attempt_id;
+    std::string left_table;
+    std::string right_table;
+    std::string left_join_column;
+    std::string right_join_column;
+    std::vector<std::string> projection_tables;
+    std::vector<std::string> projection_columns;
+    RepartitionBucketResult left;
+    RepartitionBucketResult right;
+};
+
+struct BucketJoinResult {
+    bool complete = false;
+    QueryId query_id;
+    ExchangeId exchange_id;
+    BucketId bucket_id;
+    AttemptId attempt_id;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
+
+struct RepartitionAggregateScanCommand {
+    RepartitionScanFragment fragment;
+    std::string group_column;
+    std::string aggregate_function;
+    std::string aggregate_column;
+};
+
+struct AggregatePartialGroup {
+    std::string group_key;
+    size_t count = 0;
+    int64_t sum = 0;
+};
+
+struct AggregateBucketResult {
+    bool complete = false;
+    ExchangeKey key;
+    std::string source_table;
+    std::string group_column;
+    std::string aggregate_function;
+    std::string aggregate_column;
+    std::vector<AggregatePartialGroup> groups;
+};
+
+struct RepartitionAggregateScanResult {
+    bool complete = false;
+    QueryId query_id;
+    ExchangeId exchange_id;
+    FragmentId fragment_id;
+    AttemptId attempt_id;
+    std::string table;
+    std::vector<AggregateBucketResult> buckets;
+};
+
+struct FinalizeAggregateBucketCommand {
+    QueryId query_id;
+    ExchangeId exchange_id;
+    BucketId bucket_id;
+    AttemptId attempt_id;
+    std::string table;
+    std::string group_column;
+    std::string aggregate_function;
+    std::string aggregate_column;
+    std::vector<AggregateBucketResult> partials;
+};
+
+struct FinalAggregateBucketResult {
+    bool complete = false;
+    QueryId query_id;
+    ExchangeId exchange_id;
+    BucketId bucket_id;
+    AttemptId attempt_id;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
 };
 
 struct ExplainRouteCommand {
@@ -12083,6 +13299,11 @@ using Command = std::variant<
     SelectWhereCommand,
     RangeReadCommand,
     ExecuteQueryFragmentCommand,
+    ExecuteJoinFragmentCommand,
+    ExecuteRepartitionScanCommand,
+    ExecuteBucketHashJoinCommand,
+    RepartitionAggregateScanCommand,
+    FinalizeAggregateBucketCommand,
     ExplainRouteCommand,
     RoutedSQLCommand,
     RoutedTransactionCommand,
@@ -12156,6 +13377,7 @@ bool operator==(const SelectWhereCommand& lhs, const SelectWhereCommand& rhs) {
 }
 bool operator==(const RangeReadCommand& lhs, const RangeReadCommand& rhs) {
     return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.replica_group_id == rhs.replica_group_id &&
            lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
            lhs.read_ts == rhs.read_ts;
 }
@@ -12178,6 +13400,152 @@ bool operator==(const QueryFragment& lhs, const QueryFragment& rhs) {
 bool operator==(const ExecuteQueryFragmentCommand& lhs,
                 const ExecuteQueryFragmentCommand& rhs) {
     return lhs.fragment == rhs.fragment;
+}
+bool operator==(const JoinFragment& lhs, const JoinFragment& rhs) {
+    return lhs.query_id == rhs.query_id &&
+           lhs.fragment_id == rhs.fragment_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.sql == rhs.sql &&
+           lhs.large_table == rhs.large_table &&
+           lhs.small_table == rhs.small_table &&
+           lhs.large_join_column == rhs.large_join_column &&
+           lhs.small_join_column == rhs.small_join_column &&
+           lhs.range_id == rhs.range_id &&
+           lhs.replica_group_id == rhs.replica_group_id &&
+           lhs.start_key == rhs.start_key &&
+           lhs.end_key == rhs.end_key &&
+           lhs.predicate_table == rhs.predicate_table &&
+           lhs.predicate_column == rhs.predicate_column &&
+           lhs.predicate_value == rhs.predicate_value &&
+           lhs.small_columns == rhs.small_columns &&
+           lhs.small_rows == rhs.small_rows &&
+           lhs.projection_tables == rhs.projection_tables &&
+           lhs.projection_columns == rhs.projection_columns &&
+           lhs.read_ts == rhs.read_ts;
+}
+bool operator==(const ExecuteJoinFragmentCommand& lhs,
+                const ExecuteJoinFragmentCommand& rhs) {
+    return lhs.fragment == rhs.fragment;
+}
+bool operator==(const RepartitionScanFragment& lhs,
+                const RepartitionScanFragment& rhs) {
+    return lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.fragment_id == rhs.fragment_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.table == rhs.table &&
+           lhs.join_column == rhs.join_column &&
+           lhs.range_id == rhs.range_id &&
+           lhs.replica_group_id == rhs.replica_group_id &&
+           lhs.start_key == rhs.start_key &&
+           lhs.end_key == rhs.end_key &&
+           lhs.predicate_column == rhs.predicate_column &&
+           lhs.predicate_value == rhs.predicate_value &&
+           lhs.bucket_count == rhs.bucket_count &&
+           lhs.read_ts == rhs.read_ts;
+}
+bool operator==(const ExecuteRepartitionScanCommand& lhs,
+                const ExecuteRepartitionScanCommand& rhs) {
+    return lhs.fragment == rhs.fragment;
+}
+bool operator==(const RepartitionBucketResult& lhs,
+                const RepartitionBucketResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.key == rhs.key &&
+           lhs.source_table == rhs.source_table &&
+           lhs.join_column == rhs.join_column &&
+           lhs.columns == rhs.columns &&
+           lhs.rows == rhs.rows;
+}
+bool operator==(const RepartitionScanResult& lhs,
+                const RepartitionScanResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.fragment_id == rhs.fragment_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.table == rhs.table &&
+           lhs.buckets == rhs.buckets;
+}
+bool operator==(const ExecuteBucketHashJoinCommand& lhs,
+                const ExecuteBucketHashJoinCommand& rhs) {
+    return lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.bucket_id == rhs.bucket_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.left_table == rhs.left_table &&
+           lhs.right_table == rhs.right_table &&
+           lhs.left_join_column == rhs.left_join_column &&
+           lhs.right_join_column == rhs.right_join_column &&
+           lhs.projection_tables == rhs.projection_tables &&
+           lhs.projection_columns == rhs.projection_columns &&
+           lhs.left == rhs.left &&
+           lhs.right == rhs.right;
+}
+bool operator==(const BucketJoinResult& lhs,
+                const BucketJoinResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.bucket_id == rhs.bucket_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.columns == rhs.columns &&
+           lhs.rows == rhs.rows;
+}
+bool operator==(const RepartitionAggregateScanCommand& lhs,
+                const RepartitionAggregateScanCommand& rhs) {
+    return lhs.fragment == rhs.fragment &&
+           lhs.group_column == rhs.group_column &&
+           lhs.aggregate_function == rhs.aggregate_function &&
+           lhs.aggregate_column == rhs.aggregate_column;
+}
+bool operator==(const AggregatePartialGroup& lhs,
+                const AggregatePartialGroup& rhs) {
+    return lhs.group_key == rhs.group_key &&
+           lhs.count == rhs.count &&
+           lhs.sum == rhs.sum;
+}
+bool operator==(const AggregateBucketResult& lhs,
+                const AggregateBucketResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.key == rhs.key &&
+           lhs.source_table == rhs.source_table &&
+           lhs.group_column == rhs.group_column &&
+           lhs.aggregate_function == rhs.aggregate_function &&
+           lhs.aggregate_column == rhs.aggregate_column &&
+           lhs.groups == rhs.groups;
+}
+bool operator==(const RepartitionAggregateScanResult& lhs,
+                const RepartitionAggregateScanResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.fragment_id == rhs.fragment_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.table == rhs.table &&
+           lhs.buckets == rhs.buckets;
+}
+bool operator==(const FinalizeAggregateBucketCommand& lhs,
+                const FinalizeAggregateBucketCommand& rhs) {
+    return lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.bucket_id == rhs.bucket_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.table == rhs.table &&
+           lhs.group_column == rhs.group_column &&
+           lhs.aggregate_function == rhs.aggregate_function &&
+           lhs.aggregate_column == rhs.aggregate_column &&
+           lhs.partials == rhs.partials;
+}
+bool operator==(const FinalAggregateBucketResult& lhs,
+                const FinalAggregateBucketResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.query_id == rhs.query_id &&
+           lhs.exchange_id == rhs.exchange_id &&
+           lhs.bucket_id == rhs.bucket_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.columns == rhs.columns &&
+           lhs.rows == rhs.rows;
 }
 bool operator==(const ExplainRouteCommand& lhs,
                 const ExplainRouteCommand& rhs) {
@@ -12492,6 +13860,37 @@ struct DistributedQueryResult {
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
 };
+struct JoinFragmentResult {
+    bool complete = false;
+    std::string query_id;
+    size_t fragment_id = 0;
+    size_t attempt_id = 0;
+    std::string range_id;
+    std::string replica_group_id;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
+struct DistributedJoinResult {
+    bool complete = false;
+    bool unsupported = false;
+    std::string query_id;
+    std::string sql;
+    std::string join_strategy = "broadcast";
+    std::string rejected_reason;
+    size_t planner_memo_groups = 0;
+    size_t planner_memo_expressions = 0;
+    std::string planner_winner_expression;
+    HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+    std::shared_ptr<PhysicalPlanNode> physical_plan;
+    DistributedCost distributed_cost;
+    std::vector<JoinFragment> fragments;
+    std::vector<JoinFragmentResult> fragment_results;
+    std::vector<BucketJoinResult> bucket_results;
+    std::vector<size_t> fragment_row_counts;
+    std::vector<std::string> explain_lines;
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> rows;
+};
 struct RangeRowsResult {
     std::string table;
     std::string range_id;
@@ -12596,6 +13995,11 @@ using Result = std::variant<
     SelectAllResult,
     FragmentResult,
     DistributedQueryResult,
+    JoinFragmentResult,
+    RepartitionScanResult,
+    BucketJoinResult,
+    RepartitionAggregateScanResult,
+    FinalAggregateBucketResult,
     RangeRowsResult,
     DistributedRangeReadResult,
     RouteResult,
@@ -12655,6 +14059,17 @@ bool operator==(const DistributedQueryResult& lhs,
            lhs.fragment_results == rhs.fragment_results &&
            lhs.fragment_row_counts == rhs.fragment_row_counts &&
            lhs.explain_lines == rhs.explain_lines &&
+           lhs.columns == rhs.columns &&
+           lhs.rows == rhs.rows;
+}
+bool operator==(const JoinFragmentResult& lhs,
+                const JoinFragmentResult& rhs) {
+    return lhs.complete == rhs.complete &&
+           lhs.query_id == rhs.query_id &&
+           lhs.fragment_id == rhs.fragment_id &&
+           lhs.attempt_id == rhs.attempt_id &&
+           lhs.range_id == rhs.range_id &&
+           lhs.replica_group_id == rhs.replica_group_id &&
            lhs.columns == rhs.columns &&
            lhs.rows == rhs.rows;
 }
@@ -12807,6 +14222,7 @@ std::string describeCommand(const Command& command) {
             } else if constexpr (std::is_same_v<T, RangeReadCommand>) {
                 out << "RangeRead(" << value.table
                     << ", range=" << value.range_id
+                    << ", group=" << value.replica_group_id
                     << ", [" << value.start_key << ", "
                     << value.end_key << ")";
                 if (!value.read_ts.isZero()) {
@@ -12837,6 +14253,68 @@ std::string describeCommand(const Command& command) {
                         << hlcToString(value.fragment.read_ts);
                 }
                 out << ")";
+            } else if constexpr (std::is_same_v<T, ExecuteJoinFragmentCommand>) {
+                out << "ExecuteJoinFragment(" << value.fragment.query_id
+                    << "#" << value.fragment.fragment_id
+                    << ", attempt=" << value.fragment.attempt_id
+                    << ", range=" << value.fragment.range_id
+                    << ", group=" << value.fragment.replica_group_id
+                    << ", broadcast_rows="
+                    << value.fragment.small_rows.size()
+                    << ", join=" << value.fragment.large_table
+                    << "." << value.fragment.large_join_column
+                    << "=" << value.fragment.small_table
+                    << "." << value.fragment.small_join_column;
+                if (!value.fragment.predicate_column.empty()) {
+                    out << ", where "
+                        << value.fragment.predicate_table
+                        << "." << value.fragment.predicate_column
+                        << "=" << value.fragment.predicate_value;
+                }
+                if (!value.fragment.read_ts.isZero()) {
+                    out << ", read_ts="
+                        << hlcToString(value.fragment.read_ts);
+                }
+                out << ")";
+            } else if constexpr (std::is_same_v<T, ExecuteRepartitionScanCommand>) {
+                out << "ExecuteRepartitionScan(q="
+                    << value.fragment.query_id.value
+                    << ", x=" << value.fragment.exchange_id.value
+                    << ", f=" << value.fragment.fragment_id.value
+                    << ", attempt=" << value.fragment.attempt_id.value
+                    << ", table=" << value.fragment.table
+                    << ", join=" << value.fragment.join_column
+                    << ", range=" << value.fragment.range_id
+                    << ", group=" << value.fragment.replica_group_id
+                    << ", buckets=" << value.fragment.bucket_count << ")";
+            } else if constexpr (std::is_same_v<T, ExecuteBucketHashJoinCommand>) {
+                out << "ExecuteBucketHashJoin(q=" << value.query_id.value
+                    << ", x=" << value.exchange_id.value
+                    << ", bucket=" << value.bucket_id.value
+                    << ", attempt=" << value.attempt_id.value
+                    << ", join=" << value.left_table << "."
+                    << value.left_join_column << "="
+                    << value.right_table << "."
+                    << value.right_join_column << ")";
+            } else if constexpr (std::is_same_v<T, RepartitionAggregateScanCommand>) {
+                out << "RepartitionAggregateScan(q="
+                    << value.fragment.query_id.value
+                    << ", x=" << value.fragment.exchange_id.value
+                    << ", f=" << value.fragment.fragment_id.value
+                    << ", table=" << value.fragment.table
+                    << ", group=" << value.group_column
+                    << ", aggregate=" << value.aggregate_function;
+                if (!value.aggregate_column.empty()) {
+                    out << "(" << value.aggregate_column << ")";
+                }
+                out << ")";
+            } else if constexpr (std::is_same_v<T, FinalizeAggregateBucketCommand>) {
+                out << "FinalizeAggregateBucket(q="
+                    << value.query_id.value
+                    << ", x=" << value.exchange_id.value
+                    << ", bucket=" << value.bucket_id.value
+                    << ", aggregate=" << value.aggregate_function
+                    << ")";
             } else if constexpr (std::is_same_v<T, ExplainRouteCommand>) {
                 out << "ExplainRoute(" << value.table;
                 if (value.full_scan) {
@@ -13086,6 +14564,11 @@ std::string describeResult(const Result& result) {
             else if constexpr (std::is_same_v<T, SelectAllResult>) out << "SelectAll(columns=" << value.columns.size() << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, FragmentResult>) out << "FragmentResult(query=" << value.query_id << ", fragment=" << value.fragment_id << ", complete=" << (value.complete ? "true" : "false") << ", rows=" << value.rows.size() << ", partial_count=" << value.partial_count << ", partial_sum=" << value.partial_sum << ")";
             else if constexpr (std::is_same_v<T, DistributedQueryResult>) out << "DistributedQuery(query=" << value.query_id << ", complete=" << (value.complete ? "true" : "false") << ", fragments=" << value.fragments.size() << ", rows=" << value.rows.size() << ", final_count=" << value.final_count << ", final_sum=" << value.final_sum << ")";
+            else if constexpr (std::is_same_v<T, JoinFragmentResult>) out << "JoinFragmentResult(query=" << value.query_id << ", fragment=" << value.fragment_id << ", complete=" << (value.complete ? "true" : "false") << ", rows=" << value.rows.size() << ")";
+            else if constexpr (std::is_same_v<T, RepartitionScanResult>) out << "RepartitionScan(q=" << value.query_id.value << ", x=" << value.exchange_id.value << ", fragment=" << value.fragment_id.value << ", complete=" << (value.complete ? "true" : "false") << ", buckets=" << value.buckets.size() << ")";
+            else if constexpr (std::is_same_v<T, BucketJoinResult>) out << "BucketJoin(q=" << value.query_id.value << ", x=" << value.exchange_id.value << ", bucket=" << value.bucket_id.value << ", complete=" << (value.complete ? "true" : "false") << ", rows=" << value.rows.size() << ")";
+            else if constexpr (std::is_same_v<T, RepartitionAggregateScanResult>) out << "RepartitionAggregateScan(q=" << value.query_id.value << ", x=" << value.exchange_id.value << ", fragment=" << value.fragment_id.value << ", complete=" << (value.complete ? "true" : "false") << ", buckets=" << value.buckets.size() << ")";
+            else if constexpr (std::is_same_v<T, FinalAggregateBucketResult>) out << "FinalAggregateBucket(q=" << value.query_id.value << ", x=" << value.exchange_id.value << ", bucket=" << value.bucket_id.value << ", complete=" << (value.complete ? "true" : "false") << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, RangeRowsResult>) out << "RangeRows(table=" << value.table << ", range=" << value.range_id << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, DistributedRangeReadResult>) out << "DistributedRangeRead(table=" << value.table << ", complete=" << (value.complete ? "true" : "false") << ", ranges=" << value.range_ids.size() << ", rows=" << value.rows.size() << ")";
             else if constexpr (std::is_same_v<T, RouteResult>) out << "RouteResult(ranges=" << value.range_ids.size() << ")";
@@ -13248,6 +14731,24 @@ public:
         Result result = StatementOkResult{};
     };
 
+    struct ReplicaPlacement {
+        std::string region = "local";
+        std::string zone = "zone-a";
+        std::string status = "active";
+    };
+
+    struct NetworkLinkCost {
+        int rtt_ms = 0;
+        int bandwidth_mb_per_sec = 1000;
+        std::string status = "active";
+    };
+
+    struct PlannerTableStats {
+        size_t row_count = 0;
+        size_t avg_row_bytes = 32;
+        bool exists = false;
+    };
+
     explicit ControlPlaneRuntime(Executor catalog, int txn_timeout_ticks = 3)
         : catalog_(std::move(catalog)),
           txn_timeout_ticks_(txn_timeout_ticks) {}
@@ -13263,6 +14764,34 @@ public:
 
     void registerReplicaGroup(std::string group_id, Executor executor) {
         replica_groups_[std::move(group_id)] = std::move(executor);
+    }
+
+    void setCoordinatorRegion(std::string region) {
+        coordinator_region_ = std::move(region);
+    }
+
+    void setReplicaPlacement(std::string group_id,
+                             std::string region,
+                             std::string zone = "zone-a",
+                             std::string status = "active") {
+        replica_placement_[std::move(group_id)] =
+            ReplicaPlacement{std::move(region), std::move(zone),
+                             std::move(status)};
+    }
+
+    void setNetworkLinkCost(std::string from_region,
+                            std::string to_region,
+                            int rtt_ms,
+                            int bandwidth_mb_per_sec) {
+        network_links_[{std::move(from_region), std::move(to_region)}] =
+            NetworkLinkCost{rtt_ms, bandwidth_mb_per_sec, "active"};
+    }
+
+    void setPlannerTableStats(std::string table,
+                              size_t row_count,
+                              size_t avg_row_bytes) {
+        planner_table_stats_[std::move(table)] =
+            PlannerTableStats{row_count, avg_row_bytes, true};
     }
 
     StepResult tick() {
@@ -13354,6 +14883,19 @@ public:
         IndexLookupResult index;
         std::vector<std::string> columns;
         std::vector<std::vector<std::string>> rows;
+    };
+
+    struct BroadcastJoinPlan {
+        std::string sql;
+        std::string large_table;
+        std::string small_table;
+        std::string large_join_column;
+        std::string small_join_column;
+        std::string predicate_table;
+        std::string predicate_column;
+        std::string predicate_value;
+        std::vector<std::string> projection_tables;
+        std::vector<std::string> projection_columns;
     };
 
     std::vector<QueryFragment> planQueryFragments(
@@ -13492,6 +15034,276 @@ public:
             sql, start_key, end_key, aggregate_read_ts);
     }
 
+    DistributedQueryResult executeDistributedGroupBy(
+        const std::string& sql,
+        uint32_t bucket_count = 4,
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        DistributedQueryResult result;
+        result.sql = sql;
+        result.read_ts = read_ts.isZero() ? nextQueryReadTimestamp() : read_ts;
+        result.query_id = queryIdFor("group|" + sql, "", "", result.read_ts);
+        std::smatch matches;
+        std::regex group_regex(
+            "^\\s*(?:SELECT|PROJECT)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*,\\s*"
+            "(COUNT|SUM)\\s*\\(\\s*(\\*|[A-Za-z_][A-Za-z0-9_]*)\\s*\\)"
+            "\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+GROUP\\s+BY\\s+"
+            "([A-Za-z_][A-Za-z0-9_]*)\\s*$",
+            std::regex_constants::icase);
+        if (!std::regex_match(sql, matches, group_regex) ||
+            bucket_count == 0) {
+            return result;
+        }
+
+        std::string projected_group = matches[1];
+        std::string aggregate_function = matches[2];
+        std::transform(aggregate_function.begin(),
+                       aggregate_function.end(),
+                       aggregate_function.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::toupper(c));
+                       });
+        std::string aggregate_column =
+            matches[3] == "*" ? std::string{} : std::string(matches[3]);
+        std::string table = matches[4];
+        std::string group_column = matches[5];
+        if (projected_group != group_column ||
+            (aggregate_function == "SUM" && aggregate_column.empty())) {
+            return result;
+        }
+
+        QueryId typed_query =
+            typedQueryIdFor("group|" + sql + "|" +
+                            std::to_string(result.read_ts.physical) + "." +
+                            std::to_string(result.read_ts.logical));
+        ExchangeId exchange_id{2};
+        std::vector<RepartitionScanFragment> fragments =
+            planRepartitionScanFragments(typed_query,
+                                         exchange_id,
+                                         table,
+                                         group_column,
+                                         "",
+                                         "",
+                                         "",
+                                         bucket_count,
+                                         result.read_ts);
+        if (fragments.empty()) return result;
+
+        std::vector<RepartitionAggregateScanResult> partial_scans;
+        for (const auto& fragment : fragments) {
+            auto owner = replica_groups_.find(fragment.replica_group_id);
+            if (owner == replica_groups_.end() ||
+                !replicaGroupAvailable(fragment.replica_group_id)) {
+                result.rows.clear();
+                return result;
+            }
+            Result partial = owner->second(
+                Command{RepartitionAggregateScanCommand{
+                    fragment,
+                    group_column,
+                    aggregate_function,
+                    aggregate_column}});
+            const auto* scan =
+                std::get_if<RepartitionAggregateScanResult>(&partial);
+            if (scan == nullptr || !scan->complete ||
+                scan->buckets.size() != bucket_count) {
+                result.rows.clear();
+                return result;
+            }
+            partial_scans.push_back(*scan);
+        }
+
+        std::vector<std::vector<AggregateBucketResult>> by_bucket(bucket_count);
+        std::set<uint32_t> seen_fragments;
+        for (const auto& scan : partial_scans) {
+            if (scan.query_id != typed_query ||
+                scan.exchange_id != exchange_id ||
+                scan.attempt_id != AttemptId{1} ||
+                !seen_fragments.insert(scan.fragment_id.value).second) {
+                result.rows.clear();
+                return result;
+            }
+            for (const auto& bucket : scan.buckets) {
+                if (!bucket.complete ||
+                    bucket.key.query_id != typed_query ||
+                    bucket.key.exchange_id != exchange_id ||
+                    bucket.key.attempt_id != AttemptId{1} ||
+                    bucket.key.bucket_id.value >= bucket_count) {
+                    result.rows.clear();
+                    return result;
+                }
+                by_bucket[bucket.key.bucket_id.value].push_back(bucket);
+            }
+        }
+
+        std::vector<std::string> workers = exchangeWorkerGroups();
+        if (workers.empty()) return result;
+        result.table = table;
+        result.aggregate_function = aggregate_function;
+        result.aggregate_column = aggregate_column;
+        result.columns = {group_column,
+                          aggregate_function == "COUNT" ? "count" : "sum"};
+        for (uint32_t bucket = 0; bucket < bucket_count; ++bucket) {
+            const std::string& worker = workers[bucket % workers.size()];
+            auto executor = replica_groups_.find(worker);
+            if (executor == replica_groups_.end() ||
+                !replicaGroupAvailable(worker)) {
+                result.rows.clear();
+                return result;
+            }
+            Result finalized = executor->second(
+                Command{FinalizeAggregateBucketCommand{
+                    typed_query,
+                    exchange_id,
+                    BucketId{bucket},
+                    AttemptId{1},
+                    table,
+                    group_column,
+                    aggregate_function,
+                    aggregate_column,
+                    by_bucket[bucket]}});
+            const auto* bucket_result =
+                std::get_if<FinalAggregateBucketResult>(&finalized);
+            if (bucket_result == nullptr || !bucket_result->complete ||
+                bucket_result->columns != result.columns) {
+                result.rows.clear();
+                return result;
+            }
+            result.fragment_row_counts.push_back(bucket_result->rows.size());
+            result.rows.insert(result.rows.end(),
+                               bucket_result->rows.begin(),
+                               bucket_result->rows.end());
+        }
+        std::sort(result.rows.begin(), result.rows.end());
+        if (aggregate_function == "COUNT") {
+            for (const auto& row : result.rows) {
+                if (row.size() > 1) result.final_count += std::stoull(row[1]);
+            }
+        } else {
+            for (const auto& row : result.rows) {
+                if (row.size() > 1) result.final_sum += std::stoll(row[1]);
+            }
+        }
+        result.explain_lines = {
+            "RepartitionExchange(" + table + "." + group_column +
+                ") buckets=" + std::to_string(bucket_count),
+            "PartialAggregate(" + aggregate_function + ")",
+            "FinalAggregate(" + aggregate_function + ")"};
+        result.complete = true;
+        return result;
+    }
+
+    struct PlannedDistributedJoin {
+        bool parsed = false;
+        bool executable = false;
+        bool unsupported = false;
+        std::string rejected_reason;
+        std::string strategy = "broadcast";
+        BroadcastJoinPlan plan;
+        HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
+        QueryId typed_query_id;
+        ExchangeId exchange_id{1};
+        uint32_t bucket_count = 0;
+        std::vector<JoinFragment> fragments;
+        std::vector<RepartitionScanFragment> left_repartition_fragments;
+        std::vector<RepartitionScanFragment> right_repartition_fragments;
+        std::shared_ptr<PhysicalPlanNode> physical_plan;
+        DistributedCost cost;
+        DistributedRangeReadResult small_side;
+        DistributedRangeReadResult left_side;
+        DistributedRangeReadResult right_side;
+        size_t planner_memo_groups = 0;
+        size_t planner_memo_expressions = 0;
+        std::string planner_winner_expression;
+        std::vector<std::string> planner_memo_lines;
+    };
+
+    DistributedJoinResult explainDistributedJoin(
+        const std::string& sql,
+        size_t broadcast_row_limit = 32,
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        HybridLogicalTimestamp join_read_ts =
+            read_ts.isZero() ? nextQueryReadTimestamp() : read_ts;
+        PlannedDistributedJoin planned =
+            planDistributedJoin(sql, broadcast_row_limit, join_read_ts);
+        DistributedJoinResult result =
+            planned.parsed
+                ? baseJoinResult(planned.plan, join_read_ts, planned.fragments)
+                : DistributedJoinResult{};
+        if (!planned.parsed) {
+            result.sql = sql;
+            result.query_id = queryIdFor("join|" + sql, "", "", join_read_ts);
+        }
+        attachDistributedPlan(result, planned);
+        return result;
+    }
+
+    DistributedJoinResult executeDistributedJoin(
+        const std::string& sql,
+        size_t broadcast_row_limit = 32,
+        const HybridLogicalTimestamp& read_ts =
+            HybridLogicalTimestamp::zero()) {
+        HybridLogicalTimestamp join_read_ts =
+            read_ts.isZero() ? nextQueryReadTimestamp() : read_ts;
+        PlannedDistributedJoin planned =
+            planDistributedJoin(sql, broadcast_row_limit, join_read_ts);
+        if (!planned.parsed) {
+            DistributedJoinResult rejected;
+            rejected.sql = sql;
+            rejected.query_id =
+                queryIdFor("join|" + sql, "", "", join_read_ts);
+            attachDistributedPlan(rejected, planned);
+            return rejected;
+        }
+        if (!planned.executable) {
+            DistributedJoinResult rejected =
+                baseJoinResult(planned.plan, join_read_ts, planned.fragments);
+            attachDistributedPlan(rejected, planned);
+            return rejected;
+        }
+        if (planned.strategy == "repartition") {
+            return executeRepartitionDistributedJoin(planned, join_read_ts);
+        }
+
+        std::vector<JoinFragmentResult> fragment_results;
+        for (const auto& fragment : planned.fragments) {
+            auto owner = replica_groups_.find(fragment.replica_group_id);
+            if (owner == replica_groups_.end() ||
+                !replicaGroupAvailable(fragment.replica_group_id)) {
+                DistributedJoinResult failed =
+                    baseJoinResult(planned.plan, join_read_ts,
+                                   planned.fragments);
+                planned.executable = false;
+                planned.unsupported = false;
+                planned.rejected_reason = "owner_unavailable";
+                attachDistributedPlan(failed, planned);
+                return failed;
+            }
+            Result executed = owner->second(
+                Command{ExecuteJoinFragmentCommand{fragment}});
+            const auto* result =
+                std::get_if<JoinFragmentResult>(&executed);
+            if (result == nullptr || !result->complete) {
+                DistributedJoinResult failed =
+                    baseJoinResult(planned.plan, join_read_ts,
+                                   planned.fragments);
+                planned.executable = false;
+                planned.unsupported = false;
+                planned.rejected_reason = "fragment_failed";
+                attachDistributedPlan(failed, planned);
+                return failed;
+            }
+            fragment_results.push_back(*result);
+        }
+        DistributedJoinResult joined =
+            mergeJoinFragmentResults(
+                planned.plan, join_read_ts, planned.fragments,
+                fragment_results);
+        attachDistributedPlan(joined, planned);
+        return joined;
+    }
+
     DistributedQueryResult mergeQueryFragmentResults(
         const std::string& sql,
         const std::string& start_key,
@@ -13522,6 +15334,10 @@ public:
                 result.fragment_row_counts.clear();
                 result.complete = false;
                 return result;
+            }
+            if (fragment_result.attempt_id !=
+                expected_fragment->second.attempt_id) {
+                continue;
             }
             if (!seen.insert(fragment_result.fragment_id).second) {
                 continue;
@@ -13592,6 +15408,285 @@ public:
             std::sort(result.rows.begin(), result.rows.end());
         }
         result.complete = true;
+        return result;
+    }
+
+    DistributedJoinResult mergeJoinFragmentResults(
+        const std::string& sql,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<JoinFragment>& fragments,
+        const std::vector<JoinFragmentResult>& fragment_results) {
+        try {
+            return mergeJoinFragmentResults(
+                parseBroadcastJoin(sql),
+                read_ts,
+                fragments,
+                fragment_results);
+        } catch (const std::exception&) {
+            DistributedJoinResult rejected;
+            rejected.sql = sql;
+            rejected.query_id =
+                queryIdFor("join|" + sql, "", "", read_ts);
+            rejected.unsupported = true;
+            return rejected;
+        }
+    }
+
+    DistributedJoinResult mergeJoinFragmentResults(
+        const BroadcastJoinPlan& plan,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<JoinFragment>& fragments,
+        const std::vector<JoinFragmentResult>& fragment_results) {
+        DistributedJoinResult result =
+            baseJoinResult(plan, read_ts, fragments);
+        std::map<size_t, JoinFragment> expected;
+        for (const auto& fragment : fragments) {
+            expected[fragment.fragment_id] = fragment;
+        }
+
+        std::set<size_t> seen;
+        std::map<size_t, size_t> row_counts;
+        for (const auto& fragment_result : fragment_results) {
+            auto expected_fragment =
+                expected.find(fragment_result.fragment_id);
+            if (expected_fragment == expected.end() ||
+                fragment_result.query_id != result.query_id ||
+                !fragment_result.complete) {
+                result.rows.clear();
+                result.fragment_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                return result;
+            }
+            if (fragment_result.attempt_id !=
+                expected_fragment->second.attempt_id) {
+                continue;
+            }
+            if (!seen.insert(fragment_result.fragment_id).second) {
+                continue;
+            }
+            if (fragment_result.range_id !=
+                    expected_fragment->second.range_id ||
+                fragment_result.replica_group_id !=
+                    expected_fragment->second.replica_group_id ||
+                (!result.columns.empty() &&
+                 result.columns != fragment_result.columns)) {
+                result.rows.clear();
+                result.fragment_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                return result;
+            }
+            if (result.columns.empty()) {
+                result.columns = fragment_result.columns;
+            }
+            row_counts[fragment_result.fragment_id] =
+                fragment_result.rows.size();
+            result.fragment_results.push_back(fragment_result);
+            result.rows.insert(result.rows.end(),
+                               fragment_result.rows.begin(),
+                               fragment_result.rows.end());
+        }
+        if (seen.size() != fragments.size()) {
+            result.rows.clear();
+            result.fragment_results.clear();
+            result.fragment_row_counts.clear();
+            result.complete = false;
+            return result;
+        }
+        for (const auto& fragment : fragments) {
+            result.fragment_row_counts.push_back(
+                row_counts[fragment.fragment_id]);
+        }
+        std::sort(result.rows.begin(), result.rows.end());
+        result.complete = true;
+        return result;
+    }
+
+    DistributedJoinResult mergeRepartitionBucketJoinResults(
+        const std::string& sql,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<BucketJoinResult>& bucket_results,
+        uint32_t bucket_count = 4) {
+        PlannedDistributedJoin planned =
+            planRepartitionCandidate(parseBroadcastJoin(sql),
+                                     read_ts,
+                                     bucket_count);
+        return mergeRepartitionBucketJoinResults(planned,
+                                                 read_ts,
+                                                 bucket_results);
+    }
+
+    DistributedJoinResult executeRepartitionDistributedJoin(
+        PlannedDistributedJoin planned,
+        const HybridLogicalTimestamp& read_ts) {
+        auto fail = [&](std::string reason) {
+            DistributedJoinResult failed =
+                baseJoinResult(planned.plan, read_ts, planned.fragments);
+            planned.executable = false;
+            planned.unsupported = false;
+            planned.rejected_reason = std::move(reason);
+            attachDistributedPlan(failed, planned);
+            return failed;
+        };
+
+        auto executeScan =
+            [&](const RepartitionScanFragment& fragment)
+            -> std::optional<RepartitionScanResult> {
+            auto owner = replica_groups_.find(fragment.replica_group_id);
+            if (owner == replica_groups_.end() ||
+                !replicaGroupAvailable(fragment.replica_group_id)) {
+                return std::nullopt;
+            }
+            Result executed = owner->second(
+                Command{ExecuteRepartitionScanCommand{fragment}});
+            const auto* result =
+                std::get_if<RepartitionScanResult>(&executed);
+            if (result == nullptr || !result->complete) {
+                return std::nullopt;
+            }
+            return *result;
+        };
+
+        std::vector<RepartitionScanResult> left_scans;
+        std::vector<RepartitionScanResult> right_scans;
+        for (const auto& fragment : planned.left_repartition_fragments) {
+            auto scan = executeScan(fragment);
+            if (!scan.has_value()) return fail("left_repartition_scan_failed");
+            left_scans.push_back(std::move(*scan));
+        }
+        for (const auto& fragment : planned.right_repartition_fragments) {
+            auto scan = executeScan(fragment);
+            if (!scan.has_value()) return fail("right_repartition_scan_failed");
+            right_scans.push_back(std::move(*scan));
+        }
+
+        auto left_buckets =
+            combineRepartitionBuckets(left_scans,
+                                      planned.typed_query_id,
+                                      planned.exchange_id,
+                                      AttemptId{1},
+                                      planned.bucket_count,
+                                      planned.plan.large_table,
+                                      planned.plan.large_join_column);
+        auto right_buckets =
+            combineRepartitionBuckets(right_scans,
+                                      planned.typed_query_id,
+                                      planned.exchange_id,
+                                      AttemptId{1},
+                                      planned.bucket_count,
+                                      planned.plan.small_table,
+                                      planned.plan.small_join_column);
+        if (!left_buckets.has_value() || !right_buckets.has_value()) {
+            return fail("repartition_bucket_merge_failed");
+        }
+
+        std::vector<std::string> workers = exchangeWorkerGroups();
+        if (workers.empty()) return fail("no_exchange_workers");
+
+        std::vector<BucketJoinResult> bucket_results;
+        for (uint32_t bucket = 0; bucket < planned.bucket_count; ++bucket) {
+            const std::string& worker =
+                workers[bucket % workers.size()];
+            if (!replicaGroupAvailable(worker)) {
+                return fail("bucket_worker_unavailable");
+            }
+            auto executor = replica_groups_.find(worker);
+            if (executor == replica_groups_.end()) {
+                return fail("bucket_worker_missing");
+            }
+            Result joined = executor->second(
+                Command{ExecuteBucketHashJoinCommand{
+                    planned.typed_query_id,
+                    planned.exchange_id,
+                    BucketId{bucket},
+                    AttemptId{1},
+                    planned.plan.large_table,
+                    planned.plan.small_table,
+                    planned.plan.large_join_column,
+                    planned.plan.small_join_column,
+                    planned.plan.projection_tables,
+                    planned.plan.projection_columns,
+                    left_buckets->at(bucket),
+                    right_buckets->at(bucket)}});
+            const auto* bucket_result =
+                std::get_if<BucketJoinResult>(&joined);
+            if (bucket_result == nullptr || !bucket_result->complete) {
+                return fail("bucket_join_failed");
+            }
+            bucket_results.push_back(*bucket_result);
+        }
+        return mergeRepartitionBucketJoinResults(planned,
+                                                 read_ts,
+                                                 bucket_results);
+    }
+
+    DistributedJoinResult mergeRepartitionBucketJoinResults(
+        PlannedDistributedJoin planned,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<BucketJoinResult>& bucket_results) {
+        DistributedJoinResult result =
+            baseJoinResult(planned.plan, read_ts, planned.fragments);
+        std::set<uint32_t> seen;
+        std::map<uint32_t, size_t> row_counts;
+        for (const auto& bucket_result : bucket_results) {
+            if (!bucket_result.complete ||
+                bucket_result.query_id != planned.typed_query_id ||
+                bucket_result.exchange_id != planned.exchange_id) {
+                result.rows.clear();
+                result.bucket_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                attachDistributedPlan(result, planned);
+                return result;
+            }
+            if (bucket_result.attempt_id != AttemptId{1}) {
+                continue;
+            }
+            if (bucket_result.bucket_id.value >= planned.bucket_count) {
+                result.rows.clear();
+                result.bucket_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                attachDistributedPlan(result, planned);
+                return result;
+            }
+            if (!seen.insert(bucket_result.bucket_id.value).second) {
+                continue;
+            }
+            if (!result.columns.empty() &&
+                result.columns != bucket_result.columns) {
+                result.rows.clear();
+                result.bucket_results.clear();
+                result.fragment_row_counts.clear();
+                result.complete = false;
+                attachDistributedPlan(result, planned);
+                return result;
+            }
+            if (result.columns.empty()) {
+                result.columns = bucket_result.columns;
+            }
+            row_counts[bucket_result.bucket_id.value] =
+                bucket_result.rows.size();
+            result.bucket_results.push_back(bucket_result);
+            result.rows.insert(result.rows.end(),
+                               bucket_result.rows.begin(),
+                               bucket_result.rows.end());
+        }
+        if (seen.size() != planned.bucket_count) {
+            result.rows.clear();
+            result.bucket_results.clear();
+            result.fragment_row_counts.clear();
+            result.complete = false;
+            attachDistributedPlan(result, planned);
+            return result;
+        }
+        for (uint32_t bucket = 0; bucket < planned.bucket_count; ++bucket) {
+            result.fragment_row_counts.push_back(row_counts[bucket]);
+        }
+        std::sort(result.rows.begin(), result.rows.end());
+        result.complete = true;
+        attachDistributedPlan(result, planned);
         return result;
     }
 
@@ -13803,6 +15898,7 @@ public:
                 owner->second(Command{RangeReadCommand{
                     table,
                     fragment.range_id,
+                    fragment.replica_group_id,
                     fragment_start,
                     fragment_end,
                     read_ts}});
@@ -13987,6 +16083,1114 @@ private:
         ProjectScan scan = parseProjectScan(sql);
         result.aggregate_function = scan.aggregate_function;
         result.aggregate_column = scan.aggregate_column;
+        return result;
+    }
+
+    ReplicaPlacement placementForGroup(const std::string& group_id) const {
+        auto it = replica_placement_.find(group_id);
+        if (it != replica_placement_.end()) return it->second;
+        return ReplicaPlacement{coordinator_region_, "zone-a", "active"};
+    }
+
+    bool replicaGroupAvailable(const std::string& group_id) const {
+        return placementForGroup(group_id).status != "unavailable";
+    }
+
+    NetworkLinkCost linkCost(const std::string& from_region,
+                             const std::string& to_region) const {
+        if (from_region == to_region) return NetworkLinkCost{0, 1000, "active"};
+        auto it = network_links_.find({from_region, to_region});
+        if (it != network_links_.end()) return it->second;
+        return NetworkLinkCost{10, 1000, "active"};
+    }
+
+    static size_t rowBytes(const std::vector<std::string>& row) {
+        size_t bytes = 0;
+        for (const auto& value : row) bytes += value.size() + 1;
+        return std::max<size_t>(1, bytes);
+    }
+
+    static size_t rowsBytes(const std::vector<std::vector<std::string>>& rows) {
+        size_t bytes = 0;
+        for (const auto& row : rows) bytes += rowBytes(row);
+        return bytes;
+    }
+
+    size_t estimatedTableBytes(
+        const std::string& table,
+        const std::vector<std::vector<std::string>>& actual_rows) const {
+        auto stats = planner_table_stats_.find(table);
+        if (stats != planner_table_stats_.end() && stats->second.exists) {
+            return stats->second.row_count * stats->second.avg_row_bytes;
+        }
+        return rowsBytes(actual_rows);
+    }
+
+    static QueryId typedQueryIdFor(const std::string& key) {
+        return QueryId{
+            static_cast<uint64_t>(std::hash<std::string>{}(key))};
+    }
+
+    std::vector<std::string> exchangeWorkerGroups() const {
+        std::vector<std::string> groups;
+        for (const auto& [group_id, executor] : replica_groups_) {
+            (void)executor;
+            if (replicaGroupAvailable(group_id)) groups.push_back(group_id);
+        }
+        std::sort(groups.begin(), groups.end());
+        return groups;
+    }
+
+    static BroadcastJoinPlan reversedBroadcastPlan(
+        const BroadcastJoinPlan& plan) {
+        BroadcastJoinPlan reversed = plan;
+        reversed.large_table = plan.small_table;
+        reversed.small_table = plan.large_table;
+        reversed.large_join_column = plan.small_join_column;
+        reversed.small_join_column = plan.large_join_column;
+        return reversed;
+    }
+
+    static DistributionTrait rangeDistributionFor(
+        const std::string& table,
+        const std::vector<JoinFragment>& fragments) {
+        DistributionTrait trait;
+        trait.kind = DistributionKind::RangePartitioned;
+        trait.partition_table = table;
+        for (const auto& fragment : fragments) {
+            trait.range_ids.push_back(fragment.range_id);
+            trait.replica_group_ids.push_back(fragment.replica_group_id);
+        }
+        return trait;
+    }
+
+    static DistributionTrait hashDistributionFor(
+        const std::string& table,
+        const std::string& partition_key,
+        uint32_t bucket_count,
+        const std::vector<std::string>& workers) {
+        DistributionTrait trait;
+        trait.kind = DistributionKind::HashPartitioned;
+        trait.partition_table = table;
+        trait.partition_key = partition_key;
+        for (uint32_t bucket = 0; bucket < bucket_count; ++bucket) {
+            trait.range_ids.push_back("bucket-" + std::to_string(bucket));
+            if (!workers.empty()) {
+                trait.replica_group_ids.push_back(
+                    workers[bucket % workers.size()]);
+            }
+        }
+        return trait;
+    }
+
+    static DistributionTrait rangeDistributionFor(
+        const std::string& table,
+        const std::vector<RepartitionScanFragment>& fragments) {
+        DistributionTrait trait;
+        trait.kind = DistributionKind::RangePartitioned;
+        trait.partition_table = table;
+        for (const auto& fragment : fragments) {
+            trait.range_ids.push_back(fragment.range_id);
+            trait.replica_group_ids.push_back(fragment.replica_group_id);
+        }
+        return trait;
+    }
+
+    static std::shared_ptr<PhysicalPlanNode> distributedScanNode(
+        const std::string& table,
+        double rows,
+        const DistributionTrait& distribution,
+        const DistributedCost& cost) {
+        auto scan = makePhysicalNode(
+            PhysicalPlanNode::Kind::DISTRIBUTED_RANGE_SCAN);
+        scan->tableName = table;
+        scan->rows = rows;
+        scan->cost = cost.total();
+        scan->distribution = distribution;
+        scan->distributedCost = cost;
+        return scan;
+    }
+
+    std::shared_ptr<PhysicalPlanNode> buildBroadcastJoinPhysicalPlan(
+        const BroadcastJoinPlan& plan,
+        const DistributedRangeReadResult& small_side,
+        const std::vector<JoinFragment>& fragments,
+        const DistributedCost& cost,
+        const std::string& rejected_reason = "") const {
+        DistributionTrait large_distribution =
+            rangeDistributionFor(plan.large_table, fragments);
+        DistributedCost large_scan_cost;
+        large_scan_cost.fragment_count = fragments.size();
+        auto large_scan = distributedScanNode(
+            plan.large_table,
+            static_cast<double>(std::max<size_t>(1, fragments.size())),
+            large_distribution,
+            large_scan_cost);
+
+        DistributionTrait small_distribution;
+        small_distribution.kind = DistributionKind::RangePartitioned;
+        small_distribution.partition_table = plan.small_table;
+        small_distribution.replica_group_ids = small_side.replica_group_ids;
+        small_distribution.range_ids = small_side.range_ids;
+        DistributedCost small_scan_cost;
+        small_scan_cost.remote_bytes = rowsBytes(small_side.rows);
+        small_scan_cost.fragment_count = small_side.range_ids.size();
+        auto small_scan = distributedScanNode(
+            plan.small_table,
+            static_cast<double>(small_side.rows.size()),
+            small_distribution,
+            small_scan_cost);
+
+        auto broadcast = makePhysicalNode(
+            PhysicalPlanNode::Kind::BROADCAST_EXCHANGE, {small_scan});
+        broadcast->tableName = plan.small_table;
+        broadcast->detail = "broadcast " + plan.small_table;
+        broadcast->rows = static_cast<double>(small_side.rows.size());
+        broadcast->distribution.kind = DistributionKind::Replicated;
+        broadcast->distribution.partition_table = plan.small_table;
+        broadcast->distributedCost = cost;
+        broadcast->cost = cost.total();
+
+        auto join = makePhysicalNode(
+            PhysicalPlanNode::Kind::BROADCAST_HASH_JOIN,
+            {large_scan, broadcast});
+        join->tableName = plan.large_table;
+        join->detail = plan.large_table + "." + plan.large_join_column +
+                       "=" + plan.small_table + "." +
+                       plan.small_join_column;
+        join->rows = 1.0;
+        join->distribution = large_distribution;
+        join->distributedCost = cost;
+        join->cost = cost.total();
+
+        auto gather = makePhysicalNode(
+            PhysicalPlanNode::Kind::GATHER_EXCHANGE, {join});
+        gather->detail = "root requires gathered";
+        gather->rows = join->rows;
+        gather->distribution.kind = DistributionKind::Gathered;
+        gather->distributedCost = cost;
+        gather->cost = cost.total();
+        gather->rejectedReason = rejected_reason;
+        return gather;
+    }
+
+    std::shared_ptr<PhysicalPlanNode> buildRepartitionJoinPhysicalPlan(
+        const BroadcastJoinPlan& plan,
+        const std::vector<RepartitionScanFragment>& left_fragments,
+        const std::vector<RepartitionScanFragment>& right_fragments,
+        uint32_t bucket_count,
+        const DistributedCost& cost,
+        const std::string& rejected_reason = "") const {
+        std::vector<std::string> workers = exchangeWorkerGroups();
+        auto left_scan = distributedScanNode(
+            plan.large_table,
+            static_cast<double>(std::max<size_t>(1, left_fragments.size())),
+            rangeDistributionFor(plan.large_table, left_fragments),
+            DistributedCost{});
+        auto right_scan = distributedScanNode(
+            plan.small_table,
+            static_cast<double>(std::max<size_t>(1, right_fragments.size())),
+            rangeDistributionFor(plan.small_table, right_fragments),
+            DistributedCost{});
+
+        auto left_exchange = makePhysicalNode(
+            PhysicalPlanNode::Kind::REPARTITION_EXCHANGE, {left_scan});
+        left_exchange->tableName = plan.large_table;
+        left_exchange->detail =
+            "hash " + plan.large_table + "." + plan.large_join_column;
+        left_exchange->distribution =
+            hashDistributionFor(plan.large_table,
+                                plan.large_join_column,
+                                bucket_count,
+                                workers);
+        left_exchange->distributedCost = cost;
+        left_exchange->cost = cost.total();
+
+        auto right_exchange = makePhysicalNode(
+            PhysicalPlanNode::Kind::REPARTITION_EXCHANGE, {right_scan});
+        right_exchange->tableName = plan.small_table;
+        right_exchange->detail =
+            "hash " + plan.small_table + "." + plan.small_join_column;
+        right_exchange->distribution =
+            hashDistributionFor(plan.small_table,
+                                plan.small_join_column,
+                                bucket_count,
+                                workers);
+        right_exchange->distributedCost = cost;
+        right_exchange->cost = cost.total();
+
+        auto join = makePhysicalNode(
+            PhysicalPlanNode::Kind::REPARTITION_HASH_JOIN,
+            {left_exchange, right_exchange});
+        join->tableName = plan.large_table;
+        join->detail = plan.large_table + "." + plan.large_join_column +
+                       "=" + plan.small_table + "." +
+                       plan.small_join_column;
+        join->distribution =
+            hashDistributionFor(plan.large_table,
+                                plan.large_join_column,
+                                bucket_count,
+                                workers);
+        join->distributedCost = cost;
+        join->cost = cost.total();
+
+        auto gather = makePhysicalNode(
+            PhysicalPlanNode::Kind::GATHER_EXCHANGE, {join});
+        gather->detail = "root requires gathered";
+        gather->distribution.kind = DistributionKind::Gathered;
+        gather->distributedCost = cost;
+        gather->cost = cost.total();
+        gather->rejectedReason = rejected_reason;
+        return gather;
+    }
+
+    std::shared_ptr<PhysicalPlanNode> unsupportedDistributedJoinPlan(
+        const BroadcastJoinPlan& plan,
+        const std::string& reason) const {
+        auto node = makePhysicalNode(
+            PhysicalPlanNode::Kind::UNSUPPORTED_REPARTITION_JOIN);
+        node->tableName = plan.large_table;
+        node->detail = plan.large_table + " join " + plan.small_table;
+        node->distribution.kind = DistributionKind::Unknown;
+        node->rejectedReason = reason;
+        return node;
+    }
+
+    DistributedCost estimateBroadcastJoinCost(
+        const BroadcastJoinPlan& plan,
+        const DistributedRangeReadResult& small_side,
+        const std::vector<JoinFragment>& fragments) const {
+        DistributedCost cost;
+        cost.fragment_count = fragments.size();
+        cost.broadcast_bytes =
+            estimatedTableBytes(plan.small_table, small_side.rows) *
+            std::max<size_t>(1, fragments.size());
+        cost.remote_bytes = rowsBytes(small_side.rows);
+        cost.local_cpu = static_cast<double>(small_side.rows.size()) * 0.05;
+        cost.local_io = static_cast<double>(fragments.size());
+        for (const auto& fragment : fragments) {
+            ReplicaPlacement placement =
+                placementForGroup(fragment.replica_group_id);
+            NetworkLinkCost link =
+                linkCost(coordinator_region_, placement.region);
+            if (link.status != "active" || placement.status == "unavailable") {
+                cost.network_latency_ms += 1000000.0;
+            } else {
+                cost.network_latency_ms += link.rtt_ms;
+                if (link.bandwidth_mb_per_sec > 0) {
+                    double mb = static_cast<double>(
+                        estimatedTableBytes(plan.small_table,
+                                            small_side.rows)) /
+                        (1024.0 * 1024.0);
+                    cost.network_latency_ms +=
+                        (mb / link.bandwidth_mb_per_sec) * 1000.0;
+                }
+            }
+        }
+        return cost;
+    }
+
+    DistributedCost estimateRepartitionJoinCost(
+        const BroadcastJoinPlan& plan,
+        const DistributedRangeReadResult& left_side,
+        const DistributedRangeReadResult& right_side,
+        const std::vector<RepartitionScanFragment>& left_fragments,
+        const std::vector<RepartitionScanFragment>& right_fragments,
+        uint32_t bucket_count) const {
+        DistributedCost cost;
+        cost.scan_fragments = left_fragments.size() + right_fragments.size();
+        cost.exchange_fragments = bucket_count;
+        cost.fragment_count = cost.scan_fragments;
+        cost.repartition_bytes =
+            estimatedTableBytes(plan.large_table, left_side.rows) +
+            estimatedTableBytes(plan.small_table, right_side.rows);
+        cost.remote_bytes = rowsBytes(left_side.rows) + rowsBytes(right_side.rows);
+        cost.local_cpu =
+            static_cast<double>(left_side.rows.size() + right_side.rows.size()) *
+            0.10;
+        cost.local_io =
+            static_cast<double>(left_fragments.size() + right_fragments.size());
+        for (const auto& fragment : left_fragments) {
+            ReplicaPlacement placement =
+                placementForGroup(fragment.replica_group_id);
+            NetworkLinkCost link =
+                linkCost(coordinator_region_, placement.region);
+            cost.network_latency_ms +=
+                link.status == "active" && placement.status != "unavailable"
+                    ? link.rtt_ms
+                    : 1000000.0;
+        }
+        for (const auto& fragment : right_fragments) {
+            ReplicaPlacement placement =
+                placementForGroup(fragment.replica_group_id);
+            NetworkLinkCost link =
+                linkCost(coordinator_region_, placement.region);
+            cost.network_latency_ms +=
+                link.status == "active" && placement.status != "unavailable"
+                    ? link.rtt_ms
+                    : 1000000.0;
+        }
+        return cost;
+    }
+
+    bool fragmentsAllAvailable(
+        const std::vector<JoinFragment>& fragments) const {
+        for (const auto& fragment : fragments) {
+            if (!replicaGroupAvailable(fragment.replica_group_id)) return false;
+        }
+        return true;
+    }
+
+    bool repartitionFragmentsAllAvailable(
+        const std::vector<RepartitionScanFragment>& fragments) const {
+        for (const auto& fragment : fragments) {
+            if (!replicaGroupAvailable(fragment.replica_group_id)) return false;
+        }
+        return true;
+    }
+
+    static std::optional<std::vector<RepartitionBucketResult>>
+    combineRepartitionBuckets(
+        const std::vector<RepartitionScanResult>& scans,
+        QueryId query_id,
+        ExchangeId exchange_id,
+        AttemptId attempt_id,
+        uint32_t bucket_count,
+        const std::string& table,
+        const std::string& join_column) {
+        std::vector<RepartitionBucketResult> buckets;
+        buckets.reserve(bucket_count);
+        for (uint32_t bucket = 0; bucket < bucket_count; ++bucket) {
+            buckets.push_back(
+                RepartitionBucketResult{
+                    true,
+                    ExchangeKey{query_id, exchange_id, BucketId{bucket},
+                                attempt_id},
+                    table,
+                    join_column,
+                    {},
+                    {}});
+        }
+
+        std::set<uint32_t> seen_fragments;
+        for (const auto& scan : scans) {
+            if (!scan.complete ||
+                scan.query_id != query_id ||
+                scan.exchange_id != exchange_id ||
+                scan.attempt_id != attempt_id ||
+                scan.table != table ||
+                !seen_fragments.insert(scan.fragment_id.value).second ||
+                scan.buckets.size() != bucket_count) {
+                return std::nullopt;
+            }
+            for (const auto& bucket : scan.buckets) {
+                if (!bucket.complete ||
+                    bucket.key.query_id != query_id ||
+                    bucket.key.exchange_id != exchange_id ||
+                    bucket.key.attempt_id != attempt_id ||
+                    bucket.key.bucket_id.value >= bucket_count ||
+                    bucket.source_table != table ||
+                    bucket.join_column != join_column) {
+                    return std::nullopt;
+                }
+                auto& combined = buckets[bucket.key.bucket_id.value];
+                if (combined.columns.empty()) {
+                    combined.columns = bucket.columns;
+                } else if (combined.columns != bucket.columns) {
+                    return std::nullopt;
+                }
+                combined.rows.insert(combined.rows.end(),
+                                     bucket.rows.begin(),
+                                     bucket.rows.end());
+            }
+        }
+        return buckets;
+    }
+
+    static std::string distributedMemoCost(double cost) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(2) << cost;
+        return out.str();
+    }
+
+    static std::string distributedScanMemoProperty(
+        const std::string& table) {
+        return "tables={" + table + "}; distribution=range";
+    }
+
+    static std::string distributedJoinMemoProperty(
+        const BroadcastJoinPlan& plan) {
+        std::vector<std::string> tables{plan.large_table, plan.small_table};
+        std::sort(tables.begin(), tables.end());
+        return "tables={" + tables[0] + "," + tables[1] +
+               "}; join=" + plan.large_table + "." +
+               plan.large_join_column + "=" + plan.small_table +
+               "." + plan.small_join_column + "; distribution=gathered";
+    }
+
+    static void annotateDistributedPlannerMemo(
+        PlannedDistributedJoin& selected,
+        const BroadcastJoinPlan& parsed,
+        const std::vector<PlannedDistributedJoin>& candidates) {
+        Memo memo;
+        GroupId root_group =
+            memo.internGroup(distributedJoinMemoProperty(parsed));
+        memo.setFinalGroupId(root_group);
+
+        std::vector<std::string> lines;
+        for (const auto& candidate : candidates) {
+            GroupId large_group =
+                memo.internGroup(
+                    distributedScanMemoProperty(candidate.plan.large_table));
+            GroupId small_group =
+                memo.internGroup(
+                    distributedScanMemoProperty(candidate.plan.small_table));
+            memo.addExpressionToGroup(
+                large_group,
+                makeMemoExpression(
+                    "DistributedRangeScan",
+                    {},
+                    {candidate.plan.large_table}));
+            memo.addExpressionToGroup(
+                small_group,
+                makeMemoExpression(
+                    "DistributedRangeScan",
+                    {},
+                    {candidate.plan.small_table}));
+
+            std::string expression =
+                candidate.physical_plan
+                    ? physicalPlanExpression(candidate.physical_plan)
+                    : "RejectedDistributedJoin";
+            std::vector<std::string> details{
+                "strategy=" + candidate.strategy,
+                "left=" + candidate.plan.large_table,
+                "right=" + candidate.plan.small_table,
+                "cost=" + distributedMemoCost(candidate.cost.total())};
+            if (candidate.strategy == "broadcast") {
+                details.push_back("broadcast=" + candidate.plan.small_table);
+            } else if (candidate.strategy == "repartition") {
+                details.push_back(
+                    "buckets=" + std::to_string(candidate.bucket_count));
+            }
+            if (candidate.executable) {
+                details.push_back("executable");
+            } else {
+                details.push_back("rejected=" + candidate.rejected_reason);
+            }
+            memo.addExpressionToGroup(
+                root_group,
+                makeMemoExpression(
+                    candidate.executable
+                        ? (candidate.strategy == "repartition"
+                               ? "RepartitionHashJoin"
+                               : "BroadcastHashJoin")
+                        : "RejectedDistributedJoin",
+                    {large_group, small_group},
+                    details));
+
+            lines.push_back(
+                "distributed memo alternative " + expression +
+                " cost=" + distributedMemoCost(candidate.cost.total()) +
+                (candidate.executable ? " executable"
+                                      : " rejected=" +
+                                            candidate.rejected_reason));
+        }
+
+        selected.planner_memo_groups = memo.groupCount();
+        selected.planner_memo_expressions = memo.expressionCount();
+        selected.planner_winner_expression =
+            selected.physical_plan
+                ? physicalPlanExpression(selected.physical_plan)
+                : "RejectedDistributedJoin";
+        memo.setWinner(root_group,
+                       MemoWinner{
+                           "distribution=gathered",
+                           selected.planner_winner_expression,
+                           selected.cost.total()});
+        lines.push_back(
+            "distributed memo winner " +
+            selected.planner_winner_expression +
+            " cost=" + distributedMemoCost(selected.cost.total()));
+        selected.planner_memo_lines = std::move(lines);
+    }
+
+    PlannedDistributedJoin planBroadcastCandidate(
+        const BroadcastJoinPlan& plan,
+        size_t broadcast_row_limit,
+        const HybridLogicalTimestamp& read_ts) {
+        PlannedDistributedJoin candidate;
+        candidate.parsed = true;
+        candidate.plan = plan;
+        candidate.read_ts = read_ts;
+        if (!plan.predicate_table.empty() &&
+            plan.predicate_table != plan.large_table) {
+            candidate.unsupported = true;
+            candidate.rejected_reason = "predicate_on_broadcast_side";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+        if (broadcast_row_limit == 0) {
+            candidate.unsupported = true;
+            candidate.rejected_reason = "repartition_required";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+
+        candidate.small_side =
+            readTableRange(plan.small_table, "", "", read_ts);
+        if (!candidate.small_side.complete) {
+            candidate.rejected_reason = "broadcast_side_unavailable";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+        if (candidate.small_side.rows.size() > broadcast_row_limit) {
+            candidate.unsupported = true;
+            candidate.rejected_reason = "broadcast_over_limit";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+
+        candidate.fragments =
+            planBroadcastJoinFragments(plan,
+                                       read_ts,
+                                       candidate.small_side.columns,
+                                       candidate.small_side.rows);
+        if (candidate.fragments.empty()) {
+            candidate.rejected_reason = "missing_scan_fragments";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+        candidate.cost =
+            estimateBroadcastJoinCost(plan,
+                                      candidate.small_side,
+                                      candidate.fragments);
+        candidate.physical_plan =
+            buildBroadcastJoinPhysicalPlan(plan,
+                                           candidate.small_side,
+                                           candidate.fragments,
+                                           candidate.cost);
+        if (!fragmentsAllAvailable(candidate.fragments)) {
+            candidate.rejected_reason = "owner_unavailable";
+            candidate.physical_plan->rejectedReason =
+                candidate.rejected_reason;
+            return candidate;
+        }
+        candidate.executable = true;
+        return candidate;
+    }
+
+    PlannedDistributedJoin planRepartitionCandidate(
+        const BroadcastJoinPlan& plan,
+        const HybridLogicalTimestamp& read_ts,
+        uint32_t bucket_count = 4) {
+        PlannedDistributedJoin candidate;
+        candidate.parsed = true;
+        candidate.executable = false;
+        candidate.strategy = "repartition";
+        candidate.plan = plan;
+        candidate.read_ts = read_ts;
+        candidate.typed_query_id =
+            typedQueryIdFor("repartition|" + plan.sql + "|" +
+                            std::to_string(read_ts.physical) + "." +
+                            std::to_string(read_ts.logical));
+        candidate.exchange_id = ExchangeId{1};
+        candidate.bucket_count = bucket_count;
+
+        std::vector<std::string> workers = exchangeWorkerGroups();
+        if (workers.empty()) {
+            candidate.rejected_reason = "no_exchange_workers";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+
+        candidate.left_side =
+            readTableRange(plan.large_table, "", "", read_ts);
+        candidate.right_side =
+            readTableRange(plan.small_table, "", "", read_ts);
+        if (!candidate.left_side.complete ||
+            !candidate.right_side.complete) {
+            candidate.rejected_reason = "repartition_side_unavailable";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+
+        candidate.left_repartition_fragments =
+            planRepartitionScanFragments(
+                candidate.typed_query_id,
+                candidate.exchange_id,
+                plan.large_table,
+                plan.large_join_column,
+                plan.predicate_table,
+                plan.predicate_column,
+                plan.predicate_value,
+                bucket_count,
+                read_ts);
+        candidate.right_repartition_fragments =
+            planRepartitionScanFragments(
+                candidate.typed_query_id,
+                candidate.exchange_id,
+                plan.small_table,
+                plan.small_join_column,
+                plan.predicate_table,
+                plan.predicate_column,
+                plan.predicate_value,
+                bucket_count,
+                read_ts);
+        if (candidate.left_repartition_fragments.empty() ||
+            candidate.right_repartition_fragments.empty()) {
+            candidate.rejected_reason = "missing_repartition_fragments";
+            candidate.physical_plan =
+                unsupportedDistributedJoinPlan(plan,
+                                               candidate.rejected_reason);
+            return candidate;
+        }
+        candidate.cost =
+            estimateRepartitionJoinCost(
+                plan,
+                candidate.left_side,
+                candidate.right_side,
+                candidate.left_repartition_fragments,
+                candidate.right_repartition_fragments,
+                bucket_count);
+        candidate.physical_plan =
+            buildRepartitionJoinPhysicalPlan(
+                plan,
+                candidate.left_repartition_fragments,
+                candidate.right_repartition_fragments,
+                bucket_count,
+                candidate.cost);
+        if (!repartitionFragmentsAllAvailable(
+                candidate.left_repartition_fragments) ||
+            !repartitionFragmentsAllAvailable(
+                candidate.right_repartition_fragments)) {
+            candidate.rejected_reason = "owner_unavailable";
+            candidate.physical_plan->rejectedReason =
+                candidate.rejected_reason;
+            return candidate;
+        }
+        candidate.executable = true;
+        return candidate;
+    }
+
+    PlannedDistributedJoin planDistributedJoin(
+        const std::string& sql,
+        size_t broadcast_row_limit,
+        const HybridLogicalTimestamp& read_ts) {
+        PlannedDistributedJoin failed;
+        failed.read_ts = read_ts;
+        BroadcastJoinPlan parsed;
+        try {
+            parsed = parseBroadcastJoin(sql);
+        } catch (const std::exception&) {
+            failed.unsupported = true;
+            failed.rejected_reason = "unsupported_join_shape";
+            return failed;
+        }
+
+        std::vector<BroadcastJoinPlan> alternatives{
+            parsed,
+            reversedBroadcastPlan(parsed)};
+        std::vector<PlannedDistributedJoin> candidates;
+        const size_t none = std::numeric_limits<size_t>::max();
+        size_t best_index = none;
+        size_t rejection_index = none;
+        for (const auto& alternative : alternatives) {
+            candidates.push_back(
+                planBroadcastCandidate(alternative,
+                                       broadcast_row_limit,
+                                       read_ts));
+            const PlannedDistributedJoin& candidate = candidates.back();
+            if (!candidate.executable) {
+                if (rejection_index == none) {
+                    rejection_index = candidates.size() - 1;
+                }
+                continue;
+            }
+            if (best_index == none ||
+                candidate.cost.total() <
+                    candidates[best_index].cost.total()) {
+                best_index = candidates.size() - 1;
+            }
+        }
+        candidates.push_back(
+            planRepartitionCandidate(parsed, read_ts, 4));
+        const PlannedDistributedJoin& repartition = candidates.back();
+        if (!repartition.executable) {
+            if (rejection_index == none) {
+                rejection_index = candidates.size() - 1;
+            }
+        } else if (best_index == none ||
+                   repartition.cost.total() <
+                       candidates[best_index].cost.total()) {
+            best_index = candidates.size() - 1;
+        }
+
+        if (best_index != none) {
+            PlannedDistributedJoin selected = candidates[best_index];
+            annotateDistributedPlannerMemo(selected, parsed, candidates);
+            return selected;
+        }
+        if (rejection_index != none) {
+            PlannedDistributedJoin selected = candidates[rejection_index];
+            annotateDistributedPlannerMemo(selected, parsed, candidates);
+            return selected;
+        }
+
+        failed.parsed = true;
+        failed.plan = parsed;
+        failed.unsupported = true;
+        failed.rejected_reason = "repartition_required";
+        failed.physical_plan =
+            unsupportedDistributedJoinPlan(parsed, failed.rejected_reason);
+        annotateDistributedPlannerMemo(failed, parsed, {});
+        return failed;
+    }
+
+    static void attachDistributedPlan(
+        DistributedJoinResult& result,
+        const PlannedDistributedJoin& planned) {
+        result.unsupported = planned.unsupported;
+        result.rejected_reason = planned.rejected_reason;
+        result.physical_plan = planned.physical_plan;
+        result.distributed_cost = planned.cost;
+        result.planner_memo_groups = planned.planner_memo_groups;
+        result.planner_memo_expressions = planned.planner_memo_expressions;
+        result.planner_winner_expression =
+            planned.planner_winner_expression;
+        if (planned.parsed) {
+            if (!planned.executable) {
+                result.join_strategy = "cascades:rejected";
+            } else if (planned.strategy == "repartition") {
+                result.join_strategy =
+                    "cascades:repartition_hash(buckets=" +
+                    std::to_string(planned.bucket_count) + ")";
+            } else {
+                result.join_strategy =
+                    "cascades:broadcast(" + planned.plan.small_table + ")";
+            }
+        } else {
+            result.join_strategy = "cascades:rejected";
+        }
+        if (planned.physical_plan) {
+            std::vector<std::string> physical_lines;
+            std::stringstream tree(physicalPlanTreeString(
+                planned.physical_plan));
+            std::string line;
+            while (std::getline(tree, line)) {
+                if (!line.empty()) physical_lines.push_back(line);
+            }
+            if (planned.planner_memo_expressions > 0) {
+                physical_lines.push_back(
+                    "distributed memo groups=" +
+                    std::to_string(planned.planner_memo_groups) +
+                    " expressions=" +
+                    std::to_string(planned.planner_memo_expressions));
+                physical_lines.insert(physical_lines.end(),
+                                      planned.planner_memo_lines.begin(),
+                                      planned.planner_memo_lines.end());
+            }
+            physical_lines.insert(physical_lines.end(),
+                                  result.explain_lines.begin(),
+                                  result.explain_lines.end());
+            result.explain_lines = std::move(physical_lines);
+        }
+    }
+
+    static std::string trimJoinToken(const std::string& input) {
+        size_t begin = 0;
+        while (begin < input.size() &&
+               std::isspace(static_cast<unsigned char>(input[begin]))) {
+            ++begin;
+        }
+        size_t end = input.size();
+        while (end > begin &&
+               std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+            --end;
+        }
+        return input.substr(begin, end - begin);
+    }
+
+    static std::vector<std::string> splitJoinProjectionList(
+        const std::string& projections) {
+        std::vector<std::string> parts;
+        std::stringstream stream(projections);
+        std::string token;
+        while (std::getline(stream, token, ',')) {
+            std::string trimmed = trimJoinToken(token);
+            if (!trimmed.empty()) parts.push_back(trimmed);
+        }
+        return parts;
+    }
+
+    static std::pair<std::string, std::string> parseQualifiedColumn(
+        const std::string& value) {
+        size_t separator = value.find('.');
+        if (separator == std::string::npos ||
+            separator == 0 ||
+            separator + 1 >= value.size()) {
+            throw std::runtime_error("expected qualified column");
+        }
+        return {value.substr(0, separator),
+                value.substr(separator + 1)};
+    }
+
+    static BroadcastJoinPlan parseBroadcastJoin(const std::string& sql) {
+        std::smatch matches;
+        std::regex join_regex(
+            "^\\s*(?:SELECT|PROJECT)\\s+(.+)\\s+FROM\\s+"
+            "([A-Za-z_][A-Za-z0-9_]*)\\s+JOIN\\s+"
+            "([A-Za-z_][A-Za-z0-9_]*)\\s+ON\\s+"
+            "([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*"
+            "([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)"
+            "(?:\\s+WHERE\\s+\\{?([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}?\\s*=\\s*([^\\s]+))?\\s*$",
+            std::regex_constants::icase);
+        if (!std::regex_match(sql, matches, join_regex)) {
+            throw std::runtime_error("unsupported distributed join SQL");
+        }
+
+        BroadcastJoinPlan plan;
+        plan.sql = sql;
+        plan.large_table = matches[2];
+        plan.small_table = matches[3];
+        if (plan.large_table == plan.small_table) {
+            throw std::runtime_error("self joins need aliases/repartitioning");
+        }
+
+        std::string join_left_table = matches[4];
+        std::string join_left_column = matches[5];
+        std::string join_right_table = matches[6];
+        std::string join_right_column = matches[7];
+        if (join_left_table == plan.large_table &&
+            join_right_table == plan.small_table) {
+            plan.large_join_column = join_left_column;
+            plan.small_join_column = join_right_column;
+        } else if (join_left_table == plan.small_table &&
+                   join_right_table == plan.large_table) {
+            plan.large_join_column = join_right_column;
+            plan.small_join_column = join_left_column;
+        } else {
+            throw std::runtime_error("join predicate tables mismatch");
+        }
+
+        if (matches[8].matched) {
+            plan.predicate_table = matches[8];
+            plan.predicate_column = matches[9];
+            plan.predicate_value = matches[10];
+            if (plan.predicate_table != plan.large_table) {
+                throw std::runtime_error(
+                    "v150 pushes predicates only to the scan side");
+            }
+        }
+
+        for (const auto& projection :
+             splitJoinProjectionList(matches[1])) {
+            auto [table, column] = parseQualifiedColumn(projection);
+            if (table != plan.large_table && table != plan.small_table) {
+                throw std::runtime_error("projection table outside join");
+            }
+            plan.projection_tables.push_back(std::move(table));
+            plan.projection_columns.push_back(std::move(column));
+        }
+        if (plan.projection_tables.empty()) {
+            throw std::runtime_error("missing join projection");
+        }
+        return plan;
+    }
+
+    std::vector<JoinFragment> planBroadcastJoinFragments(
+        const BroadcastJoinPlan& plan,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<std::string>& small_columns,
+        const std::vector<std::vector<std::string>>& small_rows) {
+        Result ownership_result =
+            catalog_(Command{ReadRangeOwnershipCommand{
+                plan.large_table, true}});
+        const auto* ownership = std::get_if<SelectAllResult>(&ownership_result);
+        if (ownership == nullptr) return {};
+
+        std::vector<ReadRangeFragment> active_ranges;
+        for (const auto& row : ownership->rows) {
+            auto table_name = valueAt(*ownership, row, "table_name");
+            auto index_name = valueAt(*ownership, row, "index_name");
+            auto range_id = valueAt(*ownership, row, "range_id");
+            auto range_start = valueAt(*ownership, row, "start_key");
+            auto range_end = valueAt(*ownership, row, "end_key");
+            auto replica_group_id =
+                valueAt(*ownership, row, "replica_group_id");
+            auto owner_version = valueAt(*ownership, row, "owner_version");
+            auto status = valueAt(*ownership, row, "status");
+            if (!table_name.has_value() ||
+                *table_name != plan.large_table ||
+                !index_name.has_value() || *index_name != "primary" ||
+                !range_id.has_value() || !range_start.has_value() ||
+                !range_end.has_value() || !replica_group_id.has_value() ||
+                !owner_version.has_value() || !status.has_value() ||
+                *status != "active") {
+                continue;
+            }
+            active_ranges.push_back(
+                ReadRangeFragment{
+                    *range_id,
+                    *range_start,
+                    *range_end,
+                    *replica_group_id,
+                    std::stoi(*owner_version)});
+        }
+        sortReadRanges(active_ranges);
+
+        std::vector<JoinFragment> fragments;
+        std::string query_id =
+            queryIdFor("join|" + plan.sql, "", "", read_ts);
+        for (const auto& range : active_ranges) {
+            fragments.push_back(
+                JoinFragment{
+                    query_id,
+                    fragments.size(),
+                    1,
+                    plan.sql,
+                    plan.large_table,
+                    plan.small_table,
+                    plan.large_join_column,
+                    plan.small_join_column,
+                    range.range_id,
+                    range.replica_group_id,
+                    range.start_key,
+                    range.end_key,
+                    plan.predicate_table,
+                    plan.predicate_column,
+                    plan.predicate_value,
+                    small_columns,
+                    small_rows,
+                    plan.projection_tables,
+                    plan.projection_columns,
+                    read_ts});
+        }
+        return fragments;
+    }
+
+    std::vector<RepartitionScanFragment> planRepartitionScanFragments(
+        QueryId query_id,
+        ExchangeId exchange_id,
+        const std::string& table,
+        const std::string& join_column,
+        const std::string& predicate_table,
+        const std::string& predicate_column,
+        const std::string& predicate_value,
+        uint32_t bucket_count,
+        const HybridLogicalTimestamp& read_ts) {
+        Result ownership_result =
+            catalog_(Command{ReadRangeOwnershipCommand{table, true}});
+        const auto* ownership = std::get_if<SelectAllResult>(&ownership_result);
+        if (ownership == nullptr) return {};
+
+        std::vector<ReadRangeFragment> active_ranges;
+        for (const auto& row : ownership->rows) {
+            auto table_name = valueAt(*ownership, row, "table_name");
+            auto index_name = valueAt(*ownership, row, "index_name");
+            auto range_id = valueAt(*ownership, row, "range_id");
+            auto range_start = valueAt(*ownership, row, "start_key");
+            auto range_end = valueAt(*ownership, row, "end_key");
+            auto replica_group_id =
+                valueAt(*ownership, row, "replica_group_id");
+            auto owner_version = valueAt(*ownership, row, "owner_version");
+            auto status = valueAt(*ownership, row, "status");
+            if (!table_name.has_value() || *table_name != table ||
+                !index_name.has_value() || *index_name != "primary" ||
+                !range_id.has_value() || !range_start.has_value() ||
+                !range_end.has_value() || !replica_group_id.has_value() ||
+                !owner_version.has_value() || !status.has_value() ||
+                *status != "active") {
+                continue;
+            }
+            active_ranges.push_back(
+                ReadRangeFragment{
+                    *range_id,
+                    *range_start,
+                    *range_end,
+                    *replica_group_id,
+                    std::stoi(*owner_version)});
+        }
+        sortReadRanges(active_ranges);
+
+        std::vector<RepartitionScanFragment> fragments;
+        for (const auto& range : active_ranges) {
+            fragments.push_back(
+                RepartitionScanFragment{
+                    query_id,
+                    exchange_id,
+                    FragmentId{
+                        static_cast<uint32_t>(fragments.size())},
+                    AttemptId{1},
+                    table,
+                    join_column,
+                    range.range_id,
+                    range.replica_group_id,
+                    range.start_key,
+                    range.end_key,
+                    predicate_table == table ? predicate_column : "",
+                    predicate_table == table ? predicate_value : "",
+                    bucket_count,
+                    read_ts});
+        }
+        return fragments;
+    }
+
+    static std::vector<std::string> explainLinesFor(
+        const std::vector<JoinFragment>& fragments) {
+        std::vector<std::string> lines;
+        for (const auto& fragment : fragments) {
+            std::ostringstream line;
+            line << "join fragment " << fragment.fragment_id
+                 << " range=" << fragment.range_id
+                 << " group=" << fragment.replica_group_id
+                 << " broadcast_rows=" << fragment.small_rows.size()
+                 << " [" << fragment.start_key << ", "
+                 << fragment.end_key << ")";
+            if (!fragment.predicate_column.empty()) {
+                line << " predicate=" << fragment.predicate_table
+                     << "." << fragment.predicate_column
+                     << "=" << fragment.predicate_value;
+            }
+            if (!fragment.read_ts.isZero()) {
+                line << " read_ts=" << hlcToString(fragment.read_ts);
+            }
+            lines.push_back(line.str());
+        }
+        return lines;
+    }
+
+    static DistributedJoinResult baseJoinResult(
+        const BroadcastJoinPlan& plan,
+        const HybridLogicalTimestamp& read_ts,
+        const std::vector<JoinFragment>& fragments) {
+        DistributedJoinResult result;
+        result.sql = plan.sql;
+        result.query_id = fragments.empty()
+                              ? queryIdFor("join|" + plan.sql, "", "",
+                                           read_ts)
+                              : fragments.front().query_id;
+        result.read_ts = read_ts;
+        result.fragments = fragments;
+        result.explain_lines = explainLinesFor(fragments);
+        for (size_t i = 0; i < plan.projection_tables.size(); ++i) {
+            result.columns.push_back(plan.projection_tables[i] + "." +
+                                     plan.projection_columns[i]);
+        }
         return result;
     }
 
@@ -15102,6 +18306,11 @@ private:
 
     Executor catalog_;
     std::map<std::string, Executor> replica_groups_;
+    std::string coordinator_region_ = "local";
+    std::map<std::string, ReplicaPlacement> replica_placement_;
+    std::map<std::pair<std::string, std::string>, NetworkLinkCost>
+        network_links_;
+    std::map<std::string, PlannerTableStats> planner_table_stats_;
     bool control_plane_leader_ = true;
     int txn_timeout_ticks_ = 3;
     int metadata_retention_ticks_ = 2;
@@ -15573,20 +18782,51 @@ RouteResult routeResultFor(const std::string& start_key,
 class BuzzDBCore {
 public:
     BuzzDBCore()
-        : database_file_(makeScratchBuzzDBFile()), owns_bundle_(true) {
+        : database_file_(makeScratchBuzzDBFile()),
+          node_id_(nextComputeNodeId()),
+          storage_context_(attachStorageContextForDatabaseFile(
+              database_file_,
+              node_id_,
+              AttachMode::ReadWrite)),
+          owns_bundle_(true),
+          owns_lease_(true) {
         open();
     }
 
     explicit BuzzDBCore(std::string database_file)
         : database_file_(std::filesystem::absolute(database_file).string()),
-          owns_bundle_(false) {
+          node_id_(nextComputeNodeId()),
+          storage_context_(attachStorageContextForDatabaseFile(
+              database_file_,
+              node_id_,
+              AttachMode::ReadWrite)),
+          owns_bundle_(false),
+          owns_lease_(true) {
+        std::filesystem::create_directories(std::filesystem::path(database_file_).parent_path());
+        open();
+    }
+
+    BuzzDBCore(std::string database_file,
+               StorageContext storage_context,
+               bool owns_bundle = false)
+        : database_file_(std::filesystem::absolute(database_file).string()),
+          node_id_(storage_context.lease.holder),
+          storage_context_(std::move(storage_context)),
+          owns_bundle_(owns_bundle),
+          owns_lease_(false) {
         std::filesystem::create_directories(std::filesystem::path(database_file_).parent_path());
         open();
     }
 
     BuzzDBCore(const BuzzDBCore& other)
         : database_file_(makeScratchBuzzDBFile()),
-          owns_bundle_(true) {
+          node_id_(nextComputeNodeId()),
+          storage_context_(attachStorageContextForDatabaseFile(
+              database_file_,
+              node_id_,
+              AttachMode::ReadWrite)),
+          owns_bundle_(true),
+          owns_lease_(true) {
         std::ostringstream sink;
         auto* old_buffer = std::cout.rdbuf(sink.rdbuf());
         try {
@@ -15602,9 +18842,16 @@ public:
 
     BuzzDBCore& operator=(const BuzzDBCore& other) {
         if (this == &other) return *this;
+        cleanupOwnedLease();
         cleanupOwnedBundle();
         database_file_ = makeScratchBuzzDBFile();
+        node_id_ = nextComputeNodeId();
+        storage_context_ = attachStorageContextForDatabaseFile(
+            database_file_,
+            node_id_,
+            AttachMode::ReadWrite);
         owns_bundle_ = true;
+        owns_lease_ = true;
         std::ostringstream sink;
         auto* old_buffer = std::cout.rdbuf(sink.rdbuf());
         try {
@@ -15619,7 +18866,10 @@ public:
         return *this;
     }
 
-    ~BuzzDBCore() { cleanupOwnedBundle(); }
+    ~BuzzDBCore() {
+        cleanupOwnedLease();
+        cleanupOwnedBundle();
+    }
 
     Result execute(const Command& command) {
         ScopedBuzzDBFileBundle scope(database_file_);
@@ -15634,6 +18884,9 @@ public:
             if (message.find("No table found") != std::string::npos ||
                 message.find("Unknown table") != std::string::npos) {
                 return TableNotFoundResult{};
+            }
+            if (message.find("compute write lease") != std::string::npos) {
+                return ConfigRejectedResult{};
             }
             if (message.find("schema") != std::string::npos ||
                 message.find("Wrong field count") != std::string::npos ||
@@ -15766,6 +19019,11 @@ public:
     void recover() {
         ScopedBuzzDBFileBundle scope(database_file_);
         db_->recovery_manager.recover();
+    }
+
+    void flushForDetach() {
+        ScopedBuzzDBFileBundle scope(database_file_);
+        if (db_) db_->buffer_manager.flushAllPages("compute detach");
     }
 
     void bootstrapJobDatabase(const std::string& data_file,
@@ -15915,9 +19173,17 @@ private:
         std::filesystem::remove_all(std::filesystem::path(database_file_).parent_path(), ec);
     }
 
+    void cleanupOwnedLease() {
+        if (!owns_lease_ || !storage_context_.storage) return;
+        storage_context_.storage->detachCompute(
+            storage_context_.namespace_id,
+            storage_context_.lease);
+        owns_lease_ = false;
+    }
+
     void open() {
         ScopedBuzzDBFileBundle scope(database_file_);
-        db_ = std::make_unique<BuzzDB>();
+        db_ = std::make_unique<BuzzDB>(storage_context_);
         secondary_index_cache_.clear();
     }
 
@@ -18330,6 +21596,121 @@ private:
         return true;
     }
 
+    static bool endKeyCovers(const std::string& owner_end,
+                             const std::string& requested_end) {
+        if (requested_end.empty()) return owner_end.empty();
+        if (owner_end.empty()) return true;
+        return requested_end <= owner_end;
+    }
+
+    static bool descriptorCoversRequest(const RangeDescriptor& descriptor,
+                                        const std::string& start_key,
+                                        const std::string& end_key) {
+        if (!start_key.empty() && start_key < descriptor.start_key) {
+            return false;
+        }
+        return endKeyCovers(descriptor.end_key, end_key);
+    }
+
+    bool locallyOwnsActiveRange(const std::string& table,
+                                const std::string& range_id,
+                                const std::string& replica_group_id,
+                                const std::string& start_key,
+                                const std::string& end_key) {
+        if (range_id.empty()) return false;
+        if (isSystemCatalogTable(table)) return true;
+        ensureSystemCatalogTables();
+        auto descriptor = latestRangeDescriptorById(range_id);
+        if (descriptor.has_value() && descriptor->status == "active" &&
+            (replica_group_id.empty() ||
+             descriptor->replica_group_id == replica_group_id) &&
+            descriptorCoversRequest(*descriptor, start_key, end_key)) {
+            return true;
+        }
+        if (replica_group_id.empty()) return false;
+
+        for (const auto& covering :
+             latestActiveRangeDescriptors(rangeDescriptors())) {
+            if (covering.replica_group_id == replica_group_id &&
+                descriptorCoversRequest(covering, start_key, end_key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void appendLocalRangeOwnership(const std::string& table,
+                                   const std::string& range_id,
+                                   const std::string& replica_group_id,
+                                   const std::string& start_key,
+                                   const std::string& end_key,
+                                   const std::string& status) {
+        if (range_id.empty() ||
+            isSystemCatalogTable(table) ||
+            replica_group_id.empty()) {
+            return;
+        }
+        auto previous = latestRangeDescriptorById(range_id);
+        int descriptor_version =
+            std::max(latestRangeConfigNumber() + 1,
+                     previous.has_value()
+                         ? previous->descriptor_version + 1
+                         : 1);
+        insertSystemCatalogRows({
+            InsertRowCommand{
+                "__ranges",
+                {range_id,
+                 start_key,
+                 end_key,
+                 replica_group_id,
+                 std::to_string(descriptor_version),
+                 status}},
+            rangeOwnershipCatalogRow(table,
+                                     range_id,
+                                     start_key,
+                                     end_key,
+                                     replica_group_id,
+                                     descriptor_version,
+                                     status)});
+    }
+
+    void installLocalRangeOwnership(const std::string& table,
+                                    const std::string& range_id,
+                                    const std::string& replica_group_id,
+                                    const std::string& start_key,
+                                    const std::string& end_key) {
+        if (locallyOwnsActiveRange(table,
+                                   range_id,
+                                   replica_group_id,
+                                   start_key,
+                                   end_key)) {
+            return;
+        }
+        appendLocalRangeOwnership(table,
+                                  range_id,
+                                  replica_group_id,
+                                  start_key,
+                                  end_key,
+                                  "active");
+    }
+
+    void retireLocalRangeOwnership(const std::string& table,
+                                   const std::string& range_id,
+                                   const std::string& start_key,
+                                   const std::string& end_key) {
+        if (range_id.empty() || isSystemCatalogTable(table)) return;
+        auto descriptor = latestRangeDescriptorById(range_id);
+        if (!descriptor.has_value() || descriptor->status != "active") return;
+        appendLocalRangeOwnership(table,
+                                  range_id,
+                                  descriptor->replica_group_id,
+                                  start_key.empty() ? descriptor->start_key
+                                                    : start_key,
+                                  end_key.empty() ? descriptor->end_key
+                                                 : end_key,
+                                  "retired");
+    }
+
     void appendDistributedTxnPhase(
         const std::string& txn_id,
         const std::string& status,
@@ -19619,6 +23000,10 @@ private:
                 executeOne(DeleteRowsCommand{"__range_client_sessions",
                                              "range_id",
                                              command.range_id});
+                retireLocalRangeOwnership(command.table,
+                                          command.range_id,
+                                          command.start_key,
+                                          command.end_key);
                 return *count;
             }
             return result;
@@ -19651,6 +23036,10 @@ private:
         executeOne(DeleteRowsCommand{"__range_client_sessions",
                                      "range_id",
                                      command.range_id});
+        retireLocalRangeOwnership(command.table,
+                                  command.range_id,
+                                  command.start_key,
+                                  command.end_key);
         return DeleteRowsResult{deleted};
     }
 
@@ -19665,6 +23054,11 @@ private:
                                    command.start_key,
                                    command.end_key});
         if (!std::holds_alternative<DeleteRowsResult>(cleared)) return cleared;
+        installLocalRangeOwnership(command.table,
+                                   command.range_id,
+                                   command.target_replica_group_id,
+                                   command.start_key,
+                                   command.end_key);
 
         std::vector<std::string> columns = columnNames(command.table);
         auto range_column = columnIndex(columns, "range_id");
@@ -19853,6 +23247,13 @@ private:
 
     Result executeOne(const RangeReadCommand& command) {
         if (!tableExists(command.table)) return TableNotFoundResult{};
+        if (!locallyOwnsActiveRange(command.table,
+                                    command.range_id,
+                                    command.replica_group_id,
+                                    command.start_key,
+                                    command.end_key)) {
+            return RouteRejectedResult{};
+        }
         try {
             SelectAllResult all =
                 command.read_ts.isZero()
@@ -19879,6 +23280,13 @@ private:
         const QueryFragment& fragment = command.fragment;
         if (!tableExists(fragment.table) || fragment.range_id.empty()) {
             return TableNotFoundResult{};
+        }
+        if (!locallyOwnsActiveRange(fragment.table,
+                                    fragment.range_id,
+                                    fragment.replica_group_id,
+                                    fragment.start_key,
+                                    fragment.end_key)) {
+            return RouteRejectedResult{};
         }
         try {
             SelectAllResult all =
@@ -19950,6 +23358,435 @@ private:
         } catch (const std::exception&) {
             return SchemaMismatchResult{};
         }
+    }
+
+    Result executeOne(const ExecuteJoinFragmentCommand& command) {
+        const JoinFragment& fragment = command.fragment;
+        if (!tableExists(fragment.large_table) ||
+            fragment.range_id.empty()) {
+            return TableNotFoundResult{};
+        }
+        if (!locallyOwnsActiveRange(fragment.large_table,
+                                    fragment.range_id,
+                                    fragment.replica_group_id,
+                                    fragment.start_key,
+                                    fragment.end_key)) {
+            return RouteRejectedResult{};
+        }
+        try {
+            SelectAllResult large =
+                fragment.read_ts.isZero()
+                    ? selectAll(fragment.large_table)
+                    : selectAllAt(fragment.large_table,
+                                  fragment.read_ts);
+            auto large_join_column =
+                columnIndex(large.columns, fragment.large_join_column);
+            auto small_join_column =
+                columnIndex(fragment.small_columns,
+                            fragment.small_join_column);
+            if (!large_join_column.has_value() ||
+                !small_join_column.has_value()) {
+                return SchemaMismatchResult{};
+            }
+
+            std::optional<size_t> predicate_column;
+            if (!fragment.predicate_column.empty()) {
+                if (fragment.predicate_table != fragment.large_table) {
+                    return SchemaMismatchResult{};
+                }
+                predicate_column =
+                    columnIndex(large.columns,
+                                fragment.predicate_column);
+                if (!predicate_column.has_value()) {
+                    return SchemaMismatchResult{};
+                }
+            }
+
+            struct ProjectionIndex {
+                bool large_side = true;
+                size_t column = 0;
+            };
+            std::vector<ProjectionIndex> projection_indexes;
+            std::vector<std::string> output_columns;
+            for (size_t i = 0;
+                 i < fragment.projection_tables.size();
+                 ++i) {
+                const std::string& table =
+                    fragment.projection_tables[i];
+                const std::string& column =
+                    fragment.projection_columns[i];
+                if (table == fragment.large_table) {
+                    auto index = columnIndex(large.columns, column);
+                    if (!index.has_value()) {
+                        return SchemaMismatchResult{};
+                    }
+                    projection_indexes.push_back(
+                        ProjectionIndex{true, *index});
+                } else if (table == fragment.small_table) {
+                    auto index = columnIndex(fragment.small_columns,
+                                             column);
+                    if (!index.has_value()) {
+                        return SchemaMismatchResult{};
+                    }
+                    projection_indexes.push_back(
+                        ProjectionIndex{false, *index});
+                } else {
+                    return SchemaMismatchResult{};
+                }
+                output_columns.push_back(table + "." + column);
+            }
+
+            JoinFragmentResult result;
+            result.complete = true;
+            result.query_id = fragment.query_id;
+            result.fragment_id = fragment.fragment_id;
+            result.attempt_id = fragment.attempt_id;
+            result.range_id = fragment.range_id;
+            result.replica_group_id = fragment.replica_group_id;
+            result.columns = std::move(output_columns);
+
+            for (const auto& large_row : large.rows) {
+                if (!rowBelongsToRange(fragment.large_table,
+                                      large.columns,
+                                      large_row,
+                                      fragment.range_id,
+                                      fragment.start_key,
+                                      fragment.end_key)) {
+                    continue;
+                }
+                if (predicate_column.has_value() &&
+                    (*predicate_column >= large_row.size() ||
+                     large_row[*predicate_column] !=
+                         fragment.predicate_value)) {
+                    continue;
+                }
+                if (*large_join_column >= large_row.size()) {
+                    return SchemaMismatchResult{};
+                }
+                for (const auto& small_row : fragment.small_rows) {
+                    if (*small_join_column >= small_row.size()) {
+                        return SchemaMismatchResult{};
+                    }
+                    if (large_row[*large_join_column] !=
+                        small_row[*small_join_column]) {
+                        continue;
+                    }
+                    std::vector<std::string> joined;
+                    joined.reserve(projection_indexes.size());
+                    for (const auto& projection : projection_indexes) {
+                        const auto& source =
+                            projection.large_side ? large_row
+                                                  : small_row;
+                        if (projection.column >= source.size()) {
+                            return SchemaMismatchResult{};
+                        }
+                        joined.push_back(source[projection.column]);
+                    }
+                    result.rows.push_back(std::move(joined));
+                }
+            }
+            return result;
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeOne(const ExecuteRepartitionScanCommand& command) {
+        const RepartitionScanFragment& fragment = command.fragment;
+        if (!tableExists(fragment.table) || fragment.range_id.empty() ||
+            fragment.bucket_count == 0) {
+            return TableNotFoundResult{};
+        }
+        if (!locallyOwnsActiveRange(fragment.table,
+                                    fragment.range_id,
+                                    fragment.replica_group_id,
+                                    fragment.start_key,
+                                    fragment.end_key)) {
+            return RouteRejectedResult{};
+        }
+        try {
+            SelectAllResult all =
+                fragment.read_ts.isZero()
+                    ? selectAll(fragment.table)
+                    : selectAllAt(fragment.table, fragment.read_ts);
+            auto join_column =
+                columnIndex(all.columns, fragment.join_column);
+            if (!join_column.has_value()) {
+                return SchemaMismatchResult{};
+            }
+            std::optional<size_t> predicate_column;
+            if (!fragment.predicate_column.empty()) {
+                predicate_column =
+                    columnIndex(all.columns, fragment.predicate_column);
+                if (!predicate_column.has_value()) {
+                    return SchemaMismatchResult{};
+                }
+            }
+
+            RepartitionScanResult result;
+            result.complete = true;
+            result.query_id = fragment.query_id;
+            result.exchange_id = fragment.exchange_id;
+            result.fragment_id = fragment.fragment_id;
+            result.attempt_id = fragment.attempt_id;
+            result.table = fragment.table;
+            result.buckets.reserve(fragment.bucket_count);
+            for (uint32_t bucket = 0; bucket < fragment.bucket_count; ++bucket) {
+                result.buckets.push_back(
+                    RepartitionBucketResult{
+                        true,
+                        ExchangeKey{
+                            fragment.query_id,
+                            fragment.exchange_id,
+                            BucketId{bucket},
+                            fragment.attempt_id},
+                        fragment.table,
+                        fragment.join_column,
+                        all.columns,
+                        {}});
+            }
+
+            for (const auto& row : all.rows) {
+                if (!rowBelongsToRange(fragment.table,
+                                      all.columns,
+                                      row,
+                                      fragment.range_id,
+                                      fragment.start_key,
+                                      fragment.end_key)) {
+                    continue;
+                }
+                if (predicate_column.has_value() &&
+                    (*predicate_column >= row.size() ||
+                     row[*predicate_column] != fragment.predicate_value)) {
+                    continue;
+                }
+                if (*join_column >= row.size()) {
+                    return SchemaMismatchResult{};
+                }
+                uint32_t bucket = static_cast<uint32_t>(
+                    std::hash<std::string>{}(row[*join_column]) %
+                    fragment.bucket_count);
+                result.buckets[bucket].rows.push_back(row);
+            }
+            return result;
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeOne(const ExecuteBucketHashJoinCommand& command) {
+        if (!command.left.complete || !command.right.complete ||
+            command.left.key.query_id != command.query_id ||
+            command.right.key.query_id != command.query_id ||
+            command.left.key.exchange_id != command.exchange_id ||
+            command.right.key.exchange_id != command.exchange_id ||
+            command.left.key.bucket_id != command.bucket_id ||
+            command.right.key.bucket_id != command.bucket_id ||
+            command.left.key.attempt_id != command.attempt_id ||
+            command.right.key.attempt_id != command.attempt_id) {
+            return RouteRejectedResult{};
+        }
+        auto left_join =
+            columnIndex(command.left.columns, command.left_join_column);
+        auto right_join =
+            columnIndex(command.right.columns, command.right_join_column);
+        if (!left_join.has_value() || !right_join.has_value()) {
+            return SchemaMismatchResult{};
+        }
+
+        struct ProjectionIndex {
+            bool left_side = true;
+            size_t column = 0;
+        };
+        std::vector<ProjectionIndex> projection_indexes;
+        std::vector<std::string> output_columns;
+        for (size_t i = 0; i < command.projection_tables.size(); ++i) {
+            const std::string& table = command.projection_tables[i];
+            const std::string& column = command.projection_columns[i];
+            if (table == command.left_table) {
+                auto index = columnIndex(command.left.columns, column);
+                if (!index.has_value()) return SchemaMismatchResult{};
+                projection_indexes.push_back(ProjectionIndex{true, *index});
+            } else if (table == command.right_table) {
+                auto index = columnIndex(command.right.columns, column);
+                if (!index.has_value()) return SchemaMismatchResult{};
+                projection_indexes.push_back(ProjectionIndex{false, *index});
+            } else {
+                return SchemaMismatchResult{};
+            }
+            output_columns.push_back(table + "." + column);
+        }
+
+        std::map<std::string, std::vector<std::vector<std::string>>> right_by_key;
+        for (const auto& row : command.right.rows) {
+            if (*right_join >= row.size()) return SchemaMismatchResult{};
+            right_by_key[row[*right_join]].push_back(row);
+        }
+
+        BucketJoinResult result;
+        result.complete = true;
+        result.query_id = command.query_id;
+        result.exchange_id = command.exchange_id;
+        result.bucket_id = command.bucket_id;
+        result.attempt_id = command.attempt_id;
+        result.columns = std::move(output_columns);
+        for (const auto& left_row : command.left.rows) {
+            if (*left_join >= left_row.size()) return SchemaMismatchResult{};
+            auto matches = right_by_key.find(left_row[*left_join]);
+            if (matches == right_by_key.end()) continue;
+            for (const auto& right_row : matches->second) {
+                std::vector<std::string> joined;
+                joined.reserve(projection_indexes.size());
+                for (const auto& projection : projection_indexes) {
+                    const auto& source =
+                        projection.left_side ? left_row : right_row;
+                    if (projection.column >= source.size()) {
+                        return SchemaMismatchResult{};
+                    }
+                    joined.push_back(source[projection.column]);
+                }
+                result.rows.push_back(std::move(joined));
+            }
+        }
+        return result;
+    }
+
+    Result executeOne(const RepartitionAggregateScanCommand& command) {
+        const RepartitionScanFragment& fragment = command.fragment;
+        if (!tableExists(fragment.table) || fragment.range_id.empty() ||
+            fragment.bucket_count == 0) {
+            return TableNotFoundResult{};
+        }
+        if (!locallyOwnsActiveRange(fragment.table,
+                                    fragment.range_id,
+                                    fragment.replica_group_id,
+                                    fragment.start_key,
+                                    fragment.end_key)) {
+            return RouteRejectedResult{};
+        }
+        try {
+            SelectAllResult all =
+                fragment.read_ts.isZero()
+                    ? selectAll(fragment.table)
+                    : selectAllAt(fragment.table, fragment.read_ts);
+            auto group_column = columnIndex(all.columns, command.group_column);
+            if (!group_column.has_value()) return SchemaMismatchResult{};
+            std::optional<size_t> aggregate_column;
+            if (command.aggregate_function == "SUM") {
+                aggregate_column =
+                    columnIndex(all.columns, command.aggregate_column);
+                if (!aggregate_column.has_value()) {
+                    return SchemaMismatchResult{};
+                }
+            } else if (command.aggregate_function != "COUNT") {
+                return SchemaMismatchResult{};
+            }
+
+            std::vector<std::map<std::string, AggregatePartialGroup>> grouped(
+                fragment.bucket_count);
+            for (const auto& row : all.rows) {
+                if (!rowBelongsToRange(fragment.table,
+                                      all.columns,
+                                      row,
+                                      fragment.range_id,
+                                      fragment.start_key,
+                                      fragment.end_key)) {
+                    continue;
+                }
+                if (*group_column >= row.size()) {
+                    return SchemaMismatchResult{};
+                }
+                std::string key = row[*group_column];
+                uint32_t bucket = static_cast<uint32_t>(
+                    std::hash<std::string>{}(key) % fragment.bucket_count);
+                auto& group = grouped[bucket][key];
+                group.group_key = key;
+                ++group.count;
+                if (command.aggregate_function == "SUM") {
+                    if (!aggregate_column.has_value() ||
+                        *aggregate_column >= row.size()) {
+                        return SchemaMismatchResult{};
+                    }
+                    group.sum += std::stoll(row[*aggregate_column]);
+                }
+            }
+
+            RepartitionAggregateScanResult result;
+            result.complete = true;
+            result.query_id = fragment.query_id;
+            result.exchange_id = fragment.exchange_id;
+            result.fragment_id = fragment.fragment_id;
+            result.attempt_id = fragment.attempt_id;
+            result.table = fragment.table;
+            result.buckets.reserve(fragment.bucket_count);
+            for (uint32_t bucket = 0; bucket < fragment.bucket_count; ++bucket) {
+                AggregateBucketResult bucket_result;
+                bucket_result.complete = true;
+                bucket_result.key = ExchangeKey{
+                    fragment.query_id,
+                    fragment.exchange_id,
+                    BucketId{bucket},
+                    fragment.attempt_id};
+                bucket_result.source_table = fragment.table;
+                bucket_result.group_column = command.group_column;
+                bucket_result.aggregate_function = command.aggregate_function;
+                bucket_result.aggregate_column = command.aggregate_column;
+                for (const auto& [group_key, group] : grouped[bucket]) {
+                    (void)group_key;
+                    bucket_result.groups.push_back(group);
+                }
+                result.buckets.push_back(std::move(bucket_result));
+            }
+            return result;
+        } catch (const std::exception&) {
+            return SchemaMismatchResult{};
+        }
+    }
+
+    Result executeOne(const FinalizeAggregateBucketCommand& command) {
+        if (command.aggregate_function != "COUNT" &&
+            command.aggregate_function != "SUM") {
+            return SchemaMismatchResult{};
+        }
+        std::map<std::string, AggregatePartialGroup> merged;
+        for (const auto& partial : command.partials) {
+            if (!partial.complete ||
+                partial.key.query_id != command.query_id ||
+                partial.key.exchange_id != command.exchange_id ||
+                partial.key.bucket_id != command.bucket_id ||
+                partial.key.attempt_id != command.attempt_id ||
+                partial.source_table != command.table ||
+                partial.group_column != command.group_column ||
+                partial.aggregate_function != command.aggregate_function ||
+                partial.aggregate_column != command.aggregate_column) {
+                return RouteRejectedResult{};
+            }
+            for (const auto& group : partial.groups) {
+                auto& existing = merged[group.group_key];
+                existing.group_key = group.group_key;
+                existing.count += group.count;
+                existing.sum += group.sum;
+            }
+        }
+
+        FinalAggregateBucketResult result;
+        result.complete = true;
+        result.query_id = command.query_id;
+        result.exchange_id = command.exchange_id;
+        result.bucket_id = command.bucket_id;
+        result.attempt_id = command.attempt_id;
+        result.columns = {
+            command.group_column,
+            command.aggregate_function == "COUNT" ? "count" : "sum"};
+        for (const auto& [group_key, group] : merged) {
+            (void)group_key;
+            result.rows.push_back(
+                {group.group_key,
+                 std::to_string(command.aggregate_function == "COUNT"
+                                    ? static_cast<int64_t>(group.count)
+                                    : group.sum)});
+        }
+        return result;
     }
 
     Result executeOne(const ExplainRouteCommand& command) {
@@ -21234,9 +25071,153 @@ private:
     }
 
     std::string database_file_;
+    ComputeNodeId node_id_;
+    StorageContext storage_context_;
     bool owns_bundle_ = false;
+    bool owns_lease_ = false;
     std::unique_ptr<BuzzDB> db_;
     std::map<std::string, HashIndex> secondary_index_cache_;
+};
+
+bool commandAllowedOnReadOnlyCompute(const Command& command) {
+    return std::visit(
+        [](const auto& value) {
+            using T = std::decay_t<decltype(value)>;
+            return std::is_same_v<T, SelectAllCommand> ||
+                   std::is_same_v<T, SelectWhereCommand> ||
+                   std::is_same_v<T, RangeReadCommand> ||
+                   std::is_same_v<T, ExecuteQueryFragmentCommand> ||
+                   std::is_same_v<T, ExecuteJoinFragmentCommand> ||
+                   std::is_same_v<T, ExecuteRepartitionScanCommand> ||
+                   std::is_same_v<T, ExecuteBucketHashJoinCommand> ||
+                   std::is_same_v<T, RepartitionAggregateScanCommand> ||
+                   std::is_same_v<T, FinalizeAggregateBucketCommand> ||
+                   std::is_same_v<T, ExplainRouteCommand> ||
+                   std::is_same_v<T, QuerySQLCommand> ||
+                   std::is_same_v<T, CountRowsCommand> ||
+                   std::is_same_v<T, ReadClusterIdentityCommand> ||
+                   std::is_same_v<T, ReadRangeOwnershipCommand> ||
+                   std::is_same_v<T, QueryRangeConfigCommand> ||
+                   std::is_same_v<T, ExplainIndexLookupCommand> ||
+                   std::is_same_v<T, ReadSecondaryIndexCommand> ||
+                   std::is_same_v<T, ReadTxnParticipantStatusCommand> ||
+                   std::is_same_v<T, ReadSystemCatalogCommand> ||
+                   std::is_same_v<T, ReadReplicaSafeTimestampCommand>;
+        },
+        command);
+}
+
+class ComputeNode {
+public:
+    ComputeNode(ComputeNodeId node_id,
+                StorageNamespaceFiles files,
+                std::shared_ptr<StorageService> storage =
+                    defaultStorageService())
+        : node_id_(node_id),
+          files_(std::move(files)),
+          storage_(std::move(storage)) {}
+
+    ~ComputeNode() {
+        if (attached_) {
+            detach();
+        }
+    }
+
+    AttachResult attach(NamespaceId namespace_id, AttachMode mode) {
+        if (attached_) {
+            detach();
+        }
+        storage_->bindNamespace(namespace_id, files_);
+        AttachResult attached =
+            storage_->attachCompute(namespace_id, node_id_, mode);
+        if (attached.status != AttachStatus::Attached) {
+            return attached;
+        }
+        namespace_id_ = namespace_id;
+        lease_ = attached.lease;
+        read_only_ = mode == AttachMode::ReadOnly;
+        storage_context_ = StorageContext{namespace_id_, storage_, lease_};
+        core_ = std::make_unique<BuzzDBCore>(
+            files_.data_file,
+            storage_context_,
+            false);
+        attached_ = true;
+        if (mode == AttachMode::ReadWrite) {
+            core_->recover();
+        }
+        return attached;
+    }
+
+    void detach() {
+        if (!attached_) return;
+        if (core_ && lease_.write_enabled) {
+            try {
+                storage_->validateWriteLease(namespace_id_, lease_);
+                core_->flushForDetach();
+            } catch (const std::runtime_error& error) {
+                std::string message = error.what();
+                if (message.find("compute write lease") == std::string::npos) {
+                    throw;
+                }
+            }
+        }
+        core_.reset();
+        storage_->detachCompute(namespace_id_, lease_);
+        attached_ = false;
+        read_only_ = false;
+    }
+
+    void crashWithoutDetach() {
+        core_.reset();
+        attached_ = false;
+        read_only_ = false;
+    }
+
+    Result execute(const Command& command) {
+        if (!attached_ || !core_) {
+            return RouteRejectedResult{};
+        }
+        if (read_only_ && !commandAllowedOnReadOnlyCompute(command)) {
+            return ConfigRejectedResult{};
+        }
+        if (!read_only_ && !commandAllowedOnReadOnlyCompute(command)) {
+            try {
+                storage_->validateWriteLease(namespace_id_, lease_);
+            } catch (const std::runtime_error& error) {
+                std::string message = error.what();
+                if (message.find("compute write lease") != std::string::npos) {
+                    return ConfigRejectedResult{};
+                }
+                throw;
+            }
+        }
+        return core_->execute(command);
+    }
+
+    void recover() {
+        if (core_) {
+            core_->recover();
+        }
+    }
+
+    const ComputeLease& lease() const {
+        return lease_;
+    }
+
+    bool attached() const {
+        return attached_;
+    }
+
+private:
+    ComputeNodeId node_id_;
+    StorageNamespaceFiles files_;
+    std::shared_ptr<StorageService> storage_;
+    NamespaceId namespace_id_;
+    ComputeLease lease_;
+    StorageContext storage_context_;
+    std::unique_ptr<BuzzDBCore> core_;
+    bool attached_ = false;
+    bool read_only_ = false;
 };
 
 template <typename Fn>
@@ -21943,6 +25924,16 @@ std::vector<std::string> realTitleSchemaColumns() {
 
 CreateTableCommand createTitleTableCommand() {
     return CreateTableCommand{"title", realTitleSchemaColumns()};
+}
+
+std::vector<std::string> realMovieCompaniesSchemaColumns() {
+    return {"id:int", "movie_id:int", "company_id:int",
+            "company_type_id:int", "note:string"};
+}
+
+CreateTableCommand createMovieCompaniesTableCommand() {
+    return CreateTableCommand{"movie_companies",
+                              realMovieCompaniesSchemaColumns()};
 }
 
 std::vector<std::string> requireTupleLinesFromFile(
@@ -23739,15 +27730,15 @@ void printPartitionedSQLTrace(const std::string& data_file) {
 
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--measure-restart") {
-        std::cerr << "--measure-restart is not available in v147; "
-                  << "this version focuses on durable distributed commit."
+        std::cerr << "--measure-restart is not available in v153; "
+                  << "this version focuses on durable volume fencing."
                   << std::endl;
         return 2;
     }
 
     bool tests_only = argc > 1 && std::string(argv[1]) == "--tests-only";
     int imdb_arg = tests_only ? 2 : 1;
-    std::cout << "BuzzDB v147: durable distributed commit"
+    std::cout << "BuzzDB v153: durable volume fencing and log-safe attach"
               << std::endl;
     const std::string imdb_file =
         argc > imdb_arg ? argv[imdb_arg] : defaultImdbInputFile();
@@ -23801,6 +27792,7 @@ int main(int argc, char* argv[]) {
 
     struct TitleIndexFixture {
         std::vector<TitleRowFixture> initial_rows;
+        std::vector<TitleRowFixture> movie_company_rows;
         TitleRowFixture extra_row;
         std::string duplicate_year;
     };
@@ -23824,6 +27816,25 @@ int main(int argc, char* argv[]) {
         TitleIndexFixture fixture;
         fixture.initial_rows.assign(titles.begin(), titles.begin() + 8);
         fixture.extra_row = titles[8];
+        std::set<std::string> title_ids;
+        for (const auto& row : fixture.initial_rows) {
+            title_ids.insert(row.values.front());
+        }
+        std::vector<std::string> company_lines =
+            requireTupleLinesFromFile(imdb_file, "movie_companies", 60);
+        for (const auto& line : company_lines) {
+            TitleRowFixture row{line,
+                                tupleValuesFromLine(line,
+                                                    "movie_companies")};
+            if (row.values.size() >= 2 &&
+                title_ids.count(row.values[1]) != 0) {
+                fixture.movie_company_rows.push_back(std::move(row));
+            }
+        }
+        if (fixture.movie_company_rows.empty()) {
+            throw std::runtime_error(
+                "Need movie_companies rows that join with title rows.");
+        }
         std::map<std::string, std::vector<std::string>> by_year;
         for (const auto& row : fixture.initial_rows) {
             if (row.values.size() < 4) {
@@ -23856,6 +27867,27 @@ int main(int argc, char* argv[]) {
             title_year_index, "title", "production_year", group_id};
     };
 
+    auto prefixedReplicas = [](const std::string& prefix,
+                               size_t count = 3) {
+        std::vector<Address> replicas;
+        for (size_t i = 1; i <= count; ++i) {
+            replicas.emplace_back(prefix + std::to_string(i));
+        }
+        return replicas;
+    };
+
+    auto electConsensusGroupState = [&](const std::vector<Address>& replicas,
+                                        const Address& leader) {
+        SearchState state = consensusClusterState(replicas);
+        std::vector<Address> voters;
+        for (const auto& replica : replicas) {
+            if (!(replica.rootAddress() == leader.rootAddress())) {
+                voters.push_back(replica);
+            }
+        }
+        return electConsensusLeader(state, leader, voters);
+    };
+
     struct ConsensusGroupHarness {
         std::string group_id;
         std::vector<Address> replicas;
@@ -23866,28 +27898,22 @@ int main(int argc, char* argv[]) {
         int next_request_id = 1;
     };
 
-    auto prefixedConsensusReplicas = [](const std::string& prefix) {
-        return std::vector<Address>{
-            Address(prefix + "1"),
-            Address(prefix + "2"),
-            Address(prefix + "3")};
-    };
-
     auto makeConsensusGroup =
         [&](const std::string& group_id,
             const std::string& prefix,
-            int client_id) {
+            int client_id,
+            size_t replica_count = 3) {
         ConsensusGroupHarness group;
         group.group_id = group_id;
-        group.replicas = prefixedConsensusReplicas(prefix);
+        group.replicas = prefixedReplicas(prefix, replica_count);
         group.leader = group.replicas.front();
-        group.client = Address("client-" + group_id + "-" + prefix);
-        group.state = electedConsensusState(group.replicas, group.leader);
+        group.client = Address("client-" + group_id);
+        group.state = electConsensusGroupState(group.replicas, group.leader);
         group.client_id = client_id;
         return group;
     };
 
-    auto consensusFollowers = [](const ConsensusGroupHarness& group) {
+    auto followerReplicas = [](const ConsensusGroupHarness& group) {
         std::vector<Address> followers;
         for (const auto& replica : group.replicas) {
             if (!(replica.rootAddress() == group.leader.rootAddress())) {
@@ -23897,10 +27923,9 @@ int main(int argc, char* argv[]) {
         return followers;
     };
 
-    auto consensusReplyFor = [](const SearchState& state,
-                                int client_id,
-                                int request_id)
-        -> std::optional<Result> {
+    auto clientReplyFor = [](const SearchState& state,
+                             int client_id,
+                             int request_id) -> std::optional<Result> {
         for (auto it = state.network().rbegin();
              it != state.network().rend(); ++it) {
             const auto* reply = std::get_if<ClientReply>(&it->message);
@@ -23913,8 +27938,8 @@ int main(int argc, char* argv[]) {
         return std::nullopt;
     };
 
-    auto commitConsensusCommand =
-        [&](ConsensusGroupHarness& group, const Command& command) {
+    auto commitCommand = [&](ConsensusGroupHarness& group,
+                             const Command& command) {
         int request_id = group.next_request_id++;
         group.state = deliverConsensusCommandToQuorum(
             group.state,
@@ -23923,82 +27948,359 @@ int main(int argc, char* argv[]) {
             group.client_id,
             request_id,
             command,
-            consensusFollowers(group));
+            followerReplicas(group));
         auto reply =
-            consensusReplyFor(group.state, group.client_id, request_id);
+            clientReplyFor(group.state, group.client_id, request_id);
         if (!reply.has_value()) {
             throw std::runtime_error(
-                "missing consensus reply for " + describeCommand(command));
+                "missing client reply for " + describeCommand(command));
         }
         return *reply;
     };
 
-    auto consensusLeader = [](const ConsensusGroupHarness& group) {
-        const auto* node = group.state.nodeAs<ConsensusReplica>(group.leader);
-        if (node == nullptr) {
-            throw std::runtime_error("missing consensus leader");
+    [[maybe_unused]] auto commitCommandWithRequestId =
+        [&](ConsensusGroupHarness& group,
+            int request_id,
+            const Command& command) {
+            group.next_request_id =
+                std::max(group.next_request_id, request_id + 1);
+            group.state = deliverConsensusCommandToQuorum(
+                group.state,
+                group.leader,
+                group.client,
+                group.client_id,
+                request_id,
+                command,
+                followerReplicas(group));
+            auto reply =
+                clientReplyFor(group.state, group.client_id, request_id);
+            if (!reply.has_value()) {
+                throw std::runtime_error(
+                    "missing client reply for " + describeCommand(command));
+            }
+            return *reply;
+        };
+
+    [[maybe_unused]] auto directClientCommand =
+        [&](ConsensusGroupHarness& group,
+            const Address& target,
+            const Command& command) {
+        int request_id = group.next_request_id++;
+        group.state.send(
+            group.client,
+            target,
+            ClientRequest{group.client_id, request_id, command});
+        group.state = stepRequired(
+            group.state,
+            requireMessageEvent(
+                group.state,
+                [&](const MessageEnvelope& envelope) {
+                    const auto* request =
+                        std::get_if<ClientRequest>(&envelope.message);
+                    return request != nullptr &&
+                           request->client_id == group.client_id &&
+                           request->request_id == request_id &&
+                           envelope.from.rootAddress() ==
+                               group.client.rootAddress() &&
+                           envelope.to.rootAddress() ==
+                               target.rootAddress();
+                },
+                "direct client request",
+                SearchSettings{}),
+            SearchSettings{});
+        auto reply =
+            clientReplyFor(group.state, group.client_id, request_id);
+        if (!reply.has_value()) {
+            throw std::runtime_error(
+                "missing direct client reply for " +
+                describeCommand(command));
         }
-        return node;
+        return *reply;
     };
 
-    auto consensusSystemCatalog =
-        [&](const ConsensusGroupHarness& group, const std::string& table) {
+    [[maybe_unused]] auto immediateClientCommandWithRequestId =
+        [&](ConsensusGroupHarness& group,
+            const Address& target,
+            int request_id,
+            const Command& command) {
+            group.next_request_id =
+                std::max(group.next_request_id, request_id + 1);
+            group.state.send(
+                group.client,
+                target,
+                ClientRequest{group.client_id, request_id, command});
+            group.state = stepRequired(
+                group.state,
+                requireMessageEvent(
+                    group.state,
+                    [&](const MessageEnvelope& envelope) {
+                        const auto* request =
+                            std::get_if<ClientRequest>(&envelope.message);
+                        return request != nullptr &&
+                               request->client_id == group.client_id &&
+                               request->request_id == request_id &&
+                               envelope.from.rootAddress() ==
+                                   group.client.rootAddress() &&
+                               envelope.to.rootAddress() ==
+                                   target.rootAddress();
+                    },
+                    "immediate client request",
+                    SearchSettings{}),
+                SearchSettings{});
+            auto reply =
+                clientReplyFor(group.state, group.client_id, request_id);
+            if (!reply.has_value()) {
+                throw std::runtime_error(
+                    "missing immediate client reply for " +
+                    describeCommand(command));
+            }
+            return *reply;
+        };
+
+    struct IndexScenario {
+        TitleIndexFixture fixture;
+        ConsensusGroupHarness catalog;
+        ConsensusGroupHarness table_owner;
+        ConsensusGroupHarness index_owner;
+    };
+
+    [[maybe_unused]] auto buildIndexScenario = [&](size_t replica_count = 3) {
+        IndexScenario scenario;
+        scenario.fixture = titleIndexFixture();
+        scenario.catalog =
+            makeConsensusGroup("catalog", "server", 1, replica_count);
+        scenario.table_owner =
+            makeConsensusGroup("group-1", "table-server", 2, replica_count);
+        scenario.index_owner =
+            makeConsensusGroup(index_replica_group, "index-server", 3,
+                               replica_count);
+
+        auto readSystemCatalog = [&](ConsensusGroupHarness& group,
+                                     const std::string& table) {
+            const auto* node = group.state.nodeAs<ConsensusReplica>(group.leader);
+            if (node == nullptr) {
+                throw std::runtime_error("missing catalog leader");
+            }
+            Result result =
+                node->executeReadOnlyForTest(ReadSystemCatalogCommand{table});
+            const auto* rows = std::get_if<SelectAllResult>(&result);
+            if (rows == nullptr) {
+                throw std::runtime_error("missing catalog table " + table);
+            }
+            return *rows;
+        };
+
+        auto indexDescriptorVersionOn = [&](ConsensusGroupHarness& group) {
+            SelectAllResult indexes = readSystemCatalog(group, "__indexes");
+            for (const auto& row : indexes.rows) {
+                auto name = selectAllValue(indexes, row, "index_name");
+                auto version = selectAllValue(indexes, row, "descriptor_version");
+                if (name.has_value() && *name == title_year_index &&
+                    version.has_value()) {
+                    return std::stoi(*version);
+                }
+            }
+            throw std::runtime_error("missing secondary index descriptor");
+        };
+
+        auto bootstrapGroup = [&](ConsensusGroupHarness& group,
+                                  bool include_index_group) {
+            tests.check(commitCommand(group, bootstrapClusterACommand()) ==
+                            Result{StatementOkResult{}},
+                        "participant group should bootstrap the cluster");
+            tests.check(commitCommand(group, registerGroup1Command()) ==
+                            Result{StatementOkResult{}},
+                        "participant group should register the table group");
+            if (include_index_group) {
+                tests.check(commitCommand(group, registerIndexGroupCommand()) ==
+                                Result{StatementOkResult{}},
+                            "participant should register the index group");
+            }
+            tests.check(commitCommand(group, createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        "participant should create the title table schema");
+            tests.check(commitCommand(group,
+                                      createMovieCompaniesTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        "participant should create the movie_companies table schema");
+        };
+
+        bootstrapGroup(scenario.catalog, true);
+        tests.check(
+            commitCommand(scenario.catalog,
+                          createTitleYearIndexCommand(index_replica_group)) ==
+                Result{StatementOkResult{}},
+            "catalog should record the secondary index metadata");
+
+        bootstrapGroup(scenario.table_owner, false);
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(
+                commitCommand(scenario.table_owner,
+                              parseSQL("INSERT " + row.line)) ==
+                    Result{InsertOkResult{}},
+                "table participant should store a real IMDB title row");
+        }
+        for (const auto& row : scenario.fixture.movie_company_rows) {
+            tests.check(
+                commitCommand(scenario.table_owner,
+                              parseSQL("INSERT " + row.line)) ==
+                    Result{InsertOkResult{}},
+                "table participant should store a real IMDB movie_companies row");
+        }
+
+        bootstrapGroup(scenario.index_owner, true);
+        tests.check(
+            commitCommand(scenario.index_owner,
+                          createTitleYearIndexCommand(index_replica_group)) ==
+                Result{StatementOkResult{}},
+            "index participant should create physical index metadata");
+        int index_version = indexDescriptorVersionOn(scenario.index_owner);
+        std::string index_range = defaultRangeIdForIndex(title_year_index);
+        for (const auto& row : scenario.fixture.initial_rows) {
+            std::string index_key = row.values[3];
+            std::string primary_key = row.values[0];
+            tests.check(
+                commitCommand(
+                    scenario.index_owner,
+                    InsertRowCommand{
+                        "__index_entries",
+                        {title_year_index,
+                         index_key,
+                         primary_key,
+                         indexEntryKey(title_year_index,
+                                       index_key,
+                                       primary_key),
+                         index_range,
+                         index_replica_group,
+                         std::to_string(index_version),
+                         std::to_string(HashIndex::hashSlotFor(
+                             std::stoi(index_key))),
+                         "active"}}) == Result{InsertOkResult{}},
+                "index participant should store a physical index posting");
+        }
+        return scenario;
+    };
+
+    auto catalogTableOn = [&](const ConsensusGroupHarness& group,
+                              const Address& replica,
+                              const std::string& table) {
+        const auto* node = group.state.nodeAs<ConsensusReplica>(replica);
+        if (node == nullptr) {
+            throw std::runtime_error("missing catalog replica");
+        }
         Result result =
-            consensusLeader(group)->executeReadOnlyForTest(
-                ReadSystemCatalogCommand{table});
+            node->executeReadOnlyForTest(ReadSystemCatalogCommand{table});
         const auto* rows = std::get_if<SelectAllResult>(&result);
         if (rows == nullptr) {
-            throw std::runtime_error("missing consensus catalog table " +
-                                     table);
+            throw std::runtime_error("missing catalog table " + table);
         }
         return *rows;
     };
 
-    auto consensusHasRow =
+    auto leaderNode = [](const ConsensusGroupHarness& group) {
+        const auto* node =
+            group.state.nodeAs<ConsensusReplica>(group.leader);
+        if (node == nullptr) {
+            throw std::runtime_error("missing catalog leader");
+        }
+        return node;
+    };
+
+    [[maybe_unused]] auto readIndexOn =
         [&](const ConsensusGroupHarness& group,
-            const std::string& table,
-            const std::map<std::string, std::string>& row) {
-        return selectAllHasRow(consensusSystemCatalog(group, table), row);
+            const Address& replica,
+            const std::string& year) {
+        const auto* node = group.state.nodeAs<ConsensusReplica>(replica);
+        if (node == nullptr) {
+            throw std::runtime_error("missing catalog replica");
+        }
+        Result result =
+            node->executeReadOnlyForTest(
+                ReadSecondaryIndexCommand{title_year_index, year});
+        const auto* lookup = std::get_if<IndexLookupResult>(&result);
+        if (lookup == nullptr) {
+            throw std::runtime_error("index lookup failed");
+        }
+        return *lookup;
     };
 
-    auto indexDescriptorVersionOnConsensus =
-        [&](const ConsensusGroupHarness& group) {
-        SelectAllResult indexes = consensusSystemCatalog(group, "__indexes");
-        for (const auto& row : indexes.rows) {
-            auto name = selectAllValue(indexes, row, "index_name");
-            auto version = selectAllValue(indexes, row, "descriptor_version");
-            if (name.has_value() && *name == title_year_index &&
-                version.has_value()) {
-                return std::stoi(*version);
+    auto controlPlaneRuntime = [&](IndexScenario& scenario) {
+        ControlPlaneRuntime runtime{
+            [&](const Command& command) {
+                return commitCommand(scenario.catalog, command);
             }
-        }
-        throw std::runtime_error("missing consensus index descriptor");
+        };
+        runtime.registerReplicaGroup(
+            scenario.table_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.table_owner, command);
+            });
+        runtime.registerReplicaGroup(
+            scenario.index_owner.group_id,
+            [&](const Command& command) {
+                return commitCommand(scenario.index_owner, command);
+            });
+        return runtime;
     };
 
-    auto bootstrapConsensusGroup =
-        [&](ConsensusGroupHarness& group, bool include_index_group) {
-        tests.check(commitConsensusCommand(group, bootstrapClusterACommand()) ==
-                        Result{StatementOkResult{}},
-                    "consensus group should bootstrap cluster metadata");
-        tests.check(commitConsensusCommand(group, registerGroup1Command()) ==
-                        Result{StatementOkResult{}},
-                    "consensus group should register table group");
-        if (include_index_group) {
-            tests.check(
-                commitConsensusCommand(
-                    group,
-                    Command{registerIndexGroupCommand()}) ==
-                    Result{StatementOkResult{}},
-                "consensus group should register index group");
-        }
-        tests.check(commitConsensusCommand(group,
-                                           Command{createTitleTableCommand()}) ==
-                        Result{CreateTableOkResult{}},
-                    "consensus group should create title table");
+    [[maybe_unused]] auto participantHasStatus =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            const std::string& range_id,
+            const std::string& status) {
+            return selectAllHasRow(
+                catalogTableOn(group, group.leader, "__participant_txns"),
+                {{"txn_id", txn_id},
+                 {"range_id", range_id},
+                 {"status", status}});
+        };
+
+    [[maybe_unused]] auto participantIntentHasStatus =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            const std::string& range_id,
+            const std::string& status) {
+            return selectAllHasRow(
+                catalogTableOn(group, group.leader, "__txn_intents"),
+                {{"txn_id", txn_id},
+                 {"range_id", range_id},
+                 {"status", status}});
+        };
+
+    [[maybe_unused]] auto containsText =
+        [](const std::vector<std::string>& values,
+           const std::string& value) {
+        return std::find(values.begin(), values.end(), value) !=
+               values.end();
     };
 
-    auto firstRowValue = [](const SelectAllResult& rows,
-                            const std::string& column)
+    [[maybe_unused]] auto countRowsOn =
+        [&](const ConsensusGroupHarness& group, const std::string& table) {
+        Result result =
+            leaderNode(group)->executeReadOnlyForTest(CountRowsCommand{table});
+        const auto* count = std::get_if<CountRowsResult>(&result);
+        if (count == nullptr) {
+            throw std::runtime_error("count failed for " + table);
+        }
+        return count->count;
+    };
+
+    [[maybe_unused]] auto selectTitleById =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& id) {
+        Result result =
+            leaderNode(group)->executeReadOnlyForTest(
+                SelectWhereCommand{"title", "id", id});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) {
+            throw std::runtime_error("title lookup failed");
+        }
+        return *rows;
+    };
+
+    [[maybe_unused]] auto firstRowValue =
+        [](const SelectAllResult& rows,
+           const std::string& column)
         -> std::optional<std::string> {
         auto index = catalogColumnIndex(rows, column);
         if (!index.has_value() || rows.rows.empty() ||
@@ -24008,16 +28310,542 @@ int main(int argc, char* argv[]) {
         return rows.rows.front()[*index];
     };
 
+    struct TitleRangeFragment {
+        std::string range_id;
+        std::string start_key;
+        std::string end_key;
+        std::string replica_group_id;
+        int owner_version = 0;
+    };
+
+    struct SplitTitleRanges {
+        TitleRangeFragment left;
+        TitleRangeFragment middle;
+        TitleRangeFragment right;
+        size_t moved_rows = 0;
+    };
+
+    auto activeTitleFragment =
+        [&](const ConsensusGroupHarness& catalog,
+            const std::string& range_id) {
+        SelectAllResult ownership =
+            catalogTableOn(catalog, catalog.leader, "__range_ownership");
+        std::optional<TitleRangeFragment> latest;
+        for (const auto& row : ownership.rows) {
+            auto table_name = selectAllValue(ownership, row, "table_name");
+            auto index_name = selectAllValue(ownership, row, "index_name");
+            auto row_range = selectAllValue(ownership, row, "range_id");
+            auto status = selectAllValue(ownership, row, "status");
+            auto owner_version =
+                selectAllValue(ownership, row, "owner_version");
+            auto start_key = selectAllValue(ownership, row, "start_key");
+            auto end_key = selectAllValue(ownership, row, "end_key");
+            auto replica_group_id =
+                selectAllValue(ownership, row, "replica_group_id");
+            if (!table_name.has_value() || *table_name != "title" ||
+                !index_name.has_value() || *index_name != "primary" ||
+                !row_range.has_value() || *row_range != range_id ||
+                !status.has_value() || *status != "active" ||
+                !owner_version.has_value() || !start_key.has_value() ||
+                !end_key.has_value() || !replica_group_id.has_value()) {
+                continue;
+            }
+            TitleRangeFragment fragment{
+                *row_range,
+                *start_key,
+                *end_key,
+                *replica_group_id,
+                std::stoi(*owner_version)};
+            if (!latest.has_value() ||
+                fragment.owner_version >= latest->owner_version) {
+                latest = fragment;
+            }
+        }
+        if (!latest.has_value()) {
+            throw std::runtime_error("missing active title fragment " +
+                                     range_id);
+        }
+        return *latest;
+    };
+
+    [[maybe_unused]] auto splitTitleTableAcrossThreeRanges = [&](IndexScenario& scenario) {
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(commitCommand(scenario.catalog,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "catalog should store title keys before splitting");
+        }
+
+        size_t source_rows_before =
+            countRowsOn(scenario.table_owner, "title");
+        Result plan_result =
+            commitCommand(scenario.catalog,
+                          PlanTableSplitCommand{
+                              "title",
+                              defaultRangeIdForTable("title"),
+                              3});
+        const auto* plan = std::get_if<RangeConfigResult>(&plan_result);
+        tests.check(plan != nullptr && plan->range_ids.size() == 3,
+                    "catalog should plan three title ranges from real row keys");
+        if (plan == nullptr || plan->range_ids.size() != 3) {
+            throw std::runtime_error("table split planning failed");
+        }
+
+        auto runtime = controlPlaneRuntime(scenario);
+        tests.check(runtime.runUntilIdle(12) >= 6,
+                    "control plane should execute planned range transfers");
+
+        SplitTitleRanges split{
+            activeTitleFragment(scenario.catalog, plan->range_ids[0]),
+            activeTitleFragment(scenario.catalog, plan->range_ids[1]),
+            activeTitleFragment(scenario.catalog, plan->range_ids[2]),
+            0};
+        TitleRangeFragment target_middle =
+            activeTitleFragment(scenario.index_owner, plan->range_ids[1]);
+        TitleRangeFragment target_right =
+            activeTitleFragment(scenario.index_owner, plan->range_ids[2]);
+        size_t source_rows_after =
+            countRowsOn(scenario.table_owner, "title");
+        tests.check(split.left.replica_group_id ==
+                            scenario.table_owner.group_id &&
+                        split.middle.replica_group_id ==
+                            scenario.index_owner.group_id &&
+                        split.right.replica_group_id ==
+                            scenario.index_owner.group_id,
+                    "committed transfer protocol should publish the final split ownership");
+        tests.check(target_middle.replica_group_id ==
+                            scenario.index_owner.group_id &&
+                        target_middle.start_key == split.middle.start_key &&
+                        target_middle.end_key == split.middle.end_key &&
+                        target_right.replica_group_id ==
+                            scenario.index_owner.group_id &&
+                        target_right.start_key == split.right.start_key &&
+                        target_right.end_key == split.right.end_key,
+                    "target group should install active local serving metadata for moved ranges");
+        split.moved_rows =
+            source_rows_before >= source_rows_after
+                ? source_rows_before - source_rows_after
+                : 0;
+        return split;
+    };
+
+    [[maybe_unused]] auto titleRowsInKeyRange =
+        [](const IndexScenario& scenario,
+           const std::string& start_key,
+           const std::string& end_key) {
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            std::string row_key = tableRowKey("title", row.values.front());
+            if (row_key >= start_key &&
+                (end_key.empty() || row_key < end_key)) {
+                rows.push_back(row.values);
+            }
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
+
+    [[maybe_unused]] auto titleRowsSortedByKey =
+        [](std::vector<TitleRowFixture> rows) {
+        std::sort(
+            rows.begin(),
+            rows.end(),
+            [](const TitleRowFixture& lhs, const TitleRowFixture& rhs) {
+                return tableRowKey("title", lhs.values.front()) <
+                       tableRowKey("title", rhs.values.front());
+            });
+        return rows;
+    };
+
+    [[maybe_unused]] auto splitRangeIds = [](const SplitTitleRanges& split) {
+        return std::vector<std::string>{
+            split.left.range_id,
+            split.middle.range_id,
+            split.right.range_id};
+    };
+
+    [[maybe_unused]] auto splitReplicaGroupIds =
+        [](const SplitTitleRanges& split) {
+        return std::vector<std::string>{
+            split.left.replica_group_id,
+            split.middle.replica_group_id,
+            split.right.replica_group_id};
+    };
+
+    [[maybe_unused]] auto fragmentRowTotal =
+        [](const DistributedRangeReadResult& read) {
+        size_t total = 0;
+        for (size_t count : read.fragment_row_counts) {
+            total += count;
+        }
+        return total;
+    };
+
+    [[maybe_unused]] auto runPrepare =
+        [&](ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            const std::vector<std::string>& statements) {
+        Result result = commitCommand(
+            group,
+            PrepareDistributedTransactionCommand{txn_id, statements});
+        const auto* prepared = std::get_if<DistributedTxnResult>(&result);
+        if (prepared == nullptr) {
+            throw std::runtime_error("prepare failed");
+        }
+        return *prepared;
+    };
+
+    [[maybe_unused]] auto commitPrepared =
+        [&](ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            bool apply) {
+        return commitCommand(
+            group,
+            CommitPreparedDistributedTransactionCommand{txn_id, apply});
+    };
+
+    [[maybe_unused]] auto abortPrepared =
+        [&](ConsensusGroupHarness& group, const std::string& txn_id) {
+        return commitCommand(
+            group,
+            AbortPreparedDistributedTransactionCommand{txn_id});
+    };
+
+    auto txnHasStatus = [&](const ConsensusGroupHarness& group,
+                            const std::string& txn_id,
+                            const std::string& status) {
+        return selectAllHasRow(
+            catalogTableOn(group, group.leader, "__distributed_txns"),
+            {{"txn_id", txn_id}, {"status", status}});
+    };
+
+    [[maybe_unused]] auto txnHasLivenessStatus =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& txn_id,
+            const std::string& status) {
+            return selectAllHasRow(
+                catalogTableOn(group, group.leader, "__txn_liveness"),
+                {{"txn_id", txn_id},
+                 {"owner", "coordinator"},
+                 {"status", status}});
+        };
+
+    [[maybe_unused]] auto catalogHasTxnRow =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& table,
+            const std::string& txn_id) {
+            return selectAllHasRow(
+                catalogTableOn(group, group.leader, table),
+                {{"txn_id", txn_id}});
+        };
+
+    struct RangeTransferView {
+        std::string range_id;
+        std::string source_group_id;
+        std::string target_group_id;
+        int transfer_epoch = 0;
+        size_t snapshot_key_count = 0;
+        size_t catchup_key_count = 0;
+        size_t source_copy_key_count = 0;
+        size_t target_copy_key_count = 0;
+        int prepared_config_num = 0;
+        std::string status;
+    };
+
+    [[maybe_unused]] auto latestTransferOn =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& range_id)
+        -> std::optional<RangeTransferView> {
+        SelectAllResult transfers =
+            catalogTableOn(group, group.leader, "__range_transfers");
+        std::optional<RangeTransferView> latest;
+        for (const auto& row : transfers.rows) {
+            auto row_range = selectAllValue(transfers, row, "range_id");
+            auto source = selectAllValue(transfers, row, "source_group_id");
+            auto target = selectAllValue(transfers, row, "target_group_id");
+            auto epoch = selectAllValue(transfers, row, "transfer_epoch");
+            auto snapshot = selectAllValue(transfers, row, "snapshot_key_count");
+            auto catchup = selectAllValue(transfers, row, "catchup_key_count");
+            auto source_copy =
+                selectAllValue(transfers, row, "source_copy_key_count");
+            auto target_copy =
+                selectAllValue(transfers, row, "target_copy_key_count");
+            auto config = selectAllValue(transfers, row, "prepared_config_num");
+            auto status = selectAllValue(transfers, row, "status");
+            if (!row_range.has_value() || *row_range != range_id ||
+                !source.has_value() || !target.has_value() ||
+                !epoch.has_value() || !snapshot.has_value() ||
+                !catchup.has_value() || !source_copy.has_value() ||
+                !target_copy.has_value() || !config.has_value() ||
+                !status.has_value()) {
+                continue;
+            }
+            RangeTransferView view{
+                *row_range,
+                *source,
+                *target,
+                std::stoi(*epoch),
+                static_cast<size_t>(std::stoull(*snapshot)),
+                static_cast<size_t>(std::stoull(*catchup)),
+                static_cast<size_t>(std::stoull(*source_copy)),
+                static_cast<size_t>(std::stoull(*target_copy)),
+                std::stoi(*config),
+                *status};
+            if (!latest.has_value() ||
+                view.transfer_epoch >= latest->transfer_epoch) {
+                latest = view;
+            }
+        }
+        return latest;
+    };
+
+    [[maybe_unused]] auto physicalIndexEntryCount =
+        [&](const ConsensusGroupHarness& group,
+            const std::string& range_id) {
+        SelectAllResult rows =
+            catalogTableOn(group, group.leader, "__index_entries");
+        auto range_column = catalogColumnIndex(rows, "range_id");
+        auto status_column = catalogColumnIndex(rows, "status");
+        if (!range_column.has_value() || !status_column.has_value()) {
+            return size_t{0};
+        }
+        size_t count = 0;
+        for (const auto& row : rows.rows) {
+            if (*range_column < row.size() &&
+                *status_column < row.size() &&
+                row[*range_column] == range_id &&
+                row[*status_column] == "active") {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    [[maybe_unused]] auto indexRouteGroupOnCatalog =
+        [&](const ConsensusGroupHarness& catalog,
+            const std::string& year) {
+        Result route_result =
+            leaderNode(catalog)->executeReadOnlyForTest(
+                ExplainIndexLookupCommand{title_year_index, year});
+        const auto* route = std::get_if<RouteResult>(&route_result);
+        if (route == nullptr || route->replica_group_ids.empty()) {
+            throw std::runtime_error("missing index route for " + year);
+        }
+        return route->replica_group_ids.front();
+    };
+
+    struct IndexMovementScenario {
+        TitleIndexFixture fixture;
+        ConsensusGroupHarness catalog;
+        ConsensusGroupHarness source;
+        ConsensusGroupHarness target;
+    };
+
+    [[maybe_unused]] auto buildIndexMovementScenario = [&]() {
+        IndexMovementScenario scenario;
+        scenario.fixture = titleIndexFixture();
+        scenario.catalog =
+            makeConsensusGroup("movement-catalog", "move-catalog", 11);
+        scenario.source =
+            makeConsensusGroup("group-index-source", "index-source", 12);
+        scenario.target =
+            makeConsensusGroup("group-index-target", "index-target", 13);
+
+        auto registerSource = [&]() {
+            return RegisterReplicaGroupCommand{
+                scenario.source.group_id, {"source1", "source2", "source3"}, 1};
+        };
+        auto registerTarget = [&]() {
+            return RegisterReplicaGroupCommand{
+                scenario.target.group_id, {"target1", "target2", "target3"}, 1};
+        };
+        auto indexCommandFor = [&](const std::string& group_id) {
+            return CreateSecondaryIndexCommand{
+                title_year_index, "title", "production_year", group_id};
+        };
+        auto bootstrapMovementGroup = [&](ConsensusGroupHarness& group) {
+            tests.check(commitCommand(group, bootstrapClusterACommand()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should bootstrap");
+            tests.check(commitCommand(group, registerGroup1Command()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should register table group");
+            tests.check(commitCommand(group, registerSource()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should register source index group");
+            tests.check(commitCommand(group, registerTarget()) ==
+                            Result{StatementOkResult{}},
+                        group.group_id + " should register target index group");
+            tests.check(commitCommand(group, createTitleTableCommand()) ==
+                            Result{CreateTableOkResult{}},
+                        group.group_id + " should create title schema");
+        };
+
+        bootstrapMovementGroup(scenario.catalog);
+        bootstrapMovementGroup(scenario.source);
+        bootstrapMovementGroup(scenario.target);
+        for (const auto& row : scenario.fixture.initial_rows) {
+            tests.check(commitCommand(scenario.catalog,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "catalog should store title row for index metadata");
+            tests.check(commitCommand(scenario.source,
+                                      parseSQL("INSERT " + row.line)) ==
+                            Result{InsertOkResult{}},
+                        "source should store title row for physical index build");
+        }
+        tests.check(commitCommand(scenario.catalog,
+                                  indexCommandFor(scenario.source.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "catalog should route index range to source");
+        tests.check(commitCommand(scenario.source,
+                                  indexCommandFor(scenario.source.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "source should materialize index postings");
+        tests.check(commitCommand(scenario.target,
+                                  indexCommandFor(scenario.target.group_id)) ==
+                        Result{StatementOkResult{}},
+                    "target should create empty physical index range");
+        return scenario;
+    };
+
     struct RuntimeDriveResult {
         size_t ticks = 0;
         bool ended = false;
         std::string trace;
     };
 
-    auto textCount = [](const std::vector<std::string>& values,
-                        const std::string& value) {
-        return static_cast<size_t>(
-            std::count(values.begin(), values.end(), value));
+    [[maybe_unused]] auto driveTxnToEnd =
+        [&](ControlPlaneRuntime& runtime,
+            ConsensusGroupHarness& catalog,
+            const std::string& txn_id,
+            size_t max_ticks) {
+        RuntimeDriveResult driven;
+        for (size_t i = 0; i < max_ticks; ++i) {
+            if (txnHasStatus(catalog, txn_id, "ended")) {
+                driven.ended = true;
+                return driven;
+            }
+            auto step = runtime.tick();
+            if (!driven.trace.empty()) driven.trace += "; ";
+            driven.trace += step.status_before + "->" +
+                            step.status_after + ":" +
+                            describeResult(step.result);
+            if (!step.advanced) {
+                driven.ended = txnHasStatus(catalog, txn_id, "ended");
+                return driven;
+            }
+            ++driven.ticks;
+        }
+        driven.ended = txnHasStatus(catalog, txn_id, "ended");
+        return driven;
+    };
+
+
+
+    const std::string broadcast_join_sql =
+        "SELECT title.title, movie_companies.company_id "
+        "FROM title JOIN movie_companies "
+        "ON title.id = movie_companies.movie_id "
+        "WHERE title.production_year=2011";
+    const std::string no_predicate_join_sql =
+        "SELECT title.title, movie_companies.company_id "
+        "FROM title JOIN movie_companies "
+        "ON title.id = movie_companies.movie_id";
+
+    [[maybe_unused]] auto joinReference =
+        [](const IndexScenario& scenario,
+           const std::map<std::string, std::string>& year_overrides = {}) {
+        std::map<std::string, std::string> title_by_id;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            std::vector<std::string> values = row.values;
+            auto override = year_overrides.find(values[0]);
+            if (override != year_overrides.end()) {
+                values[3] = override->second;
+            }
+            if (values.size() >= 4 && values[3] == "2011") {
+                title_by_id[values[0]] = values[1];
+            }
+        }
+
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& row : scenario.fixture.movie_company_rows) {
+            if (row.values.size() < 3) continue;
+            auto title = title_by_id.find(row.values[1]);
+            if (title == title_by_id.end()) continue;
+            rows.push_back({title->second, row.values[2]});
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
+
+    [[maybe_unused]] auto fullJoinReference = [](const IndexScenario& scenario) {
+        std::map<std::string, std::string> title_by_id;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            if (row.values.size() >= 2) {
+                title_by_id[row.values[0]] = row.values[1];
+            }
+        }
+
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& row : scenario.fixture.movie_company_rows) {
+            if (row.values.size() < 3) continue;
+            auto title = title_by_id.find(row.values[1]);
+            if (title == title_by_id.end()) continue;
+            rows.push_back({title->second, row.values[2]});
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
+
+    [[maybe_unused]] auto groupedYearCountReference = [](const IndexScenario& scenario) {
+        std::map<std::string, size_t> counts;
+        for (const auto& row : scenario.fixture.initial_rows) {
+            if (row.values.size() >= 4) {
+                ++counts[row.values[3]];
+            }
+        }
+        std::vector<std::vector<std::string>> rows;
+        for (const auto& [year, count] : counts) {
+            rows.push_back({year, std::to_string(count)});
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
+
+    [[maybe_unused]] auto allJoinFragmentsUseReadTimestamp =
+        [](const DistributedJoinResult& result) {
+        if (result.read_ts.isZero()) return false;
+        for (const auto& fragment : result.fragments) {
+            if (fragment.read_ts != result.read_ts) return false;
+        }
+        return true;
+    };
+
+    [[maybe_unused]] auto physicalPlanContains =
+        [](const std::shared_ptr<PhysicalPlanNode>& root,
+           PhysicalPlanNode::Kind kind) {
+        std::function<bool(const std::shared_ptr<PhysicalPlanNode>&)> visit =
+            [&](const std::shared_ptr<PhysicalPlanNode>& node) {
+                if (!node) return false;
+                if (node->kind == kind) return true;
+                for (const auto& input : node->inputs) {
+                    if (visit(input)) return true;
+                }
+                return false;
+        };
+        return visit(root);
+    };
+
+    [[maybe_unused]] auto explainContains =
+        [](const DistributedJoinResult& result,
+           const std::string& needle) {
+        return std::any_of(
+            result.explain_lines.begin(),
+            result.explain_lines.end(),
+            [&](const std::string& line) {
+                return line.find(needle) != std::string::npos;
+            });
     };
 
     auto coreSystemCatalog = [&](BuzzDBCore& core,
@@ -24026,1134 +28854,377 @@ int main(int argc, char* argv[]) {
             core.execute(Command{ReadSystemCatalogCommand{table}});
         const auto* rows = std::get_if<SelectAllResult>(&result);
         if (rows == nullptr) {
-            throw std::runtime_error("missing persistent catalog table " +
+            throw std::runtime_error("missing recovered catalog table " +
                                      table);
         }
         return *rows;
     };
 
-    auto coreHasRow = [&](BuzzDBCore& core,
-                          const std::string& table,
-                          const std::map<std::string, std::string>& row) {
+    [[maybe_unused]] auto coreHasRow =
+        [&](BuzzDBCore& core,
+            const std::string& table,
+            const std::map<std::string, std::string>& row) {
         return selectAllHasRow(coreSystemCatalog(core, table), row);
     };
 
-    auto coreSelectTitleById = [&](BuzzDBCore& core,
-                                   const std::string& id) {
+    auto storageTraceHas =
+        [](const std::vector<StorageTraceEvent>& trace,
+           const std::string& operation) {
+        return std::any_of(
+            trace.begin(),
+            trace.end(),
+            [&](const StorageTraceEvent& event) {
+                return event.operation == operation;
+            });
+    };
+
+    size_t storage_path_counter = 0;
+    auto withStoragePath =
+        [&](const std::string& label, auto&& fn) {
+        std::string safe_label = label;
+        for (char& ch : safe_label) {
+            if (!std::isalnum(static_cast<unsigned char>(ch))) {
+                ch = '-';
+            }
+        }
+        std::filesystem::path dir =
+            std::filesystem::temp_directory_path() /
+            ("buzzdb-v153-" + std::to_string(::getpid()) + "-" +
+             std::to_string(++storage_path_counter) + "-" + safe_label);
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        try {
+            fn((dir / "buzzdb.dat").string(), dir);
+            std::filesystem::remove_all(dir);
+        } catch (...) {
+            std::filesystem::remove_all(dir);
+            throw;
+        }
+    };
+
+    auto requireSelectWhere =
+        [&](BuzzDBCore& core,
+            const std::string& table,
+            const std::string& column,
+            const std::string& value) {
         Result result =
-            core.execute(Command{SelectWhereCommand{"title", "id", id}});
+            core.execute(SelectWhereCommand{table, column, value});
         const auto* rows = std::get_if<SelectAllResult>(&result);
         if (rows == nullptr) {
-            throw std::runtime_error("persistent title lookup failed");
+            throw std::runtime_error("select failed for " + table);
         }
         return *rows;
     };
 
-    auto coreReadIndexOn = [&](BuzzDBCore& core,
-                               const std::string& year) {
+    auto requireIndexLookup =
+        [&](BuzzDBCore& core,
+            const std::string& index_name,
+            const std::string& index_key) {
         Result result =
-            core.execute(Command{
-                ReadSecondaryIndexCommand{title_year_index, year}});
+            core.execute(ReadSecondaryIndexCommand{index_name, index_key});
         const auto* lookup = std::get_if<IndexLookupResult>(&result);
         if (lookup == nullptr) {
-            throw std::runtime_error("persistent index lookup failed");
+            throw std::runtime_error("index lookup failed for " + index_name);
         }
         return *lookup;
     };
 
-    auto indexDescriptorVersionOnCore = [&](BuzzDBCore& core) {
-        SelectAllResult indexes = coreSystemCatalog(core, "__indexes");
-        for (const auto& row : indexes.rows) {
-            auto name = selectAllValue(indexes, row, "index_name");
-            auto version = selectAllValue(indexes, row, "descriptor_version");
-            if (name.has_value() && *name == title_year_index &&
-                version.has_value()) {
-                return std::stoi(*version);
-            }
-        }
-        throw std::runtime_error("missing persistent index descriptor");
-    };
-
-    struct PersistentTxnScenario {
-        TitleIndexFixture fixture;
-        std::filesystem::path root;
-        std::string catalog_file;
-        std::string table_file;
-        std::string index_file;
-        std::unique_ptr<BuzzDBCore> catalog;
-        std::unique_ptr<BuzzDBCore> table_owner;
-        std::unique_ptr<BuzzDBCore> index_owner;
-
-        ~PersistentTxnScenario() {
-            catalog.reset();
-            table_owner.reset();
-            index_owner.reset();
-            if (!root.empty()) {
-                std::error_code ec;
-                std::filesystem::remove_all(root, ec);
-            }
-        }
-    };
-
-    auto bootstrapPersistentGroup =
-        [&](BuzzDBCore& core, bool include_index_group) {
+    auto bootstrapSingleGroupCore = [&](BuzzDBCore& core) {
         tests.check(core.execute(bootstrapClusterACommand()) ==
                         Result{StatementOkResult{}},
-                    "persistent group should bootstrap cluster metadata");
+                    "core should bootstrap cluster metadata");
         tests.check(core.execute(registerGroup1Command()) ==
                         Result{StatementOkResult{}},
-                    "persistent group should register the table group");
-        if (include_index_group) {
-            tests.check(core.execute(Command{registerIndexGroupCommand()}) ==
-                            Result{StatementOkResult{}},
-                        "persistent group should register index group");
-        }
-        tests.check(core.execute(Command{createTitleTableCommand()}) ==
+                    "core should register group-1");
+        tests.check(core.execute(createTitleTableCommand()) ==
                         Result{CreateTableOkResult{}},
-                    "persistent group should create title table");
+                    "core should create title table");
     };
 
-    auto buildPersistentTxnScenario = [&]() {
-        static size_t counter = 0;
-        auto scenario = std::make_unique<PersistentTxnScenario>();
-        scenario->fixture = titleIndexFixture();
-        scenario->root =
-            std::filesystem::temp_directory_path() /
-            ("buzzdb-v147-durable-commit-" + std::to_string(::getpid()) +
-             "-" + std::to_string(++counter));
-        std::error_code ec;
-        std::filesystem::remove_all(scenario->root, ec);
-        std::filesystem::create_directories(scenario->root);
-        scenario->catalog_file = (scenario->root / "catalog.dat").string();
-        scenario->table_file = (scenario->root / "table-owner.dat").string();
-        scenario->index_file = (scenario->root / "index-owner.dat").string();
-        scenario->catalog =
-            std::make_unique<BuzzDBCore>(scenario->catalog_file);
-        scenario->table_owner =
-            std::make_unique<BuzzDBCore>(scenario->table_file);
-        scenario->index_owner =
-            std::make_unique<BuzzDBCore>(scenario->index_file);
-
-        bootstrapPersistentGroup(*scenario->catalog, true);
-        tests.check(
-            scenario->catalog->execute(
-                Command{createTitleYearIndexCommand(index_replica_group)}) ==
-                Result{StatementOkResult{}},
-            "persistent catalog should record index metadata");
-
-        bootstrapPersistentGroup(*scenario->table_owner, false);
-        for (const auto& row : scenario->fixture.initial_rows) {
-            tests.check(scenario->table_owner->execute(
-                            parseSQL("INSERT " + row.line)) ==
-                            Result{InsertOkResult{}},
-                        "table owner should store title rows");
+    auto requireComputeSelectWhere =
+        [&](ComputeNode& node,
+            const std::string& table,
+            const std::string& column,
+            const std::string& value) {
+        Result result =
+            node.execute(SelectWhereCommand{table, column, value});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) {
+            throw std::runtime_error("compute select failed for " + table);
         }
-
-        bootstrapPersistentGroup(*scenario->index_owner, true);
-        tests.check(
-            scenario->index_owner->execute(
-                Command{createTitleYearIndexCommand(index_replica_group)}) ==
-                Result{StatementOkResult{}},
-            "index owner should create physical index metadata");
-        int index_version =
-            indexDescriptorVersionOnCore(*scenario->index_owner);
-        std::string index_range = defaultRangeIdForIndex(title_year_index);
-        for (const auto& row : scenario->fixture.initial_rows) {
-            std::string index_key = row.values[3];
-            std::string primary_key = row.values[0];
-            tests.check(
-                scenario->index_owner->execute(
-                    Command{InsertRowCommand{
-                        "__index_entries",
-                        {title_year_index,
-                         index_key,
-                         primary_key,
-                         indexEntryKey(title_year_index,
-                                       index_key,
-                                       primary_key),
-                         index_range,
-                         index_replica_group,
-                         std::to_string(index_version),
-                         std::to_string(HashIndex::hashSlotFor(
-                             std::stoi(index_key))),
-                         "active"}}}) == Result{InsertOkResult{}},
-                "index owner should store physical index entries");
-        }
-        return scenario;
+        return *rows;
     };
 
-    struct ConsensusTxnScenario {
-        TitleIndexFixture fixture;
-        ConsensusGroupHarness catalog;
-        ConsensusGroupHarness table_owner;
-        ConsensusGroupHarness index_owner;
+    auto requireComputeIndexLookup =
+        [&](ComputeNode& node,
+            const std::string& index_name,
+            const std::string& index_key) {
+        Result result =
+            node.execute(ReadSecondaryIndexCommand{index_name, index_key});
+        const auto* lookup = std::get_if<IndexLookupResult>(&result);
+        if (lookup == nullptr) {
+            throw std::runtime_error("compute index lookup failed for " +
+                                     index_name);
+        }
+        return *lookup;
     };
 
-    auto buildConsensusTxnScenario = [&]() {
-        static size_t counter = 0;
-        ConsensusTxnScenario scenario;
-        scenario.fixture = titleIndexFixture();
-        std::string suffix = std::to_string(++counter) + "-";
-        scenario.catalog =
-            makeConsensusGroup("catalog", "v147-catalog-" + suffix, 14710);
-        scenario.table_owner =
-            makeConsensusGroup("group-1", "v147-table-" + suffix, 14720);
-        scenario.index_owner =
-            makeConsensusGroup(index_replica_group,
-                               "v147-index-" + suffix,
-                               14730);
-
-        bootstrapConsensusGroup(scenario.catalog, true);
-        tests.check(
-            commitConsensusCommand(
-                scenario.catalog,
-                Command{createTitleYearIndexCommand(index_replica_group)}) ==
-                Result{StatementOkResult{}},
-            "consensus catalog should record index metadata");
-
-        bootstrapConsensusGroup(scenario.table_owner, false);
-        for (const auto& row : scenario.fixture.initial_rows) {
-            tests.check(
-                commitConsensusCommand(scenario.table_owner,
-                                       parseSQL("INSERT " + row.line)) ==
-                    Result{InsertOkResult{}},
-                "consensus table owner should store title rows");
-        }
-
-        bootstrapConsensusGroup(scenario.index_owner, true);
-        tests.check(
-            commitConsensusCommand(
-                scenario.index_owner,
-                Command{createTitleYearIndexCommand(index_replica_group)}) ==
-                Result{StatementOkResult{}},
-            "consensus index owner should create physical index metadata");
-
-        int index_version =
-            indexDescriptorVersionOnConsensus(scenario.index_owner);
-        std::string index_range = defaultRangeIdForIndex(title_year_index);
-        for (const auto& row : scenario.fixture.initial_rows) {
-            std::string index_key = row.values[3];
-            std::string primary_key = row.values[0];
-            tests.check(
-                commitConsensusCommand(
-                    scenario.index_owner,
-                    Command{InsertRowCommand{
-                        "__index_entries",
-                        {title_year_index,
-                         index_key,
-                         primary_key,
-                         indexEntryKey(title_year_index,
-                                       index_key,
-                                       primary_key),
-                         index_range,
-                         index_replica_group,
-                         std::to_string(index_version),
-                         std::to_string(HashIndex::hashSlotFor(
-                             std::stoi(index_key))),
-                         "active"}}}) == Result{InsertOkResult{}},
-                "consensus index owner should store physical index entries");
-        }
-        return scenario;
-    };
-
-    auto restartCore = [&](std::unique_ptr<BuzzDBCore>& core,
-                           const std::string& database_file) {
-        core.reset();
-        core = std::make_unique<BuzzDBCore>(database_file);
-        tests.check(core->execute(Command{RecoverDistributedTransactionsCommand{}}) ==
+    auto bootstrapSingleGroupCompute = [&](ComputeNode& node) {
+        tests.check(node.execute(bootstrapClusterACommand()) ==
                         Result{StatementOkResult{}},
-                    "persistent core should recover through the public recovery command");
+                    "compute should bootstrap cluster metadata");
+        tests.check(node.execute(registerGroup1Command()) ==
+                        Result{StatementOkResult{}},
+                    "compute should register group-1");
+        tests.check(node.execute(createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "compute should create title table");
     };
 
-    auto snapshotConsensusScenario =
-        [&](ConsensusTxnScenario& consensus, const std::string& label) {
-        static size_t counter = 0;
-        auto scenario = std::make_unique<PersistentTxnScenario>();
-        scenario->fixture = consensus.fixture;
-        scenario->root =
-            std::filesystem::temp_directory_path() /
-            ("buzzdb-v147-consensus-snapshot-" + label + "-" +
-             std::to_string(::getpid()) + "-" +
-             std::to_string(++counter));
-        std::error_code ec;
-        std::filesystem::remove_all(scenario->root, ec);
-        std::filesystem::create_directories(scenario->root);
-        scenario->catalog_file = (scenario->root / "catalog.dat").string();
-        scenario->table_file = (scenario->root / "table-owner.dat").string();
-        scenario->index_file = (scenario->root / "index-owner.dat").string();
+    tests.test("Persistent volume lease fences stale writer across storage service restart", [&] {
+        withStoragePath("persistent-volume-fence",
+                        [&](const std::string& database_file,
+                            const std::filesystem::path&) {
+            NamespaceId ns = storageNamespaceForDatabaseFile(database_file);
+            StorageNamespaceFiles files =
+                storageFilesForDatabaseFile(database_file);
 
-        auto recoverLeader =
-            [&](ConsensusGroupHarness& group,
-                const std::string& database_file,
-                const std::string& name) {
-            consensusLeader(group)->copyDurableDatabaseForTest(database_file);
-            auto core = std::make_unique<BuzzDBCore>(database_file);
-            tests.check(
-                core->execute(
-                    Command{RecoverDistributedTransactionsCommand{}}) ==
-                    Result{StatementOkResult{}},
-                name + " should recover consensus-applied durable state");
-            return core;
-        };
+            auto stale_storage = std::make_shared<LocalStorageService>();
+            ComputeNode stale{ComputeNodeId{601}, files, stale_storage};
+            tests.check(stale.attach(ns, AttachMode::ReadWrite).status ==
+                            AttachStatus::Attached,
+                        "stale writer should initially attach");
+            tests.check(stale.execute(CreateTableCommand{
+                            "kv", {"id:int", "value:int"}}) ==
+                            Result{CreateTableOkResult{}},
+                        "stale writer should create table before fencing");
 
-        scenario->catalog =
-            recoverLeader(consensus.catalog,
-                          scenario->catalog_file,
-                          label + " catalog");
-        scenario->table_owner =
-            recoverLeader(consensus.table_owner,
-                          scenario->table_file,
-                          label + " table owner");
-        scenario->index_owner =
-            recoverLeader(consensus.index_owner,
-                          scenario->index_file,
-                          label + " index owner");
-        return scenario;
-    };
-
-    auto persistentRuntime = [&](PersistentTxnScenario& scenario) {
-        ControlPlaneRuntime runtime{
-            [&](const Command& command) {
-                return scenario.catalog->execute(command);
-            }
-        };
-        runtime.registerReplicaGroup(
-            "group-1",
-            [&](const Command& command) {
-                return scenario.table_owner->execute(command);
-            });
-        runtime.registerReplicaGroup(
-            index_replica_group,
-            [&](const Command& command) {
-                return scenario.index_owner->execute(command);
+            auto current_storage = std::make_shared<LocalStorageService>();
+            ComputeNode current{ComputeNodeId{602}, files, current_storage};
+            tests.check(current.attach(ns, AttachMode::ReadWrite).status ==
+                            AttachStatus::Attached,
+                        "replacement storage service should take persisted lease");
+            Result rejected =
+                stale.execute(InsertRowCommand{"kv", {"6", "60"}});
+            SelectAllResult rows =
+                requireComputeSelectWhere(current, "kv", "id", "6");
+            StorageManifest manifest = current_storage->readManifest(ns);
+            tests.check(rejected == Result{ConfigRejectedResult{}} &&
+                            rows.rows.empty() &&
+                            manifest.lease_epoch ==
+                                current.lease().epoch.value &&
+                            manifest.writer_node_id ==
+                                current.lease().holder.value,
+                        "persisted manifest should fence the old writer");
         });
-        return runtime;
-    };
+    });
 
-    auto consensusRuntime = [&](ConsensusTxnScenario& scenario) {
-        ControlPlaneRuntime runtime{
-            [&](const Command& command) {
-                return commitConsensusCommand(scenario.catalog, command);
+    tests.test("Storage rejects page write beyond durable WAL", [&] {
+        withStoragePath("wal-page-fence",
+                        [&](const std::string& database_file,
+                            const std::filesystem::path&) {
+            NamespaceId ns = storageNamespaceForDatabaseFile(database_file);
+            StorageNamespaceFiles files =
+                storageFilesForDatabaseFile(database_file);
+            auto storage = std::make_shared<LocalStorageService>();
+            storage->bindNamespace(ns, files);
+            AttachResult attached =
+                storage->attachCompute(ns, ComputeNodeId{611},
+                                       AttachMode::ReadWrite);
+            tests.check(attached.status == AttachStatus::Attached,
+                        "direct storage writer should attach");
+
+            PageImage image;
+            image.key = PageKey{STORAGE_DATA_FILE, PageId{0}};
+            image.page_lsn = Lsn{5};
+            bool rejected = false;
+            try {
+                storage->writePage(ns, attached.lease, image);
+            } catch (const std::runtime_error& error) {
+                rejected =
+                    std::string(error.what()).find("durable log fence") !=
+                    std::string::npos;
             }
-        };
-        runtime.registerReplicaGroup(
-            "group-1",
-            [&](const Command& command) {
-                return commitConsensusCommand(scenario.table_owner, command);
-            });
-        runtime.registerReplicaGroup(
-            index_replica_group,
-            [&](const Command& command) {
-                return commitConsensusCommand(scenario.index_owner, command);
-            });
-        return runtime;
-    };
+            tests.check(rejected,
+                        "storage should reject pageLSN ahead of durable WAL");
 
-    auto consensusTxnHasStatus =
-        [&](const ConsensusGroupHarness& group,
-            const std::string& txn_id,
-            const std::string& status) {
-        return consensusHasRow(group,
-                               "__distributed_txns",
-                               {{"txn_id", txn_id}, {"status", status}});
-    };
+            std::string line = "5 DIRECT_TEST\n";
+            std::vector<uint8_t> bytes = bytesFromString(line);
+            storage->appendLog(
+                ns,
+                attached.lease,
+                LogRecordBytes{Lsn{5}, bytes, storageCrc(bytes)});
+            tests.check(storage->forceLog(ns, attached.lease, Lsn{5}).value == 5,
+                        "forceLog should advance durable log LSN");
+            storage->writePage(ns, attached.lease, image);
+            StorageManifest manifest = storage->readManifest(ns);
+            tests.check(manifest.durable_log_lsn.value == 5,
+                        "manifest should persist the durable log fence");
+        });
+    });
 
-    auto consensusParticipantHasStatus =
-        [&](const ConsensusGroupHarness& group,
-            const std::string& txn_id,
-            const std::string& range_id,
-            const std::string& status) {
-        return consensusHasRow(group,
-                               "__participant_txns",
-                               {{"txn_id", txn_id},
-                                {"range_id", range_id},
-                                {"status", status}});
-    };
+    tests.test("Compute writes satisfy storage WAL fence", [&] {
+        withStoragePath("compute-wal-fence",
+                        [&](const std::string& database_file,
+                            const std::filesystem::path&) {
+            NamespaceId ns = storageNamespaceForDatabaseFile(database_file);
+            StorageNamespaceFiles files =
+                storageFilesForDatabaseFile(database_file);
+            auto storage = std::make_shared<LocalStorageService>();
+            ComputeNode writer{ComputeNodeId{621}, files, storage};
+            tests.check(writer.attach(ns, AttachMode::ReadWrite).status ==
+                            AttachStatus::Attached,
+                        "writer should attach");
+            tests.check(writer.execute(CreateTableCommand{
+                            "kv", {"id:int", "value:int"}}) ==
+                            Result{CreateTableOkResult{}},
+                        "writer should create table");
+            tests.check(writer.execute(InsertRowCommand{
+                            "kv", {"7", "70"}}) ==
+                            Result{InsertOkResult{}},
+                        "writer should insert under the storage WAL fence");
+            writer.detach();
 
-    struct UpdateWorkload {
-        std::string primary_key;
-        std::string old_year;
-        std::string new_year;
-        std::vector<std::string> statements;
-    };
-
-    auto updateWorkloadFromFixture =
-        [&](const TitleIndexFixture& fixture, size_t offset) {
-        for (size_t i = 0; i < fixture.initial_rows.size(); ++i) {
-            const auto& row = fixture.initial_rows.at(
-                (offset + i) % fixture.initial_rows.size());
-            UpdateWorkload workload;
-            workload.primary_key = row.values[0];
-            workload.old_year = row.values[3];
-            workload.new_year =
-                replacementProductionYear(workload.old_year);
-            workload.statements = {
-                "UPDATE title SET production_year=" + workload.new_year +
-                " WHERE id=" + workload.primary_key};
-            return workload;
-        }
-        throw std::runtime_error(
-            "transaction fixture has no title rows");
-    };
-
-    auto updateWorkload = [&](PersistentTxnScenario& scenario,
-                              size_t offset) {
-        for (size_t i = 0; i < scenario.fixture.initial_rows.size(); ++i) {
-            const auto& row = scenario.fixture.initial_rows.at(
-                (offset + i) % scenario.fixture.initial_rows.size());
-            SelectAllResult existing =
-                coreSelectTitleById(*scenario.table_owner, row.values[0]);
-            if (existing.rows.empty()) continue;
-            UpdateWorkload workload;
-            workload.primary_key = row.values[0];
-            workload.old_year = row.values[3];
-            workload.new_year =
-                replacementProductionYear(workload.old_year);
-            workload.statements = {
-                "UPDATE title SET production_year=" + workload.new_year +
-                " WHERE id=" + workload.primary_key};
-            return workload;
-        }
-        throw std::runtime_error(
-            "persistent transaction fixture has no selectable title rows");
-    };
-
-    auto drivePersistentTxnToEnd =
-        [&](ControlPlaneRuntime& runtime,
-            PersistentTxnScenario& scenario,
-            const std::string& txn_id,
-            size_t max_ticks) {
-        RuntimeDriveResult driven;
-        for (size_t i = 0; i < max_ticks; ++i) {
-            if (coreHasRow(*scenario.catalog,
-                           "__distributed_txns",
-                           {{"txn_id", txn_id}, {"status", "ended"}})) {
-                driven.ended = true;
-                return driven;
-            }
-            auto step = runtime.tick();
-            if (!driven.trace.empty()) driven.trace += "; ";
-            driven.trace += step.status_before + "->" +
-                            step.status_after + ":" +
-                            describeResult(step.result);
-            if (!step.advanced) {
-                driven.ended =
-                    coreHasRow(*scenario.catalog,
-                               "__distributed_txns",
-                               {{"txn_id", txn_id}, {"status", "ended"}});
-                return driven;
-            }
-            ++driven.ticks;
-        }
-        driven.ended =
-            coreHasRow(*scenario.catalog,
-                       "__distributed_txns",
-                       {{"txn_id", txn_id}, {"status", "ended"}});
-        return driven;
-    };
-
-    auto driveConsensusTxnToEnd =
-        [&](ControlPlaneRuntime& runtime,
-            ConsensusTxnScenario& scenario,
-            const std::string& txn_id,
-            size_t max_ticks) {
-        RuntimeDriveResult driven;
-        for (size_t i = 0; i < max_ticks; ++i) {
-            if (consensusTxnHasStatus(scenario.catalog,
-                                      txn_id,
-                                      "ended")) {
-                driven.ended = true;
-                return driven;
-            }
-            auto step = runtime.tick();
-            if (!driven.trace.empty()) driven.trace += "; ";
-            driven.trace += step.status_before + "->" +
-                            step.status_after + ":" +
-                            describeResult(step.result);
-            if (!step.advanced) {
-                driven.ended =
-                    consensusTxnHasStatus(scenario.catalog,
-                                          txn_id,
-                                          "ended");
-                return driven;
-            }
-            ++driven.ticks;
-        }
-        driven.ended =
-            consensusTxnHasStatus(scenario.catalog, txn_id, "ended");
-        return driven;
-    };
-
-    tests.test("Consensus-applied coordinator decision survives WAL recovery", [&] {
-        TitleIndexFixture fixture = titleIndexFixture();
-        const TitleRowFixture& row = fixture.initial_rows.front();
-        const std::string primary_key = row.values[0];
-        const std::string new_year =
-            replacementProductionYear(row.values[3]);
-        std::vector<Address> replicas{
-            Address("durable-catalog-1"),
-            Address("durable-catalog-2"),
-            Address("durable-catalog-3")};
-        Address leader = replicas.front();
-        Address client("client-durable-catalog");
-        const int client_id = 14701;
-        int request_id = 1;
-        SearchState state = electedConsensusState(replicas, leader);
-
-        auto replyFor = [&](int id) -> std::optional<Result> {
-            for (auto it = state.network().rbegin();
-                 it != state.network().rend(); ++it) {
-                const auto* reply = std::get_if<ClientReply>(&it->message);
-                if (reply != nullptr &&
-                    reply->client_id == client_id &&
-                    reply->request_id == id) {
-                    return reply->result;
+            auto trace = storage->trace();
+            uint64_t max_page_lsn = 0;
+            for (const auto& event : trace) {
+                if (event.operation == "WritePage") {
+                    max_page_lsn =
+                        std::max(max_page_lsn, event.lsn.value);
                 }
             }
-            return std::nullopt;
-        };
-        auto commitConsensusCommand = [&](const Command& command) {
-            int id = request_id++;
-            state = deliverConsensusCommandToQuorum(
-                state,
-                leader,
-                client,
-                client_id,
-                id,
-                command,
-                {replicas[1], replicas[2]});
-            auto reply = replyFor(id);
-            if (!reply.has_value()) {
-                throw std::runtime_error(
-                    "missing consensus reply for " +
-                    describeCommand(command));
+            StorageManifest manifest = storage->readManifest(ns);
+            tests.check(max_page_lsn > 0 &&
+                            manifest.durable_log_lsn.value >= max_page_lsn &&
+                            storageTraceHas(trace, "ForceLog"),
+                        "compute page writes should be covered by durable WAL");
+        });
+    });
+
+    tests.test("Replacement compute auto-recovers on attach", [&] {
+        withStoragePath("auto-recover-attach",
+                        [&](const std::string& database_file,
+                            const std::filesystem::path&) {
+            NamespaceId ns = storageNamespaceForDatabaseFile(database_file);
+            StorageNamespaceFiles files =
+                storageFilesForDatabaseFile(database_file);
+
+            auto writer_storage = std::make_shared<LocalStorageService>();
+            ComputeNode writer{ComputeNodeId{631}, files, writer_storage};
+            tests.check(writer.attach(ns, AttachMode::ReadWrite).status ==
+                            AttachStatus::Attached,
+                        "writer should attach");
+            tests.check(writer.execute(CreateTableCommand{
+                            "kv", {"id:int", "value:int"}}) ==
+                            Result{CreateTableOkResult{}},
+                        "writer should create table");
+            tests.check(writer.execute(InsertRowCommand{
+                            "kv", {"8", "80"}}) ==
+                            Result{InsertOkResult{}},
+                        "writer should commit row");
+            writer.crashWithoutDetach();
+
+            auto replacement_storage =
+                std::make_shared<LocalStorageService>();
+            ComputeNode replacement{
+                ComputeNodeId{632}, files, replacement_storage};
+            tests.check(replacement.attach(ns, AttachMode::ReadWrite).status ==
+                            AttachStatus::Attached,
+                        "replacement should attach and recover");
+            SelectAllResult rows =
+                requireComputeSelectWhere(replacement, "kv", "id", "8");
+            auto trace = replacement_storage->trace();
+            tests.check(rows.rows.size() == 1 &&
+                            rows.rows.front()[1] == "80" &&
+                            storageTraceHas(trace, "ReadLog"),
+                        "attach should recover committed data without a manual recover call");
+        });
+    });
+
+    tests.test("Participant commit survives fenced compute replacement", [&] {
+        withStoragePath("fenced-participant-replacement",
+                        [&](const std::string& database_file,
+                            const std::filesystem::path&) {
+            NamespaceId ns = storageNamespaceForDatabaseFile(database_file);
+            StorageNamespaceFiles files =
+                storageFilesForDatabaseFile(database_file);
+            const std::string txn_id = "txn-v153-participant";
+            const std::string table_range_id =
+                defaultRangeIdForTable("title");
+            const std::string index_range_id =
+                defaultRangeIdForIndex(title_year_index);
+
+            auto writer_storage = std::make_shared<LocalStorageService>();
+            ComputeNode writer{ComputeNodeId{641}, files, writer_storage};
+            tests.check(writer.attach(ns, AttachMode::ReadWrite).status ==
+                            AttachStatus::Attached,
+                        "participant writer should attach");
+            bootstrapSingleGroupCompute(writer);
+            tests.check(writer.execute(CreateSecondaryIndexCommand{
+                            title_year_index,
+                            "title",
+                            "production_year",
+                            "group-1"}) ==
+                            Result{StatementOkResult{}},
+                        "writer should create title index");
+            for (const std::string& range_id :
+                 {table_range_id, index_range_id}) {
+                Result prepared = writer.execute(PrepareTxnParticipantCommand{
+                    txn_id,
+                    range_id,
+                    "group-1",
+                    {"INSERT title|9|Compute|1|2011"}});
+                const auto* prepared_txn =
+                    std::get_if<DistributedTxnResult>(&prepared);
+                tests.check(prepared_txn != nullptr &&
+                                prepared_txn->status == "prepared",
+                            "writer should prepare participant " + range_id);
+                Result committed = writer.execute(CommitTxnParticipantCommand{
+                    txn_id,
+                    range_id,
+                    "group-1"});
+                const auto* committed_txn =
+                    std::get_if<DistributedTxnResult>(&committed);
+                tests.check(committed_txn != nullptr &&
+                                committed_txn->status == "committed",
+                            "writer should commit participant " + range_id);
             }
-            return *reply;
-        };
-        auto leaderReplica = [&]() {
-            const auto* node = state.nodeAs<ConsensusReplica>(leader);
-            if (node == nullptr) {
-                throw std::runtime_error("missing consensus leader");
-            }
-            return node;
-        };
 
-        tests.check(commitConsensusCommand(bootstrapClusterACommand()) ==
-                        Result{StatementOkResult{}},
-                    "consensus leader should bootstrap cluster metadata");
-        tests.check(commitConsensusCommand(registerGroup1Command()) ==
-                        Result{StatementOkResult{}},
-                    "consensus leader should register the table group");
-        tests.check(
-            commitConsensusCommand(Command{registerIndexGroupCommand()}) ==
-                Result{StatementOkResult{}},
-            "consensus leader should register the index group");
-        tests.check(commitConsensusCommand(Command{createTitleTableCommand()}) ==
-                        Result{CreateTableOkResult{}},
-                    "consensus leader should create the title table");
-        tests.check(commitConsensusCommand(parseSQL("INSERT " + row.line)) ==
-                        Result{InsertOkResult{}},
-                    "consensus leader should store a real IMDB title row");
-        tests.check(
-            commitConsensusCommand(
-                Command{createTitleYearIndexCommand(index_replica_group)}) ==
-                Result{StatementOkResult{}},
-            "consensus leader should create secondary index metadata");
-
-        const std::string txn_id = "txn-consensus-durable-decision";
-        std::vector<std::string> statements{
-            "UPDATE title SET production_year=" + new_year +
-            " WHERE id=" + primary_key};
-        Result prepared_result =
-            commitConsensusCommand(
-                Command{PrepareDistributedTransactionCommand{
-                    txn_id, statements}});
-        const auto* prepared =
-            std::get_if<DistributedTxnResult>(&prepared_result);
-        tests.check(prepared != nullptr &&
-                        prepared->status == "prepared" &&
-                        prepared->participant_range_ids.size() == 2,
-                    "consensus-applied prepare should plan two participants");
-
-        Result decision_result =
-            commitConsensusCommand(
-                Command{CommitPreparedDistributedTransactionCommand{
-                    txn_id, false}});
-        const auto* decision =
-            std::get_if<DistributedTxnResult>(&decision_result);
-        tests.check(decision != nullptr &&
-                        decision->status == "committed" &&
-                        !decision->commit_ts.isZero(),
-                    "consensus-applied coordinator should force commit decision");
-
-        struct ConsensusSnapshotDir {
-            std::filesystem::path root;
-            ~ConsensusSnapshotDir() {
-                if (!root.empty()) {
-                    std::error_code ec;
-                    std::filesystem::remove_all(root, ec);
-                }
-            }
-        } snapshot{
-            std::filesystem::temp_directory_path() /
-            ("buzzdb-v147-consensus-recover-" +
-             std::to_string(::getpid()))};
-        std::error_code ec;
-        std::filesystem::remove_all(snapshot.root, ec);
-        std::filesystem::create_directories(snapshot.root);
-        std::string database_file =
-            (snapshot.root / "catalog-leader.dat").string();
-        leaderReplica()->copyDurableDatabaseForTest(database_file);
-
-        BuzzDBCore recovered(database_file);
-        tests.check(
-            recovered.execute(
-                Command{RecoverDistributedTransactionsCommand{}}) ==
-                Result{StatementOkResult{}},
-            "recovered consensus database should use the public recovery command");
-        tests.check(
-            coreHasRow(recovered,
-                       "__distributed_txns",
-                       {{"txn_id", txn_id}, {"status", "committed"}}) &&
-                coreHasRow(recovered,
-                           "__txn_participants",
-                           {{"txn_id", txn_id},
-                            {"range_id", defaultRangeIdForTable("title")},
-                            {"replica_group_id", "group-1"},
-                            {"status", "committed"}}) &&
-                coreHasRow(
-                    recovered,
-                    "__txn_participants",
-                    {{"txn_id", txn_id},
-                     {"range_id", defaultRangeIdForIndex(title_year_index)},
-                     {"replica_group_id", index_replica_group},
-                     {"status", "committed"}}) &&
-                coreHasRow(recovered,
-                           "__txn_statements",
-                           {{"txn_id", txn_id}}),
-            "consensus-applied coordinator decision should survive WAL recovery");
+            auto replacement_storage =
+                std::make_shared<LocalStorageService>();
+            ComputeNode replacement{
+                ComputeNodeId{642}, files, replacement_storage};
+            tests.check(replacement.attach(ns, AttachMode::ReadWrite).status ==
+                            AttachStatus::Attached,
+                        "replacement should take persisted participant lease");
+            Result stale_rejected = writer.execute(
+                InsertRowCommand{"title", {"10", "Stale", "1", "2012"}});
+            SelectAllResult title =
+                requireComputeSelectWhere(replacement, "title", "id", "9");
+            IndexLookupResult lookup =
+                requireComputeIndexLookup(replacement,
+                                          title_year_index,
+                                          "2011");
+            Result status = replacement.execute(
+                ReadTxnParticipantStatusCommand{
+                    txn_id,
+                    table_range_id,
+                    "group-1"});
+            const auto* table_participant =
+                std::get_if<DistributedTxnResult>(&status);
+            StorageManifest manifest = replacement_storage->readManifest(ns);
+            tests.check(stale_rejected == Result{ConfigRejectedResult{}} &&
+                            title.rows.size() == 1 &&
+                            std::find(lookup.primary_keys.begin(),
+                                      lookup.primary_keys.end(),
+                                      "9") != lookup.primary_keys.end() &&
+                            table_participant != nullptr &&
+                            table_participant->status == "committed" &&
+                            manifest.writer_node_id ==
+                                replacement.lease().holder.value,
+                        "fenced replacement should recover participant state and reject stale writes");
+        });
     });
-
-    tests.test("Consensus-applied participant commit survives WAL recovery", [&] {
-        auto consensus = buildConsensusTxnScenario();
-        UpdateWorkload workload =
-            updateWorkloadFromFixture(consensus.fixture, 2);
-        const std::string txn_id = "txn-consensus-participant-commit";
-
-        Result prepared =
-            commitConsensusCommand(
-                consensus.catalog,
-                Command{PrepareDistributedTransactionCommand{
-                    txn_id, workload.statements}});
-        const auto* prepared_result =
-            std::get_if<DistributedTxnResult>(&prepared);
-        tests.check(prepared_result != nullptr &&
-                        prepared_result->status == "prepared" &&
-                        prepared_result->participant_range_ids.size() == 2,
-                    "consensus coordinator should prepare participant plan");
-        Result decision =
-            commitConsensusCommand(
-                consensus.catalog,
-                Command{CommitPreparedDistributedTransactionCommand{
-                    txn_id, false}});
-        const auto* decision_result =
-            std::get_if<DistributedTxnResult>(&decision);
-        tests.check(decision_result != nullptr &&
-                        decision_result->status == "committed",
-                    "consensus coordinator should persist commit decision");
-
-        auto runtime = consensusRuntime(consensus);
-        RuntimeDriveResult driven =
-            driveConsensusTxnToEnd(runtime, consensus, txn_id, 12);
-        tests.check(
-            driven.ended &&
-                consensusTxnHasStatus(consensus.catalog,
-                                      txn_id,
-                                      "ended") &&
-                consensusParticipantHasStatus(
-                    consensus.table_owner,
-                    txn_id,
-                    defaultRangeIdForTable("title"),
-                    "committed") &&
-                consensusParticipantHasStatus(
-                    consensus.index_owner,
-                    txn_id,
-                    defaultRangeIdForIndex(title_year_index),
-                    "committed"),
-            "consensus runtime should commit participant groups: " +
-            driven.trace);
-
-        auto snapshot =
-            snapshotConsensusScenario(consensus, "participant-commit");
-        SelectAllResult title =
-            coreSelectTitleById(*snapshot->table_owner,
-                                workload.primary_key);
-        auto observed_year = firstRowValue(title, "production_year");
-        IndexLookupResult old_lookup =
-            coreReadIndexOn(*snapshot->index_owner, workload.old_year);
-        IndexLookupResult new_lookup =
-            coreReadIndexOn(*snapshot->index_owner, workload.new_year);
-        tests.check(
-            observed_year.has_value() &&
-                *observed_year == workload.new_year &&
-                textCount(old_lookup.primary_keys,
-                          workload.primary_key) == 0 &&
-                textCount(new_lookup.primary_keys,
-                          workload.primary_key) == 1,
-            "consensus-applied participant effects should survive WAL recovery");
-    });
-
-    tests.test("Consensus-applied duplicate participant commit is idempotent", [&] {
-        auto consensus = buildConsensusTxnScenario();
-        UpdateWorkload workload =
-            updateWorkloadFromFixture(consensus.fixture, 3);
-        const std::string txn_id = "txn-consensus-duplicate-commit";
-
-        tests.check(
-            std::holds_alternative<DistributedTxnResult>(
-                commitConsensusCommand(
-                    consensus.catalog,
-                    Command{PrepareDistributedTransactionCommand{
-                        txn_id, workload.statements}})),
-            "consensus coordinator should prepare duplicate replay txn");
-        auto runtime = consensusRuntime(consensus);
-        RuntimeDriveResult driven =
-            driveConsensusTxnToEnd(runtime, consensus, txn_id, 12);
-        tests.check(driven.ended,
-                    "consensus runtime should finish before replay: " +
-                    driven.trace);
-
-        SelectAllResult before =
-            consensusSystemCatalog(consensus.index_owner,
-                                   "__index_entries");
-        Result duplicate_coordinator =
-            commitConsensusCommand(
-                consensus.catalog,
-                Command{CommitPreparedDistributedTransactionCommand{
-                    txn_id, true}});
-        Result duplicate_table =
-            commitConsensusCommand(
-                consensus.table_owner,
-                Command{CommitTxnParticipantCommand{
-                    txn_id,
-                    defaultRangeIdForTable("title"),
-                    "group-1"}});
-        Result duplicate_index =
-            commitConsensusCommand(
-                consensus.index_owner,
-                Command{CommitTxnParticipantCommand{
-                    txn_id,
-                    defaultRangeIdForIndex(title_year_index),
-                    index_replica_group}});
-        SelectAllResult after =
-            consensusSystemCatalog(consensus.index_owner,
-                                   "__index_entries");
-
-        auto snapshot =
-            snapshotConsensusScenario(consensus, "duplicate-commit");
-        IndexLookupResult new_lookup =
-            coreReadIndexOn(*snapshot->index_owner, workload.new_year);
-        tests.check(
-            std::holds_alternative<DistributedTxnResult>(
-                duplicate_coordinator) &&
-                std::holds_alternative<DistributedTxnResult>(
-                    duplicate_table) &&
-                std::holds_alternative<DistributedTxnResult>(
-                    duplicate_index) &&
-                after.rows.size() == before.rows.size() &&
-                textCount(new_lookup.primary_keys,
-                          workload.primary_key) == 1,
-            "consensus-applied duplicate commits should not double-apply");
-    });
-
-    tests.test("Consensus-applied abort resolves prepared participants", [&] {
-        auto consensus = buildConsensusTxnScenario();
-        UpdateWorkload workload =
-            updateWorkloadFromFixture(consensus.fixture, 4);
-        const std::string txn_id = "txn-consensus-abort";
-
-        Result prepared =
-            commitConsensusCommand(
-                consensus.catalog,
-                Command{PrepareDistributedTransactionCommand{
-                    txn_id, workload.statements}});
-        const auto* prepared_result =
-            std::get_if<DistributedTxnResult>(&prepared);
-        tests.check(prepared_result != nullptr &&
-                        prepared_result->status == "prepared",
-                    "consensus coordinator should prepare before abort");
-        tests.check(
-            std::holds_alternative<DistributedTxnResult>(
-                commitConsensusCommand(
-                    consensus.table_owner,
-                    Command{PrepareTxnParticipantCommand{
-                        txn_id,
-                        defaultRangeIdForTable("title"),
-                        "group-1",
-                        workload.statements,
-                        prepared_result->read_ts}})) &&
-                std::holds_alternative<DistributedTxnResult>(
-                    commitConsensusCommand(
-                        consensus.index_owner,
-                        Command{PrepareTxnParticipantCommand{
-                            txn_id,
-                            defaultRangeIdForIndex(title_year_index),
-                            index_replica_group,
-                            workload.statements,
-                            prepared_result->read_ts}})),
-            "consensus participants should durably prepare before abort");
-        Result aborted =
-            commitConsensusCommand(
-                consensus.catalog,
-                Command{AbortPreparedDistributedTransactionCommand{txn_id}});
-        const auto* aborted_result =
-            std::get_if<DistributedTxnResult>(&aborted);
-        tests.check(aborted_result != nullptr &&
-                        aborted_result->status == "aborted",
-                    "consensus coordinator should persist abort decision");
-
-        auto runtime = consensusRuntime(consensus);
-        std::string trace;
-        for (size_t i = 0; i < 8; ++i) {
-            auto step = runtime.tick();
-            if (!trace.empty()) trace += "; ";
-            trace += step.status_before + "->" +
-                     step.status_after + ":" +
-                     describeResult(step.result);
-            if (consensusParticipantHasStatus(
-                    consensus.table_owner,
-                    txn_id,
-                    defaultRangeIdForTable("title"),
-                    "aborted") &&
-                consensusParticipantHasStatus(
-                    consensus.index_owner,
-                    txn_id,
-                    defaultRangeIdForIndex(title_year_index),
-                    "aborted")) {
-                break;
-            }
-            if (!step.advanced) break;
-        }
-
-        auto snapshot =
-            snapshotConsensusScenario(consensus, "abort-participants");
-        SelectAllResult title =
-            coreSelectTitleById(*snapshot->table_owner,
-                                workload.primary_key);
-        auto observed_year = firstRowValue(title, "production_year");
-        IndexLookupResult old_lookup =
-            coreReadIndexOn(*snapshot->index_owner, workload.old_year);
-        IndexLookupResult new_lookup =
-            coreReadIndexOn(*snapshot->index_owner, workload.new_year);
-        tests.check(
-            consensusTxnHasStatus(consensus.catalog,
-                                  txn_id,
-                                  "aborted") &&
-                consensusParticipantHasStatus(
-                    consensus.table_owner,
-                    txn_id,
-                    defaultRangeIdForTable("title"),
-                    "aborted") &&
-                consensusParticipantHasStatus(
-                    consensus.index_owner,
-                    txn_id,
-                    defaultRangeIdForIndex(title_year_index),
-                    "aborted") &&
-                observed_year.has_value() &&
-                *observed_year == workload.old_year &&
-                textCount(old_lookup.primary_keys,
-                          workload.primary_key) == 1 &&
-                textCount(new_lookup.primary_keys,
-                          workload.primary_key) == 0,
-            "consensus-applied abort should resolve participants without writes: " +
-            trace);
-    });
-
-    tests.test("Prepared coordinator plan survives restart", [&] {
-        auto scenario = buildPersistentTxnScenario();
-        UpdateWorkload workload = updateWorkload(*scenario, 1);
-        const std::string txn_id = "txn-prepared-restart";
-
-        Result prepared_result =
-            scenario->catalog->execute(
-                Command{PrepareDistributedTransactionCommand{
-                    txn_id, workload.statements}});
-        const auto* prepared =
-            std::get_if<DistributedTxnResult>(&prepared_result);
-        tests.check(prepared != nullptr &&
-                        prepared->status == "prepared" &&
-                        prepared->participant_range_ids.size() == 2,
-                    "coordinator should durably prepare a two-participant plan");
-
-        restartCore(scenario->catalog, scenario->catalog_file);
-        tests.check(
-            coreHasRow(*scenario->catalog,
-                       "__distributed_txns",
-                       {{"txn_id", txn_id}, {"status", "prepared"}}) &&
-                coreHasRow(*scenario->catalog,
-                           "__txn_participants",
-                           {{"txn_id", txn_id},
-                            {"range_id", defaultRangeIdForTable("title")},
-                            {"replica_group_id", "group-1"}}) &&
-                coreHasRow(
-                    *scenario->catalog,
-                    "__txn_participants",
-                    {{"txn_id", txn_id},
-                     {"range_id", defaultRangeIdForIndex(title_year_index)},
-                     {"replica_group_id", index_replica_group}}) &&
-                coreHasRow(*scenario->catalog,
-                           "__txn_statements",
-                           {{"txn_id", txn_id}}),
-            "prepared coordinator metadata should survive restart");
-        tests.check(
-            !coreHasRow(*scenario->table_owner,
-                        "__participant_txns",
-                        {{"txn_id", txn_id}}) &&
-                !coreHasRow(*scenario->index_owner,
-                            "__participant_txns",
-                            {{"txn_id", txn_id}}),
-            "participant records should not appear before participant prepare");
-    });
-
-    tests.test("Commit decision resumes participant apply after restart", [&] {
-        auto scenario = buildPersistentTxnScenario();
-        UpdateWorkload workload = updateWorkload(*scenario, 2);
-        const std::string txn_id = "txn-commit-resume";
-
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        scenario->catalog->execute(
-                            Command{PrepareDistributedTransactionCommand{
-                                txn_id, workload.statements}})),
-                    "coordinator should prepare before decision");
-        Result decision =
-            scenario->catalog->execute(
-                Command{CommitPreparedDistributedTransactionCommand{
-                    txn_id, false}});
-        const auto* committed = std::get_if<DistributedTxnResult>(&decision);
-        tests.check(committed != nullptr &&
-                        committed->status == "committed",
-                    "coordinator should persist commit decision without apply");
-
-        restartCore(scenario->catalog, scenario->catalog_file);
-        restartCore(scenario->table_owner, scenario->table_file);
-        restartCore(scenario->index_owner, scenario->index_file);
-        auto runtime = persistentRuntime(*scenario);
-        RuntimeDriveResult driven =
-            drivePersistentTxnToEnd(runtime, *scenario, txn_id, 12);
-        restartCore(scenario->catalog, scenario->catalog_file);
-        restartCore(scenario->table_owner, scenario->table_file);
-        restartCore(scenario->index_owner, scenario->index_file);
-
-        SelectAllResult title =
-            coreSelectTitleById(*scenario->table_owner,
-                                workload.primary_key);
-        auto observed_year = firstRowValue(title, "production_year");
-        IndexLookupResult old_lookup =
-            coreReadIndexOn(*scenario->index_owner, workload.old_year);
-        IndexLookupResult new_lookup =
-            coreReadIndexOn(*scenario->index_owner, workload.new_year);
-        tests.check(driven.ended &&
-                        coreHasRow(*scenario->catalog,
-                                   "__distributed_txns",
-                                   {{"txn_id", txn_id},
-                                    {"status", "ended"}}) &&
-                        coreHasRow(
-                            *scenario->table_owner,
-                            "__participant_txns",
-                            {{"txn_id", txn_id},
-                             {"range_id", defaultRangeIdForTable("title")},
-                             {"status", "committed"}}) &&
-                        coreHasRow(
-                            *scenario->index_owner,
-                            "__participant_txns",
-                            {{"txn_id", txn_id},
-                             {"range_id",
-                              defaultRangeIdForIndex(title_year_index)},
-                             {"status", "committed"}}),
-                    "runtime should finish durable decision after restart: " +
-                    driven.trace);
-        tests.check(observed_year.has_value() &&
-                        *observed_year == workload.new_year &&
-                        textCount(old_lookup.primary_keys,
-                                  workload.primary_key) == 0 &&
-                        textCount(new_lookup.primary_keys,
-                                  workload.primary_key) == 1,
-                    "durable commit should apply base row and index changes once");
-    });
-
-    tests.test("Duplicate durable commit replay is idempotent", [&] {
-        auto scenario = buildPersistentTxnScenario();
-        UpdateWorkload workload = updateWorkload(*scenario, 3);
-        const std::string txn_id = "txn-duplicate-replay";
-
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        scenario->catalog->execute(
-                            Command{PrepareDistributedTransactionCommand{
-                                txn_id, workload.statements}})),
-                    "coordinator should prepare duplicate replay txn");
-        auto runtime = persistentRuntime(*scenario);
-        RuntimeDriveResult driven =
-            drivePersistentTxnToEnd(runtime, *scenario, txn_id, 12);
-        tests.check(driven.ended,
-                    "runtime should finish transaction before duplicate replay: " +
-                    driven.trace);
-
-        restartCore(scenario->catalog, scenario->catalog_file);
-        restartCore(scenario->table_owner, scenario->table_file);
-        restartCore(scenario->index_owner, scenario->index_file);
-        SelectAllResult index_entries_before =
-            coreSystemCatalog(*scenario->index_owner, "__index_entries");
-
-        Result duplicate_coordinator =
-            scenario->catalog->execute(
-                Command{CommitPreparedDistributedTransactionCommand{
-                    txn_id, true}});
-        Result duplicate_table =
-            scenario->table_owner->execute(
-                Command{CommitTxnParticipantCommand{
-                    txn_id,
-                    defaultRangeIdForTable("title"),
-                    "group-1"}});
-        Result duplicate_index =
-            scenario->index_owner->execute(
-                Command{CommitTxnParticipantCommand{
-                    txn_id,
-                    defaultRangeIdForIndex(title_year_index),
-                    index_replica_group}});
-        SelectAllResult index_entries_after =
-            coreSystemCatalog(*scenario->index_owner, "__index_entries");
-        IndexLookupResult new_lookup =
-            coreReadIndexOn(*scenario->index_owner, workload.new_year);
-        tests.check(
-            std::holds_alternative<DistributedTxnResult>(
-                duplicate_coordinator) &&
-                std::holds_alternative<DistributedTxnResult>(
-                    duplicate_table) &&
-                std::holds_alternative<DistributedTxnResult>(
-                    duplicate_index) &&
-                index_entries_after.rows.size() ==
-                    index_entries_before.rows.size() &&
-                textCount(new_lookup.primary_keys,
-                          workload.primary_key) == 1,
-            "duplicate coordinator and participant commits should not double-apply");
-    });
-
-    tests.test("Abort decision survives restart without leaking writes", [&] {
-        auto scenario = buildPersistentTxnScenario();
-        UpdateWorkload workload = updateWorkload(*scenario, 4);
-        const std::string txn_id = "txn-abort-restart";
-
-        Result prepared_result =
-            scenario->catalog->execute(
-                Command{PrepareDistributedTransactionCommand{
-                    txn_id, workload.statements}});
-        const auto* prepared =
-            std::get_if<DistributedTxnResult>(&prepared_result);
-        tests.check(prepared != nullptr &&
-                        prepared->status == "prepared",
-                    "coordinator should prepare before abort test");
-        tests.check(std::holds_alternative<DistributedTxnResult>(
-                        scenario->table_owner->execute(
-                            Command{PrepareTxnParticipantCommand{
-                                txn_id,
-                                defaultRangeIdForTable("title"),
-                                "group-1",
-                                workload.statements,
-                                prepared->read_ts}})) &&
-                        std::holds_alternative<DistributedTxnResult>(
-                            scenario->index_owner->execute(
-                                Command{PrepareTxnParticipantCommand{
-                                    txn_id,
-                                    defaultRangeIdForIndex(title_year_index),
-                                    index_replica_group,
-                                    workload.statements,
-                                    prepared->read_ts}})),
-                    "participants should persist prepared records before abort");
-        Result aborted =
-            scenario->catalog->execute(
-                Command{AbortPreparedDistributedTransactionCommand{txn_id}});
-        const auto* aborted_result =
-            std::get_if<DistributedTxnResult>(&aborted);
-        tests.check(aborted_result != nullptr &&
-                        aborted_result->status == "aborted",
-                    "coordinator should persist abort decision");
-        tests.check(
-            !coreSelectTitleById(*scenario->table_owner,
-                                 workload.primary_key).rows.empty(),
-            "prepared participant should not hide the base row before restart");
-
-        restartCore(scenario->catalog, scenario->catalog_file);
-        restartCore(scenario->table_owner, scenario->table_file);
-        restartCore(scenario->index_owner, scenario->index_file);
-        tests.check(
-            !coreSelectTitleById(*scenario->table_owner,
-                                 workload.primary_key).rows.empty(),
-            "restart should recover the base row before abort resolution");
-        auto runtime = persistentRuntime(*scenario);
-        for (size_t i = 0; i < 8; ++i) {
-            auto step = runtime.tick();
-            if (!step.advanced) break;
-            if (coreHasRow(*scenario->table_owner,
-                           "__participant_txns",
-                           {{"txn_id", txn_id},
-                            {"range_id", defaultRangeIdForTable("title")},
-                            {"status", "aborted"}}) &&
-                coreHasRow(
-                    *scenario->index_owner,
-                    "__participant_txns",
-                    {{"txn_id", txn_id},
-                     {"range_id", defaultRangeIdForIndex(title_year_index)},
-                     {"status", "aborted"}})) {
-                break;
-            }
-        }
-        restartCore(scenario->catalog, scenario->catalog_file);
-        restartCore(scenario->table_owner, scenario->table_file);
-        restartCore(scenario->index_owner, scenario->index_file);
-
-        SelectAllResult title =
-            coreSelectTitleById(*scenario->table_owner,
-                                workload.primary_key);
-        auto observed_year = firstRowValue(title, "production_year");
-        IndexLookupResult old_lookup =
-            coreReadIndexOn(*scenario->index_owner, workload.old_year);
-        IndexLookupResult new_lookup =
-            coreReadIndexOn(*scenario->index_owner, workload.new_year);
-        tests.check(
-            coreHasRow(*scenario->catalog,
-                       "__distributed_txns",
-                       {{"txn_id", txn_id}, {"status", "aborted"}}) &&
-                coreHasRow(*scenario->table_owner,
-                           "__participant_txns",
-                           {{"txn_id", txn_id},
-                            {"range_id", defaultRangeIdForTable("title")},
-                            {"status", "aborted"}}) &&
-                coreHasRow(
-                    *scenario->index_owner,
-                    "__participant_txns",
-                    {{"txn_id", txn_id},
-                     {"range_id", defaultRangeIdForIndex(title_year_index)},
-                     {"status", "aborted"}}),
-            "abort decision should resolve durable participant records");
-        tests.check(observed_year.has_value() &&
-                        *observed_year == workload.old_year &&
-                        textCount(old_lookup.primary_keys,
-                                  workload.primary_key) == 1 &&
-                        textCount(new_lookup.primary_keys,
-                                  workload.primary_key) == 0,
-                    "durable abort should not leak base row or index writes "
-                    "(observed_year=" +
-                    (observed_year.has_value() ? *observed_year
-                                               : std::string{"<none>"}) +
-                    ", old_index_count=" +
-                    std::to_string(textCount(old_lookup.primary_keys,
-                                             workload.primary_key)) +
-                    ", new_index_count=" +
-                    std::to_string(textCount(new_lookup.primary_keys,
-                                             workload.primary_key)) + ")");
-    });
-
-
 
     return tests.finish();
 }

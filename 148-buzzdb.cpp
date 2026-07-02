@@ -11785,6 +11785,7 @@ struct SelectWhereCommand {
 struct RangeReadCommand {
     std::string table;
     std::string range_id;
+    std::string replica_group_id;
     std::string start_key;
     std::string end_key;
     HybridLogicalTimestamp read_ts = HybridLogicalTimestamp::zero();
@@ -12184,6 +12185,7 @@ bool operator==(const SelectWhereCommand& lhs, const SelectWhereCommand& rhs) {
 }
 bool operator==(const RangeReadCommand& lhs, const RangeReadCommand& rhs) {
     return lhs.table == rhs.table && lhs.range_id == rhs.range_id &&
+           lhs.replica_group_id == rhs.replica_group_id &&
            lhs.start_key == rhs.start_key && lhs.end_key == rhs.end_key &&
            lhs.read_ts == rhs.read_ts;
 }
@@ -12897,6 +12899,7 @@ std::string describeCommand(const Command& command) {
             } else if constexpr (std::is_same_v<T, RangeReadCommand>) {
                 out << "RangeRead(" << value.table
                     << ", range=" << value.range_id
+                    << ", group=" << value.replica_group_id
                     << ", [" << value.start_key << ", "
                     << value.end_key << ")";
                 if (!value.read_ts.isZero()) {
@@ -13638,6 +13641,12 @@ public:
 
         HybridLogicalTimestamp join_read_ts =
             read_ts.isZero() ? nextQueryReadTimestamp() : read_ts;
+        if (broadcast_row_limit == 0) {
+            DistributedJoinResult rejected =
+                baseJoinResult(plan, join_read_ts, {});
+            rejected.unsupported = true;
+            return rejected;
+        }
         DistributedRangeReadResult small_side =
             readTableRange(plan.small_table,
                            "",
@@ -13706,6 +13715,10 @@ public:
                 result.fragment_row_counts.clear();
                 result.complete = false;
                 return result;
+            }
+            if (fragment_result.attempt_id !=
+                expected_fragment->second.attempt_id) {
+                continue;
             }
             if (!seen.insert(fragment_result.fragment_id).second) {
                 continue;
@@ -13825,6 +13838,10 @@ public:
                 result.fragment_row_counts.clear();
                 result.complete = false;
                 return result;
+            }
+            if (fragment_result.attempt_id !=
+                expected_fragment->second.attempt_id) {
+                continue;
             }
             if (!seen.insert(fragment_result.fragment_id).second) {
                 continue;
@@ -14075,6 +14092,7 @@ public:
                 owner->second(Command{RangeReadCommand{
                     table,
                     fragment.range_id,
+                    fragment.replica_group_id,
                     fragment_start,
                     fragment_end,
                     read_ts}});
@@ -14344,7 +14362,7 @@ private:
             plan.predicate_value = matches[10];
             if (plan.predicate_table != plan.large_table) {
                 throw std::runtime_error(
-                    "v147 pushes predicates only to the scan side");
+                    "v148 pushes predicates only to the scan side");
             }
         }
 
@@ -16165,6 +16183,13 @@ public:
     std::string databaseFile() const { return database_file_; }
     std::string logFile() const { return buzzdbCompanionFilename(database_file_, ".log"); }
     std::string masterFile() const { return buzzdbCompanionFilename(database_file_, ".master"); }
+
+    void copyDurableBundleTo(const std::string& target_database_file) {
+        ScopedBuzzDBFileBundle scope(database_file_);
+        flushForSnapshot();
+        copyBundle(database_file_,
+                   std::filesystem::absolute(target_database_file).string());
+    }
 
     std::optional<Result> cachedClientResultForCommand(
         const Command& command,
@@ -18811,6 +18836,121 @@ private:
         return true;
     }
 
+    static bool endKeyCovers(const std::string& owner_end,
+                             const std::string& requested_end) {
+        if (requested_end.empty()) return owner_end.empty();
+        if (owner_end.empty()) return true;
+        return requested_end <= owner_end;
+    }
+
+    static bool descriptorCoversRequest(const RangeDescriptor& descriptor,
+                                        const std::string& start_key,
+                                        const std::string& end_key) {
+        if (!start_key.empty() && start_key < descriptor.start_key) {
+            return false;
+        }
+        return endKeyCovers(descriptor.end_key, end_key);
+    }
+
+    bool locallyOwnsActiveRange(const std::string& table,
+                                const std::string& range_id,
+                                const std::string& replica_group_id,
+                                const std::string& start_key,
+                                const std::string& end_key) {
+        if (range_id.empty()) return false;
+        if (isSystemCatalogTable(table)) return true;
+        ensureSystemCatalogTables();
+        auto descriptor = latestRangeDescriptorById(range_id);
+        if (descriptor.has_value() && descriptor->status == "active" &&
+            (replica_group_id.empty() ||
+             descriptor->replica_group_id == replica_group_id) &&
+            descriptorCoversRequest(*descriptor, start_key, end_key)) {
+            return true;
+        }
+        if (replica_group_id.empty()) return false;
+
+        for (const auto& covering :
+             latestActiveRangeDescriptors(rangeDescriptors())) {
+            if (covering.replica_group_id == replica_group_id &&
+                descriptorCoversRequest(covering, start_key, end_key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void appendLocalRangeOwnership(const std::string& table,
+                                   const std::string& range_id,
+                                   const std::string& replica_group_id,
+                                   const std::string& start_key,
+                                   const std::string& end_key,
+                                   const std::string& status) {
+        if (range_id.empty() ||
+            isSystemCatalogTable(table) ||
+            replica_group_id.empty()) {
+            return;
+        }
+        auto previous = latestRangeDescriptorById(range_id);
+        int descriptor_version =
+            std::max(latestRangeConfigNumber() + 1,
+                     previous.has_value()
+                         ? previous->descriptor_version + 1
+                         : 1);
+        insertSystemCatalogRows({
+            InsertRowCommand{
+                "__ranges",
+                {range_id,
+                 start_key,
+                 end_key,
+                 replica_group_id,
+                 std::to_string(descriptor_version),
+                 status}},
+            rangeOwnershipCatalogRow(table,
+                                     range_id,
+                                     start_key,
+                                     end_key,
+                                     replica_group_id,
+                                     descriptor_version,
+                                     status)});
+    }
+
+    void installLocalRangeOwnership(const std::string& table,
+                                    const std::string& range_id,
+                                    const std::string& replica_group_id,
+                                    const std::string& start_key,
+                                    const std::string& end_key) {
+        if (locallyOwnsActiveRange(table,
+                                   range_id,
+                                   replica_group_id,
+                                   start_key,
+                                   end_key)) {
+            return;
+        }
+        appendLocalRangeOwnership(table,
+                                  range_id,
+                                  replica_group_id,
+                                  start_key,
+                                  end_key,
+                                  "active");
+    }
+
+    void retireLocalRangeOwnership(const std::string& table,
+                                   const std::string& range_id,
+                                   const std::string& start_key,
+                                   const std::string& end_key) {
+        if (range_id.empty() || isSystemCatalogTable(table)) return;
+        auto descriptor = latestRangeDescriptorById(range_id);
+        if (!descriptor.has_value() || descriptor->status != "active") return;
+        appendLocalRangeOwnership(table,
+                                  range_id,
+                                  descriptor->replica_group_id,
+                                  start_key.empty() ? descriptor->start_key
+                                                    : start_key,
+                                  end_key.empty() ? descriptor->end_key
+                                                 : end_key,
+                                  "retired");
+    }
+
     void appendDistributedTxnPhase(
         const std::string& txn_id,
         const std::string& status,
@@ -19868,6 +20008,7 @@ private:
     }
 
     Result executeOne(const RecoverDistributedTransactionsCommand&) {
+        db_->recovery_manager.recover();
         ensureSystemCatalogTables();
         return StatementOkResult{};
     }
@@ -20099,6 +20240,10 @@ private:
                 executeOne(DeleteRowsCommand{"__range_client_sessions",
                                              "range_id",
                                              command.range_id});
+                retireLocalRangeOwnership(command.table,
+                                          command.range_id,
+                                          command.start_key,
+                                          command.end_key);
                 return *count;
             }
             return result;
@@ -20131,6 +20276,10 @@ private:
         executeOne(DeleteRowsCommand{"__range_client_sessions",
                                      "range_id",
                                      command.range_id});
+        retireLocalRangeOwnership(command.table,
+                                  command.range_id,
+                                  command.start_key,
+                                  command.end_key);
         return DeleteRowsResult{deleted};
     }
 
@@ -20145,6 +20294,11 @@ private:
                                    command.start_key,
                                    command.end_key});
         if (!std::holds_alternative<DeleteRowsResult>(cleared)) return cleared;
+        installLocalRangeOwnership(command.table,
+                                   command.range_id,
+                                   command.target_replica_group_id,
+                                   command.start_key,
+                                   command.end_key);
 
         std::vector<std::string> columns = columnNames(command.table);
         auto range_column = columnIndex(columns, "range_id");
@@ -20333,6 +20487,13 @@ private:
 
     Result executeOne(const RangeReadCommand& command) {
         if (!tableExists(command.table)) return TableNotFoundResult{};
+        if (!locallyOwnsActiveRange(command.table,
+                                    command.range_id,
+                                    command.replica_group_id,
+                                    command.start_key,
+                                    command.end_key)) {
+            return RouteRejectedResult{};
+        }
         try {
             SelectAllResult all =
                 command.read_ts.isZero()
@@ -20359,6 +20520,13 @@ private:
         const QueryFragment& fragment = command.fragment;
         if (!tableExists(fragment.table) || fragment.range_id.empty()) {
             return TableNotFoundResult{};
+        }
+        if (!locallyOwnsActiveRange(fragment.table,
+                                    fragment.range_id,
+                                    fragment.replica_group_id,
+                                    fragment.start_key,
+                                    fragment.end_key)) {
+            return RouteRejectedResult{};
         }
         try {
             SelectAllResult all =
@@ -20437,6 +20605,13 @@ private:
         if (!tableExists(fragment.large_table) ||
             fragment.range_id.empty()) {
             return TableNotFoundResult{};
+        }
+        if (!locallyOwnsActiveRange(fragment.large_table,
+                                    fragment.range_id,
+                                    fragment.replica_group_id,
+                                    fragment.start_key,
+                                    fragment.end_key)) {
+            return RouteRejectedResult{};
         }
         try {
             SelectAllResult large =
@@ -22920,6 +23095,12 @@ public:
     int commitIndex() const { return commit_index_; }
     HybridLogicalTimestamp safeTimestamp() const { return safe_timestamp_; }
 
+    void copyDurableDatabaseForTest(
+        const std::string& target_database_file) const {
+        const_cast<BuzzDBCore&>(db_).copyDurableBundleTo(
+            target_database_file);
+    }
+
     Result executeReadOnlyForTest(const Command& command) const {
         return runWithSuppressedStdout([&] {
             BuzzDBCore copy = db_;
@@ -25017,6 +25198,10 @@ int main(int argc, char* argv[]) {
             activeTitleFragment(scenario.catalog, plan->range_ids[1]),
             activeTitleFragment(scenario.catalog, plan->range_ids[2]),
             0};
+        TitleRangeFragment target_middle =
+            activeTitleFragment(scenario.index_owner, plan->range_ids[1]);
+        TitleRangeFragment target_right =
+            activeTitleFragment(scenario.index_owner, plan->range_ids[2]);
         size_t source_rows_after =
             countRowsOn(scenario.table_owner, "title");
         tests.check(split.left.replica_group_id ==
@@ -25026,6 +25211,15 @@ int main(int argc, char* argv[]) {
                         split.right.replica_group_id ==
                             scenario.index_owner.group_id,
                     "committed transfer protocol should publish the final split ownership");
+        tests.check(target_middle.replica_group_id ==
+                            scenario.index_owner.group_id &&
+                        target_middle.start_key == split.middle.start_key &&
+                        target_middle.end_key == split.middle.end_key &&
+                        target_right.replica_group_id ==
+                            scenario.index_owner.group_id &&
+                        target_right.start_key == split.right.start_key &&
+                        target_right.end_key == split.right.end_key,
+                    "target group should install active local serving metadata for moved ranges");
         split.moved_rows =
             source_rows_before >= source_rows_after
                 ? source_rows_before - source_rows_after
@@ -25387,6 +25581,131 @@ int main(int argc, char* argv[]) {
         return true;
     };
 
+    auto coreSystemCatalog = [&](BuzzDBCore& core,
+                                 const std::string& table) {
+        Result result =
+            core.execute(Command{ReadSystemCatalogCommand{table}});
+        const auto* rows = std::get_if<SelectAllResult>(&result);
+        if (rows == nullptr) {
+            throw std::runtime_error("missing recovered catalog table " +
+                                     table);
+        }
+        return *rows;
+    };
+
+    auto coreHasRow = [&](BuzzDBCore& core,
+                          const std::string& table,
+                          const std::map<std::string, std::string>& row) {
+        return selectAllHasRow(coreSystemCatalog(core, table), row);
+    };
+
+    tests.test("Consensus-applied coordinator decision survives WAL recovery", [&] {
+        TitleIndexFixture fixture = titleIndexFixture();
+        const TitleRowFixture& row = fixture.initial_rows.front();
+        const std::string primary_key = row.values[0];
+        const std::string new_year =
+            replacementProductionYear(row.values[3]);
+
+        auto group =
+            makeConsensusGroup("durable-catalog", "durable-catalog-", 14701);
+
+        tests.check(commitCommand(group, bootstrapClusterACommand()) ==
+                        Result{StatementOkResult{}},
+                    "consensus leader should bootstrap cluster metadata");
+        tests.check(commitCommand(group, registerGroup1Command()) ==
+                        Result{StatementOkResult{}},
+                    "consensus leader should register the table group");
+        tests.check(commitCommand(group, registerIndexGroupCommand()) ==
+                        Result{StatementOkResult{}},
+                    "consensus leader should register the index group");
+        tests.check(commitCommand(group, createTitleTableCommand()) ==
+                        Result{CreateTableOkResult{}},
+                    "consensus leader should create title table");
+        tests.check(commitCommand(group, parseSQL("INSERT " + row.line)) ==
+                        Result{InsertOkResult{}},
+                    "consensus leader should store a real IMDB title row");
+        tests.check(commitCommand(
+                        group,
+                        createTitleYearIndexCommand(index_replica_group)) ==
+                        Result{StatementOkResult{}},
+                    "consensus leader should create secondary index metadata");
+
+        const std::string txn_id = "txn-v148-consensus-durable";
+        std::vector<std::string> statements{
+            "UPDATE title SET production_year=" + new_year +
+            " WHERE id=" + primary_key};
+        Result prepared_result =
+            commitCommand(group,
+                          PrepareDistributedTransactionCommand{
+                              txn_id, statements});
+        const auto* prepared =
+            std::get_if<DistributedTxnResult>(&prepared_result);
+        tests.check(prepared != nullptr &&
+                        prepared->status == "prepared" &&
+                        prepared->participant_range_ids.size() == 2,
+                    "consensus-applied prepare should plan table and index participants");
+
+        Result committed_result =
+            commitCommand(group,
+                          CommitPreparedDistributedTransactionCommand{
+                              txn_id, false});
+        const auto* committed =
+            std::get_if<DistributedTxnResult>(&committed_result);
+        tests.check(committed != nullptr &&
+                        committed->status == "committed" &&
+                        !committed->commit_ts.isZero(),
+                    "consensus-applied coordinator should persist commit decision");
+
+        struct SnapshotDir {
+            std::filesystem::path root;
+            ~SnapshotDir() {
+                if (!root.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove_all(root, ec);
+                }
+            }
+        } snapshot{
+            std::filesystem::temp_directory_path() /
+            ("buzzdb-v148-consensus-recover-" +
+             std::to_string(::getpid()))};
+        std::error_code ec;
+        std::filesystem::remove_all(snapshot.root, ec);
+        std::filesystem::create_directories(snapshot.root);
+        std::string database_file =
+            (snapshot.root / "catalog-leader.dat").string();
+        const auto* leader_node =
+            group.state.nodeAs<ConsensusReplica>(group.leader);
+        if (leader_node == nullptr) {
+            throw std::runtime_error("missing consensus leader");
+        }
+        leader_node->copyDurableDatabaseForTest(database_file);
+
+        BuzzDBCore recovered(database_file);
+        tests.check(
+            recovered.execute(
+                Command{RecoverDistributedTransactionsCommand{}}) ==
+                Result{StatementOkResult{}},
+            "recovered consensus database should run public recovery");
+        tests.check(
+            coreHasRow(recovered,
+                       "__distributed_txns",
+                       {{"txn_id", txn_id}, {"status", "committed"}}) &&
+                coreHasRow(recovered,
+                           "__txn_participants",
+                           {{"txn_id", txn_id},
+                            {"range_id", defaultRangeIdForTable("title")},
+                            {"replica_group_id", "group-1"},
+                            {"status", "committed"}}) &&
+                coreHasRow(
+                    recovered,
+                    "__txn_participants",
+                    {{"txn_id", txn_id},
+                     {"range_id", defaultRangeIdForIndex(title_year_index)},
+                     {"replica_group_id", index_replica_group},
+                     {"status", "committed"}}),
+            "consensus-applied coordinator decision should survive WAL recovery");
+    });
+
     tests.test("Broadcast join correct against reference result", [&] {
         auto scenario = buildIndexScenario(3);
         SplitTitleRanges split = splitTitleTableAcrossThreeRanges(scenario);
@@ -25418,6 +25737,7 @@ int main(int argc, char* argv[]) {
 
         DistributedJoinResult joined =
             runtime.executeDistributedJoin(broadcast_join_sql);
+        auto expected_join = joinReference(scenario);
 
         tests.check(joined.complete &&
                         !joined.unsupported &&
@@ -25425,13 +25745,87 @@ int main(int argc, char* argv[]) {
                             std::vector<std::string>{
                                 "title.title",
                                 "movie_companies.company_id"} &&
-                        joined.rows == joinReference(scenario) &&
+                        joined.rows == expected_join &&
                         joined.fragments.size() ==
                             splitRangeIds(split).size() &&
                         table_fragments == 1 &&
                         moved_fragments == 2 &&
                         allJoinFragmentsUseReadTimestamp(joined),
-                    "broadcast join should scan current title owners and match the local reference");
+                    "broadcast join should scan current title owners and match the local reference "
+                    "(complete=" +
+                    std::string(joined.complete ? "true" : "false") +
+                    ", unsupported=" +
+                    std::string(joined.unsupported ? "true" : "false") +
+                    ", rows=" + std::to_string(joined.rows.size()) +
+                    ", expected=" + std::to_string(expected_join.size()) +
+                    ", fragments=" +
+                    std::to_string(joined.fragments.size()) +
+                    ", table_fragments=" +
+                    std::to_string(table_fragments) +
+                    ", moved_fragments=" +
+                    std::to_string(moved_fragments) + ")");
+    });
+
+    tests.test("Query exchange attempts ignore duplicate and stale results", [&] {
+        auto scenario = buildIndexScenario(3);
+        splitTitleTableAcrossThreeRanges(scenario);
+        auto runtime = controlPlaneRuntime(scenario);
+
+        const std::string sql = "PROJECT COUNT(*) FROM title";
+        DistributedQueryResult counted =
+            runtime.executeDistributedAggregate(sql);
+        tests.check(counted.complete && !counted.fragment_results.empty(),
+                    "aggregate should produce real exchange fragments before attempt merging");
+        if (!counted.complete || counted.fragment_results.empty()) return;
+        std::vector<FragmentResult> duplicated =
+            counted.fragment_results;
+        duplicated.push_back(counted.fragment_results.front());
+        DistributedQueryResult duplicate_merge =
+            runtime.mergeQueryFragmentResults(
+                sql,
+                "",
+                "",
+                counted.read_ts,
+                counted.fragments,
+                duplicated);
+
+        std::vector<FragmentResult> stale =
+            counted.fragment_results;
+        for (auto& result : stale) ++result.attempt_id;
+        DistributedQueryResult stale_only =
+            runtime.mergeQueryFragmentResults(
+                sql,
+                "",
+                "",
+                counted.read_ts,
+                counted.fragments,
+                stale);
+        std::vector<FragmentResult> stale_then_current = stale;
+        stale_then_current.insert(stale_then_current.end(),
+                                  counted.fragment_results.begin(),
+                                  counted.fragment_results.end());
+        DistributedQueryResult current_wins =
+            runtime.mergeQueryFragmentResults(
+                sql,
+                "",
+                "",
+                counted.read_ts,
+                counted.fragments,
+                stale_then_current);
+
+        tests.check(counted.complete &&
+                        duplicate_merge.complete &&
+                        duplicate_merge.final_count ==
+                            counted.final_count &&
+                        duplicate_merge.fragment_results.size() ==
+                            counted.fragment_results.size() &&
+                        !stale_only.complete &&
+                        stale_only.rows.empty() &&
+                        current_wins.complete &&
+                        current_wins.final_count == counted.final_count &&
+                        current_wins.fragment_results.size() ==
+                            counted.fragment_results.size(),
+                    "query exchange should dedupe same attempts and ignore stale attempts");
     });
 
     tests.test("Duplicate exchange result ignored", [&] {
@@ -25441,6 +25835,9 @@ int main(int argc, char* argv[]) {
 
         DistributedJoinResult joined =
             runtime.executeDistributedJoin(broadcast_join_sql);
+        tests.check(joined.complete && !joined.fragment_results.empty(),
+                    "join should produce real exchange fragments before dedupe");
+        if (!joined.complete || joined.fragment_results.empty()) return;
         std::vector<JoinFragmentResult> duplicated =
             joined.fragment_results;
         duplicated.push_back(joined.fragment_results.front());
@@ -25452,62 +25849,159 @@ int main(int argc, char* argv[]) {
                 joined.fragments,
                 duplicated);
 
+        std::vector<JoinFragmentResult> stale =
+            joined.fragment_results;
+        for (auto& result : stale) ++result.attempt_id;
+        DistributedJoinResult stale_only =
+            runtime.mergeJoinFragmentResults(
+                broadcast_join_sql,
+                joined.read_ts,
+                joined.fragments,
+                stale);
+        std::vector<JoinFragmentResult> stale_then_current = stale;
+        stale_then_current.insert(stale_then_current.end(),
+                                  joined.fragment_results.begin(),
+                                  joined.fragment_results.end());
+        DistributedJoinResult current_wins =
+            runtime.mergeJoinFragmentResults(
+                broadcast_join_sql,
+                joined.read_ts,
+                joined.fragments,
+                stale_then_current);
+
         tests.check(joined.complete &&
                         merged.complete &&
                         merged.rows == joined.rows &&
                         merged.fragment_results.size() ==
                             joined.fragment_results.size() &&
                         merged.fragment_row_counts ==
-                            joined.fragment_row_counts,
-                    "coordinator should dedupe duplicate exchange output by fragment id");
+                            joined.fragment_row_counts &&
+                        !stale_only.complete &&
+                        stale_only.rows.empty() &&
+                        current_wins.complete &&
+                        current_wins.rows == joined.rows &&
+                        current_wins.fragment_results.size() ==
+                            joined.fragment_results.size(),
+                    "coordinator should dedupe duplicate exchange output and ignore stale attempts");
     });
 
     tests.test("Lost exchange safely fails without partial output", [&] {
         auto scenario = buildIndexScenario(3);
         SplitTitleRanges split = splitTitleTableAcrossThreeRanges(scenario);
-        ControlPlaneRuntime runtime{
-            [&](const Command& command) {
-                return commitCommand(scenario.catalog, command);
-            }
-        };
-        runtime.registerReplicaGroup(
-            scenario.table_owner.group_id,
-            [&](const Command& command) {
-                return commitCommand(scenario.table_owner, command);
-            });
+        auto runtime = controlPlaneRuntime(scenario);
 
         DistributedJoinResult joined =
             runtime.executeDistributedJoin(broadcast_join_sql);
+        std::vector<JoinFragmentResult> partial =
+            joined.fragment_results;
+        tests.check(!partial.empty(),
+                    "join should produce real exchange fragments before loss");
+        if (partial.empty()) return;
+        partial.pop_back();
+        DistributedJoinResult failed =
+            runtime.mergeJoinFragmentResults(
+                broadcast_join_sql,
+                joined.read_ts,
+                joined.fragments,
+                partial);
 
-        tests.check(!joined.complete &&
-                        joined.rows.empty() &&
-                        joined.fragment_results.empty() &&
-                        joined.fragments.size() ==
+        tests.check(joined.complete &&
+                        !failed.complete &&
+                        failed.rows.empty() &&
+                        failed.fragment_results.empty() &&
+                        failed.fragments.size() ==
                             splitRangeIds(split).size() &&
-                        allJoinFragmentsUseReadTimestamp(joined),
-                    "missing moved-range owner should fail the whole join without partial rows");
+                        allJoinFragmentsUseReadTimestamp(failed),
+                    "missing exchange fragment should fail the whole join without partial rows");
     });
 
-    tests.test("Unsupported repartition join does not pretend to work", [&] {
+    tests.test("Wrong owner rejects moved range fragments", [&] {
         auto scenario = buildIndexScenario(3);
         splitTitleTableAcrossThreeRanges(scenario);
         auto runtime = controlPlaneRuntime(scenario);
 
+        DistributedJoinResult joined =
+            runtime.executeDistributedJoin(broadcast_join_sql);
+        auto moved_join =
+            std::find_if(joined.fragments.begin(),
+                         joined.fragments.end(),
+                         [&](const JoinFragment& fragment) {
+                             return fragment.replica_group_id ==
+                                    scenario.index_owner.group_id;
+                         });
+        tests.check(moved_join != joined.fragments.end(),
+                    "join should include a moved range fragment");
+        if (moved_join == joined.fragments.end()) return;
+        Result wrong_join =
+            commitCommand(scenario.table_owner,
+                          ExecuteJoinFragmentCommand{*moved_join});
+
+        DistributedQueryResult explained =
+            runtime.explainDistributedAggregate(
+                "PROJECT COUNT(*) FROM title");
+        auto moved_query =
+            std::find_if(explained.fragments.begin(),
+                         explained.fragments.end(),
+                         [&](const QueryFragment& fragment) {
+                             return fragment.replica_group_id ==
+                                    scenario.index_owner.group_id;
+                         });
+        tests.check(moved_query != explained.fragments.end(),
+                    "query should include a moved range fragment");
+        if (moved_query == explained.fragments.end()) return;
+        Result wrong_query =
+            commitCommand(scenario.table_owner,
+                          ExecuteQueryFragmentCommand{*moved_query});
+        Result wrong_range =
+            commitCommand(scenario.table_owner,
+                          RangeReadCommand{
+                              moved_query->table,
+                              moved_query->range_id,
+                              moved_query->replica_group_id,
+                              moved_query->start_key,
+                              moved_query->end_key,
+                              moved_query->read_ts});
+
+        tests.check(std::holds_alternative<RouteRejectedResult>(wrong_join) &&
+                        std::holds_alternative<RouteRejectedResult>(
+                            wrong_query) &&
+                        std::holds_alternative<RouteRejectedResult>(
+                            wrong_range),
+                    "old owner should reject moved range join query and read fragments");
+    });
+
+    tests.test("Unsupported repartition join does not pretend to work", [&] {
+        auto scenario = buildIndexScenario(3);
+        auto runtime = controlPlaneRuntime(scenario);
+
+        DistributedJoinResult disabled_broadcast =
+            runtime.executeDistributedJoin(broadcast_join_sql, 0);
+        DistributedJoinResult over_limit =
+            runtime.executeDistributedJoin(broadcast_join_sql, 1);
         DistributedJoinResult self_join =
             runtime.executeDistributedJoin(
                 "SELECT title.id FROM title JOIN title "
                 "ON title.id = title.id");
-        DistributedJoinResult oversized =
-            runtime.executeDistributedJoin(broadcast_join_sql, 1);
+        DistributedJoinResult small_side_predicate =
+            runtime.executeDistributedJoin(
+                "SELECT title.title, movie_companies.company_id "
+                "FROM title JOIN movie_companies "
+                "ON title.id = movie_companies.movie_id "
+                "WHERE movie_companies.company_id=1");
 
-        tests.check(!self_join.complete &&
+        tests.check(!disabled_broadcast.complete &&
+                        disabled_broadcast.unsupported &&
+                        disabled_broadcast.rows.empty() &&
+                        !over_limit.complete &&
+                        over_limit.unsupported &&
+                        over_limit.rows.empty() &&
+                        !self_join.complete &&
                         self_join.unsupported &&
-                        self_join.rows.empty(),
-                    "self/large-large join should be rejected because v147 has no repartition join");
-        tests.check(!oversized.complete &&
-                        oversized.unsupported &&
-                        oversized.rows.empty(),
-                    "oversized broadcast side should be rejected instead of silently repartitioning");
+                        self_join.rows.empty() &&
+                        !small_side_predicate.complete &&
+                        small_side_predicate.unsupported &&
+                        small_side_predicate.rows.empty(),
+                    "unsupported joins should fail honestly instead of silently repartitioning");
     });
 
     tests.test("Capstone composes movement index txn and distributed query", [&] {
