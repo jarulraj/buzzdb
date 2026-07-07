@@ -589,14 +589,9 @@ private:
     std::unordered_map<std::string, TableMetadata> tables_by_name;
 
 public:
-    bool createTable(const std::string& name, TableSchema schema) {
-        if (tables_by_name.find(name) != tables_by_name.end()) {
-            return false;
-        }
-
+    void createTable(const std::string& name, TableSchema schema) {
         TableMetadata metadata{next_table_id++, name, std::move(schema), {}};
-        tables_by_name.emplace(name, std::move(metadata));
-        return true;
+        tables_by_name.insert_or_assign(name, std::move(metadata));
     }
 
     bool hasTable(const std::string& name) const {
@@ -1608,6 +1603,30 @@ public:
     }
 };
 
+std::string trim(const std::string& input) {
+    size_t start = 0;
+    while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
+        start++;
+    }
+
+    size_t end = input.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+        end--;
+    }
+
+    return input.substr(start, end - start);
+}
+
+std::vector<std::string> split(const std::string& input, char delimiter) {
+    std::vector<std::string> tokens;
+    std::stringstream stream(input);
+    std::string token;
+    while (std::getline(stream, token, delimiter)) {
+        tokens.push_back(trim(token));
+    }
+    return tokens;
+}
+
 
 class BuzzDB {
 public:
@@ -1620,45 +1639,8 @@ public:
         // Storage Manager automatically created
     }
 
-    bool createTable(const std::string& name, TableSchema schema) {
-        return catalog.createTable(name, std::move(schema));
-    }
-
-    static std::string trim(const std::string& input) {
-        size_t start = 0;
-        while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
-            start++;
-        }
-
-        size_t end = input.size();
-        while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-            end--;
-        }
-
-        return input.substr(start, end - start);
-    }
-
-    static std::vector<std::string> split(const std::string& input, char delimiter) {
-        std::vector<std::string> tokens;
-        std::stringstream stream(input);
-        std::string token;
-        while (std::getline(stream, token, delimiter)) {
-            tokens.push_back(trim(token));
-        }
-        return tokens;
-    }
-
-    static FieldType parseFieldType(const std::string& typeName) {
-        if (typeName == "INT") {
-            return INT;
-        }
-        if (typeName == "FLOAT") {
-            return FLOAT;
-        }
-        if (typeName == "STRING") {
-            return STRING;
-        }
-        throw std::runtime_error("Unknown field type: " + typeName);
+    void createTable(const std::string& name, TableSchema schema) {
+        catalog.createTable(name, std::move(schema));
     }
 
     static std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
@@ -1671,25 +1653,6 @@ public:
                 return std::make_unique<Field>(value);
         }
         throw std::runtime_error("Unsupported field type.");
-    }
-
-    static TableSchema parseTableSchema(const std::vector<std::string>& tokens) {
-        if (tokens.size() < 3) {
-            throw std::runtime_error("TABLE line must include at least one column.");
-        }
-
-        TableSchema schema;
-        for (size_t i = 2; i < tokens.size(); i++) {
-            auto separator = tokens[i].find(':');
-            if (separator == std::string::npos) {
-                throw std::runtime_error("Bad column declaration: " + tokens[i]);
-            }
-
-            auto column_name = tokens[i].substr(0, separator);
-            auto type_name = tokens[i].substr(separator + 1);
-            schema.columns.push_back({column_name, parseFieldType(type_name)});
-        }
-        return schema;
     }
 
     static std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
@@ -1741,49 +1704,6 @@ public:
         InsertOperator insertOp(tableHeap);
         insertOp.setTupleToInsert(std::move(tuple));
         executeStatementOperator(insertOp, printResult);
-    }
-
-    void loadDumpFile(const std::string& filename) {
-        std::ifstream inputFile(filename);
-        if (!inputFile) {
-            throw std::runtime_error("Unable to open file: " + filename);
-        }
-
-        std::unordered_map<std::string, bool> loadRowsForTable;
-        std::string line;
-        while (std::getline(inputFile, line)) {
-            line = trim(line);
-            if (line.empty() || line[0] == '#') {
-                continue;
-            }
-
-            auto tokens = split(line, '|');
-            if (tokens.empty()) {
-                continue;
-            }
-
-            if (tokens[0] == "TABLE") {
-                if (tokens.size() < 3) {
-                    throw std::runtime_error("Bad TABLE line: " + line);
-                }
-                const std::string tableName = tokens[1];
-                bool created = createTable(tableName, parseTableSchema(tokens));
-                loadRowsForTable[tableName] = created;
-                continue;
-            }
-
-            const std::string tableName = tokens[0];
-            if (!catalog.hasTable(tableName)) {
-                throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
-            }
-            if (loadRowsForTable.find(tableName) != loadRowsForTable.end() &&
-                !loadRowsForTable[tableName]) {
-                continue;
-            }
-
-            std::vector<std::string> values(tokens.begin() + 1, tokens.end());
-            insertRow(tableName, values, false);
-        }
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -1857,10 +1777,83 @@ public:
     
 };
 
+class DatabaseImporter {
+private:
+    static FieldType parseFieldType(const std::string& typeName) {
+        if (typeName == "INT") {
+            return INT;
+        }
+        if (typeName == "FLOAT") {
+            return FLOAT;
+        }
+        if (typeName == "STRING") {
+            return STRING;
+        }
+        throw std::runtime_error("Unknown field type: " + typeName);
+    }
+
+    static TableSchema parseTableSchema(const std::vector<std::string>& tokens) {
+        if (tokens.size() < 3) {
+            throw std::runtime_error("TABLE line must include at least one column.");
+        }
+
+        TableSchema schema;
+        for (size_t i = 2; i < tokens.size(); i++) {
+            auto separator = tokens[i].find(':');
+            if (separator == std::string::npos) {
+                throw std::runtime_error("Bad column declaration: " + tokens[i]);
+            }
+
+            auto column_name = tokens[i].substr(0, separator);
+            auto type_name = tokens[i].substr(separator + 1);
+            schema.columns.push_back({column_name, parseFieldType(type_name)});
+        }
+        return schema;
+    }
+
+public:
+    static void importFile(BuzzDB& db, const std::string& filename) {
+        std::ifstream inputFile(filename);
+        if (!inputFile) {
+            throw std::runtime_error("Unable to open file: " + filename);
+        }
+
+        std::string line;
+        while (std::getline(inputFile, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+
+            auto tokens = split(line, '|');
+            if (tokens.empty()) {
+                continue;
+            }
+
+            if (tokens[0] == "TABLE") {
+                if (tokens.size() < 3) {
+                    throw std::runtime_error("Bad TABLE line: " + line);
+                }
+                const std::string tableName = tokens[1];
+                db.createTable(tableName, parseTableSchema(tokens));
+                continue;
+            }
+
+            const std::string tableName = tokens[0];
+            if (!db.catalog.hasTable(tableName)) {
+                throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
+            }
+
+            std::vector<std::string> values(tokens.begin() + 1, tokens.end());
+            db.insertRow(tableName, values, false);
+        }
+    }
+};
+
 int main() {
 
     BuzzDB db;
-    db.loadDumpFile("booking.txt");
+    DatabaseImporter::importFile(db, "booking.txt");
 
     auto start = std::chrono::high_resolution_clock::now();
 
