@@ -1,0 +1,1886 @@
+#include <iostream>
+#include <map>
+#include <vector>
+#include <fstream>
+#include <iostream>
+#include <chrono>
+
+#include <list>
+#include <unordered_map>
+#include <iostream>
+#include <map>
+#include <string>
+#include <memory>
+#include <sstream>
+#include <limits>
+#include <thread>
+#include <queue>
+#include <optional>
+#include <regex>
+#include <stdexcept>
+#include <cassert>
+#include <cctype>
+
+enum FieldType { INT, FLOAT, STRING };
+
+// Define a basic Field variant class that can hold different types
+class Field {
+public:
+    FieldType type;
+    size_t data_length;
+    std::unique_ptr<char[]> data;
+
+public:
+    Field(int i) : type(INT) { 
+        data_length = sizeof(int);
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), &i, data_length);
+    }
+
+    Field(float f) : type(FLOAT) { 
+        data_length = sizeof(float);
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), &f, data_length);
+    }
+
+    Field(const std::string& s) : type(STRING) {
+        data_length = s.size() + 1;  // include null-terminator
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), s.c_str(), data_length);
+    }
+
+    Field& operator=(const Field& other) {
+        if (&other == this) {
+            return *this;
+        }
+        type = other.type;
+        data_length = other.data_length;
+        std::memcpy(data.get(), other.data.get(), data_length);
+        return *this;
+    }
+
+   // Copy constructor
+    Field(const Field& other) : type(other.type), data_length(other.data_length), data(new char[data_length]) {
+        std::memcpy(data.get(), other.data.get(), data_length);
+    }
+
+    // Move constructor - If you already have one, ensure it's correctly implemented
+    Field(Field&& other) noexcept : type(other.type), data_length(other.data_length), data(std::move(other.data)) {
+        // Optionally reset other's state if needed
+    }
+
+    // Clone method
+    std::unique_ptr<Field> clone() const {
+        // Use the copy constructor
+        return std::make_unique<Field>(*this);
+    }
+
+    FieldType getType() const { return type; }
+    int asInt() const { 
+        return *reinterpret_cast<int*>(data.get());
+    }
+    float asFloat() const { 
+        return *reinterpret_cast<float*>(data.get());
+    }
+    std::string asString() const { 
+        return std::string(data.get());
+    }
+
+    std::string serialize() {
+        std::stringstream buffer;
+        buffer << type << ' ' << data_length << ' ';
+        if (type == STRING) {
+            buffer << data.get() << ' ';
+        } else if (type == INT) {
+            buffer << *reinterpret_cast<int*>(data.get()) << ' ';
+        } else if (type == FLOAT) {
+            buffer << *reinterpret_cast<float*>(data.get()) << ' ';
+        }
+        return buffer.str();
+    }
+
+    void serialize(std::ofstream& out) {
+        std::string serializedData = this->serialize();
+        out << serializedData;
+    }
+
+    static std::unique_ptr<Field> deserialize(std::istream& in) {
+        int type; in >> type;
+        size_t length; in >> length;
+        if (type == STRING) {
+            std::string val; in >> val;
+            return std::make_unique<Field>(val);
+        } else if (type == INT) {
+            int val; in >> val;
+            return std::make_unique<Field>(val);
+        } else if (type == FLOAT) {
+            float val; in >> val;
+            return std::make_unique<Field>(val);
+        }
+        return nullptr;
+    }
+
+    void print() const{
+        switch(getType()){
+            case INT: std::cout << asInt(); break;
+            case FLOAT: std::cout << asFloat(); break;
+            case STRING: std::cout << asString(); break;
+        }
+    }
+};
+
+bool operator==(const Field& lhs, const Field& rhs) {
+    if (lhs.type != rhs.type) return false; // Different types are never equal
+
+    switch (lhs.type) {
+        case INT:
+            return *reinterpret_cast<const int*>(lhs.data.get()) == *reinterpret_cast<const int*>(rhs.data.get());
+        case FLOAT:
+            return *reinterpret_cast<const float*>(lhs.data.get()) == *reinterpret_cast<const float*>(rhs.data.get());
+        case STRING:
+            return std::string(lhs.data.get(), lhs.data_length - 1) == std::string(rhs.data.get(), rhs.data_length - 1);
+        default:
+            throw std::runtime_error("Unsupported field type for comparison.");
+    }
+}
+
+class Tuple {
+public:
+    std::vector<std::unique_ptr<Field>> fields;
+
+    void addField(std::unique_ptr<Field> field) {
+        fields.push_back(std::move(field));
+    }
+
+    size_t getSize() const {
+        size_t size = 0;
+        for (const auto& field : fields) {
+            size += field->data_length;
+        }
+        return size;
+    }
+
+    std::string serialize() {
+        std::stringstream buffer;
+        buffer << fields.size() << ' ';
+        for (const auto& field : fields) {
+            buffer << field->serialize();
+        }
+        return buffer.str();
+    }
+
+    void serialize(std::ofstream& out) {
+        std::string serializedData = this->serialize();
+        out << serializedData;
+    }
+
+    static std::unique_ptr<Tuple> deserialize(std::istream& in) {
+        auto tuple = std::make_unique<Tuple>();
+        size_t fieldCount; in >> fieldCount;
+        for (size_t i = 0; i < fieldCount; ++i) {
+            tuple->addField(Field::deserialize(in));
+        }
+        return tuple;
+    }
+
+    void print() const {
+        for (const auto& field : fields) {
+            field->print();
+            std::cout << " ";
+        }
+        std::cout << "\n";
+    }
+
+    std::unique_ptr<Tuple> clone() const {
+        auto tuple = std::make_unique<Tuple>();
+        for (const auto& field : fields) {
+            tuple->addField(field->clone());
+        }
+        return tuple;
+    }
+};
+
+static constexpr size_t PAGE_SIZE = 4096;  // Fixed page size
+static constexpr size_t MAX_SLOTS = 512;   // Fixed number of slots
+uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
+
+struct Slot {
+    bool empty = true;                 // Is the slot empty?    
+    uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
+    uint16_t length = INVALID_VALUE;    // Length of the slot
+};
+
+// Slotted Page class
+class SlottedPage {
+public:
+    std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
+    size_t metadata_size = sizeof(Slot) * MAX_SLOTS;
+
+    SlottedPage(){
+        // Empty page -> initialize slot array inside page
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+            slot_array[slot_itr].empty = true;
+            slot_array[slot_itr].offset = INVALID_VALUE;
+            slot_array[slot_itr].length = INVALID_VALUE;
+        }
+    }
+
+    // Add a tuple, returns true if it fits, false otherwise.
+    bool addTuple(std::unique_ptr<Tuple> tuple) {
+
+        // Serialize the tuple into a char array
+        auto serializedTuple = tuple->serialize();
+        size_t tuple_size = serializedTuple.size();
+
+        //std::cout << "Tuple size: " << tuple_size << " bytes\n";
+
+        // Check for first slot with enough space
+        size_t slot_itr = 0;
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());        
+        for (; slot_itr < MAX_SLOTS; slot_itr++) {
+            if (slot_array[slot_itr].empty == true and 
+                slot_array[slot_itr].length >= tuple_size) {
+                break;
+            }
+        }
+        if (slot_itr == MAX_SLOTS){
+            //std::cout << "Page does not contain an empty slot with sufficient space to store the tuple.";
+            return false;
+        }
+
+        // Identify the offset where the tuple will be placed in the page
+        // Update slot meta-data if needed
+        slot_array[slot_itr].empty = false;
+        size_t offset = INVALID_VALUE;
+        if (slot_array[slot_itr].offset == INVALID_VALUE){
+            if(slot_itr != 0){
+                auto prev_slot_offset = slot_array[slot_itr - 1].offset;
+                auto prev_slot_length = slot_array[slot_itr - 1].length;
+                offset = prev_slot_offset + prev_slot_length;
+            }
+            else{
+                offset = metadata_size;
+            }
+
+            slot_array[slot_itr].offset = offset;
+        }
+        else{
+            offset = slot_array[slot_itr].offset;
+        }
+
+        if(offset + tuple_size >= PAGE_SIZE){
+            slot_array[slot_itr].empty = true;
+            slot_array[slot_itr].offset = INVALID_VALUE;
+            return false;
+        }
+
+        assert(offset != INVALID_VALUE);
+        assert(offset >= metadata_size);
+        assert(offset + tuple_size < PAGE_SIZE);
+
+        if (slot_array[slot_itr].length == INVALID_VALUE){
+            slot_array[slot_itr].length = tuple_size;
+        }
+
+        // Copy serialized data into the page
+        std::memcpy(page_data.get() + offset, 
+                    serializedTuple.c_str(), 
+                    tuple_size);
+
+        return true;
+    }
+
+    std::unique_ptr<Tuple> getTuple(size_t index) const {
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        if (index >= MAX_SLOTS || slot_array[index].empty) {
+            return nullptr;
+        }
+
+        assert(slot_array[index].offset != INVALID_VALUE);
+        const char* tuple_data = page_data.get() + slot_array[index].offset;
+        std::istringstream iss(std::string(tuple_data, slot_array[index].length));
+        return Tuple::deserialize(iss);
+    }
+
+    bool updateTuple(size_t index, std::unique_ptr<Tuple> tuple) {
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        if (index >= MAX_SLOTS || slot_array[index].empty) {
+            return false;
+        }
+
+        auto serializedTuple = tuple->serialize();
+        if (serializedTuple.size() > slot_array[index].length) {
+            return false;
+        }
+
+        std::memcpy(page_data.get() + slot_array[index].offset,
+                    serializedTuple.c_str(),
+                    serializedTuple.size());
+        return true;
+    }
+
+    void deleteTuple(size_t index) {
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        size_t slot_itr = 0;
+        for (; slot_itr < MAX_SLOTS; slot_itr++) {
+            if(slot_itr == index and
+               slot_array[slot_itr].empty == false){
+                slot_array[slot_itr].empty = true;
+                break;
+               }
+        }
+
+        //std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    void print() const{
+        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+            if (slot_array[slot_itr].empty == false){
+                assert(slot_array[slot_itr].offset != INVALID_VALUE);
+                const char* tuple_data = page_data.get() + slot_array[slot_itr].offset;
+                std::istringstream iss(tuple_data);
+                auto loadedTuple = Tuple::deserialize(iss);
+                std::cout << "Slot " << slot_itr << " : [";
+                std::cout << (uint16_t)(slot_array[slot_itr].offset) << "] :: ";
+                loadedTuple->print();
+            }
+        }
+        std::cout << "\n";
+    }
+};
+
+const std::string database_filename = "buzzdb.dat";
+
+class StorageManager {
+public:    
+    std::fstream fileStream;
+    size_t num_pages = 0;
+
+public:
+    StorageManager(){
+        fileStream.open(database_filename, std::ios::in | std::ios::out);
+        if (!fileStream) {
+            // If file does not exist, create it
+            fileStream.clear(); // Reset the state
+            fileStream.open(database_filename, std::ios::out);
+        }
+        fileStream.close(); 
+        fileStream.open(database_filename, std::ios::in | std::ios::out); 
+
+        fileStream.seekg(0, std::ios::end);
+        num_pages = fileStream.tellg() / PAGE_SIZE;
+
+        std::cout << "Storage Manager :: Num pages: " << num_pages << "\n";        
+        if(num_pages == 0){
+            extend();
+        }
+
+    }
+
+    ~StorageManager() {
+        if (fileStream.is_open()) {
+            fileStream.close();
+        }
+    }
+
+    // Read a page from disk
+    std::unique_ptr<SlottedPage> load(uint16_t page_id) {
+        fileStream.seekg(page_id * PAGE_SIZE, std::ios::beg);
+        auto page = std::make_unique<SlottedPage>();
+        // Read the content of the file into the page
+        if(fileStream.read(page->page_data.get(), PAGE_SIZE)){
+            //std::cout << "Page read successfully from file." << std::endl;
+        }
+        else{
+            std::cerr << "Error: Unable to read data from the file. \n";
+            exit(-1);
+        }
+        return page;
+    }
+
+    // Write a page to disk
+    void flush(uint16_t page_id, const std::unique_ptr<SlottedPage>& page) {
+        size_t page_offset = page_id * PAGE_SIZE;        
+
+        // Move the write pointer
+        fileStream.seekp(page_offset, std::ios::beg);
+        fileStream.write(page->page_data.get(), PAGE_SIZE);        
+        fileStream.flush();
+    }
+
+    // Extend database file by one page
+    void extend() {
+        std::cout << "Extending database file \n";
+
+        // Create a slotted page
+        auto empty_slotted_page = std::make_unique<SlottedPage>();
+
+        // Move the write pointer
+        fileStream.seekp(0, std::ios::end);
+
+        // Write the page to the file, extending it
+        fileStream.write(empty_slotted_page->page_data.get(), PAGE_SIZE);
+        fileStream.flush();
+
+        // Update number of pages
+        num_pages += 1;
+    }
+
+};
+
+using PageID = uint16_t;
+
+class Policy {
+public:
+    virtual bool touch(PageID page_id) = 0;
+    virtual PageID evict() = 0;
+    virtual ~Policy() = default;
+};
+
+void printList(std::string list_name, const std::list<PageID>& myList) {
+        std::cout << list_name << " :: ";
+        for (const PageID& value : myList) {
+            std::cout << value << ' ';
+        }
+        std::cout << '\n';
+}
+
+class LruPolicy : public Policy {
+private:
+    // List to keep track of the order of use
+    std::list<PageID> lruList;
+
+    // Map to find a page's iterator in the list efficiently
+    std::unordered_map<PageID, std::list<PageID>::iterator> map;
+
+    size_t cacheSize;
+
+public:
+
+    LruPolicy(size_t cacheSize) : cacheSize(cacheSize) {}
+
+    bool touch(PageID page_id) override {
+        //printList("LRU", lruList);
+
+        bool found = false;
+        // If page already in the list, remove it
+        if (map.find(page_id) != map.end()) {
+            found = true;
+            lruList.erase(map[page_id]);
+            map.erase(page_id);            
+        }
+
+        // If cache is full, evict
+        if(lruList.size() == cacheSize){
+            evict();
+        }
+
+        if(lruList.size() < cacheSize){
+            // Add the page to the front of the list
+            lruList.emplace_front(page_id);
+            map[page_id] = lruList.begin();
+        }
+
+        return found;
+    }
+
+    PageID evict() override {
+        // Evict the least recently used page
+        PageID evictedPageId = INVALID_VALUE;
+        if(lruList.size() != 0){
+            evictedPageId = lruList.back();
+            map.erase(evictedPageId);
+            lruList.pop_back();
+        }
+        return evictedPageId;
+    }
+
+};
+
+constexpr size_t MAX_PAGES_IN_MEMORY = 10;
+
+class BufferManager {
+private:
+    using PageMap = std::unordered_map<PageID, std::unique_ptr<SlottedPage>>;
+
+    StorageManager storage_manager;
+    PageMap pageMap;
+    std::unique_ptr<Policy> policy;
+
+public:
+    BufferManager(): 
+    policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
+
+    std::unique_ptr<SlottedPage>& getPage(int page_id) {
+        auto it = pageMap.find(page_id);
+        if (it != pageMap.end()) {
+            policy->touch(page_id);
+            return pageMap.find(page_id)->second;
+        }
+
+        if (pageMap.size() >= MAX_PAGES_IN_MEMORY) {
+            auto evictedPageId = policy->evict();
+            if(evictedPageId != INVALID_VALUE){
+                std::cout << "Evicting page " << evictedPageId << "\n";
+                storage_manager.flush(evictedPageId, 
+                                      pageMap[evictedPageId]);
+            }
+        }
+
+        auto page = storage_manager.load(page_id);
+        policy->touch(page_id);
+        std::cout << "Loading page: " << page_id << "\n";
+        pageMap[page_id] = std::move(page);
+        return pageMap[page_id];
+    }
+
+    void flushPage(int page_id) {
+        //std::cout << "Flush page " << page_id << "\n";
+        storage_manager.flush(page_id, pageMap[page_id]);
+    }
+
+    void extend(){
+        storage_manager.extend();
+    }
+    
+    size_t getNumPages(){
+        return storage_manager.num_pages;
+    }
+
+};
+
+// Logical table identifier used by the in-memory catalog.
+using TableId = uint16_t;
+
+// One column in a table schema.
+struct ColumnSchema {
+    std::string name;
+    FieldType type;
+};
+
+// Ordered list of columns for a table.
+struct TableSchema {
+    std::vector<ColumnSchema> columns;
+
+    int getColumnIndex(const std::string& name) const {
+        for (size_t i = 0; i < columns.size(); i++) {
+            if (columns[i].name == name) {
+                return static_cast<int>(i);
+            }
+        }
+        throw std::runtime_error("Unknown column: " + name);
+    }
+};
+
+// Catalog-owned table description.
+struct TableMetadata {
+    TableId table_id;
+    std::string name;
+    TableSchema schema;
+    std::vector<PageID> page_ids;
+};
+
+// In-memory catalog mapping table names to table metadata.
+class Catalog {
+private:
+    TableId next_table_id = 1;
+    std::unordered_map<std::string, TableMetadata> tables_by_name;
+
+public:
+    bool createTable(const std::string& name, TableSchema schema) {
+        if (tables_by_name.find(name) != tables_by_name.end()) {
+            return false;
+        }
+
+        TableMetadata metadata{next_table_id++, name, std::move(schema), {}};
+        tables_by_name.emplace(name, std::move(metadata));
+        return true;
+    }
+
+    bool hasTable(const std::string& name) const {
+        return tables_by_name.find(name) != tables_by_name.end();
+    }
+
+    TableMetadata& getTable(const std::string& name) {
+        auto it = tables_by_name.find(name);
+        if (it == tables_by_name.end()) {
+            throw std::runtime_error("Unknown table: " + name);
+        }
+        return it->second;
+    }
+
+    const TableMetadata& getTable(const std::string& name) const {
+        auto it = tables_by_name.find(name);
+        if (it == tables_by_name.end()) {
+            throw std::runtime_error("Unknown table: " + name);
+        }
+        return it->second;
+    }
+};
+
+// Runtime handle for one table's heap pages; owns no catalog metadata.
+class TableHeap {
+private:
+    TableMetadata& metadata;
+    BufferManager& buffer_manager;
+
+public:
+    TableHeap(TableMetadata& metadata, BufferManager& buffer_manager)
+        : metadata(metadata), buffer_manager(buffer_manager) {}
+
+    const std::vector<PageID>& getPageIds() const {
+        return metadata.page_ids;
+    }
+
+    std::unique_ptr<SlottedPage>& getPage(PageID page_id) {
+        return buffer_manager.getPage(page_id);
+    }
+
+    bool addTuple(std::unique_ptr<Tuple> tuple) {
+        for (auto page_id : metadata.page_ids) {
+            auto& page = buffer_manager.getPage(page_id);
+            if (page->addTuple(tuple->clone())) {
+                buffer_manager.flushPage(page_id);
+                return true;
+            }
+        }
+
+        buffer_manager.extend();
+        auto page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
+        metadata.page_ids.push_back(page_id);
+
+        auto& page = buffer_manager.getPage(page_id);
+        if (!page->addTuple(std::move(tuple))) {
+            return false;
+        }
+
+        buffer_manager.flushPage(page_id);
+        return true;
+    }
+
+    void flushPage(PageID page_id) {
+        buffer_manager.flushPage(page_id);
+    }
+};
+
+class HashIndex {
+private:
+    struct HashEntry {
+        int key;
+        int value;
+        int position; // Final position within the array
+        bool exists; // Flag to check if entry exists
+
+        // Default constructor
+        HashEntry() : key(0), value(0), position(-1), exists(false) {}
+
+        // Constructor for initializing with key, value, and exists flag
+        HashEntry(int k, int v, int pos) : key(k), value(v), position(pos), exists(true) {}    
+    };
+
+    static const size_t capacity = 100; // Hard-coded capacity
+    HashEntry hashTable[capacity]; // Static-sized array
+
+    size_t hashFunction(int key) const {
+        return key % capacity; // Simple modulo hash function
+    }
+
+public:
+    HashIndex() {
+        // Initialize all entries as non-existing by default
+        for (size_t i = 0; i < capacity; ++i) {
+            hashTable[i] = HashEntry();
+        }
+    }
+
+    void insertOrUpdate(int key, int value) {
+        size_t index = hashFunction(key);
+        size_t originalIndex = index;
+        bool inserted = false;
+        int i = 0; // Attempt counter
+
+        do {
+            if (!hashTable[index].exists) {
+                hashTable[index] = HashEntry(key, value, true);
+                hashTable[index].position = index;
+                inserted = true;
+                break;
+            } else if (hashTable[index].key == key) {
+                hashTable[index].value += value;
+                hashTable[index].position = index;
+                inserted = true;
+                break;
+            }
+            i++;
+            index = (originalIndex + i*i) % capacity; // Quadratic probing
+        } while (index != originalIndex && !inserted);
+
+        if (!inserted) {
+            std::cerr << "HashTable is full or cannot insert key: " << key << std::endl;
+        }
+    }
+
+   int getValue(int key) const {
+        size_t index = hashFunction(key);
+        size_t originalIndex = index;
+
+        do {
+            if (hashTable[index].exists && hashTable[index].key == key) {
+                return hashTable[index].value;
+            }
+            if (!hashTable[index].exists) {
+                break; // Stop if we find a slot that has never been used
+            }
+            index = (index + 1) % capacity;
+        } while (index != originalIndex);
+
+        return -1; // Key not found
+    }
+
+    // This method is not efficient for range queries 
+    // as this is an unordered index
+    // but is included for comparison
+    std::vector<int> rangeQuery(int lowerBound, int upperBound) const {
+        std::vector<int> values;
+        for (size_t i = 0; i < capacity; ++i) {
+            if (hashTable[i].exists && hashTable[i].key >= lowerBound && hashTable[i].key <= upperBound) {
+                std::cout << "Key: " << hashTable[i].key << 
+                ", Value: " << hashTable[i].value << std::endl;
+                values.push_back(hashTable[i].value);
+            }
+        }
+        return values;
+    }
+
+    void print() const {
+        for (size_t i = 0; i < capacity; ++i) {
+            if (hashTable[i].exists) {
+                std::cout << "Position: " << hashTable[i].position << 
+                ", Key: " << hashTable[i].key << 
+                ", Value: " << hashTable[i].value << std::endl;
+            }
+        }
+    }
+};
+
+class Operator {
+    public:
+    virtual ~Operator() = default;
+
+    /// Initializes the operator.
+    virtual void open() = 0;
+
+    /// Tries to generate the next tuple. Return true when a new tuple is
+    /// available.
+    virtual bool next() = 0;
+
+    /// Destroys the operator.
+    virtual void close() = 0;
+
+    /// This returns the pointers to the Fields of the generated tuple. When
+    /// `next()` returns true, the Fields will contain the values for the
+    /// next tuple. Each `Field` pointer in the vector stands for one attribute of the tuple.
+    virtual std::vector<std::unique_ptr<Field>> getOutput() = 0;
+};
+
+class UnaryOperator : public Operator {
+    protected:
+    Operator* input;
+
+    public:
+    explicit UnaryOperator(Operator& input) : input(&input) {}
+
+    ~UnaryOperator() override = default;
+};
+
+class BinaryOperator : public Operator {
+    protected:
+    Operator* input_left;
+    Operator* input_right;
+
+    public:
+    explicit BinaryOperator(Operator& input_left, Operator& input_right)
+        : input_left(&input_left), input_right(&input_right) {}
+
+    ~BinaryOperator() override = default;
+};
+
+class ScanOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    size_t currentPageIndex = 0;
+    size_t currentSlotIndex = 0;
+    std::unique_ptr<Tuple> currentTuple;
+    size_t tuple_count = 0;
+
+public:
+    ScanOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+
+    void open() override {
+        currentPageIndex = 0;
+        currentSlotIndex = 0;
+        currentTuple.reset(); // Ensure currentTuple is reset
+    }
+
+    bool next() override {
+        loadNextTuple();
+        return currentTuple != nullptr;
+    }
+
+    void close() override {
+        std::cout << "Scan Operator tuple_count: " << tuple_count << "\n";
+        currentPageIndex = 0;
+        currentSlotIndex = 0;
+        currentTuple.reset();
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        if (currentTuple) {
+            return std::move(currentTuple->fields);
+        }
+        return {}; // Return an empty vector if no tuple is available
+    }
+
+private:
+    void loadNextTuple() {
+        const auto& page_ids = tableHeap.getPageIds();
+        while (currentPageIndex < page_ids.size()) {
+            auto& currentPage = tableHeap.getPage(page_ids[currentPageIndex]);
+            if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
+                currentSlotIndex = 0; // Reset slot index when moving to a new page
+            }
+
+            char* page_buffer = currentPage->page_data.get();
+            Slot* slot_array = reinterpret_cast<Slot*>(page_buffer);
+
+            while (currentSlotIndex < MAX_SLOTS) {
+                if (!slot_array[currentSlotIndex].empty) {
+                    assert(slot_array[currentSlotIndex].offset != INVALID_VALUE);
+                    const char* tuple_data = page_buffer + slot_array[currentSlotIndex].offset;
+                    std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length));
+                    currentTuple = Tuple::deserialize(iss);
+                    currentSlotIndex++; // Move to the next slot for the next call
+                    tuple_count++;
+                    return; // Tuple loaded successfully
+                }
+                currentSlotIndex++;
+            }
+
+            // Increment page index after exhausting current page
+            currentPageIndex++;
+        }
+
+        // No more tuples are available
+        currentTuple.reset();
+    }
+};
+
+class IPredicate {
+public:
+    virtual ~IPredicate() = default;
+    virtual bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const = 0;
+};
+
+void printTuple(const std::vector<std::unique_ptr<Field>>& tupleFields) {
+    std::cout << "Tuple: [";
+    for (const auto& field : tupleFields) {
+        field->print(); // Assuming `print()` is a method that prints field content
+        std::cout << " ";
+    }
+    std::cout << "]";
+}
+
+class SimplePredicate: public IPredicate {
+public:
+    enum OperandType { DIRECT, INDIRECT };
+    enum ComparisonOperator { EQ, NE, GT, GE, LT, LE }; // Renamed from PredicateType
+
+    struct Operand {
+        std::unique_ptr<Field> directValue;
+        size_t index;
+        OperandType type;
+
+        Operand(std::unique_ptr<Field> value) : directValue(std::move(value)), type(DIRECT) {}
+        Operand(size_t idx) : index(idx), type(INDIRECT) {}
+    };
+
+    Operand left_operand;
+    Operand right_operand;
+    ComparisonOperator comparison_operator;
+
+    SimplePredicate(Operand left, Operand right, ComparisonOperator op)
+        : left_operand(std::move(left)), right_operand(std::move(right)), comparison_operator(op) {}
+
+    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
+        const Field* leftField = nullptr;
+        const Field* rightField = nullptr;
+
+        if (left_operand.type == DIRECT) {
+            leftField = left_operand.directValue.get();
+        } else if (left_operand.type == INDIRECT) {
+            leftField = tupleFields[left_operand.index].get();
+        }
+
+        if (right_operand.type == DIRECT) {
+            rightField = right_operand.directValue.get();
+        } else if (right_operand.type == INDIRECT) {
+            rightField = tupleFields[right_operand.index].get();
+        }
+
+        if (leftField == nullptr || rightField == nullptr) {
+            std::cerr << "Error: Invalid field reference.\n";
+            return false;
+        }
+
+        if (leftField->getType() != rightField->getType()) {
+            std::cerr << "Error: Comparing fields of different types.\n";
+            return false;
+        }
+
+        // Perform comparison based on field type
+        switch (leftField->getType()) {
+            case FieldType::INT: {
+                int left_val = leftField->asInt();
+                int right_val = rightField->asInt();
+                return compare(left_val, right_val);
+            }
+            case FieldType::FLOAT: {
+                float left_val = leftField->asFloat();
+                float right_val = rightField->asFloat();
+                return compare(left_val, right_val);
+            }
+            case FieldType::STRING: {
+                std::string left_val = leftField->asString();
+                std::string right_val = rightField->asString();
+                return compare(left_val, right_val);
+            }
+            default:
+                std::cerr << "Invalid field type\n";
+                return false;
+        }
+    }
+
+
+private:
+
+    // Compares two values of the same type
+    template<typename T>
+    bool compare(const T& left_val, const T& right_val) const {
+        switch (comparison_operator) {
+            case ComparisonOperator::EQ: return left_val == right_val;
+            case ComparisonOperator::NE: return left_val != right_val;
+            case ComparisonOperator::GT: return left_val > right_val;
+            case ComparisonOperator::GE: return left_val >= right_val;
+            case ComparisonOperator::LT: return left_val < right_val;
+            case ComparisonOperator::LE: return left_val <= right_val;
+            default: std::cerr << "Invalid predicate type\n"; return false;
+        }
+    }
+};
+
+class ComplexPredicate : public IPredicate {
+public:
+    enum LogicOperator { AND, OR };
+
+private:
+    std::vector<std::unique_ptr<IPredicate>> predicates;
+    LogicOperator logic_operator;
+
+public:
+    ComplexPredicate(LogicOperator op) : logic_operator(op) {}
+
+    void addPredicate(std::unique_ptr<IPredicate> predicate) {
+        predicates.push_back(std::move(predicate));
+    }
+
+    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
+        
+        if (logic_operator == AND) {
+            for (const auto& pred : predicates) {
+                if (!pred->check(tupleFields)) {
+                    return false; // If any predicate fails, the AND condition fails
+                }
+            }
+            return true; // All predicates passed
+        } else if (logic_operator == OR) {
+            for (const auto& pred : predicates) {
+                if (pred->check(tupleFields)) {
+                    return true; // If any predicate passes, the OR condition passes
+                }
+            }
+            return false; // No predicates passed
+        }
+        return false;
+    }
+
+
+};
+
+
+class SelectOperator : public UnaryOperator {
+private:
+    std::unique_ptr<IPredicate> predicate;
+    bool has_next;
+    std::vector<std::unique_ptr<Field>> currentOutput; // Store the current output here
+
+public:
+    SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate)
+        : UnaryOperator(input), predicate(std::move(predicate)), has_next(false) {}
+
+    void open() override {
+        input->open();
+        has_next = false;
+        currentOutput.clear(); // Ensure currentOutput is cleared at the beginning
+    }
+
+    bool next() override {
+        while (input->next()) {
+            const auto& output = input->getOutput(); // Temporarily hold the output
+            if (predicate->check(output)) {
+                // If the predicate is satisfied, store the output in the member variable
+                currentOutput.clear(); // Clear previous output
+                for (const auto& field : output) {
+                    // Assuming Field class has a clone method or copy constructor to duplicate fields
+                    currentOutput.push_back(field->clone());
+                }
+                has_next = true;
+                return true;
+            }
+        }
+        has_next = false;
+        currentOutput.clear(); // Clear output if no more tuples satisfy the predicate
+        return false;
+    }
+
+    void close() override {
+        input->close();
+        currentOutput.clear(); // Ensure currentOutput is cleared at the end
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        if (has_next) {
+            // Since currentOutput already holds the desired output, simply return it
+            // Need to create a deep copy to return since we're returning by value
+            std::vector<std::unique_ptr<Field>> outputCopy;
+            for (const auto& field : currentOutput) {
+                outputCopy.push_back(field->clone()); // Clone each field
+            }
+            return outputCopy;
+        } else {
+            return {}; // Return an empty vector if no matching tuple is found
+        }
+    }
+};
+
+enum class AggrFuncType { COUNT, MAX, MIN, SUM };
+
+struct AggrFunc {
+    AggrFuncType func;
+    size_t attr_index; // Index of the attribute to aggregate
+};
+
+class HashAggregationOperator : public UnaryOperator {
+private:
+    std::vector<size_t> group_by_attrs;
+    std::vector<AggrFunc> aggr_funcs;
+    std::vector<Tuple> output_tuples; // Use your Tuple class for output
+    size_t output_tuples_index = 0;
+
+    struct FieldVectorHasher {
+        std::size_t operator()(const std::vector<Field>& fields) const {
+            std::size_t hash = 0;
+            for (const auto& field : fields) {
+                std::hash<std::string> hasher;
+                std::size_t fieldHash = 0;
+
+                // Depending on the type, hash the corresponding data
+                switch (field.type) {
+                    case INT: {
+                        // Convert integer data to string and hash
+                        int value = *reinterpret_cast<const int*>(field.data.get());
+                        fieldHash = hasher(std::to_string(value));
+                        break;
+                    }
+                    case FLOAT: {
+                        // Convert float data to string and hash
+                        float value = *reinterpret_cast<const float*>(field.data.get());
+                        fieldHash = hasher(std::to_string(value));
+                        break;
+                    }
+                    case STRING: {
+                        // Directly hash the string data
+                        std::string value(field.data.get(), field.data_length - 1); // Exclude null-terminator
+                        fieldHash = hasher(value);
+                        break;
+                    }
+                    default:
+                        throw std::runtime_error("Unsupported field type for hashing.");
+                }
+
+                // Combine the hash of the current field with the hash so far
+                hash ^= fieldHash + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            }
+            return hash;
+        }
+    };
+
+
+public:
+    HashAggregationOperator(Operator& input, std::vector<size_t> group_by_attrs, std::vector<AggrFunc> aggr_funcs)
+        : UnaryOperator(input), group_by_attrs(group_by_attrs), aggr_funcs(aggr_funcs) {}
+
+    void open() override {
+        input->open(); // Ensure the input operator is opened
+        output_tuples_index = 0;
+        output_tuples.clear();
+
+        // Assume a hash map to aggregate tuples based on group_by_attrs
+        std::unordered_map<std::vector<Field>, std::vector<Field>, FieldVectorHasher> hash_table;
+
+        while (input->next()) {
+            const auto& tuple = input->getOutput(); // Assume getOutput returns a reference to the current tuple
+
+            // Extract group keys and initialize aggregation values
+            std::vector<Field> group_keys;
+            for (auto& index : group_by_attrs) {
+                group_keys.push_back(*tuple[index]); // Deep copy the Field object for group key
+            }
+
+            // Process aggregation functions
+            if (!hash_table.count(group_keys)) {
+                // Initialize aggregate values for a new group
+                std::vector<Field> aggr_values(aggr_funcs.size(), Field(0)); // Assuming Field(int) initializes an integer Field
+                hash_table[group_keys] = aggr_values;
+            }
+
+            // Update aggregate values
+            auto& aggr_values = hash_table[group_keys];
+            for (size_t i = 0; i < aggr_funcs.size(); ++i) {
+                // Simplified update logic for demonstration
+                // You'll need to implement actual aggregation logic here
+                aggr_values[i] = updateAggregate(aggr_funcs[i], aggr_values[i], *tuple[aggr_funcs[i].attr_index]);
+            }
+        }
+
+        // Prepare output tuples from the hash table
+        for (const auto& entry : hash_table) {
+            const auto& group_keys = entry.first;
+            const auto& aggr_values = entry.second;
+            Tuple output_tuple;
+            // Assuming Tuple has a method to add Fields
+            for (const auto& key : group_keys) {
+                output_tuple.addField(std::make_unique<Field>(key)); // Add group keys to the tuple
+            }
+            for (const auto& value : aggr_values) {
+                output_tuple.addField(std::make_unique<Field>(value)); // Add aggregated values to the tuple
+            }
+            output_tuples.push_back(std::move(output_tuple));
+        }
+    }
+
+    bool next() override {
+        if (output_tuples_index < output_tuples.size()) {
+            output_tuples_index++;
+            return true;
+        }
+        return false;
+    }
+
+    void close() override {
+        input->close();
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> outputCopy;
+
+        if (output_tuples_index == 0 || output_tuples_index > output_tuples.size()) {
+            // If there is no current tuple because next() hasn't been called yet or we're past the last tuple,
+            // return an empty vector.
+            return outputCopy; // This will be an empty vector
+        }
+
+        // Assuming that output_tuples stores Tuple objects and each Tuple has a vector of Field objects or similar
+        const auto& currentTuple = output_tuples[output_tuples_index - 1]; // Adjust for 0-based indexing after increment in next()
+
+        // Assuming the Tuple class provides a way to access its fields, e.g., a method or a public member
+        for (const auto& field : currentTuple.fields) {
+            outputCopy.push_back(field->clone()); // Use the clone method to create a deep copy of each field
+        }
+
+        return outputCopy;
+    }
+
+
+private:
+
+    Field updateAggregate(const AggrFunc& aggrFunc, const Field& currentAggr, const Field& newValue) {
+        switch (aggrFunc.func) {
+            case AggrFuncType::COUNT: {
+                if (currentAggr.getType() == FieldType::INT) {
+                    // For COUNT, simply increment the integer value
+                    int count = currentAggr.asInt() + 1;
+                    return Field(count);
+                }
+                break;
+            }
+            case AggrFuncType::SUM: {
+                if (currentAggr.getType() != newValue.getType()) {
+                    throw std::runtime_error("Mismatched Field types in aggregation.");
+                }
+                if (currentAggr.getType() == FieldType::INT) {
+                    int sum = currentAggr.asInt() + newValue.asInt();
+                    return Field(sum);
+                } else if (currentAggr.getType() == FieldType::FLOAT) {
+                    float sum = currentAggr.asFloat() + newValue.asFloat();
+                    return Field(sum);
+                }
+                break;
+            }
+            case AggrFuncType::MAX: {
+                if (currentAggr.getType() != newValue.getType()) {
+                    throw std::runtime_error("Mismatched Field types in aggregation.");
+                }
+                if (currentAggr.getType() == FieldType::INT) {
+                    int max = std::max(currentAggr.asInt(), newValue.asInt());
+                    return Field(max);
+                } else if (currentAggr.getType() == FieldType::FLOAT) {
+                    float max = std::max(currentAggr.asFloat(), newValue.asFloat());
+                    return Field(max);
+                }
+                break;
+            }
+            case AggrFuncType::MIN: {
+                if (currentAggr.getType() != newValue.getType()) {
+                    throw std::runtime_error("Mismatched Field types in aggregation.");
+                }
+                if (currentAggr.getType() == FieldType::INT) {
+                    int min = std::min(currentAggr.asInt(), newValue.asInt());
+                    return Field(min);
+                } else if (currentAggr.getType() == FieldType::FLOAT) {
+                    float min = std::min(currentAggr.asFloat(), newValue.asFloat());
+                    return Field(min);
+                }
+                break;
+            }
+            default:
+                throw std::runtime_error("Unsupported aggregation function.");
+        }
+
+        // Default case for unsupported operations or types
+        throw std::runtime_error(
+            "Invalid operation or unsupported Field type.");
+    }
+
+};
+
+struct QueryComponents {
+    std::string tableName;
+    std::vector<int> selectAttributes;
+    bool aggregateOperation = false;
+    AggrFuncType aggregateFunction = AggrFuncType::SUM;
+    int aggregateAttributeIndex = -1;
+    bool groupBy = false;
+    int groupByAttributeIndex = -1;
+    bool whereCondition = false;
+    int whereAttributeIndex = -1;
+    int lowerBound = std::numeric_limits<int>::min();
+    int upperBound = std::numeric_limits<int>::max();
+};
+
+QueryComponents parseQuery(const std::string& query, const Catalog& catalog) {
+    QueryComponents components;
+
+    std::regex selectAllRegex(
+        "^\\s*\\{\\*\\}\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$",
+        std::regex_constants::icase);
+    std::smatch selectAllMatches;
+    if (std::regex_match(query, selectAllMatches, selectAllRegex)) {
+        const std::string tableName = selectAllMatches[1];
+        const auto& metadata = catalog.getTable(tableName);
+
+        components.tableName = tableName;
+        for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
+            components.selectAttributes.push_back(static_cast<int>(i));
+        }
+        return components;
+    }
+
+    std::regex queryRegex(
+        "^\\s*(SUM|COUNT)\\(([A-Za-z_][A-Za-z0-9_]*)\\)\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+GROUP\\s+BY\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*>\\s*(-?\\d+)\\s+and\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*<\\s*(-?\\d+))?\\s*$",
+        std::regex_constants::icase);
+    std::smatch matches;
+    if (!std::regex_match(query, matches, queryRegex)) {
+        throw std::runtime_error("Unsupported query: " + query);
+    }
+
+    std::string aggregateName = matches[1];
+    for (auto& ch : aggregateName) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    const std::string aggregateColumnName = matches[2];
+    const std::string tableName = matches[3];
+    const std::string groupByColumnName = matches[4];
+    const auto& metadata = catalog.getTable(tableName);
+
+    components.tableName = tableName;
+    components.aggregateOperation = true;
+    components.aggregateFunction = (aggregateName == "COUNT")
+        ? AggrFuncType::COUNT
+        : AggrFuncType::SUM;
+    components.aggregateAttributeIndex = metadata.schema.getColumnIndex(aggregateColumnName);
+    components.groupBy = true;
+    components.groupByAttributeIndex = metadata.schema.getColumnIndex(groupByColumnName);
+    components.selectAttributes.push_back(components.aggregateAttributeIndex);
+
+    if (matches[5].matched) {
+        const std::string lowerBoundColumnName = matches[5];
+        const int lowerBound = std::stoi(matches[6]);
+        const std::string upperBoundColumnName = matches[7];
+        const int upperBound = std::stoi(matches[8]);
+
+        if (lowerBoundColumnName != upperBoundColumnName) {
+            throw std::runtime_error("WHERE clause conditions apply to different columns.");
+        }
+
+        components.whereCondition = true;
+        components.whereAttributeIndex = metadata.schema.getColumnIndex(lowerBoundColumnName);
+        components.lowerBound = lowerBound;
+        components.upperBound = upperBound;
+    }
+
+    return components;
+}
+
+void prettyPrint(const QueryComponents& components) {
+    std::cout << "Query Components:\n";
+    std::cout << "  Table: " << components.tableName << "\n";
+    std::cout << "  Selected Attributes: ";
+    for (auto attr : components.selectAttributes) {
+        std::cout << "{" << attr + 1 << "} "; // Convert back to 1-based indexing for display
+    }
+    std::cout << "\n  Aggregate Operation: " << (components.aggregateOperation ? "Yes" : "No");
+    if (components.aggregateOperation) {
+        std::cout << " "
+                  << (components.aggregateFunction == AggrFuncType::COUNT ? "COUNT" : "SUM")
+                  << " on {" << components.aggregateAttributeIndex + 1 << "}";
+    }
+    std::cout << "\n  GROUP BY: " << (components.groupBy ? "Yes" : "No");
+    if (components.groupBy) {
+        std::cout << " on {" << components.groupByAttributeIndex + 1 << "}";
+    }
+    std::cout << "\n  WHERE Condition: " << (components.whereCondition ? "Yes" : "No");
+    if (components.whereCondition) {
+        std::cout << " on {" << components.whereAttributeIndex + 1 << "} > " << components.lowerBound << " and < " << components.upperBound;
+    }
+    std::cout << std::endl;
+}
+
+void executeQuery(const QueryComponents& components, 
+                  TableMetadata& metadata,
+                  BufferManager& buffer_manager) {
+    // Stack allocation of ScanOperator
+    TableHeap tableHeap(metadata, buffer_manager);
+    ScanOperator scanOp(tableHeap);
+
+    // Using a pointer to Operator to handle polymorphism
+    Operator* rootOp = &scanOp;
+
+    // Buffer for optional operators to ensure lifetime
+    std::optional<SelectOperator> selectOpBuffer;
+    std::optional<HashAggregationOperator> hashAggOpBuffer;
+
+    // Apply WHERE conditions
+    if (components.whereAttributeIndex != -1) {
+        // Create simple predicates with comparison operators
+        auto predicate1 = std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(components.whereAttributeIndex),
+            SimplePredicate::Operand(std::make_unique<Field>(components.lowerBound)),
+            SimplePredicate::ComparisonOperator::GT
+        );
+
+        auto predicate2 = std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(components.whereAttributeIndex),
+            SimplePredicate::Operand(std::make_unique<Field>(components.upperBound)),
+            SimplePredicate::ComparisonOperator::LT
+        );
+
+        // Combine simple predicates into a complex predicate with logical AND operator
+        auto complexPredicate = std::make_unique<ComplexPredicate>(ComplexPredicate::LogicOperator::AND);
+        complexPredicate->addPredicate(std::move(predicate1));
+        complexPredicate->addPredicate(std::move(predicate2));
+
+        // Using std::optional to manage the lifetime of SelectOperator
+        selectOpBuffer.emplace(*rootOp, std::move(complexPredicate));
+        rootOp = &*selectOpBuffer;
+    }
+
+    // Apply SUM or GROUP BY operation
+    if (components.aggregateOperation || components.groupBy) {
+        std::vector<size_t> groupByAttrs;
+        if (components.groupBy) {
+            groupByAttrs.push_back(static_cast<size_t>(components.groupByAttributeIndex));
+        }
+        std::vector<AggrFunc> aggrFuncs{
+            {components.aggregateFunction, static_cast<size_t>(components.aggregateAttributeIndex)}
+        };
+
+        // Using std::optional to manage the lifetime of HashAggregationOperator
+        hashAggOpBuffer.emplace(*rootOp, groupByAttrs, aggrFuncs);
+        rootOp = &*hashAggOpBuffer;
+    }
+
+    // Execute the Root Operator
+    rootOp->open();
+    while (rootOp->next()) {
+        // Retrieve and print the current tuple
+        const auto& output = rootOp->getOutput();
+        for (const auto& field : output) {
+            field->print();
+            std::cout << " ";
+        }
+        std::cout << std::endl;
+    }
+    rootOp->close();
+}
+
+class InsertOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    std::unique_ptr<Tuple> tupleToInsert;
+    bool executed = false;
+    size_t insertedCount = 0;
+
+public:
+    InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+
+    void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
+        tupleToInsert = std::move(tuple);
+    }
+
+    void open() override {
+        executed = false;
+        insertedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        if (tupleToInsert && tableHeap.addTuple(std::move(tupleToInsert))) {
+            insertedCount = 1;
+        }
+
+        executed = true;
+        return true;
+    }
+
+    void close() override {}
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> output;
+        output.push_back(std::make_unique<Field>(static_cast<int>(insertedCount)));
+        return output;
+    }
+};
+
+class UpdateOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    std::unique_ptr<IPredicate> predicate;
+    std::vector<std::pair<size_t, Field>> assignments;
+    bool executed = false;
+    size_t updatedCount = 0;
+
+public:
+    UpdateOperator(TableHeap& tableHeap,
+                   std::unique_ptr<IPredicate> predicate,
+                   std::vector<std::pair<size_t, Field>> assignments)
+        : tableHeap(tableHeap),
+          predicate(std::move(predicate)),
+          assignments(std::move(assignments)) {}
+
+    void open() override {
+        executed = false;
+        updatedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        for (auto pageId : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(pageId);
+            bool pageUpdated = false;
+
+            for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
+                auto tuple = page->getTuple(slot);
+                if (!tuple || !predicate->check(tuple->fields)) {
+                    continue;
+                }
+
+                for (const auto& assignment : assignments) {
+                    if (assignment.first >= tuple->fields.size()) {
+                        throw std::runtime_error("UPDATE column is out of range.");
+                    }
+                    tuple->fields[assignment.first] = assignment.second.clone();
+                }
+                if (!page->updateTuple(slot, std::move(tuple))) {
+                    throw std::runtime_error("Updated tuple no longer fits in its slot.");
+                }
+                updatedCount++;
+                pageUpdated = true;
+            }
+
+            if (pageUpdated) {
+                tableHeap.flushPage(pageId);
+            }
+        }
+
+        executed = true;
+        return true;
+    }
+
+    void close() override {}
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> output;
+        output.push_back(std::make_unique<Field>(static_cast<int>(updatedCount)));
+        return output;
+    }
+};
+
+class DeleteOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    std::unique_ptr<IPredicate> predicate;
+    bool executed = false;
+    size_t deletedCount = 0;
+
+public:
+    DeleteOperator(TableHeap& tableHeap,
+                   std::unique_ptr<IPredicate> predicate)
+        : tableHeap(tableHeap),
+          predicate(std::move(predicate)) {}
+
+    void open() override {
+        executed = false;
+        deletedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        for (auto pageId : tableHeap.getPageIds()) {
+            auto& page = tableHeap.getPage(pageId);
+            bool pageUpdated = false;
+
+            for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
+                auto tuple = page->getTuple(slot);
+                if (!tuple || !predicate->check(tuple->fields)) {
+                    continue;
+                }
+                page->deleteTuple(slot);
+                deletedCount++;
+                pageUpdated = true;
+            }
+
+            if (pageUpdated) {
+                tableHeap.flushPage(pageId);
+            }
+        }
+
+        executed = true;
+        return true;
+    }
+
+    void close() override {}
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> output;
+        output.push_back(std::make_unique<Field>(static_cast<int>(deletedCount)));
+        return output;
+    }
+};
+
+
+class BuzzDB {
+public:
+    HashIndex hash_index;
+    Catalog catalog;
+    BufferManager buffer_manager;
+
+public:
+    BuzzDB(){
+        // Storage Manager automatically created
+    }
+
+    bool createTable(const std::string& name, TableSchema schema) {
+        return catalog.createTable(name, std::move(schema));
+    }
+
+    static std::string trim(const std::string& input) {
+        size_t start = 0;
+        while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
+            start++;
+        }
+
+        size_t end = input.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+            end--;
+        }
+
+        return input.substr(start, end - start);
+    }
+
+    static std::vector<std::string> split(const std::string& input, char delimiter) {
+        std::vector<std::string> tokens;
+        std::stringstream stream(input);
+        std::string token;
+        while (std::getline(stream, token, delimiter)) {
+            tokens.push_back(trim(token));
+        }
+        return tokens;
+    }
+
+    static FieldType parseFieldType(const std::string& typeName) {
+        if (typeName == "INT") {
+            return INT;
+        }
+        if (typeName == "FLOAT") {
+            return FLOAT;
+        }
+        if (typeName == "STRING") {
+            return STRING;
+        }
+        throw std::runtime_error("Unknown field type: " + typeName);
+    }
+
+    static std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
+        switch (type) {
+            case INT:
+                return std::make_unique<Field>(std::stoi(value));
+            case FLOAT:
+                return std::make_unique<Field>(std::stof(value));
+            case STRING:
+                return std::make_unique<Field>(value);
+        }
+        throw std::runtime_error("Unsupported field type.");
+    }
+
+    static TableSchema parseTableSchema(const std::vector<std::string>& tokens) {
+        if (tokens.size() < 3) {
+            throw std::runtime_error("TABLE line must include at least one column.");
+        }
+
+        TableSchema schema;
+        for (size_t i = 2; i < tokens.size(); i++) {
+            auto separator = tokens[i].find(':');
+            if (separator == std::string::npos) {
+                throw std::runtime_error("Bad column declaration: " + tokens[i]);
+            }
+
+            auto column_name = tokens[i].substr(0, separator);
+            auto type_name = tokens[i].substr(separator + 1);
+            schema.columns.push_back({column_name, parseFieldType(type_name)});
+        }
+        return schema;
+    }
+
+    static std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                            const std::vector<std::string>& values) {
+        if (values.size() != schema.columns.size()) {
+            throw std::runtime_error("Wrong field count for table row.");
+        }
+
+        auto tuple = std::make_unique<Tuple>();
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
+        }
+        return tuple;
+    }
+
+    static std::unique_ptr<IPredicate> makeEqualityPredicate(const TableSchema& schema,
+                                                            const std::string& columnName,
+                                                            const std::string& value) {
+        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
+        auto field = parseFieldValue(schema.columns[column].type, value);
+        return std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(column),
+            SimplePredicate::Operand(std::move(field)),
+            SimplePredicate::ComparisonOperator::EQ
+        );
+    }
+
+    void executeStatementOperator(Operator& statementOperator, bool printResult) {
+        statementOperator.open();
+        while (statementOperator.next()) {
+            if (printResult) {
+                const auto& output = statementOperator.getOutput();
+                for (const auto& field : output) {
+                    field->print();
+                    std::cout << " ";
+                }
+                std::cout << std::endl;
+            }
+        }
+        statementOperator.close();
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        auto& metadata = catalog.getTable(tableName);
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, buffer_manager);
+        InsertOperator insertOp(tableHeap);
+        insertOp.setTupleToInsert(std::move(tuple));
+        executeStatementOperator(insertOp, printResult);
+    }
+
+    void loadDumpFile(const std::string& filename) {
+        std::ifstream inputFile(filename);
+        if (!inputFile) {
+            throw std::runtime_error("Unable to open file: " + filename);
+        }
+
+        std::unordered_map<std::string, bool> loadRowsForTable;
+        std::string line;
+        while (std::getline(inputFile, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+
+            auto tokens = split(line, '|');
+            if (tokens.empty()) {
+                continue;
+            }
+
+            if (tokens[0] == "TABLE") {
+                if (tokens.size() < 3) {
+                    throw std::runtime_error("Bad TABLE line: " + line);
+                }
+                const std::string tableName = tokens[1];
+                bool created = createTable(tableName, parseTableSchema(tokens));
+                loadRowsForTable[tableName] = created;
+                continue;
+            }
+
+            const std::string tableName = tokens[0];
+            if (!catalog.hasTable(tableName)) {
+                throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
+            }
+            if (loadRowsForTable.find(tableName) != loadRowsForTable.end() &&
+                !loadRowsForTable[tableName]) {
+                continue;
+            }
+
+            std::vector<std::string> values(tokens.begin() + 1, tokens.end());
+            insertRow(tableName, values, false);
+        }
+    }
+
+    void executeStatementsAndQueries(const std::vector<std::string>& statements,
+                                     bool printResult = true) {
+        for (const auto& statement : statements) {
+            std::smatch matches;
+
+            std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, insertRegex)) {
+                const std::string tableName = matches[1];
+                const std::string valuesText = matches[2];
+                insertRow(tableName, split(valuesText, ','), printResult);
+                continue;
+            }
+
+            std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, updateRegex)) {
+                const std::string tableName = matches[1];
+                const std::string setColumnName = matches[2];
+                const std::string setValue = matches[3];
+                const std::string whereColumnName = matches[4];
+                const std::string whereValue = matches[5];
+
+                auto& metadata = catalog.getTable(tableName);
+                const size_t setColumn = static_cast<size_t>(
+                    metadata.schema.getColumnIndex(setColumnName));
+                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
+                auto field = parseFieldValue(metadata.schema.columns[setColumn].type, setValue);
+                TableHeap tableHeap(metadata, buffer_manager);
+                UpdateOperator updateOp(
+                    tableHeap,
+                    std::move(predicate),
+                    {{setColumn, *field}}
+                );
+                executeStatementOperator(updateOp, printResult);
+                continue;
+            }
+
+            std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, deleteRegex)) {
+                const std::string tableName = matches[1];
+                const std::string whereColumnName = matches[2];
+                const std::string whereValue = matches[3];
+
+                auto& metadata = catalog.getTable(tableName);
+                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
+                TableHeap tableHeap(metadata, buffer_manager);
+                DeleteOperator deleteOp(tableHeap, std::move(predicate));
+                executeStatementOperator(deleteOp, printResult);
+                continue;
+            }
+
+            std::regex selectRegex("^\\s*SELECT\\s+(.*)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, selectRegex)) {
+                const std::string queryText = matches[1];
+                auto components = parseQuery(queryText, catalog);
+                auto& metadata = catalog.getTable(components.tableName);
+                prettyPrint(components);
+                executeQuery(components, metadata, buffer_manager);
+                continue;
+            }
+
+            throw std::runtime_error("Unsupported statement: " + statement);
+        }
+    }
+
+    
+};
+
+int main() {
+
+    BuzzDB db;
+    db.loadDumpFile("booking.txt");
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    db.executeStatementsAndQueries({
+        "UPDATE seats SET status = held WHERE seat_no = 1A",
+        "INSERT INTO holds VALUES (1, 1, garcia, open)",
+        "INSERT INTO holds VALUES (2, 2, patel, cancelled)",
+        "INSERT INTO holds VALUES (3, 5, zhang, open)",
+        "DELETE FROM holds WHERE status = cancelled",
+        "SELECT COUNT(id) FROM seats GROUP BY flight_id",
+        "SELECT {*} FROM holds",
+    });
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    // Calculate and print the elapsed time
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Elapsed time: " << 
+    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() 
+          << " microseconds" << std::endl;
+    
+    return 0;
+}

@@ -1,5 +1,11 @@
-# Booking dataset for WAL/recovery and concurrency-control examples.
-# Format: table_name|field1|field2|...
+# Booking database dump for WAL/recovery and concurrency-control examples.
+# Format:
+#   TABLE|table_name|column_name:TYPE|...
+#   table_name|field1|field2|...
+
+TABLE|flights|id:INT|flight_no:STRING|origin:STRING|destination:STRING|flight_date:STRING
+TABLE|seats|id:INT|flight_id:INT|seat_no:STRING|status:STRING|customer:STRING
+TABLE|holds|id:INT|seat_id:INT|customer:STRING|status:STRING
 
 flights|1|BZ101|SFO|JFK|2026-07-01
 
@@ -12,4 +18,4 @@ seats|6|1|2B|available|unassigned
 seats|7|1|2C|available|unassigned
 seats|8|1|2D|available|unassigned
 
-# holds starts empty; recovery workloads create reservations as statements.
+# holds starts empty; workloads create reservations as statements.
