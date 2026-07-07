@@ -1102,8 +1102,6 @@ public:
             // Update aggregate values
             auto& aggr_values = hash_table[group_keys];
             for (size_t i = 0; i < aggr_funcs.size(); ++i) {
-                // Simplified update logic for demonstration
-                // You'll need to implement actual aggregation logic here
                 aggr_values[i] = updateAggregate(aggr_funcs[i], aggr_values[i], *tuple[aggr_funcs[i].attr_index]);
             }
         }
