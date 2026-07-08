@@ -377,7 +377,7 @@ public:
         fileStream.seekg(0, std::ios::end);
         num_pages = fileStream.tellg() / PAGE_SIZE;
 
-        std::cout << "Storage Manager :: Num pages: " << num_pages << "\n";        
+        //std::cout << "Storage Manager :: Num pages: " << num_pages << "\n";        
         if(num_pages == 0){
             extend();
         }
@@ -414,7 +414,7 @@ public:
 
     // Extend database file by one page
     void extend() {
-        std::cout << "Extending database file \n";
+        //std::cout << "Extending database file \n";
 
         // Create a slotted page
         auto empty_slotted_page = std::make_unique<SlottedPage>();
@@ -513,7 +513,7 @@ public:
         if (pageMap.size() >= MAX_PAGES_IN_MEMORY) {
             auto evictedPageId = policy->evict();
             if(evictedPageId != INVALID_VALUE){
-                std::cout << "Evicting page " << evictedPageId << "\n";
+                //std::cout << "Evicting page " << evictedPageId << "\n";
                 storage_manager.flush(evictedPageId, 
                                       pageMap[evictedPageId]);
             }
@@ -1574,7 +1574,9 @@ void executeQuery(const QueryComponents& components,
         rootOp = &*hashAggOpBuffer;
     }
 
+    std::cout << "----------------------------------" << std::endl;
     printColumnHeader(components, metadata);
+    std::cout << "++++++++++++++++++++++++++++" << std::endl;
     rootOp->open();
     while (rootOp->next()) {
         const auto& output = rootOp->getOutput();
@@ -1584,6 +1586,7 @@ void executeQuery(const QueryComponents& components,
         }
         std::cout << std::endl;
     }
+    std::cout << "----------------------------------" << std::endl;
     rootOp->close();
 }
 
@@ -1915,6 +1918,7 @@ public:
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
                                      bool printResult = true) {
         for (const auto& statement : statements) {
+            std::cout << statement << "\n";
             std::smatch matches;
 
             std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
