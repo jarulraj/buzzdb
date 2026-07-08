@@ -184,14 +184,6 @@ public:
         return tuple;
     }
 
-    void print() const {
-        for (const auto& field : fields) {
-            field->print();
-            std::cout << " ";
-        }
-        std::cout << "\n";
-    }
-
     std::unique_ptr<Tuple> clone() const {
         auto tuple = std::make_unique<Tuple>();
         for (const auto& field : fields) {
@@ -276,8 +268,6 @@ public:
         auto serializedTuple = tuple->serialize();
         size_t tuple_size = serializedTuple.size();
 
-        //std::cout << "Tuple size: " << tuple_size << " bytes\n";
-
         // Check for first slot with enough space
         size_t slot_itr = 0;
         Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());        
@@ -288,7 +278,6 @@ public:
             }
         }
         if (slot_itr == MAX_SLOTS){
-            //std::cout << "Page does not contain an empty slot with sufficient space to store the tuple.";
             return false;
         }
 
@@ -373,24 +362,6 @@ public:
                 break;
                }
         }
-
-        //std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    void print() const{
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
-        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
-            if (slot_array[slot_itr].empty == false){
-                assert(slot_array[slot_itr].offset != INVALID_VALUE);
-                const char* tuple_data = page_data.get() + slot_array[slot_itr].offset;
-                std::istringstream iss(tuple_data);
-                auto loadedTuple = Tuple::deserialize(iss);
-                std::cout << "Slot " << slot_itr << " : [";
-                std::cout << (uint16_t)(slot_array[slot_itr].offset) << "] :: ";
-                loadedTuple->print();
-            }
-        }
-        std::cout << "\n";
     }
 };
 
@@ -433,10 +404,7 @@ public:
         fileStream.seekg(page_id * PAGE_SIZE, std::ios::beg);
         auto page = std::make_unique<SlottedPage>();
         // Read the content of the file into the page
-        if(fileStream.read(page->page_data.get(), PAGE_SIZE)){
-            //std::cout << "Page read successfully from file." << std::endl;
-        }
-        else{
+        if(!fileStream.read(page->page_data.get(), PAGE_SIZE)){
             std::cerr << "Error: Unable to read data from the file. \n";
             exit(-1);
         }
@@ -480,14 +448,6 @@ public:
     virtual ~Policy() = default;
 };
 
-void printList(std::string list_name, const std::list<PageID>& myList) {
-        std::cout << list_name << " :: ";
-        for (const PageID& value : myList) {
-            std::cout << value << ' ';
-        }
-        std::cout << '\n';
-}
-
 class LruPolicy : public Policy {
 private:
     // List to keep track of the order of use
@@ -503,8 +463,6 @@ public:
     LruPolicy(size_t cacheSize) : cacheSize(cacheSize) {}
 
     bool touch(PageID page_id) override {
-        //printList("LRU", lruList);
-
         bool found = false;
         // If page already in the list, remove it
         if (map.find(page_id) != map.end()) {
@@ -578,7 +536,6 @@ public:
     }
 
     void flushPage(int page_id) {
-        //std::cout << "Flush page " << page_id << "\n";
         storage_manager.flush(page_id, pageMap[page_id]);
     }
 
@@ -1076,15 +1033,6 @@ public:
         return values;
     }
 
-    void print() const {
-        for (size_t i = 0; i < capacity; ++i) {
-            if (hashTable[i].exists) {
-                std::cout << "Position: " << hashTable[i].position << 
-                ", Key: " << hashTable[i].key << 
-                ", Value: " << hashTable[i].value << std::endl;
-            }
-        }
-    }
 };
 
 class Operator {
@@ -1143,7 +1091,7 @@ public:
     void open() override {
         currentPageId = tableHeap.firstPage();
         currentSlotIndex = 0;
-        currentTuple.reset(); // Ensure currentTuple is reset
+        currentTuple.reset();
     }
 
     bool next() override {
@@ -1162,7 +1110,7 @@ public:
         if (currentTuple) {
             return std::move(currentTuple->fields);
         }
-        return {}; // Return an empty vector if no tuple is available
+        return {};
     }
 
 private:
@@ -1170,7 +1118,7 @@ private:
         while (currentPageId != INVALID_PAGE_ID) {
             auto& currentPage = tableHeap.getPage(currentPageId);
             if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
-                currentSlotIndex = 0; // Reset slot index when moving to a new page
+                currentSlotIndex = 0;
             }
 
             char* page_buffer = currentPage->page_data.get();
@@ -1182,18 +1130,16 @@ private:
                     const char* tuple_data = page_buffer + slot_array[currentSlotIndex].offset;
                     std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length));
                     currentTuple = Tuple::deserialize(iss);
-                    currentSlotIndex++; // Move to the next slot for the next call
+                    currentSlotIndex++;
                     tuple_count++;
-                    return; // Tuple loaded successfully
+                    return;
                 }
                 currentSlotIndex++;
             }
 
-            // Increment page index after exhausting current page
             currentPageId = tableHeap.nextPage(currentPageId);
         }
 
-        // No more tuples are available
         currentTuple.reset();
     }
 };
@@ -1203,15 +1149,6 @@ public:
     virtual ~IPredicate() = default;
     virtual bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const = 0;
 };
-
-void printTuple(const std::vector<std::unique_ptr<Field>>& tupleFields) {
-    std::cout << "Tuple: [";
-    for (const auto& field : tupleFields) {
-        field->print(); // Assuming `print()` is a method that prints field content
-        std::cout << " ";
-    }
-    std::cout << "]";
-}
 
 class SimplePredicate: public IPredicate {
 public:
@@ -1344,7 +1281,7 @@ class SelectOperator : public UnaryOperator {
 private:
     std::unique_ptr<IPredicate> predicate;
     bool has_next;
-    std::vector<std::unique_ptr<Field>> currentOutput; // Store the current output here
+    std::vector<std::unique_ptr<Field>> currentOutput;
 
 public:
     SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate)
@@ -1353,17 +1290,15 @@ public:
     void open() override {
         input->open();
         has_next = false;
-        currentOutput.clear(); // Ensure currentOutput is cleared at the beginning
+        currentOutput.clear();
     }
 
     bool next() override {
         while (input->next()) {
-            const auto& output = input->getOutput(); // Temporarily hold the output
+            const auto& output = input->getOutput();
             if (predicate->check(output)) {
-                // If the predicate is satisfied, store the output in the member variable
-                currentOutput.clear(); // Clear previous output
+                currentOutput.clear();
                 for (const auto& field : output) {
-                    // Assuming Field class has a clone method or copy constructor to duplicate fields
                     currentOutput.push_back(field->clone());
                 }
                 has_next = true;
@@ -1371,26 +1306,24 @@ public:
             }
         }
         has_next = false;
-        currentOutput.clear(); // Clear output if no more tuples satisfy the predicate
+        currentOutput.clear();
         return false;
     }
 
     void close() override {
         input->close();
-        currentOutput.clear(); // Ensure currentOutput is cleared at the end
+        currentOutput.clear();
     }
 
     std::vector<std::unique_ptr<Field>> getOutput() override {
         if (has_next) {
-            // Since currentOutput already holds the desired output, simply return it
-            // Need to create a deep copy to return since we're returning by value
             std::vector<std::unique_ptr<Field>> outputCopy;
             for (const auto& field : currentOutput) {
-                outputCopy.push_back(field->clone()); // Clone each field
+                outputCopy.push_back(field->clone());
             }
             return outputCopy;
         } else {
-            return {}; // Return an empty vector if no matching tuple is found
+            return {};
         }
     }
 };
@@ -1399,14 +1332,14 @@ enum class AggrFuncType { COUNT, MAX, MIN, SUM };
 
 struct AggrFunc {
     AggrFuncType func;
-    size_t attr_index; // Index of the attribute to aggregate
+    size_t attr_index;
 };
 
 class HashAggregationOperator : public UnaryOperator {
 private:
     std::vector<size_t> group_by_attrs;
     std::vector<AggrFunc> aggr_funcs;
-    std::vector<Tuple> output_tuples; // Use your Tuple class for output
+    std::vector<Tuple> output_tuples;
     size_t output_tuples_index = 0;
 
     struct FieldVectorHasher {
@@ -1416,23 +1349,19 @@ private:
                 std::hash<std::string> hasher;
                 std::size_t fieldHash = 0;
 
-                // Depending on the type, hash the corresponding data
                 switch (field.type) {
                     case INT: {
-                        // Convert integer data to string and hash
                         int value = *reinterpret_cast<const int*>(field.data.get());
                         fieldHash = hasher(std::to_string(value));
                         break;
                     }
                     case FLOAT: {
-                        // Convert float data to string and hash
                         float value = *reinterpret_cast<const float*>(field.data.get());
                         fieldHash = hasher(std::to_string(value));
                         break;
                     }
                     case STRING: {
-                        // Directly hash the string data
-                        std::string value(field.data.get(), field.data_length - 1); // Exclude null-terminator
+                        std::string value(field.data.get(), field.data_length - 1);
                         fieldHash = hasher(value);
                         break;
                     }
@@ -1440,7 +1369,6 @@ private:
                         throw std::runtime_error("Unsupported field type for hashing.");
                 }
 
-                // Combine the hash of the current field with the hash so far
                 hash ^= fieldHash + 0x9e3779b9 + (hash << 6) + (hash >> 2);
             }
             return hash;
@@ -1453,47 +1381,40 @@ public:
         : UnaryOperator(input), group_by_attrs(group_by_attrs), aggr_funcs(aggr_funcs) {}
 
     void open() override {
-        input->open(); // Ensure the input operator is opened
+        input->open();
         output_tuples_index = 0;
         output_tuples.clear();
 
-        // Assume a hash map to aggregate tuples based on group_by_attrs
         std::unordered_map<std::vector<Field>, std::vector<Field>, FieldVectorHasher> hash_table;
 
         while (input->next()) {
-            const auto& tuple = input->getOutput(); // Assume getOutput returns a reference to the current tuple
+            const auto& tuple = input->getOutput();
 
-            // Extract group keys and initialize aggregation values
             std::vector<Field> group_keys;
             for (auto& index : group_by_attrs) {
-                group_keys.push_back(*tuple[index]); // Deep copy the Field object for group key
+                group_keys.push_back(*tuple[index]);
             }
 
-            // Process aggregation functions
             if (!hash_table.count(group_keys)) {
-                // Initialize aggregate values for a new group
-                std::vector<Field> aggr_values(aggr_funcs.size(), Field(0)); // Assuming Field(int) initializes an integer Field
+                std::vector<Field> aggr_values(aggr_funcs.size(), Field(0));
                 hash_table[group_keys] = aggr_values;
             }
 
-            // Update aggregate values
             auto& aggr_values = hash_table[group_keys];
             for (size_t i = 0; i < aggr_funcs.size(); ++i) {
                 aggr_values[i] = updateAggregate(aggr_funcs[i], aggr_values[i], *tuple[aggr_funcs[i].attr_index]);
             }
         }
 
-        // Prepare output tuples from the hash table
         for (const auto& entry : hash_table) {
             const auto& group_keys = entry.first;
             const auto& aggr_values = entry.second;
             Tuple output_tuple;
-            // Assuming Tuple has a method to add Fields
             for (const auto& key : group_keys) {
-                output_tuple.addField(std::make_unique<Field>(key)); // Add group keys to the tuple
+                output_tuple.addField(std::make_unique<Field>(key));
             }
             for (const auto& value : aggr_values) {
-                output_tuple.addField(std::make_unique<Field>(value)); // Add aggregated values to the tuple
+                output_tuple.addField(std::make_unique<Field>(value));
             }
             output_tuples.push_back(std::move(output_tuple));
         }
@@ -1515,17 +1436,13 @@ public:
         std::vector<std::unique_ptr<Field>> outputCopy;
 
         if (output_tuples_index == 0 || output_tuples_index > output_tuples.size()) {
-            // If there is no current tuple because next() hasn't been called yet or we're past the last tuple,
-            // return an empty vector.
-            return outputCopy; // This will be an empty vector
+            return outputCopy;
         }
 
-        // Assuming that output_tuples stores Tuple objects and each Tuple has a vector of Field objects or similar
-        const auto& currentTuple = output_tuples[output_tuples_index - 1]; // Adjust for 0-based indexing after increment in next()
+        const auto& currentTuple = output_tuples[output_tuples_index - 1];
 
-        // Assuming the Tuple class provides a way to access its fields, e.g., a method or a public member
         for (const auto& field : currentTuple.fields) {
-            outputCopy.push_back(field->clone()); // Use the clone method to create a deep copy of each field
+            outputCopy.push_back(field->clone());
         }
 
         return outputCopy;
@@ -1672,30 +1589,6 @@ QueryComponents parseQuery(const std::string& query, Catalog& catalog) {
     return components;
 }
 
-void prettyPrint(const QueryComponents& components) {
-    std::cout << "Query Components:\n";
-    std::cout << "  Table: " << components.tableName << "\n";
-    std::cout << "  Selected Attributes: ";
-    for (auto attr : components.selectAttributes) {
-        std::cout << "{" << attr + 1 << "} "; // Convert back to 1-based indexing for display
-    }
-    std::cout << "\n  Aggregate Operation: " << (components.aggregateOperation ? "Yes" : "No");
-    if (components.aggregateOperation) {
-        std::cout << " "
-                  << (components.aggregateFunction == AggrFuncType::COUNT ? "COUNT" : "SUM")
-                  << " on {" << components.aggregateAttributeIndex + 1 << "}";
-    }
-    std::cout << "\n  GROUP BY: " << (components.groupBy ? "Yes" : "No");
-    if (components.groupBy) {
-        std::cout << " on {" << components.groupByAttributeIndex + 1 << "}";
-    }
-    std::cout << "\n  WHERE Condition: " << (components.whereCondition ? "Yes" : "No");
-    if (components.whereCondition) {
-        std::cout << " on {" << components.whereAttributeIndex + 1 << "} > " << components.lowerBound << " and < " << components.upperBound;
-    }
-    std::cout << std::endl;
-}
-
 std::string aggregateFunctionName(AggrFuncType function) {
     switch (function) {
         case AggrFuncType::COUNT:
@@ -1739,20 +1632,15 @@ void printColumnHeader(const QueryComponents& components,
 void executeQuery(const QueryComponents& components, 
                   TableMetadata& metadata,
                   BufferManager& buffer_manager) {
-    // Stack allocation of ScanOperator
     TableHeap tableHeap(metadata, buffer_manager);
     ScanOperator scanOp(tableHeap);
 
-    // Using a pointer to Operator to handle polymorphism
     Operator* rootOp = &scanOp;
 
-    // Buffer for optional operators to ensure lifetime
     std::optional<SelectOperator> selectOpBuffer;
     std::optional<HashAggregationOperator> hashAggOpBuffer;
 
-    // Apply WHERE conditions
     if (components.whereAttributeIndex != -1) {
-        // Create simple predicates with comparison operators
         auto predicate1 = std::make_unique<SimplePredicate>(
             SimplePredicate::Operand(components.whereAttributeIndex),
             SimplePredicate::Operand(std::make_unique<Field>(components.lowerBound)),
@@ -1765,17 +1653,14 @@ void executeQuery(const QueryComponents& components,
             SimplePredicate::ComparisonOperator::LT
         );
 
-        // Combine simple predicates into a complex predicate with logical AND operator
         auto complexPredicate = std::make_unique<ComplexPredicate>(ComplexPredicate::LogicOperator::AND);
         complexPredicate->addPredicate(std::move(predicate1));
         complexPredicate->addPredicate(std::move(predicate2));
 
-        // Using std::optional to manage the lifetime of SelectOperator
         selectOpBuffer.emplace(*rootOp, std::move(complexPredicate));
         rootOp = &*selectOpBuffer;
     }
 
-    // Apply SUM or GROUP BY operation
     if (components.aggregateOperation || components.groupBy) {
         std::vector<size_t> groupByAttrs;
         if (components.groupBy) {
@@ -1785,16 +1670,13 @@ void executeQuery(const QueryComponents& components,
             {components.aggregateFunction, static_cast<size_t>(components.aggregateAttributeIndex)}
         };
 
-        // Using std::optional to manage the lifetime of HashAggregationOperator
         hashAggOpBuffer.emplace(*rootOp, groupByAttrs, aggrFuncs);
         rootOp = &*hashAggOpBuffer;
     }
 
-    // Execute the Root Operator
     printColumnHeader(components, metadata);
     rootOp->open();
     while (rootOp->next()) {
-        // Retrieve and print the current tuple
         const auto& output = rootOp->getOutput();
         for (const auto& field : output) {
             field->print();
@@ -2136,7 +2018,6 @@ public:
                 const std::string queryText = matches[1];
                 auto components = parseQuery(queryText, catalog);
                 auto& metadata = catalog.getTable(components.tableName);
-                prettyPrint(components);
                 executeQuery(components, metadata, buffer_manager);
                 continue;
             }
