@@ -193,6 +193,7 @@ using TableId = uint16_t;
 
 constexpr PageID CATALOG_PAGE_ID = 0;
 constexpr PageID INVALID_PAGE_ID = std::numeric_limits<PageID>::max();
+constexpr PageID FIRST_LOGICAL_PAGE_ID = 1;
 constexpr TableId INVALID_TABLE_ID = 0;
 constexpr TableId SYS_TABLES_ID = 1;
 constexpr TableId SYS_COLUMNS_ID = 2;
@@ -357,6 +358,7 @@ public:
 };
 
 const std::string database_filename = "buzzdb.dat";
+const std::string page_table_filename = "buzzdb.pagetable";
 
 class StorageManager {
 public:    
@@ -540,18 +542,159 @@ public:
 
 };
 
+using PageTable = std::map<PageID, PageID>;
+
+class PageTableManager {
+private:
+    PageTable active_mapping;
+    PageID next_logical_page_id = FIRST_LOGICAL_PAGE_ID;
+
+public:
+    PageTableManager() = default;
+
+    void reset() {
+        active_mapping.clear();
+        next_logical_page_id = FIRST_LOGICAL_PAGE_ID;
+        writePageTable(active_mapping);
+    }
+
+    void load() {
+        std::ifstream input(page_table_filename);
+        if (!input) {
+            active_mapping.clear();
+            next_logical_page_id = FIRST_LOGICAL_PAGE_ID;
+            writePageTable(active_mapping);
+            std::cout << "Recovery: initialized empty page table "
+                      << page_table_filename << "." << std::endl;
+            return;
+        }
+
+        active_mapping = readPageTable(input);
+        next_logical_page_id = nextLogicalPageId(active_mapping);
+        std::cout << "Recovery: loaded page table from "
+                  << page_table_filename << "." << std::endl;
+    }
+
+    PageID resolve(PageID logical_page_id) const {
+        auto it = active_mapping.find(logical_page_id);
+        if (it == active_mapping.end()) {
+            throw std::runtime_error(
+                "Unknown logical page: " + std::to_string(logical_page_id)
+            );
+        }
+        return it->second;
+    }
+
+    PageID allocateLogicalPage(PageID physical_page_id) {
+        if (next_logical_page_id == INVALID_PAGE_ID) {
+            throw std::runtime_error("Out of logical page ids.");
+        }
+
+        PageID logical_page_id = next_logical_page_id++;
+        active_mapping[logical_page_id] = physical_page_id;
+        writePageTable(active_mapping);
+        return logical_page_id;
+    }
+
+    PageTable cloneActive() const {
+        return active_mapping;
+    }
+
+    void commit(PageTable new_mapping) {
+        writePageTable(new_mapping);
+        active_mapping = std::move(new_mapping);
+        next_logical_page_id = nextLogicalPageId(active_mapping);
+        std::cout << "Persisted transaction page table to "
+                  << page_table_filename << "." << std::endl;
+    }
+
+private:
+    static PageTable readPageTable(std::istream& input) {
+        PageTable mapping;
+        std::string line;
+
+        while (std::getline(input, line)) {
+            if (line.empty()) {
+                continue;
+            }
+
+            std::istringstream line_input(line);
+            std::string logical_token;
+            std::string physical_token;
+            if (!std::getline(line_input, logical_token, '|')) {
+                continue;
+            }
+            if (!std::getline(line_input, physical_token, '|')) {
+                throw std::runtime_error("Bad page table entry: " + line);
+            }
+            std::string extra_token;
+            if (std::getline(line_input, extra_token, '|')) {
+                throw std::runtime_error("Bad page table entry: " + line);
+            }
+
+            PageID logical_page_id = static_cast<PageID>(std::stoi(logical_token));
+            PageID physical_page_id = static_cast<PageID>(std::stoi(physical_token));
+            if (logical_page_id == INVALID_PAGE_ID ||
+                physical_page_id == INVALID_PAGE_ID) {
+                throw std::runtime_error("Bad page table entry: " + line);
+            }
+            if (!mapping.insert({logical_page_id, physical_page_id}).second) {
+                throw std::runtime_error(
+                    "Duplicate logical page in page table: " +
+                    std::to_string(logical_page_id)
+                );
+            }
+        }
+
+        return mapping;
+    }
+
+    static PageID nextLogicalPageId(const PageTable& mapping) {
+        PageID next_page_id = FIRST_LOGICAL_PAGE_ID;
+        for (const auto& entry : mapping) {
+            if (entry.first >= next_page_id) {
+                if (entry.first == INVALID_PAGE_ID) {
+                    throw std::runtime_error("Out of logical page ids.");
+                }
+                next_page_id = static_cast<PageID>(entry.first + 1);
+            }
+        }
+        return next_page_id;
+    }
+
+    static void writePageTable(const PageTable& mapping) {
+        std::ofstream output(page_table_filename, std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to write page table.");
+        }
+
+        for (const auto& entry : mapping) {
+            output << entry.first << "|" << entry.second << "\n";
+        }
+        output.flush();
+    }
+};
+
 class RecoveryManager {
 private:
     BufferManager& buffer_manager;
+    PageTableManager& page_table_manager;
     bool txn_active = false;
+    PageTable shadow_mapping;
     std::map<PageID, PageID> shadow_pages;
 
 public:
-    explicit RecoveryManager(BufferManager& buffer_manager)
-        : buffer_manager(buffer_manager) {}
+    RecoveryManager(BufferManager& buffer_manager,
+                    PageTableManager& page_table_manager)
+        : buffer_manager(buffer_manager),
+          page_table_manager(page_table_manager) {}
 
     bool isActive() const {
         return txn_active;
+    }
+
+    void recover() {
+        page_table_manager.load();
     }
 
     void begin() {
@@ -559,6 +702,7 @@ public:
             throw std::runtime_error("Transaction already active.");
         }
         txn_active = true;
+        shadow_mapping = page_table_manager.cloneActive();
         shadow_pages.clear();
     }
 
@@ -566,53 +710,71 @@ public:
         if (!txn_active) {
             throw std::runtime_error("COMMIT without BEGIN.");
         }
-        throw std::runtime_error(
-            "Cannot atomically commit linked shadow pages without a page table."
-        );
+        page_table_manager.commit(std::move(shadow_mapping));
+        shadow_pages.clear();
+        txn_active = false;
     }
 
     void abort() {
         if (!txn_active) {
             throw std::runtime_error("ABORT without BEGIN.");
         }
+        shadow_mapping.clear();
         shadow_pages.clear();
         txn_active = false;
     }
 
-    PageID resolveRead(PageID page_id) const {
-        if (!txn_active) {
-            return page_id;
+    PageID resolveRead(PageID logical_page_id) const {
+        if (txn_active) {
+            auto shadow = shadow_pages.find(logical_page_id);
+            if (shadow != shadow_pages.end()) {
+                return shadow->second;
+            }
+
+            auto mapped = shadow_mapping.find(logical_page_id);
+            if (mapped != shadow_mapping.end()) {
+                return mapped->second;
+            }
         }
 
-        auto shadow = shadow_pages.find(page_id);
-        return shadow == shadow_pages.end() ? page_id : shadow->second;
+        return page_table_manager.resolve(logical_page_id);
     }
 
-    PageID resolveWrite(PageID page_id) {
+    PageID resolveWrite(PageID logical_page_id) {
         if (!txn_active) {
-            return page_id;
+            return page_table_manager.resolve(logical_page_id);
         }
 
-        auto shadow = shadow_pages.find(page_id);
+        auto shadow = shadow_pages.find(logical_page_id);
         if (shadow != shadow_pages.end()) {
             return shadow->second;
         }
 
-        return createShadowPage(page_id);
+        if (shadow_mapping.find(logical_page_id) == shadow_mapping.end()) {
+            throw std::runtime_error(
+                "Unknown logical page: " + std::to_string(logical_page_id)
+            );
+        }
+
+        return createShadowPage(logical_page_id);
     }
 
 private:
-    PageID createShadowPage(PageID page_id) {
-        auto& source_page = buffer_manager.getPage(page_id);
+    PageID createShadowPage(PageID logical_page_id) {
+        PageID source_page_id = shadow_mapping[logical_page_id];
+        auto& source_page = buffer_manager.getPage(source_page_id);
         buffer_manager.extend();
         PageID shadow_page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
         auto& shadow_page = buffer_manager.getPage(shadow_page_id);
         std::memcpy(shadow_page->page_data.get(), source_page->page_data.get(), PAGE_SIZE);
         buffer_manager.flushPage(shadow_page_id);
-        shadow_pages[page_id] = shadow_page_id;
-        std::cout << "Shadowing page " << page_id << " as page "
-                  << shadow_page_id
-                  << " (mapping is in memory only)." << std::endl;
+        shadow_pages[logical_page_id] = shadow_page_id;
+        shadow_mapping[logical_page_id] = shadow_page_id;
+
+        std::cout << "Shadowing logical page " << logical_page_id
+                  << " from physical page " << source_page_id
+                  << " to physical page " << shadow_page_id
+                  << " in the transaction page table." << std::endl;
         return shadow_page_id;
     }
 };
@@ -620,78 +782,86 @@ private:
 class PageManager {
 private:
     BufferManager& buffer_manager;
+    PageTableManager& page_table_manager;
     RecoveryManager& recovery_manager;
 
 public:
-    PageManager(BufferManager& buffer_manager, RecoveryManager& recovery_manager)
+    PageManager(BufferManager& buffer_manager,
+                PageTableManager& page_table_manager,
+                RecoveryManager& recovery_manager)
         : buffer_manager(buffer_manager),
+          page_table_manager(page_table_manager),
           recovery_manager(recovery_manager) {}
+
+    void resetPageTable() {
+        page_table_manager.reset();
+    }
 
     SlottedPage& readPage(TableId table_id,
                           const std::string& table_name,
-                          PageID page_id) {
+                          PageID logical_page_id) {
         return checkedPage(
             table_id,
             table_name,
-            recovery_manager.resolveRead(page_id)
+            recovery_manager.resolveRead(logical_page_id)
         );
     }
 
     SlottedPage& writePage(TableId table_id,
                            const std::string& table_name,
-                           PageID page_id) {
+                           PageID logical_page_id) {
         return checkedPage(
             table_id,
             table_name,
-            recovery_manager.resolveWrite(page_id)
+            recovery_manager.resolveWrite(logical_page_id)
         );
     }
 
     PageID nextPage(TableId table_id,
                     const std::string& table_name,
-                    PageID page_id) {
-        PageID resolved_page_id = recovery_manager.resolveRead(page_id);
-        PageID next_page_id = checkedPage(
-            table_id,
-            table_name,
-            resolved_page_id
-        ).getNextPage();
+                    PageID logical_page_id) {
+        PageID physical_page_id = recovery_manager.resolveRead(logical_page_id);
+        SlottedPage& page = checkedPage(table_id, table_name, physical_page_id);
+        PageID next_logical_page_id = page.getNextPage();
 
         std::cout << "PageManager scan " << table_name
-                  << ": page " << page_id;
-        if (resolved_page_id != page_id) {
-            std::cout << " resolves to shadow page " << resolved_page_id;
-        }
-        std::cout << " -> ";
-        if (next_page_id == INVALID_PAGE_ID) {
+                  << " via page table: logical page " << logical_page_id
+                  << " resolves to physical page " << physical_page_id
+                  << " -> ";
+        if (next_logical_page_id == INVALID_PAGE_ID) {
             std::cout << "END";
         } else {
-            std::cout << next_page_id;
+            std::cout << "logical page " << next_logical_page_id;
         }
         std::cout << std::endl;
 
-        return next_page_id;
+        return next_logical_page_id;
     }
 
-    void flushWritePage(PageID page_id) {
-        buffer_manager.flushPage(recovery_manager.resolveRead(page_id));
+    void flushWritePage(TableId, PageID logical_page_id) {
+        buffer_manager.flushPage(recovery_manager.resolveRead(logical_page_id));
     }
 
     PageID allocatePage(TableId table_id) {
         buffer_manager.extend();
-        auto page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
-        auto& page = buffer_manager.getPage(page_id);
+        auto physical_page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
+        auto& page = buffer_manager.getPage(physical_page_id);
         page->setTableId(table_id);
         page->setNextPage(INVALID_PAGE_ID);
-        buffer_manager.flushPage(page_id);
-        return page_id;
+        buffer_manager.flushPage(physical_page_id);
+
+        PageID logical_page_id = page_table_manager.allocateLogicalPage(physical_page_id);
+        std::cout << "Allocated logical page " << logical_page_id
+                  << " as physical page " << physical_page_id
+                  << " for table " << table_id << "." << std::endl;
+        return logical_page_id;
     }
 
 private:
     SlottedPage& checkedPage(TableId table_id,
                              const std::string& table_name,
-                             PageID page_id) {
-        auto& page = buffer_manager.getPage(page_id);
+                             PageID physical_page_id) {
+        auto& page = buffer_manager.getPage(physical_page_id);
         if (page->getTableId() != table_id) {
             throw std::runtime_error("Page ownership mismatch for table: " + table_name);
         }
@@ -745,76 +915,76 @@ public:
         return metadata.first_page;
     }
 
-    PageID nextPage(PageID page_id) {
-        return page_manager.nextPage(metadata.table_id, metadata.name, page_id);
+    PageID nextPage(PageID logical_page_id) {
+        return page_manager.nextPage(metadata.table_id, metadata.name, logical_page_id);
     }
 
-    SlottedPage& readPage(PageID page_id) {
-        return page_manager.readPage(metadata.table_id, metadata.name, page_id);
+    SlottedPage& readPage(PageID logical_page_id) {
+        return page_manager.readPage(metadata.table_id, metadata.name, logical_page_id);
     }
 
-    SlottedPage& writePage(PageID page_id) {
-        return page_manager.writePage(metadata.table_id, metadata.name, page_id);
+    SlottedPage& writePage(PageID logical_page_id) {
+        return page_manager.writePage(metadata.table_id, metadata.name, logical_page_id);
     }
 
-    std::unique_ptr<Tuple> getTuple(PageID page_id, size_t slot) {
-        return readPage(page_id).getTuple(slot);
+    std::unique_ptr<Tuple> getTuple(PageID logical_page_id, size_t slot) {
+        return readPage(logical_page_id).getTuple(slot);
     }
 
-    void updateTuple(PageID page_id, size_t slot, std::unique_ptr<Tuple> tuple) {
-        if (!writePage(page_id).updateTuple(slot, std::move(tuple))) {
+    void updateTuple(PageID logical_page_id, size_t slot, std::unique_ptr<Tuple> tuple) {
+        if (!writePage(logical_page_id).updateTuple(slot, std::move(tuple))) {
             throw std::runtime_error("Updated tuple no longer fits in its slot.");
         }
-        flushWritePage(page_id);
+        flushWritePage(logical_page_id);
     }
 
-    void deleteTuple(PageID page_id, size_t slot) {
-        writePage(page_id).deleteTuple(slot);
-        flushWritePage(page_id);
+    void deleteTuple(PageID logical_page_id, size_t slot) {
+        writePage(logical_page_id).deleteTuple(slot);
+        flushWritePage(logical_page_id);
     }
 
     bool addTuple(std::unique_ptr<Tuple> tuple) {
-        PageID previous_page_id = INVALID_PAGE_ID;
-        for (PageID page_id = firstPage();
-             page_id != INVALID_PAGE_ID;
-             page_id = nextPage(page_id)) {
-            if (writePage(page_id).addTuple(tuple->clone())) {
-                flushWritePage(page_id);
+        PageID previous_logical_page_id = INVALID_PAGE_ID;
+        for (PageID logical_page_id = firstPage();
+             logical_page_id != INVALID_PAGE_ID;
+             logical_page_id = nextPage(logical_page_id)) {
+            if (writePage(logical_page_id).addTuple(tuple->clone())) {
+                flushWritePage(logical_page_id);
                 return true;
             }
-            previous_page_id = page_id;
+            previous_logical_page_id = logical_page_id;
         }
 
-        PageID page_id = allocatePageAfter(previous_page_id);
-        auto& page = readPage(page_id);
+        PageID logical_page_id = allocatePageAfter(previous_logical_page_id);
+        auto& page = writePage(logical_page_id);
         if (!page.addTuple(std::move(tuple))) {
             return false;
         }
 
-        page_manager.flushWritePage(page_id);
+        page_manager.flushWritePage(metadata.table_id, logical_page_id);
         return true;
     }
 
-    PageID allocatePageAfter(PageID previous_page_id) {
-        PageID page_id = page_manager.allocatePage(metadata.table_id);
+    PageID allocatePageAfter(PageID previous_logical_page_id) {
+        PageID logical_page_id = page_manager.allocatePage(metadata.table_id);
 
-        if (previous_page_id != INVALID_PAGE_ID) {
-            writePage(previous_page_id).setNextPage(page_id);
-            flushWritePage(previous_page_id);
+        if (previous_logical_page_id != INVALID_PAGE_ID) {
+            writePage(previous_logical_page_id).setNextPage(logical_page_id);
+            flushWritePage(previous_logical_page_id);
         } else {
-            metadata.first_page = page_id;
+            metadata.first_page = logical_page_id;
         }
-        return page_id;
+        return logical_page_id;
     }
 
     std::vector<std::unique_ptr<Tuple>> readAllTuples() {
         std::vector<std::unique_ptr<Tuple>> tuples;
 
-        for (PageID page_id = firstPage();
-             page_id != INVALID_PAGE_ID;
-             page_id = nextPage(page_id)) {
+        for (PageID logical_page_id = firstPage();
+             logical_page_id != INVALID_PAGE_ID;
+             logical_page_id = nextPage(logical_page_id)) {
             for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
-                auto tuple = getTuple(page_id, slot_itr);
+                auto tuple = getTuple(logical_page_id, slot_itr);
                 if (tuple) {
                     tuples.push_back(std::move(tuple));
                 }
@@ -825,8 +995,8 @@ public:
     }
 
 private:
-    void flushWritePage(PageID page_id) {
-        page_manager.flushWritePage(page_id);
+    void flushWritePage(PageID logical_page_id) {
+        page_manager.flushWritePage(metadata.table_id, logical_page_id);
     }
 };
 
@@ -841,9 +1011,7 @@ private:
 public:
     Catalog(BufferManager& manager, PageManager& page_manager)
         : buffer_manager(manager),
-          page_manager(page_manager) {
-        load();
-    }
+          page_manager(page_manager) {}
 
     void load() {
         auto& page = buffer_manager.getPage(CATALOG_PAGE_ID);
@@ -856,6 +1024,7 @@ public:
             if (buffer_manager.getNumPages() > 1) {
                 throw std::runtime_error(database_filename + " is not a valid BuzzDB file.");
             }
+            page_manager.resetPageTable();
             initializeNewDatabase();
             return;
         }
@@ -1957,29 +2126,46 @@ public:
 class BuzzDB {
 public:
     BufferManager buffer_manager;
+    PageTableManager page_table_manager;
     RecoveryManager recovery_manager;
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
+    TxnPtr active_txn;
 
 public:
-    BuzzDB() : recovery_manager(buffer_manager),
-               page_manager(buffer_manager, recovery_manager),
-               catalog(buffer_manager, page_manager) {}
+    BuzzDB() : page_table_manager(),
+               recovery_manager(buffer_manager, page_table_manager),
+               page_manager(buffer_manager, page_table_manager, recovery_manager),
+               catalog(buffer_manager, page_manager) {
+        recovery_manager.recover();
+        catalog.load();
+    }
 
-    TxnPtr begin() {
+    void begin() {
+        if (active_txn) {
+            throw std::runtime_error("BEGIN while another transaction is active.");
+        }
         recovery_manager.begin();
-        return txn_manager.begin();
+        active_txn = txn_manager.begin();
     }
 
-    void commit(const TxnPtr& txn) {
+    void commit() {
+        if (!active_txn) {
+            throw std::runtime_error("COMMIT without BEGIN.");
+        }
         recovery_manager.commit();
-        txn_manager.commit(*txn);
+        txn_manager.commit(*active_txn);
+        active_txn.reset();
     }
 
-    void abort(const TxnPtr& txn) {
+    void abort() {
+        if (!active_txn) {
+            throw std::runtime_error("ABORT without BEGIN.");
+        }
         recovery_manager.abort();
-        txn_manager.abort(*txn);
+        txn_manager.abort(*active_txn);
+        active_txn.reset();
     }
 
     bool createTable(const std::string& name, TableSchema schema) {
@@ -2046,7 +2232,7 @@ public:
                    const std::vector<std::string>& values,
                    bool printResult = false) {
         if (recovery_manager.isActive()) {
-            throw std::runtime_error("INSERT inside a linked-shadow transaction is not supported.");
+            throw std::runtime_error("INSERT inside a shadow transaction is not supported.");
         }
 
         auto& metadata = catalog.getTable(tableName);
@@ -2058,10 +2244,39 @@ public:
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
-                                     bool printResult = true) {
+                                     bool printResult = true,
+                                     int crashAfterStatement = 0) {
+        int statementsSeen = 0;
         for (const auto& statement : statements) {
             std::cout << statement << "\n";
             std::smatch matches;
+            auto statementFinished = [&]() {
+                maybeCrashAfterStatement(statementsSeen, crashAfterStatement);
+            };
+
+            std::regex beginRegex("^\\s*BEGIN\\s*;?\\s*$",
+                                  std::regex_constants::icase);
+            if (std::regex_match(statement, beginRegex)) {
+                begin();
+                statementFinished();
+                continue;
+            }
+
+            std::regex commitRegex("^\\s*COMMIT\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, commitRegex)) {
+                commit();
+                statementFinished();
+                continue;
+            }
+
+            std::regex abortRegex("^\\s*ABORT\\s*;?\\s*$",
+                                  std::regex_constants::icase);
+            if (std::regex_match(statement, abortRegex)) {
+                abort();
+                statementFinished();
+                continue;
+            }
 
             std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
                                    std::regex_constants::icase);
@@ -2069,6 +2284,7 @@ public:
                 const std::string tableName = matches[1];
                 const std::string valuesText = matches[2];
                 insertRow(tableName, split(valuesText, ','), printResult);
+                statementFinished();
                 continue;
             }
 
@@ -2093,6 +2309,7 @@ public:
                     {{setColumn, *field}}
                 );
                 executeStatementOperator(updateOp, printResult);
+                statementFinished();
                 continue;
             }
 
@@ -2108,6 +2325,7 @@ public:
                 TableHeap tableHeap(metadata, page_manager);
                 DeleteOperator deleteOp(tableHeap, std::move(predicate));
                 executeStatementOperator(deleteOp, printResult);
+                statementFinished();
                 continue;
             }
 
@@ -2118,28 +2336,13 @@ public:
                 auto components = parseQuery(queryText, catalog);
                 auto& metadata = catalog.getTable(components.tableName);
                 executeQuery(components, metadata, page_manager);
+                statementFinished();
                 continue;
             }
 
             throw std::runtime_error("Unsupported statement: " + statement);
         }
     }
-
-    void executeTransaction(const std::vector<std::string>& statements,
-                            int crashAfterStatement = 0,
-                            bool printResult = true) {
-        auto txn = begin();
-        int statementsSeen = 0;
-
-        for (const auto& statement : statements) {
-            executeStatementsAndQueries({statement}, printResult);
-            maybeCrashAfterStatement(statementsSeen, crashAfterStatement);
-        }
-
-        commit(txn);
-    }
-
-    
 };
 
 class DatabaseImporter {
@@ -2279,14 +2482,19 @@ int main() {
         DatabaseImporter::importFile(db, "booking.txt");
 
         try {
-            db.executeTransaction({
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE flights SET destination = LAX WHERE id = 1",
+                "COMMIT",
+                "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1A",
                 "UPDATE seats SET customer = garcia WHERE seat_no = 1A",
                 "INSERT INTO holds VALUES (1, 1, garcia, open)",
-            }, 2);
+                "COMMIT",
+            }, true, 6);
         } catch (const std::runtime_error& crash) {
             std::cout << crash.what() << std::endl;
-            std::cout << "Restart loses the in-memory shadow mapping!!"
+            std::cout << "Restart uses the last persisted page table."
                       << std::endl;
         }
     }
@@ -2294,8 +2502,8 @@ int main() {
     std::cout << "\nRestart after crash\n";
     {
         BuzzDB db;
-        DatabaseImporter::importFile(db, "booking.txt");
         db.executeStatementsAndQueries({
+            "SELECT {*} FROM flights",
             "SELECT {*} FROM seats",
             "SELECT {*} FROM holds",
         });

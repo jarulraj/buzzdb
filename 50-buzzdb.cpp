@@ -2152,6 +2152,7 @@ int main() {
         BuzzDB db;
         DatabaseImporter::importFile(db, "booking.txt");
         db.executeStatementsAndQueries({
+            "SELECT {*} FROM flights",
             "SELECT {*} FROM seats",
             "SELECT {*} FROM holds",
         });
