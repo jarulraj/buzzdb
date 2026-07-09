@@ -617,6 +617,88 @@ private:
     }
 };
 
+class PageManager {
+private:
+    BufferManager& buffer_manager;
+    RecoveryManager& recovery_manager;
+
+public:
+    PageManager(BufferManager& buffer_manager, RecoveryManager& recovery_manager)
+        : buffer_manager(buffer_manager),
+          recovery_manager(recovery_manager) {}
+
+    SlottedPage& readPage(TableId table_id,
+                          const std::string& table_name,
+                          PageID page_id) {
+        return checkedPage(
+            table_id,
+            table_name,
+            recovery_manager.resolveRead(page_id)
+        );
+    }
+
+    SlottedPage& writePage(TableId table_id,
+                           const std::string& table_name,
+                           PageID page_id) {
+        return checkedPage(
+            table_id,
+            table_name,
+            recovery_manager.resolveWrite(page_id)
+        );
+    }
+
+    PageID nextPage(TableId table_id,
+                    const std::string& table_name,
+                    PageID page_id) {
+        PageID resolved_page_id = recovery_manager.resolveRead(page_id);
+        PageID next_page_id = checkedPage(
+            table_id,
+            table_name,
+            resolved_page_id
+        ).getNextPage();
+
+        std::cout << "PageManager scan " << table_name
+                  << ": page " << page_id;
+        if (resolved_page_id != page_id) {
+            std::cout << " resolves to shadow page " << resolved_page_id;
+        }
+        std::cout << " -> ";
+        if (next_page_id == INVALID_PAGE_ID) {
+            std::cout << "END";
+        } else {
+            std::cout << next_page_id;
+        }
+        std::cout << std::endl;
+
+        return next_page_id;
+    }
+
+    void flushWritePage(PageID page_id) {
+        buffer_manager.flushPage(recovery_manager.resolveRead(page_id));
+    }
+
+    PageID allocatePage(TableId table_id) {
+        buffer_manager.extend();
+        auto page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
+        auto& page = buffer_manager.getPage(page_id);
+        page->setTableId(table_id);
+        page->setNextPage(INVALID_PAGE_ID);
+        buffer_manager.flushPage(page_id);
+        return page_id;
+    }
+
+private:
+    SlottedPage& checkedPage(TableId table_id,
+                             const std::string& table_name,
+                             PageID page_id) {
+        auto& page = buffer_manager.getPage(page_id);
+        if (page->getTableId() != table_id) {
+            throw std::runtime_error("Page ownership mismatch for table: " + table_name);
+        }
+        return *page;
+    }
+};
+
 // One column in a table schema.
 struct ColumnSchema {
     std::string name;
@@ -652,31 +734,27 @@ struct TableMetadata {
 class TableHeap {
 private:
     TableMetadata& metadata;
-    BufferManager& buffer_manager;
-    RecoveryManager& recovery_manager;
+    PageManager& page_manager;
 
 public:
-    TableHeap(TableMetadata& metadata,
-              BufferManager& buffer_manager,
-              RecoveryManager& recovery_manager)
+    TableHeap(TableMetadata& metadata, PageManager& page_manager)
         : metadata(metadata),
-          buffer_manager(buffer_manager),
-          recovery_manager(recovery_manager) {}
+          page_manager(page_manager) {}
 
     PageID firstPage() const {
         return metadata.first_page;
     }
 
     PageID nextPage(PageID page_id) {
-        return readPage(page_id).getNextPage();
+        return page_manager.nextPage(metadata.table_id, metadata.name, page_id);
     }
 
     SlottedPage& readPage(PageID page_id) {
-        return checkedPage(recovery_manager.resolveRead(page_id));
+        return page_manager.readPage(metadata.table_id, metadata.name, page_id);
     }
 
     SlottedPage& writePage(PageID page_id) {
-        return checkedPage(recovery_manager.resolveWrite(page_id));
+        return page_manager.writePage(metadata.table_id, metadata.name, page_id);
     }
 
     std::unique_ptr<Tuple> getTuple(PageID page_id, size_t slot) {
@@ -713,17 +791,12 @@ public:
             return false;
         }
 
-        buffer_manager.flushPage(page_id);
+        page_manager.flushWritePage(page_id);
         return true;
     }
 
     PageID allocatePageAfter(PageID previous_page_id) {
-        buffer_manager.extend();
-        auto page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
-
-        auto& page = buffer_manager.getPage(page_id);
-        page->setTableId(metadata.table_id);
-        page->setNextPage(INVALID_PAGE_ID);
+        PageID page_id = page_manager.allocatePage(metadata.table_id);
 
         if (previous_page_id != INVALID_PAGE_ID) {
             writePage(previous_page_id).setNextPage(page_id);
@@ -731,8 +804,6 @@ public:
         } else {
             metadata.first_page = page_id;
         }
-
-        buffer_manager.flushPage(page_id);
         return page_id;
     }
 
@@ -755,15 +826,7 @@ public:
 
 private:
     void flushWritePage(PageID page_id) {
-        buffer_manager.flushPage(recovery_manager.resolveWrite(page_id));
-    }
-
-    SlottedPage& checkedPage(PageID page_id) {
-        auto& page = buffer_manager.getPage(page_id);
-        if (page->getTableId() != metadata.table_id) {
-            throw std::runtime_error("Page ownership mismatch for table: " + metadata.name);
-        }
-        return *page;
+        page_manager.flushWritePage(page_id);
     }
 };
 
@@ -771,14 +834,14 @@ private:
 class Catalog {
 private:
     BufferManager& buffer_manager;
-    RecoveryManager& recovery_manager;
+    PageManager& page_manager;
     TableId next_table_id = FIRST_USER_TABLE_ID;
     std::unordered_map<std::string, TableMetadata> tables_by_name;
 
 public:
-    Catalog(BufferManager& manager, RecoveryManager& recovery_manager)
+    Catalog(BufferManager& manager, PageManager& page_manager)
         : buffer_manager(manager),
-          recovery_manager(recovery_manager) {
+          page_manager(page_manager) {
         load();
     }
 
@@ -850,13 +913,7 @@ private:
     }
 
     PageID allocateFirstPage(TableId table_id) {
-        buffer_manager.extend();
-        auto page_id = static_cast<PageID>(buffer_manager.getNumPages() - 1);
-        auto& page = buffer_manager.getPage(page_id);
-        page->setTableId(table_id);
-        page->setNextPage(INVALID_PAGE_ID);
-        buffer_manager.flushPage(page_id);
-        return page_id;
+        return page_manager.allocatePage(table_id);
     }
 
     TableMetadata& cacheTable(TableMetadata metadata) {
@@ -956,7 +1013,7 @@ private:
 
     void insertSystemTuple(const std::string& table_name, std::unique_ptr<Tuple> tuple) {
         auto& metadata = getTable(table_name);
-        TableHeap table(metadata, buffer_manager, recovery_manager);
+        TableHeap table(metadata, page_manager);
         if (!table.addTuple(std::move(tuple))) {
             throw std::runtime_error("Unable to insert catalog tuple.");
         }
@@ -984,7 +1041,7 @@ private:
 
     void loadUserTables() {
         auto& tables_metadata = getTable("__tables");
-        TableHeap tables_heap(tables_metadata, buffer_manager, recovery_manager);
+        TableHeap tables_heap(tables_metadata, page_manager);
         std::vector<TableMetadata> user_tables;
 
         for (auto& tuple : tables_heap.readAllTuples()) {
@@ -1013,7 +1070,7 @@ private:
 
     void loadColumns(TableMetadata& metadata) {
         auto& columns_metadata = getTable("__columns");
-        TableHeap columns_heap(columns_metadata, buffer_manager, recovery_manager);
+        TableHeap columns_heap(columns_metadata, page_manager);
         std::map<int, ColumnSchema> columns_by_id;
 
         for (auto& tuple : columns_heap.readAllTuples()) {
@@ -1623,9 +1680,8 @@ void printColumnHeader(const QueryComponents& components,
 
 void executeQuery(const QueryComponents& components, 
                   TableMetadata& metadata,
-                  BufferManager& buffer_manager,
-                  RecoveryManager& recovery_manager) {
-    TableHeap tableHeap(metadata, buffer_manager, recovery_manager);
+                  PageManager& page_manager) {
+    TableHeap tableHeap(metadata, page_manager);
     ScanOperator scanOp(tableHeap);
 
     Operator* rootOp = &scanOp;
@@ -1902,12 +1958,14 @@ class BuzzDB {
 public:
     BufferManager buffer_manager;
     RecoveryManager recovery_manager;
+    PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
 
 public:
     BuzzDB() : recovery_manager(buffer_manager),
-               catalog(buffer_manager, recovery_manager) {}
+               page_manager(buffer_manager, recovery_manager),
+               catalog(buffer_manager, page_manager) {}
 
     TxnPtr begin() {
         recovery_manager.begin();
@@ -1993,7 +2051,7 @@ public:
 
         auto& metadata = catalog.getTable(tableName);
         auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, buffer_manager, recovery_manager);
+        TableHeap tableHeap(metadata, page_manager);
         InsertOperator insertOp(tableHeap);
         insertOp.setTupleToInsert(std::move(tuple));
         executeStatementOperator(insertOp, printResult);
@@ -2028,7 +2086,7 @@ public:
                     metadata.schema.getColumnIndex(setColumnName));
                 auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
                 auto field = parseFieldValue(metadata.schema.columns[setColumn].type, setValue);
-                TableHeap tableHeap(metadata, buffer_manager, recovery_manager);
+                TableHeap tableHeap(metadata, page_manager);
                 UpdateOperator updateOp(
                     tableHeap,
                     std::move(predicate),
@@ -2047,7 +2105,7 @@ public:
 
                 auto& metadata = catalog.getTable(tableName);
                 auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
-                TableHeap tableHeap(metadata, buffer_manager, recovery_manager);
+                TableHeap tableHeap(metadata, page_manager);
                 DeleteOperator deleteOp(tableHeap, std::move(predicate));
                 executeStatementOperator(deleteOp, printResult);
                 continue;
@@ -2059,7 +2117,7 @@ public:
                 const std::string queryText = matches[1];
                 auto components = parseQuery(queryText, catalog);
                 auto& metadata = catalog.getTable(components.tableName);
-                executeQuery(components, metadata, buffer_manager, recovery_manager);
+                executeQuery(components, metadata, page_manager);
                 continue;
             }
 
@@ -2164,8 +2222,8 @@ public:
 void checkBookingInvariant(BuzzDB& db) {
     auto& seatsMetadata = db.catalog.getTable("seats");
     auto& holdsMetadata = db.catalog.getTable("holds");
-    TableHeap seatsHeap(seatsMetadata, db.buffer_manager, db.recovery_manager);
-    TableHeap holdsHeap(holdsMetadata, db.buffer_manager, db.recovery_manager);
+    TableHeap seatsHeap(seatsMetadata, db.page_manager);
+    TableHeap holdsHeap(holdsMetadata, db.page_manager);
 
     auto seats = seatsHeap.readAllTuples();
     auto holds = holdsHeap.readAllTuples();
