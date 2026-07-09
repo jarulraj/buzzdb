@@ -358,7 +358,8 @@ public:
 };
 
 const std::string database_filename = "buzzdb.dat";
-const std::string page_table_filename = "buzzdb.pagetable";
+const std::string page_table_filename_prefix = "buzzdb.pagetable";
+const std::string page_table_root_filename = "buzzdb.root";
 
 class StorageManager {
 public:    
@@ -680,6 +681,7 @@ private:
     BufferManager& buffer_manager;
     PageTableManager& page_table_manager;
     bool txn_active = false;
+    int active_table = 0;
     PageTable committed_mapping;
     std::map<PageID, PageID> shadow_pages;
 
@@ -694,28 +696,35 @@ public:
     }
 
     void recover() {
-        std::ifstream input(page_table_filename);
-        if (!input) {
-            page_table_manager.reset();
-            persistPageTable();
-            std::cout << "Recovery: initialized empty page table "
-                      << page_table_filename << "." << std::endl;
+        std::ifstream root_input(page_table_root_filename);
+        if (!root_input) {
+            initializeEmpty();
             return;
         }
 
-        page_table_manager.install(PageTableManager::readPageTable(page_table_filename));
-        std::cout << "Recovery: loaded page table from "
-                  << page_table_filename << "." << std::endl;
+        active_table = readRoot(root_input);
+        page_table_manager.install(
+            PageTableManager::readPageTable(pageTableFilename(active_table))
+        );
+        std::cout << "Recovery: root " << page_table_root_filename
+                  << " selects " << pageTableFilename(active_table)
+                  << "." << std::endl;
     }
 
     void resetPageTable() {
         page_table_manager.reset();
-        persistPageTable();
+        active_table = 0;
+        PageTableManager::writePageTable(pageTableFilename(0), page_table_manager.active());
+        PageTableManager::writePageTable(pageTableFilename(1), page_table_manager.active());
+        writeRoot(active_table);
     }
 
     PageID allocateLogicalPage(PageID physical_page_id) {
         PageID logical_page_id = page_table_manager.allocateLogicalPage(physical_page_id);
-        persistPageTable();
+        PageTableManager::writePageTable(
+            pageTableFilename(active_table),
+            page_table_manager.active()
+        );
         return logical_page_id;
     }
 
@@ -732,9 +741,19 @@ public:
         if (!txn_active) {
             throw std::runtime_error("COMMIT without BEGIN.");
         }
-        persistPageTable();
+
+        int new_active_table = inactiveTable();
+        PageTableManager::writePageTable(
+            pageTableFilename(new_active_table),
+            page_table_manager.active()
+        );
+        writeRoot(new_active_table);
+        active_table = new_active_table;
         std::cout << "Persisted transaction page table to "
-                  << page_table_filename << "." << std::endl;
+                  << pageTableFilename(active_table)
+                  << " and installed root "
+                  << page_table_root_filename << "." << std::endl;
+
         committed_mapping.clear();
         shadow_pages.clear();
         txn_active = false;
@@ -769,8 +788,43 @@ public:
     }
 
 private:
-    void persistPageTable() {
-        PageTableManager::writePageTable(page_table_filename, page_table_manager.active());
+    void initializeEmpty() {
+        page_table_manager.reset();
+        active_table = 0;
+        PageTableManager::writePageTable(pageTableFilename(0), page_table_manager.active());
+        PageTableManager::writePageTable(pageTableFilename(1), page_table_manager.active());
+        writeRoot(active_table);
+        std::cout << "Recovery: initialized empty page tables and root "
+                  << page_table_root_filename << "." << std::endl;
+    }
+
+    int inactiveTable() const {
+        return active_table == 0 ? 1 : 0;
+    }
+
+    static std::string pageTableFilename(int table_index) {
+        if (table_index != 0 && table_index != 1) {
+            throw std::runtime_error("Bad page table root.");
+        }
+        return page_table_filename_prefix + std::to_string(table_index);
+    }
+
+    static int readRoot(std::istream& input) {
+        int table_index = -1;
+        input >> table_index;
+        if (!input || (table_index != 0 && table_index != 1)) {
+            throw std::runtime_error("Bad page table root.");
+        }
+        return table_index;
+    }
+
+    static void writeRoot(int table_index) {
+        std::ofstream output(page_table_root_filename, std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to write page table root.");
+        }
+        output << table_index << "\n";
+        output.flush();
     }
 
     PageID createShadowPage(PageID logical_page_id) {
