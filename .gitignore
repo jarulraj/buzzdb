@@ -37,6 +37,8 @@ page.dat
 buzzdb.dat
 buzzdb.log
 buzzdb.master
+buzzdb.root
+buzzdb.pagetable*
 pgm.txtGi
 pgm.cpp
 
