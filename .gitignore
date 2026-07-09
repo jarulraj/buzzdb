@@ -39,6 +39,7 @@ buzzdb.log
 buzzdb.master
 buzzdb.root
 buzzdb.pagetable*
+buzzdb.freepages
 pgm.txtGi
 pgm.cpp
 
