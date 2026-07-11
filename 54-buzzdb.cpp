@@ -2918,7 +2918,7 @@ int main() {
 
             std::cout << "\nTxn 3: hold 1C for patel, then COMMIT.\n"
                       << "Crash point: after txn 3 COMMIT log is forced, "
-                      << "before NO-FORCE dirty data pages reach disk.\n";
+                      << "before dirty data pages reach disk (NO-FORCE).\n";
             db.simulateCrashAfterCommitLog();
             db.executeStatementsAndQueries({
                 "BEGIN",
