@@ -2934,6 +2934,7 @@ int main() {
         DatabaseImporter::importFile(db, "booking.txt");
 
         try {
+            std::cout << "\nTxn 1: try holding 1A for garcia, then ABORT.\n";
             db.executeStatementsAndQueries({
                 "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1A",
@@ -2941,6 +2942,7 @@ int main() {
                 "ABORT",
             });
 
+            std::cout << "\nTxn 2: hold 1B for zhang, then COMMIT.\n";
             db.executeStatementsAndQueries({
                 "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1B",
@@ -2949,10 +2951,13 @@ int main() {
                 "COMMIT",
             });
 
+            std::cout << "\nTxn 3: start holding 1C for patel, then crash before COMMIT.\n";
             db.executeStatementsAndQueries({
                 "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1C",
             });
+            std::cout << "Crash point: after txn 3's uncommitted page is flushed by STEAL, "
+                      << "before any COMMIT log record exists.\n";
             db.simulateCrashAfterUncommittedFlush();
             db.executeStatementsAndQueries({
                 "UPDATE seats SET customer = patel WHERE seat_no = 1C",

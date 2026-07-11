@@ -647,6 +647,7 @@ struct LogRecord {
 };
 
 struct RecoveryAnalysis {
+    std::map<int, bool> started_txns;
     std::map<int, bool> committed_txns;
     std::map<int, bool> aborted_txns;
     int next_txn_id = 1;
@@ -772,7 +773,12 @@ private:
             record.table_id = static_cast<TableId>(table_id);
             record.page_id = static_cast<PageID>(page_id);
             record.slot_id = slot_id;
-            if (record_type != LogRecordType::DELETE) {
+            if (record_type == LogRecordType::UPDATE ||
+                record_type == LogRecordType::DELETE) {
+                record.before_tuple = Tuple::deserialize(input);
+            }
+            if (record_type == LogRecordType::UPDATE ||
+                record_type == LogRecordType::INSERT) {
                 record.after_tuple = Tuple::deserialize(input);
             }
         }
@@ -787,7 +793,15 @@ private:
             output << " " << record.table_id
                    << " " << record.page_id
                    << " " << record.slot_id;
-            if (record.type != LogRecordType::DELETE) {
+            if (record.type == LogRecordType::UPDATE ||
+                record.type == LogRecordType::DELETE) {
+                if (!record.before_tuple) {
+                    throw std::runtime_error("Log record is missing before image.");
+                }
+                output << " " << record.before_tuple->serialize();
+            }
+            if (record.type == LogRecordType::UPDATE ||
+                record.type == LogRecordType::INSERT) {
                 if (!record.after_tuple) {
                     throw std::runtime_error("Log record is missing after image.");
                 }
@@ -802,7 +816,7 @@ class RecoveryManager {
 private:
     BufferManager& buffer_manager;
     bool txn_active = false;
-    bool crash_after_commit_log = false;
+    bool crash_after_uncommitted_flush = false;
     int next_txn_id = 1;
     int current_txn_id = 0;
     LogManager log_manager;
@@ -832,11 +846,16 @@ public:
         std::cout << "Recovery analysis: "
                   << analysis.committed_txns.size()
                   << " committed transaction(s), "
+                  << countLoserTransactions(analysis)
+                  << " loser transaction(s), "
                   << records.size()
                   << " log record(s), "
-                  << countRedoRecords(records)
-                  << " redo record(s)." << std::endl;
+                  << countRedoRecords(records, analysis)
+                  << " redo record(s), "
+                  << countUndoRecords(records, analysis)
+                  << " undo record(s)." << std::endl;
         redoPass(records, analysis);
+        undoPass(records, analysis);
     }
 
     void resetLog() {
@@ -857,7 +876,7 @@ public:
         dirty_pages.clear();
         log_manager.append(LogRecord{LogRecordType::BEGIN, current_txn_id});
         std::cout << "\nWAL txn " << current_txn_id
-                  << " BEGIN (NO-STEAL/NO-FORCE)" << std::endl;
+                  << " BEGIN (STEAL/NO-FORCE)" << std::endl;
         return current_txn_id;
     }
 
@@ -866,33 +885,22 @@ public:
             throw std::runtime_error("COMMIT without BEGIN.");
         }
 
-        for (const auto& record : staged_records) {
-            log_manager.append(record);
-        }
         log_manager.append(LogRecord{LogRecordType::COMMIT, current_txn_id});
 
         if (!staged_records.empty()) {
-            std::cout << "NO-FORCE commit: forced "
+            std::cout << "NO-FORCE commit: forced COMMIT log record; "
                       << staged_records.size()
-                      << " tuple-change log record(s) plus COMMIT; "
-                      << "dirty data pages are not forced."
+                      << " tuple-change log record(s) are durable, but dirty data pages are not forced."
                       << std::endl;
-
-            if (crash_after_commit_log) {
-                throw std::runtime_error(
-                    "Simulated crash after forced COMMIT log, before NO-FORCE data pages reach disk"
-                );
-            }
         } else {
-            std::cout << "NO-FORCE commit: forced COMMIT log record for read-only transaction."
+            std::cout << "NO-FORCE commit: wrote COMMIT log record for read-only transaction."
                       << std::endl;
         }
 
-        unpinDirtyPages();
         staged_records.clear();
         dirty_pages.clear();
         current_txn_id = 0;
-        crash_after_commit_log = false;
+        crash_after_uncommitted_flush = false;
         txn_active = false;
     }
 
@@ -913,16 +921,18 @@ public:
             }
         }
 
+        auto forced_pages = forceDirtyPages();
         log_manager.append(LogRecord{LogRecordType::ABORT, current_txn_id});
-        unpinDirtyPages();
-        std::cout << "NO-STEAL abort: restored "
+        std::cout << "FORCE abort: restored "
                   << staged_records.size()
-                  << " in-memory operation(s), wrote ABORT; no restart undo needed."
+                  << " operation(s), forced "
+                  << forced_pages
+                  << " restored page(s), then wrote ABORT."
                   << std::endl;
         staged_records.clear();
         dirty_pages.clear();
         current_txn_id = 0;
-        crash_after_commit_log = false;
+        crash_after_uncommitted_flush = false;
         txn_active = false;
     }
 
@@ -975,8 +985,24 @@ public:
                     nullptr);
     }
 
-    void simulateCrashAfterCommitLog() {
-        crash_after_commit_log = true;
+    void simulateCrashAfterUncommittedFlush() {
+        crash_after_uncommitted_flush = true;
+    }
+
+    bool shouldStealUncommittedPage() const {
+        return crash_after_uncommitted_flush;
+    }
+
+    void maybeCrashAfterUncommittedFlush(PageID page_id) {
+        if (!crash_after_uncommitted_flush) {
+            return;
+        }
+        crash_after_uncommitted_flush = false;
+        throw std::runtime_error(
+            "Simulated crash after uncommitted page " +
+            std::to_string(page_id) +
+            " reached disk via STEAL, before COMMIT"
+        );
     }
 
 private:
@@ -1012,10 +1038,13 @@ private:
         return false;
     }
 
-    void unpinDirtyPages() {
+    size_t forceDirtyPages() {
+        size_t forced = 0;
         for (PageID page_id : dirty_pages) {
-            buffer_manager.unpinPage(page_id);
+            buffer_manager.flushPage(page_id);
+            forced++;
         }
+        return forced;
     }
 
     void stageRecord(LogRecordType type,
@@ -1025,7 +1054,6 @@ private:
                      std::unique_ptr<Tuple> before_tuple,
                      std::unique_ptr<Tuple> after_tuple) {
         if (!isDirtyPage(page_id)) {
-            buffer_manager.pinPage(page_id);
             dirty_pages.push_back(page_id);
         }
 
@@ -1038,13 +1066,22 @@ private:
             std::move(before_tuple),
             std::move(after_tuple)
         };
+        log_manager.append(record);
         staged_records.push_back(std::move(record));
 
-        std::cout << "NO-STEAL: staged " << logRecordName(type)
-                  << " for table " << table_id
+        std::cout << "STEAL/NO-FORCE: logged ";
+        if (type == LogRecordType::UPDATE) {
+            std::cout << "before-image and after-image UPDATE";
+        } else if (type == LogRecordType::INSERT) {
+            std::cout << "INSERT undo info and after-image";
+        } else {
+            std::cout << "before-image DELETE";
+        }
+        std::cout << " for table " << table_id
                   << ", page " << page_id
                   << ", slot " << slot_id
-                  << "; pinned page so uncommitted data cannot be stolen." << std::endl;
+                  << "; restart may need REDO for winners or UNDO for losers."
+                  << std::endl;
     }
 
     RecoveryAnalysis analysisPass(const std::vector<LogRecord>& records) const {
@@ -1052,7 +1089,9 @@ private:
         for (const auto& record : records) {
             analysis.next_txn_id = std::max(analysis.next_txn_id,
                                             record.txn_id + 1);
-            if (record.type == LogRecordType::COMMIT) {
+            if (record.type == LogRecordType::BEGIN) {
+                analysis.started_txns[record.txn_id] = true;
+            } else if (record.type == LogRecordType::COMMIT) {
                 analysis.committed_txns[record.txn_id] = true;
             } else if (record.type == LogRecordType::ABORT) {
                 analysis.aborted_txns[record.txn_id] = true;
@@ -1061,10 +1100,40 @@ private:
         return analysis;
     }
 
-    size_t countRedoRecords(const std::vector<LogRecord>& records) const {
+    bool isLoserTxn(int txn_id, const RecoveryAnalysis& analysis) const {
+        return analysis.committed_txns.find(txn_id) == analysis.committed_txns.end() &&
+               analysis.aborted_txns.find(txn_id) == analysis.aborted_txns.end();
+    }
+
+    size_t countLoserTransactions(const RecoveryAnalysis& analysis) const {
+        size_t count = 0;
+        for (const auto& entry : analysis.started_txns) {
+            if (isLoserTxn(entry.first, analysis)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    size_t countRedoRecords(const std::vector<LogRecord>& records,
+                            const RecoveryAnalysis& analysis) const {
         size_t count = 0;
         for (const auto& record : records) {
-            if (isTupleChangeRecord(record.type)) {
+            if (isTupleChangeRecord(record.type) &&
+                analysis.committed_txns.find(record.txn_id) !=
+                    analysis.committed_txns.end()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    size_t countUndoRecords(const std::vector<LogRecord>& records,
+                            const RecoveryAnalysis& analysis) const {
+        size_t count = 0;
+        for (const auto& record : records) {
+            if (isTupleChangeRecord(record.type) &&
+                isLoserTxn(record.txn_id, analysis)) {
                 count++;
             }
         }
@@ -1093,8 +1162,42 @@ private:
 
         if (applied != 0) {
             std::cout << "Restart recovery: REDO applied " << applied
-                      << " committed log record(s) because NO-FORCE may leave data pages stale."
+                      << " winner log record(s) because NO-FORCE may leave committed data pages stale."
                       << std::endl;
+        }
+    }
+
+    void undoPass(const std::vector<LogRecord>& records,
+                  const RecoveryAnalysis& analysis) {
+        size_t applied = 0;
+        std::set<int> loser_txns;
+        for (auto it = records.rbegin(); it != records.rend(); ++it) {
+            const auto& record = *it;
+            if (!isTupleChangeRecord(record.type)) {
+                continue;
+            }
+            if (!isLoserTxn(record.txn_id, analysis)) {
+                continue;
+            }
+            applyUndo(record.table_id,
+                      record.page_id,
+                      record.slot_id,
+                      record.type,
+                      record.before_tuple ? record.before_tuple->clone() : nullptr);
+            printUndoAction(record);
+            loser_txns.insert(record.txn_id);
+            applied++;
+        }
+
+        for (int txn_id : loser_txns) {
+            log_manager.append(LogRecord{LogRecordType::ABORT, txn_id});
+        }
+
+        if (applied != 0) {
+            std::cout << "Restart recovery: UNDO applied " << applied
+                      << " loser log record(s) because STEAL may leave uncommitted data on disk; wrote ABORT for "
+                      << loser_txns.size()
+                      << " loser transaction(s)." << std::endl;
         }
     }
 
@@ -1116,6 +1219,24 @@ private:
         buffer_manager.flushPage(page_id);
     }
 
+    void applyUndo(TableId table_id,
+                   PageID page_id,
+                   size_t slot_id,
+                   LogRecordType type,
+                   std::unique_ptr<Tuple> before_tuple) {
+        auto& page = buffer_manager.getPage(page_id);
+        if (page->getTableId() != table_id) {
+            throw std::runtime_error("WAL undo page ownership mismatch.");
+        }
+        if (type == LogRecordType::INSERT) {
+            page->deleteTuple(slot_id);
+        } else if (!before_tuple ||
+                   !page->putTupleAtSlot(slot_id, std::move(before_tuple))) {
+            throw std::runtime_error("Unable to undo WAL operation.");
+        }
+        buffer_manager.flushPage(page_id);
+    }
+
     void printRedoAction(const LogRecord& record) const {
         std::cout << "  REDO " << logRecordName(record.type)
                   << " log record for txn " << record.txn_id
@@ -1129,6 +1250,23 @@ private:
             std::cout << " -> write tuple after-image";
         } else if (record.type == LogRecordType::DELETE) {
             std::cout << " -> delete tuple";
+        }
+        std::cout << std::endl;
+    }
+
+    void printUndoAction(const LogRecord& record) const {
+        std::cout << "  UNDO " << logRecordName(record.type)
+                  << " log record for txn " << record.txn_id
+                  << ": table " << record.table_id
+                  << ", page " << record.page_id
+                  << ", slot " << record.slot_id;
+
+        if (record.type == LogRecordType::INSERT) {
+            std::cout << " -> delete inserted tuple";
+        } else if (record.type == LogRecordType::UPDATE) {
+            std::cout << " -> restore tuple before-image";
+        } else if (record.type == LogRecordType::DELETE) {
+            std::cout << " -> restore deleted tuple";
         }
         std::cout << std::endl;
     }
@@ -1214,8 +1352,17 @@ public:
 
     void flushWritePage(TableId, PageID page_id) {
         if (recovery_manager.isActive()) {
-            std::cout << "NO-STEAL: page " << page_id
-                      << " stays dirty only in memory; flush is blocked." << std::endl;
+            if (!recovery_manager.shouldStealUncommittedPage()) {
+                std::cout << "STEAL allowed: page " << page_id
+                          << " remains dirty in memory for now; NO-FORCE may require REDO later."
+                          << std::endl;
+                return;
+            }
+            buffer_manager.flushPage(page_id);
+            std::cout << "STEAL: flushed uncommitted page " << page_id
+                      << " before COMMIT; before-image log is already durable."
+                      << std::endl;
+            recovery_manager.maybeCrashAfterUncommittedFlush(page_id);
             return;
         }
         buffer_manager.flushPage(page_id);
@@ -2584,8 +2731,8 @@ public:
         active_txn.reset();
     }
 
-    void simulateCrashAfterCommitLog() {
-        recovery_manager.simulateCrashAfterCommitLog();
+    void simulateCrashAfterUncommittedFlush() {
+        recovery_manager.simulateCrashAfterUncommittedFlush();
     }
 
     bool createTable(const std::string& name, TableSchema schema) {
@@ -2916,16 +3063,16 @@ int main() {
                 "COMMIT",
             });
 
-            std::cout << "\nTxn 3: hold 1C for patel, then COMMIT.\n"
-                      << "Crash point: after txn 3 COMMIT log is forced, "
-                      << "before NO-FORCE dirty data pages reach disk.\n";
-            db.simulateCrashAfterCommitLog();
+            std::cout << "\nTxn 3: start holding 1C for patel, then crash before COMMIT.\n";
             db.executeStatementsAndQueries({
                 "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1C",
+            });
+            std::cout << "Crash point: txn 2 committed with NO-FORCE, then txn 3's "
+                      << "uncommitted page is flushed by STEAL before any txn 3 COMMIT log record exists.\n";
+            db.simulateCrashAfterUncommittedFlush();
+            db.executeStatementsAndQueries({
                 "UPDATE seats SET customer = patel WHERE seat_no = 1C",
-                "INSERT INTO holds VALUES (2, 3, patel, open)",
-                "COMMIT",
             });
         } catch (const std::runtime_error& crash) {
             std::cout << crash.what() << std::endl;
