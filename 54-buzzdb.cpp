@@ -215,7 +215,6 @@ struct Slot {
 class SlottedPage {
 public:
     std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
-    size_t metadata_size = sizeof(Slot) * MAX_SLOTS + sizeof(PageHeader);
 
     SlottedPage(){
         reset();
@@ -224,105 +223,105 @@ public:
     void reset() {
         std::memset(page_data.get(), 0, PAGE_SIZE);
 
-        // Empty page -> initialize slot array inside page
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+        Slot* slot_array = slots();
         for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
             slot_array[slot_itr].empty = true;
             slot_array[slot_itr].offset = INVALID_VALUE;
             slot_array[slot_itr].length = INVALID_VALUE;
         }
 
-        auto* header = getHeader();
-        header->table_id = INVALID_TABLE_ID;
-        header->next_page = INVALID_PAGE_ID;
+        header()->table_id = INVALID_TABLE_ID;
+        header()->next_page = INVALID_PAGE_ID;
     }
 
-    PageHeader* getHeader() {
-        return reinterpret_cast<PageHeader*>(
-            page_data.get() + sizeof(Slot) * MAX_SLOTS
-        );
-    }
-
-    TableId getTableId() {
-        return getHeader()->table_id;
+    TableId getTableId() const {
+        return header()->table_id;
     }
 
     void setTableId(TableId table_id) {
-        getHeader()->table_id = table_id;
+        header()->table_id = table_id;
     }
 
-    PageID getNextPage() {
-        return getHeader()->next_page;
+    PageID getNextPage() const {
+        return header()->next_page;
     }
 
     void setNextPage(PageID page_id) {
-        getHeader()->next_page = page_id;
+        header()->next_page = page_id;
     }
 
-    // Add a tuple, returns true if it fits, false otherwise.
     bool addTuple(std::unique_ptr<Tuple> tuple) {
         return addTupleAndReturnSlot(std::move(tuple)).has_value();
     }
 
     std::optional<size_t> addTupleAndReturnSlot(std::unique_ptr<Tuple> tuple) {
-        auto serializedTuple = tuple->serialize();
-        auto slot = findAvailableSlot(serializedTuple.size());
-        if (!slot || !putSerializedTupleAtSlot(*slot, serializedTuple)) {
+        auto bytes = tuple->serialize();
+        auto slot_id = findAvailableSlot(bytes.size());
+        if (!slot_id || !putSerializedTupleAtSlot(*slot_id, bytes)) {
             return std::nullopt;
         }
-        return slot;
+        return slot_id;
     }
 
-    bool putTupleAtSlot(size_t index, std::unique_ptr<Tuple> tuple) {
-        return putSerializedTupleAtSlot(index, tuple->serialize());
+    bool putTupleAtSlot(size_t slot_id, std::unique_ptr<Tuple> tuple) {
+        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
     }
 
-    std::unique_ptr<Tuple> getTuple(size_t index) const {
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
-        if (index >= MAX_SLOTS || slot_array[index].empty) {
+    std::unique_ptr<Tuple> getTuple(size_t slot_id) const {
+        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
             return nullptr;
         }
 
-        assert(slot_array[index].offset != INVALID_VALUE);
-        const char* tuple_data = page_data.get() + slot_array[index].offset;
-        std::istringstream iss(std::string(tuple_data, slot_array[index].length));
+        const auto& slot = slots()[slot_id];
+        assert(slot.offset != INVALID_VALUE);
+        assert(slot.length != INVALID_VALUE);
+        const char* tuple_data = page_data.get() + slot.offset;
+        std::istringstream iss(std::string(tuple_data, slot.length));
         return Tuple::deserialize(iss);
     }
 
-    bool updateTuple(size_t index, std::unique_ptr<Tuple> tuple) {
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
-        if (index >= MAX_SLOTS || slot_array[index].empty) {
+    bool updateTuple(size_t slot_id, std::unique_ptr<Tuple> tuple) {
+        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
             return false;
         }
 
-        auto serializedTuple = tuple->serialize();
-        if (serializedTuple.size() > slot_array[index].length) {
-            return false;
-        }
-
-        std::memcpy(page_data.get() + slot_array[index].offset,
-                    serializedTuple.c_str(),
-                    serializedTuple.size());
-        return true;
+        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
     }
 
-    void deleteTuple(size_t index) {
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
-        size_t slot_itr = 0;
-        for (; slot_itr < MAX_SLOTS; slot_itr++) {
-            if(slot_itr == index and
-               slot_array[slot_itr].empty == false){
-                slot_array[slot_itr].empty = true;
-                break;
-               }
+    void deleteTuple(size_t slot_id) {
+        if (slot_id < MAX_SLOTS) {
+            slots()[slot_id].empty = true;
         }
     }
 
 private:
-    std::optional<size_t> findAvailableSlot(size_t tuple_size) {
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
+    static constexpr size_t SLOT_ARRAY_SIZE = sizeof(Slot) * MAX_SLOTS;
+    static constexpr size_t HEADER_OFFSET = SLOT_ARRAY_SIZE;
+    static constexpr size_t DATA_START = HEADER_OFFSET + sizeof(PageHeader);
+
+    Slot* slots() {
+        return reinterpret_cast<Slot*>(page_data.get());
+    }
+
+    const Slot* slots() const {
+        return reinterpret_cast<const Slot*>(page_data.get());
+    }
+
+    PageHeader* header() {
+        return reinterpret_cast<PageHeader*>(page_data.get() + HEADER_OFFSET);
+    }
+
+    const PageHeader* header() const {
+        return reinterpret_cast<const PageHeader*>(page_data.get() + HEADER_OFFSET);
+    }
+
+    std::optional<size_t> findAvailableSlot(size_t tuple_size) const {
+        const Slot* slot_array = slots();
         for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
-            if (slot_array[slot_itr].empty == true &&
+            if (!slot_array[slot_itr].empty) {
+                continue;
+            }
+            if (slot_array[slot_itr].length == INVALID_VALUE ||
                 slot_array[slot_itr].length >= tuple_size) {
                 return slot_itr;
             }
@@ -330,52 +329,56 @@ private:
         return std::nullopt;
     }
 
+    size_t nextFreeOffset() const {
+        size_t offset = DATA_START;
+        const Slot* slot_array = slots();
+        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+            if (slot_array[slot_itr].offset == INVALID_VALUE ||
+                slot_array[slot_itr].length == INVALID_VALUE) {
+                continue;
+            }
+
+            size_t slot_end = static_cast<size_t>(slot_array[slot_itr].offset) +
+                              slot_array[slot_itr].length;
+            if (slot_end > offset) {
+                offset = slot_end;
+            }
+        }
+        return offset;
+    }
+
     bool putSerializedTupleAtSlot(size_t slot_itr,
-                                  const std::string& serializedTuple) {
+                                  const std::string& bytes) {
         if (slot_itr >= MAX_SLOTS) {
             return false;
         }
 
-        size_t tuple_size = serializedTuple.size();
-        Slot* slot_array = reinterpret_cast<Slot*>(page_data.get());
-        auto& slot = slot_array[slot_itr];
+        size_t tuple_size = bytes.size();
+        auto& slot = slots()[slot_itr];
         if (slot.length != INVALID_VALUE && tuple_size > slot.length) {
             return false;
         }
 
         size_t offset = slot.offset;
         if (offset == INVALID_VALUE) {
-            if (slot_itr != 0) {
-                auto previous_offset = slot_array[slot_itr - 1].offset;
-                auto previous_length = slot_array[slot_itr - 1].length;
-                if (previous_offset == INVALID_VALUE ||
-                    previous_length == INVALID_VALUE) {
-                    return false;
-                }
-                offset = previous_offset + previous_length;
-            } else {
-                offset = metadata_size;
-            }
+            offset = nextFreeOffset();
         }
 
-        if (offset + tuple_size >= PAGE_SIZE) {
+        if (offset < DATA_START || offset + tuple_size > PAGE_SIZE) {
             return false;
         }
 
         assert(offset != INVALID_VALUE);
-        assert(offset >= metadata_size);
-        assert(offset + tuple_size < PAGE_SIZE);
+        assert(offset >= DATA_START);
+        assert(offset + tuple_size <= PAGE_SIZE);
 
         slot.empty = false;
-        slot.offset = offset;
+        slot.offset = static_cast<uint16_t>(offset);
         if (slot.length == INVALID_VALUE) {
-            slot.length = tuple_size;
+            slot.length = static_cast<uint16_t>(tuple_size);
         }
 
-        std::memcpy(page_data.get() + offset,
-                    serializedTuple.c_str(),
-                    tuple_size);
-
+        std::memcpy(page_data.get() + offset, bytes.c_str(), tuple_size);
         return true;
     }
 };
@@ -1082,6 +1085,7 @@ private:
                       record.slot_id,
                       record.type,
                       record.after_tuple ? record.after_tuple->clone() : nullptr);
+            printRedoAction(record);
             applied++;
         }
 
@@ -1107,6 +1111,23 @@ private:
             throw std::runtime_error("Unable to redo WAL operation.");
         }
         buffer_manager.flushPage(page_id);
+    }
+
+    void printRedoAction(const LogRecord& record) const {
+        std::cout << "  redo " << logRecordName(record.type)
+                  << " log record for txn " << record.txn_id
+                  << ": table " << record.table_id
+                  << ", page " << record.page_id
+                  << ", slot " << record.slot_id;
+
+        if (record.type == LogRecordType::INSERT) {
+            std::cout << " -> insert tuple";
+        } else if (record.type == LogRecordType::UPDATE) {
+            std::cout << " -> write tuple after-image";
+        } else if (record.type == LogRecordType::DELETE) {
+            std::cout << " -> delete tuple";
+        }
+        std::cout << std::endl;
     }
 
 };
@@ -1185,16 +1206,6 @@ public:
                     PageID page_id) {
         SlottedPage& page = checkedPage(table_id, table_name, page_id);
         PageID next_page_id = page.getNextPage();
-
-        std::cout << "PageManager scan " << table_name
-                  << ": page " << page_id << " -> ";
-        if (next_page_id == INVALID_PAGE_ID) {
-            std::cout << "END";
-        } else {
-            std::cout << "page " << next_page_id;
-        }
-        std::cout << std::endl;
-
         return next_page_id;
     }
 
@@ -1733,7 +1744,6 @@ public:
     }
 
     void close() override {
-        std::cout << "Scan Operator tuple_count: " << tuple_count << "\n";
         currentPageId = INVALID_PAGE_ID;
         currentSlotIndex = 0;
         currentTuple.reset();
@@ -2888,9 +2898,6 @@ int main() {
         try {
             db.executeStatementsAndQueries({
                 "BEGIN",
-                "UPDATE flights SET destination = LAX WHERE id = 1",
-                "COMMIT",
-                "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1A",
                 "UPDATE seats SET customer = garcia WHERE seat_no = 1A",
                 "ABORT",
@@ -2913,7 +2920,6 @@ int main() {
     {
         BuzzDB db;
         db.executeStatementsAndQueries({
-            "SELECT {*} FROM flights",
             "SELECT {*} FROM seats",
             "SELECT {*} FROM holds",
         });
