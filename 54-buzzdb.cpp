@@ -185,6 +185,35 @@ public:
     }
 };
 
+std::string fieldToString(const Field& field) {
+    std::ostringstream output;
+    switch (field.getType()) {
+        case INT:
+            output << field.asInt();
+            break;
+        case FLOAT:
+            output << field.asFloat();
+            break;
+        case STRING:
+            output << field.asString();
+            break;
+    }
+    return output.str();
+}
+
+std::string tupleToString(const Tuple& tuple) {
+    std::ostringstream output;
+    output << "[";
+    for (size_t i = 0; i < tuple.fields.size(); i++) {
+        if (i != 0) {
+            output << ", ";
+        }
+        output << fieldToString(*tuple.fields[i]);
+    }
+    output << "]";
+    return output.str();
+}
+
 static constexpr size_t PAGE_SIZE = 4096;  // Fixed page size
 static constexpr size_t MAX_SLOTS = 512;   // Fixed number of slots
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
@@ -199,6 +228,12 @@ constexpr TableId SYS_TABLES_ID = 1;
 constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
 const std::string BOOTSTRAP_MAGIC = "BUZZDB_BOOTSTRAP";
+
+enum class CrashPoint {
+    NONE,
+    AFTER_COMMIT_LOG_FORCE,
+    AFTER_STEAL_PAGE_FLUSH
+};
 
 struct PageHeader {
     TableId table_id = INVALID_TABLE_ID;
@@ -802,7 +837,7 @@ class RecoveryManager {
 private:
     BufferManager& buffer_manager;
     bool txn_active = false;
-    bool crash_after_commit_log = false;
+    CrashPoint crash_point = CrashPoint::NONE;
     int next_txn_id = 1;
     int current_txn_id = 0;
     LogManager log_manager;
@@ -878,11 +913,10 @@ public:
                       << "dirty data pages are not forced."
                       << std::endl;
 
-            if (crash_after_commit_log) {
-                throw std::runtime_error(
-                    "Simulated crash after forced COMMIT log, before NO-FORCE data pages reach disk"
-                );
-            }
+            crashIfRequested(
+                CrashPoint::AFTER_COMMIT_LOG_FORCE,
+                "Simulated crash after forced COMMIT log, before NO-FORCE data pages reach disk"
+            );
         } else {
             std::cout << "NO-FORCE commit: forced COMMIT log record for read-only transaction."
                       << std::endl;
@@ -892,7 +926,7 @@ public:
         staged_records.clear();
         dirty_pages.clear();
         current_txn_id = 0;
-        crash_after_commit_log = false;
+        crash_point = CrashPoint::NONE;
         txn_active = false;
     }
 
@@ -922,7 +956,7 @@ public:
         staged_records.clear();
         dirty_pages.clear();
         current_txn_id = 0;
-        crash_after_commit_log = false;
+        crash_point = CrashPoint::NONE;
         txn_active = false;
     }
 
@@ -975,11 +1009,19 @@ public:
                     nullptr);
     }
 
-    void simulateCrashAfterCommitLog() {
-        crash_after_commit_log = true;
+    void crashAt(CrashPoint point) {
+        crash_point = point;
     }
 
 private:
+    void crashIfRequested(CrashPoint point, const std::string& message) {
+        if (crash_point != point) {
+            return;
+        }
+        crash_point = CrashPoint::NONE;
+        throw std::runtime_error(message);
+    }
+
     void initializeEmpty() {
         log_manager.reset();
         std::cout << "Recovery: initialized empty WAL file "
@@ -1038,13 +1080,28 @@ private:
             std::move(before_tuple),
             std::move(after_tuple)
         };
+        std::string before_image;
+        if (record.before_tuple) {
+            before_image = tupleToString(*record.before_tuple);
+        }
+        std::string after_image;
+        if (record.after_tuple) {
+            after_image = tupleToString(*record.after_tuple);
+        }
         staged_records.push_back(std::move(record));
 
         std::cout << "NO-STEAL: staged " << logRecordName(type)
                   << " for table " << table_id
                   << ", page " << page_id
-                  << ", slot " << slot_id
-                  << "; pinned page so uncommitted data cannot be stolen." << std::endl;
+                  << ", slot " << slot_id;
+        if (!before_image.empty()) {
+            std::cout << "; before-image " << before_image;
+        }
+        if (!after_image.empty()) {
+            std::cout << "; after-image " << after_image;
+        }
+        std::cout << "; pinned page so uncommitted data cannot be stolen."
+                  << std::endl;
     }
 
     RecoveryAnalysis analysisPass(const std::vector<LogRecord>& records) const {
@@ -1124,9 +1181,15 @@ private:
                   << ", slot " << record.slot_id;
 
         if (record.type == LogRecordType::INSERT) {
-            std::cout << " -> insert tuple";
+            std::cout << " -> insert tuple after-image";
+            if (record.after_tuple) {
+                std::cout << " " << tupleToString(*record.after_tuple);
+            }
         } else if (record.type == LogRecordType::UPDATE) {
             std::cout << " -> write tuple after-image";
+            if (record.after_tuple) {
+                std::cout << " " << tupleToString(*record.after_tuple);
+            }
         } else if (record.type == LogRecordType::DELETE) {
             std::cout << " -> delete tuple";
         }
@@ -2503,7 +2566,7 @@ std::vector<std::string> split(const std::string& input, char delimiter) {
 }
 
 
-void maybeCrashAfterStatement(int& statementsSeen, int crashAfterStatement) {
+void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
     if (crashAfterStatement <= 0) {
         return;
     }
@@ -2584,8 +2647,8 @@ public:
         active_txn.reset();
     }
 
-    void simulateCrashAfterCommitLog() {
-        recovery_manager.simulateCrashAfterCommitLog();
+    void crashAt(CrashPoint point) {
+        recovery_manager.crashAt(point);
     }
 
     bool createTable(const std::string& name, TableSchema schema) {
@@ -2667,7 +2730,7 @@ public:
             std::cout << statement << "\n";
             std::smatch matches;
             auto statementFinished = [&]() {
-                maybeCrashAfterStatement(statementsSeen, crashAfterStatement);
+                checkStatementCrashLimit(statementsSeen, crashAfterStatement);
             };
 
             std::regex beginRegex("^\\s*BEGIN\\s*;?\\s*$",
@@ -2919,7 +2982,7 @@ int main() {
             std::cout << "\nTxn 3: hold 1C for patel, then COMMIT.\n"
                       << "Crash point: after txn 3 COMMIT log is forced, "
                       << "before dirty data pages reach disk (NO-FORCE).\n";
-            db.simulateCrashAfterCommitLog();
+            db.crashAt(CrashPoint::AFTER_COMMIT_LOG_FORCE);
             db.executeStatementsAndQueries({
                 "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1C",
