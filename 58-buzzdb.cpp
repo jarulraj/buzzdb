@@ -14,6 +14,7 @@
 #include <cstring>
 #include <set>
 #include <functional>
+#include <utility>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -574,13 +575,13 @@ private:
     PageMap pageMap;
     std::unique_ptr<Policy> policy;
     std::set<PageID> pinned_pages;
-    std::function<bool(LSN)> log_force_callback;
+    std::function<std::pair<LSN, LSN>(LSN)> log_force_callback;
 
 public:
     BufferManager(): 
     policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
-    void setLogForceCallback(std::function<bool(LSN)> callback) {
+    void setLogForceCallback(std::function<std::pair<LSN, LSN>(LSN)> callback) {
         log_force_callback = std::move(callback);
     }
 
@@ -654,7 +655,10 @@ private:
             return;
         }
 
-        log_force_callback(page_lsn);
+        auto flushed = log_force_callback(page_lsn);
+        if (flushed.second < page_lsn) {
+            throw std::runtime_error("WAL rule violated: flushedLSN < pageLSN.");
+        }
     }
 
     void evictUnpinnedPage() {
@@ -848,6 +852,10 @@ public:
         }
         output.flush();
         return wrote;
+    }
+
+    LSN getFlushedLSN() const {
+        return flushed_lsn;
     }
 
     std::vector<LogRecord> readAll() {
@@ -1211,8 +1219,10 @@ private:
         return record_lsn;
     }
 
-    bool forceLogUpTo(LSN lsn) {
-        return log_manager.forceUpTo(lsn);
+    std::pair<LSN, LSN> forceLogUpTo(LSN lsn) {
+        LSN before = log_manager.getFlushedLSN();
+        log_manager.forceUpTo(lsn);
+        return {before, log_manager.getFlushedLSN()};
     }
 
     size_t forceDirtyPages() {
