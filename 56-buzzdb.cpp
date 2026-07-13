@@ -1582,7 +1582,7 @@ public:
 
         if (page_manager.recoveryActive()) {
             throw std::runtime_error(
-                "INSERT requiring a new page inside a WAL transaction is not supported in v54."
+                "INSERT requiring a new page inside a WAL transaction is not supported."
             );
         }
 

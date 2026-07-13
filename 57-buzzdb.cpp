@@ -10,11 +10,13 @@
 #include <regex>
 #include <stdexcept>
 #include <cassert>
+#include <cerrno>
 #include <cctype>
 #include <cstring>
+#include <fcntl.h>
 #include <set>
-#include <functional>
 #include <utility>
+#include <unistd.h>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -567,23 +569,22 @@ public:
 
 constexpr size_t MAX_PAGES_IN_MEMORY = 10;
 
+class LogManager;
+
 class BufferManager {
 private:
     using PageMap = std::unordered_map<PageID, std::unique_ptr<SlottedPage>>;
 
     StorageManager storage_manager;
     PageMap pageMap;
+    LogManager& log_manager;
     std::unique_ptr<Policy> policy;
     std::set<PageID> pinned_pages;
-    std::function<std::pair<LSN, LSN>(LSN)> log_force_callback;
 
 public:
-    BufferManager(): 
-    policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
-
-    void setLogForceCallback(std::function<std::pair<LSN, LSN>(LSN)> callback) {
-        log_force_callback = std::move(callback);
-    }
+    explicit BufferManager(LogManager& log_manager)
+        : log_manager(log_manager),
+          policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
     std::unique_ptr<SlottedPage>& getPage(int page_id) {
         auto it = pageMap.find(page_id);
@@ -605,7 +606,7 @@ public:
 
     void flushPage(int page_id, const std::string& reason = "page flush") {
         auto& page = getPage(page_id);
-        forceLogBeforeFlush(page_id, reason);
+        forceLogBeforePageFlush(page_id, reason);
         storage_manager.flush(page_id, page);
     }
 
@@ -641,41 +642,7 @@ public:
     }
 
 private:
-    void forceLogBeforeFlush(PageID page_id, const std::string& reason) {
-        if (!log_force_callback) {
-            return;
-        }
-        auto it = pageMap.find(page_id);
-        if (it == pageMap.end()) {
-            return;
-        }
-
-        LSN page_lsn = it->second->getPageLSN();
-        if (page_lsn == 0) {
-            return;
-        }
-
-        std::cout << "WAL rule: page " << page_id
-                  << " has pageLSN " << page_lsn
-                  << "; require flushedLSN >= pageLSN before "
-                  << reason << "." << std::endl;
-
-        auto flushed = log_force_callback(page_lsn);
-        LSN before = flushed.first;
-        LSN after = flushed.second;
-        if (after < page_lsn) {
-            throw std::runtime_error("WAL rule violated: flushedLSN < pageLSN.");
-        }
-
-        if (before < page_lsn) {
-            std::cout << "WAL rule: flushedLSN advanced from "
-                      << before << " to " << after
-                      << "; page flush is safe." << std::endl;
-        } else {
-            std::cout << "WAL rule: flushedLSN already "
-                      << before << "; page flush is safe." << std::endl;
-        }
-    }
+    void forceLogBeforePageFlush(PageID page_id, const std::string& reason);
 
     void evictUnpinnedPage() {
         size_t attempts = pageMap.size();
@@ -689,7 +656,7 @@ private:
                 continue;
             }
 
-            forceLogBeforeFlush(evictedPageId, "eviction");
+            forceLogBeforePageFlush(evictedPageId, "eviction");
             storage_manager.flush(evictedPageId, pageMap[evictedPageId]);
             pageMap.erase(evictedPageId);
             return;
@@ -802,17 +769,32 @@ bool parseLogRecordType(const std::string& type,
 class LogManager {
 private:
     std::vector<std::pair<LSN, std::string>> pending_records;
+    int log_fd = -1;
+    bool log_existed_at_open = false;
     LSN next_lsn = 1;
     LSN flushed_lsn = 0;
     size_t records_written = 0;
     size_t bytes_written = 0;
 
 public:
-    void reset() {
-        std::ofstream output(log_filename, std::ios::trunc);
-        if (!output) {
-            throw std::runtime_error("Unable to reset recovery log.");
+    LogManager() {
+        openLogFile();
+    }
+
+    ~LogManager() {
+        if (log_fd != -1) {
+            ::close(log_fd);
         }
+    }
+
+    void reset() {
+        if (::ftruncate(log_fd, 0) == -1) {
+            throw std::runtime_error(
+                "Unable to reset recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        syncLogFile();
         pending_records.clear();
         next_lsn = 1;
         flushed_lsn = 0;
@@ -834,29 +816,88 @@ public:
             return false;
         }
 
-        std::ofstream output(log_filename, std::ios::app);
-        if (!output) {
-            throw std::runtime_error("Unable to force recovery log.");
+        size_t force_count = 0;
+        LSN last_forced_lsn = flushed_lsn;
+        std::string log_bytes;
+        while (force_count < pending_records.size() &&
+               pending_records[force_count].first <= lsn) {
+            log_bytes += pending_records[force_count].second;
+            log_bytes += "\n";
+            last_forced_lsn = pending_records[force_count].first;
+            force_count++;
+        }
+        if (force_count == 0) {
+            return false;
         }
 
-        bool wrote = false;
-        while (!pending_records.empty() &&
-               pending_records.front().first <= lsn) {
-            output << pending_records.front().second << "\n";
-            flushed_lsn = pending_records.front().first;
-            pending_records.erase(pending_records.begin());
-            wrote = true;
+        size_t written = 0;
+        while (written < log_bytes.size()) {
+            ssize_t result = ::write(log_fd,
+                                     log_bytes.data() + written,
+                                     log_bytes.size() - written);
+            if (result == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                int saved_errno = errno;
+                throw std::runtime_error(
+                    "Unable to write recovery log: " +
+                    std::string(std::strerror(saved_errno))
+                );
+            }
+            written += static_cast<size_t>(result);
         }
-        output.flush();
-        return wrote;
+
+        syncLogFile();
+
+        flushed_lsn = last_forced_lsn;
+        pending_records.erase(pending_records.begin(),
+                              pending_records.begin() + force_count);
+        return true;
     }
 
     LSN getFlushedLSN() const {
         return flushed_lsn;
     }
 
+    bool existedAtOpen() const {
+        return log_existed_at_open;
+    }
+
     std::vector<LogRecord> readAll() {
-        std::ifstream input(log_filename);
+        if (::lseek(log_fd, 0, SEEK_SET) == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+
+        std::string log_contents;
+        char buffer[4096];
+        while (true) {
+            ssize_t result = ::read(log_fd, buffer, sizeof(buffer));
+            if (result == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(
+                    "Unable to read recovery log: " +
+                    std::string(std::strerror(errno))
+                );
+            }
+            if (result == 0) {
+                break;
+            }
+            log_contents.append(buffer, static_cast<size_t>(result));
+        }
+        if (::lseek(log_fd, 0, SEEK_END) == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log end: " +
+                std::string(std::strerror(errno))
+            );
+        }
+
+        std::istringstream input(log_contents);
         std::vector<LogRecord> records;
         std::string line;
         LSN durable_lsn = flushed_lsn;
@@ -874,6 +915,31 @@ public:
     }
 
 private:
+    void openLogFile() {
+        if (log_fd != -1) {
+            return;
+        }
+        log_existed_at_open = (::access(log_filename.c_str(), F_OK) == 0);
+        log_fd = ::open(log_filename.c_str(),
+                        O_RDWR | O_CREAT | O_APPEND,
+                        0644);
+        if (log_fd == -1) {
+            throw std::runtime_error(
+                "Unable to open recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+    }
+
+    void syncLogFile() {
+        if (::fsync(log_fd) == -1) {
+            throw std::runtime_error(
+                "Unable to sync recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+    }
+
     LogRecord parse(const std::string& line) const {
         std::istringstream input(line);
         LSN lsn = 0;
@@ -946,24 +1012,56 @@ private:
     }
 };
 
+void BufferManager::forceLogBeforePageFlush(PageID page_id,
+                                        const std::string& reason) {
+    auto it = pageMap.find(page_id);
+    if (it == pageMap.end()) {
+        return;
+    }
+
+    LSN page_lsn = it->second->getPageLSN();
+    if (page_lsn == 0) {
+        return;
+    }
+
+    std::cout << "WAL rule: page " << page_id
+              << " has pageLSN " << page_lsn
+              << "; require flushedLSN >= pageLSN before "
+              << reason << "." << std::endl;
+
+    LSN before = log_manager.getFlushedLSN();
+    log_manager.forceUpTo(page_lsn);
+    LSN after = log_manager.getFlushedLSN();
+    if (after < page_lsn) {
+        throw std::runtime_error("WAL rule violated: flushedLSN < pageLSN.");
+    }
+
+    if (before < page_lsn) {
+        std::cout << "WAL rule: flushedLSN advanced from "
+                  << before << " to " << after
+                  << "; page flush is safe." << std::endl;
+    } else {
+        std::cout << "WAL rule: flushedLSN already "
+                  << before << "; page flush is safe." << std::endl;
+    }
+}
+
 class RecoveryManager {
 private:
     BufferManager& buffer_manager;
+    LogManager& log_manager;
     bool txn_active = false;
     CrashPoint crash_point = CrashPoint::NONE;
     int next_txn_id = 1;
     int current_txn_id = 0;
-    LogManager log_manager;
     std::vector<LogRecord> staged_records;
     std::vector<PageID> dirty_pages;
 
 public:
-    RecoveryManager(BufferManager& buffer_manager)
-        : buffer_manager(buffer_manager) {
-        buffer_manager.setLogForceCallback([this](LSN lsn) {
-            return forceLogUpTo(lsn);
-        });
-    }
+    RecoveryManager(BufferManager& buffer_manager,
+                    LogManager& log_manager)
+        : buffer_manager(buffer_manager),
+          log_manager(log_manager) {}
 
     bool isActive() const {
         return txn_active;
@@ -1161,8 +1259,7 @@ private:
     }
 
     bool logExists() const {
-        std::ifstream input(log_filename);
-        return static_cast<bool>(input);
+        return log_manager.existedAtOpen();
     }
 
     [[noreturn]] void throwInconsistentDatabase(const std::string& reason) const {
@@ -1674,7 +1771,7 @@ public:
 
         if (page_manager.recoveryActive()) {
             throw std::runtime_error(
-                "INSERT requiring a new page inside a WAL transaction is not supported in v54."
+                "INSERT requiring a new page inside a WAL transaction is not supported."
             );
         }
 
@@ -2844,6 +2941,7 @@ public:
 
 class BuzzDB {
 public:
+    LogManager log_manager;
     BufferManager buffer_manager;
     RecoveryManager recovery_manager;
     PageManager page_manager;
@@ -2852,7 +2950,9 @@ public:
     TxnPtr active_txn;
 
 public:
-    BuzzDB() : recovery_manager(buffer_manager),
+    BuzzDB() : log_manager(),
+               buffer_manager(log_manager),
+               recovery_manager(buffer_manager, log_manager),
                page_manager(buffer_manager, recovery_manager),
                catalog(buffer_manager, page_manager) {
         recovery_manager.recover();

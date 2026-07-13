@@ -10,9 +10,13 @@
 #include <regex>
 #include <stdexcept>
 #include <cassert>
+#include <cerrno>
 #include <cctype>
 #include <cstring>
+#include <fcntl.h>
 #include <set>
+#include <utility>
+#include <unistd.h>
 
 enum FieldType { INT, FLOAT, STRING };
 
@@ -214,12 +218,13 @@ std::string tupleToString(const Tuple& tuple) {
     return output.str();
 }
 
-static constexpr size_t PAGE_SIZE = 4096;  // Fixed page size
-static constexpr size_t MAX_SLOTS = 512;   // Fixed number of slots
+static constexpr size_t PAGE_SIZE = 256;  // Small pages make DPT/pageLSN behavior visible.
+static constexpr size_t MAX_SLOTS = 16;   // Keep the slot directory small enough for 256-byte pages.
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
 
 using PageID = uint16_t;
 using TableId = uint16_t;
+using LSN = uint64_t;
 
 constexpr PageID CATALOG_PAGE_ID = 0;
 constexpr PageID INVALID_PAGE_ID = std::numeric_limits<PageID>::max();
@@ -232,12 +237,15 @@ const std::string BOOTSTRAP_MAGIC = "BUZZDB_BOOTSTRAP";
 enum class CrashPoint {
     NONE,
     AFTER_COMMIT_LOG_FORCE,
+    AFTER_ABORT_LOG_FORCE,
+    AFTER_FIRST_CLR_DURING_ABORT,
     AFTER_STEAL_PAGE_FLUSH
 };
 
 struct PageHeader {
     TableId table_id = INVALID_TABLE_ID;
     PageID next_page = INVALID_PAGE_ID;
+    LSN page_lsn = 0;
 };
 
 struct Slot {
@@ -245,6 +253,9 @@ struct Slot {
     uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
     uint16_t length = INVALID_VALUE;    // Length of the slot
 };
+
+static_assert(sizeof(Slot) * MAX_SLOTS + sizeof(PageHeader) < PAGE_SIZE,
+              "Slot directory and page header must leave tuple space.");
 
 // Slotted Page class
 class SlottedPage {
@@ -267,6 +278,7 @@ public:
 
         header()->table_id = INVALID_TABLE_ID;
         header()->next_page = INVALID_PAGE_ID;
+        header()->page_lsn = 0;
     }
 
     TableId getTableId() const {
@@ -283,6 +295,14 @@ public:
 
     void setNextPage(PageID page_id) {
         header()->next_page = page_id;
+    }
+
+    LSN getPageLSN() const {
+        return header()->page_lsn;
+    }
+
+    void setPageLSN(LSN page_lsn) {
+        header()->page_lsn = page_lsn;
     }
 
     bool addTuple(std::unique_ptr<Tuple> tuple) {
@@ -554,18 +574,22 @@ public:
 
 constexpr size_t MAX_PAGES_IN_MEMORY = 10;
 
+class LogManager;
+
 class BufferManager {
 private:
     using PageMap = std::unordered_map<PageID, std::unique_ptr<SlottedPage>>;
 
     StorageManager storage_manager;
     PageMap pageMap;
+    LogManager& log_manager;
     std::unique_ptr<Policy> policy;
     std::set<PageID> pinned_pages;
 
 public:
-    BufferManager(): 
-    policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
+    explicit BufferManager(LogManager& log_manager)
+        : log_manager(log_manager),
+          policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
 
     std::unique_ptr<SlottedPage>& getPage(int page_id) {
         auto it = pageMap.find(page_id);
@@ -585,8 +609,10 @@ public:
         return pageMap[page_id];
     }
 
-    void flushPage(int page_id) {
-        storage_manager.flush(page_id, pageMap[page_id]);
+    void flushPage(int page_id, const std::string& reason = "page flush") {
+        auto& page = getPage(page_id);
+        forceLogBeforePageFlush(page_id, reason);
+        storage_manager.flush(page_id, page);
     }
 
     void pinPage(PageID page_id) {
@@ -621,6 +647,8 @@ public:
     }
 
 private:
+    void forceLogBeforePageFlush(PageID page_id, const std::string&);
+
     void evictUnpinnedPage() {
         size_t attempts = pageMap.size();
         while (attempts-- > 0) {
@@ -633,6 +661,7 @@ private:
                 continue;
             }
 
+            forceLogBeforePageFlush(evictedPageId, "eviction");
             storage_manager.flush(evictedPageId, pageMap[evictedPageId]);
             pageMap.erase(evictedPageId);
             return;
@@ -647,18 +676,24 @@ enum class LogRecordType {
     UPDATE,
     INSERT,
     DELETE,
+    CLR,
     COMMIT,
-    ABORT
+    ABORT,
+    END
 };
 
 bool isTupleChangeRecord(LogRecordType type);
 
 struct LogRecord {
+    LSN lsn = 0;
+    LSN prev_lsn = 0;
     LogRecordType type;
     int txn_id = 0;
     TableId table_id = INVALID_TABLE_ID;
     PageID page_id = INVALID_PAGE_ID;
     size_t slot_id = 0;
+    LogRecordType undo_type = LogRecordType::UPDATE;
+    LSN undo_next_lsn = 0;
     std::unique_ptr<Tuple> before_tuple;
     std::unique_ptr<Tuple> after_tuple;
 
@@ -682,8 +717,22 @@ struct LogRecord {
 };
 
 struct RecoveryAnalysis {
-    std::map<int, bool> committed_txns;
-    std::map<int, bool> aborted_txns;
+    enum class TxnStatus {
+        RUNNING,
+        COMMITTING,
+        ABORTING
+    };
+
+    struct ActiveTransactionEntry {
+        TxnStatus status = TxnStatus::RUNNING;
+        LSN last_lsn = 0;
+    };
+
+    using ActiveTransactionTable = std::map<int, ActiveTransactionEntry>;
+    using DirtyPageTable = std::map<PageID, LSN>;
+
+    ActiveTransactionTable active_transaction_table;
+    DirtyPageTable dirty_page_table;
     int next_txn_id = 1;
 };
 
@@ -691,6 +740,10 @@ bool isTupleChangeRecord(LogRecordType type) {
     return type == LogRecordType::UPDATE ||
            type == LogRecordType::INSERT ||
            type == LogRecordType::DELETE;
+}
+
+bool isRedoableRecord(LogRecordType type) {
+    return isTupleChangeRecord(type) || type == LogRecordType::CLR;
 }
 
 std::string logRecordName(LogRecordType type) {
@@ -703,10 +756,14 @@ std::string logRecordName(LogRecordType type) {
             return "INSERT";
         case LogRecordType::DELETE:
             return "DELETE";
+        case LogRecordType::CLR:
+            return "CLR";
         case LogRecordType::COMMIT:
             return "COMMIT";
         case LogRecordType::ABORT:
             return "ABORT";
+        case LogRecordType::END:
+            return "END";
     }
     throw std::runtime_error("Unknown log record.");
 }
@@ -729,6 +786,10 @@ bool parseLogRecordType(const std::string& type,
         record_type = LogRecordType::DELETE;
         return true;
     }
+    if (type == "CLR") {
+        record_type = LogRecordType::CLR;
+        return true;
+    }
     if (type == "COMMIT") {
         record_type = LogRecordType::COMMIT;
         return true;
@@ -737,54 +798,199 @@ bool parseLogRecordType(const std::string& type,
         record_type = LogRecordType::ABORT;
         return true;
     }
+    if (type == "END") {
+        record_type = LogRecordType::END;
+        return true;
+    }
     return false;
 }
 
 class LogManager {
 private:
+    std::vector<std::pair<LSN, std::string>> pending_records;
+    int log_fd = -1;
+    bool log_existed_at_open = false;
+    LSN next_lsn = 1;
+    LSN flushed_lsn = 0;
     size_t records_written = 0;
     size_t bytes_written = 0;
 
 public:
-    void reset() {
-        std::ofstream output(log_filename, std::ios::trunc);
-        if (!output) {
-            throw std::runtime_error("Unable to reset recovery log.");
+    LogManager() {
+        openLogFile();
+    }
+
+    ~LogManager() {
+        if (log_fd != -1) {
+            ::close(log_fd);
         }
+    }
+
+    void reset() {
+        if (::ftruncate(log_fd, 0) == -1) {
+            throw std::runtime_error(
+                "Unable to reset recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        syncLogFile();
+        pending_records.clear();
+        next_lsn = 1;
+        flushed_lsn = 0;
         records_written = 0;
         bytes_written = 0;
     }
 
-    void append(const LogRecord& record) {
+    LSN append(LogRecord& record) {
+        record.lsn = next_lsn++;
         auto text = serialize(record);
-        std::ofstream output(log_filename, std::ios::app);
-        if (!output) {
-            throw std::runtime_error("Unable to append to recovery log.");
-        }
-        output << text << "\n";
-        output.flush();
+        pending_records.push_back({record.lsn, text});
         records_written++;
         bytes_written += text.size() + 1;
+        return record.lsn;
     }
 
-    std::vector<LogRecord> readAll() const {
-        std::ifstream input(log_filename);
+    bool forceUpTo(LSN lsn) {
+        if (lsn <= flushed_lsn) {
+            return false;
+        }
+
+        size_t force_count = 0;
+        LSN last_forced_lsn = flushed_lsn;
+        std::string log_bytes;
+        while (force_count < pending_records.size() &&
+               pending_records[force_count].first <= lsn) {
+            log_bytes += pending_records[force_count].second;
+            log_bytes += "\n";
+            last_forced_lsn = pending_records[force_count].first;
+            force_count++;
+        }
+        if (force_count == 0) {
+            return false;
+        }
+
+        writeAll(log_bytes);
+        syncLogFile();
+
+        flushed_lsn = last_forced_lsn;
+        pending_records.erase(pending_records.begin(),
+                              pending_records.begin() + force_count);
+        return true;
+    }
+
+    LSN getFlushedLSN() const {
+        return flushed_lsn;
+    }
+
+    bool existedAtOpen() const {
+        return log_existed_at_open;
+    }
+
+    std::vector<LogRecord> readAll() {
+        std::istringstream input(readLogContentsFromOffset(0));
         std::vector<LogRecord> records;
         std::string line;
+        LSN durable_lsn = flushed_lsn;
+        pending_records.clear();
         while (std::getline(input, line)) {
             if (!line.empty()) {
-                records.push_back(parse(line));
+                auto record = parse(line);
+                durable_lsn = std::max(durable_lsn, record.lsn);
+                records.push_back(std::move(record));
             }
         }
+        flushed_lsn = durable_lsn;
+        next_lsn = std::max(next_lsn, durable_lsn + 1);
         return records;
     }
 
 private:
+    void openLogFile() {
+        if (log_fd != -1) {
+            return;
+        }
+        log_existed_at_open = (::access(log_filename.c_str(), F_OK) == 0);
+        log_fd = ::open(log_filename.c_str(),
+                        O_RDWR | O_CREAT | O_APPEND,
+                        0644);
+        if (log_fd == -1) {
+            throw std::runtime_error(
+                "Unable to open recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+    }
+
+    void writeAll(const std::string& bytes) {
+        size_t written = 0;
+        while (written < bytes.size()) {
+            ssize_t result = ::write(log_fd,
+                                     bytes.data() + written,
+                                     bytes.size() - written);
+            if (result == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(
+                    "Unable to write recovery log: " +
+                    std::string(std::strerror(errno))
+                );
+            }
+            written += static_cast<size_t>(result);
+        }
+    }
+
+    void syncLogFile() {
+        if (::fsync(log_fd) == -1) {
+            throw std::runtime_error(
+                "Unable to sync recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+    }
+
+    std::string readLogContentsFromOffset(size_t start_offset) {
+        if (::lseek(log_fd, static_cast<off_t>(start_offset), SEEK_SET) == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+
+        std::string contents;
+        char buffer[4096];
+        while (true) {
+            ssize_t result = ::read(log_fd, buffer, sizeof(buffer));
+            if (result == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(
+                    "Unable to read recovery log: " +
+                    std::string(std::strerror(errno))
+                );
+            }
+            if (result == 0) {
+                break;
+            }
+            contents.append(buffer, static_cast<size_t>(result));
+        }
+        if (::lseek(log_fd, 0, SEEK_END) == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log end: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        return contents;
+    }
+
     LogRecord parse(const std::string& line) const {
         std::istringstream input(line);
+        LSN lsn = 0;
         std::string type;
         int txn_id = 0;
-        input >> type >> txn_id;
+        LSN prev_lsn = 0;
+        input >> lsn >> type >> txn_id >> prev_lsn;
         if (!input) {
             throw std::runtime_error("Bad log record: " + line);
         }
@@ -795,7 +1001,30 @@ private:
         }
 
         LogRecord record{record_type, txn_id};
-        if (isTupleChangeRecord(record_type)) {
+        record.lsn = lsn;
+        record.prev_lsn = prev_lsn;
+        if (record_type == LogRecordType::CLR) {
+            std::string undo_type;
+            int table_id = 0;
+            int page_id = 0;
+            size_t slot_id = 0;
+            input >> record.undo_next_lsn
+                  >> undo_type
+                  >> table_id
+                  >> page_id
+                  >> slot_id;
+            if (!input || !parseLogRecordType(undo_type, record.undo_type) ||
+                !isTupleChangeRecord(record.undo_type)) {
+                throw std::runtime_error("Bad CLR log record: " + line);
+            }
+
+            record.table_id = static_cast<TableId>(table_id);
+            record.page_id = static_cast<PageID>(page_id);
+            record.slot_id = slot_id;
+            if (record.undo_type != LogRecordType::INSERT) {
+                record.after_tuple = Tuple::deserialize(input);
+            }
+        } else if (isTupleChangeRecord(record_type)) {
             int table_id = 0;
             int page_id = 0;
             size_t slot_id = 0;
@@ -807,7 +1036,12 @@ private:
             record.table_id = static_cast<TableId>(table_id);
             record.page_id = static_cast<PageID>(page_id);
             record.slot_id = slot_id;
-            if (record_type != LogRecordType::DELETE) {
+            if (record_type == LogRecordType::UPDATE ||
+                record_type == LogRecordType::DELETE) {
+                record.before_tuple = Tuple::deserialize(input);
+            }
+            if (record_type == LogRecordType::UPDATE ||
+                record_type == LogRecordType::INSERT) {
                 record.after_tuple = Tuple::deserialize(input);
             }
         }
@@ -816,13 +1050,38 @@ private:
 
     std::string serialize(const LogRecord& record) const {
         std::ostringstream output;
-        output << logRecordName(record.type) << " "
-               << record.txn_id;
-        if (isTupleChangeRecord(record.type)) {
+        if (record.lsn == 0) {
+            throw std::runtime_error("Log record is missing an LSN.");
+        }
+        output << record.lsn << " "
+               << logRecordName(record.type) << " "
+               << record.txn_id << " "
+               << record.prev_lsn;
+        if (record.type == LogRecordType::CLR) {
+            output << " " << record.undo_next_lsn
+                   << " " << logRecordName(record.undo_type)
+                   << " " << record.table_id
+                   << " " << record.page_id
+                   << " " << record.slot_id;
+            if (record.undo_type != LogRecordType::INSERT) {
+                if (!record.after_tuple) {
+                    throw std::runtime_error("CLR is missing after-undo image.");
+                }
+                output << " " << record.after_tuple->serialize();
+            }
+        } else if (isTupleChangeRecord(record.type)) {
             output << " " << record.table_id
                    << " " << record.page_id
                    << " " << record.slot_id;
-            if (record.type != LogRecordType::DELETE) {
+            if (record.type == LogRecordType::UPDATE ||
+                record.type == LogRecordType::DELETE) {
+                if (!record.before_tuple) {
+                    throw std::runtime_error("Log record is missing before image.");
+                }
+                output << " " << record.before_tuple->serialize();
+            }
+            if (record.type == LogRecordType::UPDATE ||
+                record.type == LogRecordType::INSERT) {
                 if (!record.after_tuple) {
                     throw std::runtime_error("Log record is missing after image.");
                 }
@@ -833,20 +1092,41 @@ private:
     }
 };
 
+void BufferManager::forceLogBeforePageFlush(PageID page_id,
+                                        const std::string&) {
+    auto it = pageMap.find(page_id);
+    if (it == pageMap.end()) {
+        return;
+    }
+
+    LSN page_lsn = it->second->getPageLSN();
+    if (page_lsn == 0) {
+        return;
+    }
+
+    log_manager.forceUpTo(page_lsn);
+    if (log_manager.getFlushedLSN() < page_lsn) {
+        throw std::runtime_error("WAL rule violated: flushedLSN < pageLSN.");
+    }
+}
+
 class RecoveryManager {
 private:
     BufferManager& buffer_manager;
+    LogManager& log_manager;
     bool txn_active = false;
     CrashPoint crash_point = CrashPoint::NONE;
     int next_txn_id = 1;
     int current_txn_id = 0;
-    LogManager log_manager;
+    LSN current_txn_last_lsn = 0;
     std::vector<LogRecord> staged_records;
     std::vector<PageID> dirty_pages;
 
 public:
-    RecoveryManager(BufferManager& buffer_manager)
-        : buffer_manager(buffer_manager) {}
+    RecoveryManager(BufferManager& buffer_manager,
+                    LogManager& log_manager)
+        : buffer_manager(buffer_manager),
+          log_manager(log_manager) {}
 
     bool isActive() const {
         return txn_active;
@@ -864,14 +1144,21 @@ public:
         auto records = log_manager.readAll();
         auto analysis = analysisPass(records);
         next_txn_id = std::max(next_txn_id, analysis.next_txn_id);
-        std::cout << "Recovery analysis: "
-                  << analysis.committed_txns.size()
+        std::cout << "ARIES analysis: "
+                  << countCommittedTransactions(records)
                   << " committed transaction(s), "
+                  << countLoserTransactions(analysis)
+                  << " loser transaction(s), "
                   << records.size()
                   << " log record(s), "
                   << countRedoRecords(records)
-                  << " redo record(s)." << std::endl;
+                  << " redo record(s), "
+                  << countUndoRecords(records, analysis)
+                  << " undo record(s)." << std::endl;
+        printActiveTransactionTable(analysis);
+        printDirtyPageTable(analysis);
         redoPass(records, analysis);
+        undoPass(records, analysis);
     }
 
     void resetLog() {
@@ -888,11 +1175,15 @@ public:
         }
         txn_active = true;
         current_txn_id = next_txn_id++;
+        current_txn_last_lsn = 0;
         staged_records.clear();
         dirty_pages.clear();
-        log_manager.append(LogRecord{LogRecordType::BEGIN, current_txn_id});
-        std::cout << "\nWAL txn " << current_txn_id
-                  << " BEGIN (NO-STEAL/NO-FORCE)" << std::endl;
+        LogRecord begin_record{LogRecordType::BEGIN, current_txn_id};
+        LSN begin_lsn = appendTxnRecord(begin_record);
+        std::cout << "\nLog txn " << current_txn_id
+                  << " BEGIN, LSN "
+                  << begin_lsn
+                  << " prevLSN 0" << std::endl;
         return current_txn_id;
     }
 
@@ -901,30 +1192,40 @@ public:
             throw std::runtime_error("COMMIT without BEGIN.");
         }
 
-        for (const auto& record : staged_records) {
-            log_manager.append(record);
-        }
-        log_manager.append(LogRecord{LogRecordType::COMMIT, current_txn_id});
+        LogRecord commit_record{LogRecordType::COMMIT, current_txn_id};
+        LSN commit_lsn = appendTxnRecord(commit_record);
+        forceLogUpTo(commit_lsn);
 
         if (!staged_records.empty()) {
-            std::cout << "NO-FORCE commit: forced "
+            std::cout << "Commit txn " << current_txn_id
+                      << ": forced COMMIT LSN "
+                      << commit_lsn << "; "
                       << staged_records.size()
-                      << " tuple-change log record(s) plus COMMIT; "
-                      << "dirty data pages are not forced."
+                      << " tuple-change record(s) are durable."
                       << std::endl;
-
-            crashIfRequested(
-                CrashPoint::AFTER_COMMIT_LOG_FORCE,
-                "Simulated crash after forced COMMIT log, before NO-FORCE data pages reach disk"
-            );
         } else {
-            std::cout << "NO-FORCE commit: forced COMMIT log record for read-only transaction."
+            std::cout << "Commit txn " << current_txn_id
+                      << ": forced read-only COMMIT LSN "
+                      << commit_lsn
+                      << "."
                       << std::endl;
         }
 
-        unpinDirtyPages();
+        crashIfRequested(
+            CrashPoint::AFTER_COMMIT_LOG_FORCE,
+            "Simulated crash after COMMIT log record reached disk, before END"
+        );
+
+        LogRecord end_record{LogRecordType::END, current_txn_id};
+        LSN end_lsn = appendTxnRecord(end_record);
+        forceLogUpTo(end_lsn);
+        std::cout << "Log txn " << current_txn_id
+                  << " END, LSN " << end_lsn
+                  << " prevLSN " << end_record.prev_lsn << std::endl;
+
         staged_records.clear();
         dirty_pages.clear();
+        current_txn_last_lsn = 0;
         current_txn_id = 0;
         crash_point = CrashPoint::NONE;
         txn_active = false;
@@ -935,26 +1236,52 @@ public:
             throw std::runtime_error("ABORT without BEGIN.");
         }
 
+        LogRecord abort_record{LogRecordType::ABORT, current_txn_id};
+        LSN abort_lsn = appendTxnRecord(abort_record);
+        forceLogUpTo(abort_lsn);
+        std::cout << "Abort txn " << current_txn_id
+                  << ": forced ABORT LSN " << abort_lsn
+                  << "; undo begins." << std::endl;
+        crashIfRequested(
+            CrashPoint::AFTER_ABORT_LOG_FORCE,
+            "Simulated crash after ABORT log record reached disk, before CLRs or END"
+        );
+
         for (auto it = staged_records.rbegin(); it != staged_records.rend(); ++it) {
-            auto& page = buffer_manager.getPage(it->page_id);
-            if (it->type == LogRecordType::INSERT) {
-                page->deleteTuple(it->slot_id);
-            } else {
-                if (!it->before_tuple ||
-                    !page->putTupleAtSlot(it->slot_id, it->before_tuple->clone())) {
-                    throw std::runtime_error("Unable to restore tuple during ABORT.");
-                }
+            LogRecord clr = makeClrRecord(current_txn_id,
+                                          current_txn_last_lsn,
+                                          *it);
+            LSN clr_lsn = log_manager.append(clr);
+            current_txn_last_lsn = clr_lsn;
+            applyRecordToPage(clr);
+            printClrAction(clr, "runtime abort");
+            if (shouldCrashAt(CrashPoint::AFTER_FIRST_CLR_DURING_ABORT)) {
+                forceLogUpTo(clr_lsn);
+                crashIfRequested(
+                    CrashPoint::AFTER_FIRST_CLR_DURING_ABORT,
+                    "Simulated crash after first CLR reached disk, before abort undo completed"
+                );
             }
         }
 
-        log_manager.append(LogRecord{LogRecordType::ABORT, current_txn_id});
-        unpinDirtyPages();
-        std::cout << "NO-STEAL abort: restored "
+        auto forced_pages = forceDirtyPages();
+        std::cout << "Abort txn " << current_txn_id
+                  << ": restored "
                   << staged_records.size()
-                  << " in-memory operation(s), wrote ABORT; no restart undo needed."
+                  << " operation(s), flushed "
+                  << forced_pages
+                  << " restored page(s)."
                   << std::endl;
+        LogRecord end_record{LogRecordType::END, current_txn_id};
+        LSN end_lsn = appendTxnRecord(end_record);
+        forceLogUpTo(end_lsn);
+        std::cout << "Log txn " << current_txn_id
+                  << " END, LSN " << end_lsn
+                  << " prevLSN " << end_record.prev_lsn << std::endl;
+
         staged_records.clear();
         dirty_pages.clear();
+        current_txn_last_lsn = 0;
         current_txn_id = 0;
         crash_point = CrashPoint::NONE;
         txn_active = false;
@@ -1013,7 +1340,10 @@ public:
         crash_point = point;
     }
 
-private:
+    bool shouldCrashAt(CrashPoint point) const {
+        return crash_point == point;
+    }
+
     void crashIfRequested(CrashPoint point, const std::string& message) {
         if (crash_point != point) {
             return;
@@ -1022,6 +1352,7 @@ private:
         throw std::runtime_error(message);
     }
 
+private:
     void initializeEmpty() {
         log_manager.reset();
         std::cout << "Recovery: initialized empty WAL file "
@@ -1033,8 +1364,7 @@ private:
     }
 
     bool logExists() const {
-        std::ifstream input(log_filename);
-        return static_cast<bool>(input);
+        return log_manager.existedAtOpen();
     }
 
     [[noreturn]] void throwInconsistentDatabase(const std::string& reason) const {
@@ -1054,10 +1384,26 @@ private:
         return false;
     }
 
-    void unpinDirtyPages() {
+    LSN appendTxnRecord(LogRecord& record) {
+        record.prev_lsn = current_txn_last_lsn;
+        LSN record_lsn = log_manager.append(record);
+        current_txn_last_lsn = record_lsn;
+        return record_lsn;
+    }
+
+    std::pair<LSN, LSN> forceLogUpTo(LSN lsn) {
+        LSN before = log_manager.getFlushedLSN();
+        log_manager.forceUpTo(lsn);
+        return {before, log_manager.getFlushedLSN()};
+    }
+
+    size_t forceDirtyPages() {
+        size_t forced = 0;
         for (PageID page_id : dirty_pages) {
-            buffer_manager.unpinPage(page_id);
+            buffer_manager.flushPage(page_id);
+            forced++;
         }
+        return forced;
     }
 
     void stageRecord(LogRecordType type,
@@ -1067,7 +1413,6 @@ private:
                      std::unique_ptr<Tuple> before_tuple,
                      std::unique_ptr<Tuple> after_tuple) {
         if (!isDirtyPage(page_id)) {
-            buffer_manager.pinPage(page_id);
             dirty_pages.push_back(page_id);
         }
 
@@ -1080,27 +1425,19 @@ private:
             std::move(before_tuple),
             std::move(after_tuple)
         };
-        std::string before_image;
-        if (record.before_tuple) {
-            before_image = tupleToString(*record.before_tuple);
-        }
-        std::string after_image;
-        if (record.after_tuple) {
-            after_image = tupleToString(*record.after_tuple);
-        }
+        LSN record_lsn = appendTxnRecord(record);
+        LSN prev_lsn = record.prev_lsn;
+        auto& page = buffer_manager.getPage(page_id);
+        page->setPageLSN(record_lsn);
         staged_records.push_back(std::move(record));
 
-        std::cout << "NO-STEAL: staged " << logRecordName(type)
-                  << " for table " << table_id
+        std::cout << "Log txn " << current_txn_id
+                  << " " << logRecordName(type)
+                  << " LSN " << record_lsn
+                  << " prevLSN " << prev_lsn
+                  << " (table " << table_id
                   << ", page " << page_id
-                  << ", slot " << slot_id;
-        if (!before_image.empty()) {
-            std::cout << "; before-image " << before_image;
-        }
-        if (!after_image.empty()) {
-            std::cout << "; after-image " << after_image;
-        }
-        std::cout << "; pinned page so uncommitted data cannot be stolen."
+                  << ", slot " << slot_id << ")."
                   << std::endl;
     }
 
@@ -1109,20 +1446,167 @@ private:
         for (const auto& record : records) {
             analysis.next_txn_id = std::max(analysis.next_txn_id,
                                             record.txn_id + 1);
-            if (record.type == LogRecordType::COMMIT) {
-                analysis.committed_txns[record.txn_id] = true;
+            if (record.type == LogRecordType::BEGIN) {
+                analysis.active_transaction_table[record.txn_id] = {
+                    RecoveryAnalysis::TxnStatus::RUNNING,
+                    record.lsn
+                };
+            } else if (isTupleChangeRecord(record.type)) {
+                auto status = RecoveryAnalysis::TxnStatus::RUNNING;
+                auto it = analysis.active_transaction_table.find(record.txn_id);
+                if (it != analysis.active_transaction_table.end()) {
+                    status = it->second.status;
+                }
+                analysis.active_transaction_table[record.txn_id] = {status, record.lsn};
+            } else if (record.type == LogRecordType::CLR) {
+                auto status = RecoveryAnalysis::TxnStatus::RUNNING;
+                auto it = analysis.active_transaction_table.find(record.txn_id);
+                if (it != analysis.active_transaction_table.end()) {
+                    status = it->second.status;
+                }
+                analysis.active_transaction_table[record.txn_id] = {status, record.lsn};
+            } else if (record.type == LogRecordType::COMMIT) {
+                analysis.active_transaction_table[record.txn_id] = {
+                    RecoveryAnalysis::TxnStatus::COMMITTING,
+                    record.lsn
+                };
             } else if (record.type == LogRecordType::ABORT) {
-                analysis.aborted_txns[record.txn_id] = true;
+                analysis.active_transaction_table[record.txn_id] = {
+                    RecoveryAnalysis::TxnStatus::ABORTING,
+                    record.lsn
+                };
+            } else if (record.type == LogRecordType::END) {
+                analysis.active_transaction_table.erase(record.txn_id);
+            }
+
+            if (shouldRedoRecord(record)) {
+                PageID page_id = record.page_id;
+                LSN rec_lsn = record.lsn;
+                if (analysis.dirty_page_table.find(page_id) ==
+                    analysis.dirty_page_table.end()) {
+                    analysis.dirty_page_table[page_id] = rec_lsn;
+                }
             }
         }
         return analysis;
     }
 
+    size_t countCommittedTransactions(
+        const std::vector<LogRecord>& records) const {
+        std::set<int> committed_txns;
+        for (const auto& record : records) {
+            if (record.type == LogRecordType::COMMIT) {
+                committed_txns.insert(record.txn_id);
+            }
+        }
+        return committed_txns.size();
+    }
+
+    bool isLoserTxn(const RecoveryAnalysis::ActiveTransactionEntry& entry) const {
+        return entry.status == RecoveryAnalysis::TxnStatus::RUNNING ||
+               entry.status == RecoveryAnalysis::TxnStatus::ABORTING;
+    }
+
+    bool shouldRedoRecord(const LogRecord& record) const {
+        return isRedoableRecord(record.type);
+    }
+
+    std::string txnStatusName(RecoveryAnalysis::TxnStatus status) const {
+        switch (status) {
+            case RecoveryAnalysis::TxnStatus::RUNNING:
+                return "RUNNING";
+            case RecoveryAnalysis::TxnStatus::COMMITTING:
+                return "COMMITTING";
+            case RecoveryAnalysis::TxnStatus::ABORTING:
+                return "ABORTING";
+        }
+        throw std::runtime_error("Unknown transaction status.");
+    }
+
+    void printActiveTransactionTable(const RecoveryAnalysis& analysis) const {
+        if (analysis.active_transaction_table.empty()) {
+            std::cout << "ActiveTransactionTable after analysis: empty."
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "ActiveTransactionTable after analysis:" << std::endl;
+        for (const auto& txn : analysis.active_transaction_table) {
+            std::cout << "  txn " << txn.first
+                      << " " << txnStatusName(txn.second.status)
+                      << " lastLSN " << txn.second.last_lsn
+                      << std::endl;
+        }
+    }
+
+    void printDirtyPageTable(const RecoveryAnalysis& analysis) const {
+        if (analysis.dirty_page_table.empty()) {
+            std::cout << "DirtyPageTable after analysis: empty."
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "DirtyPageTable after analysis:" << std::endl;
+        for (const auto& [page_id, rec_lsn] : analysis.dirty_page_table) {
+            std::cout << "  page " << page_id
+                      << " recLSN " << rec_lsn
+                      << std::endl;
+        }
+    }
+
+    std::map<LSN, const LogRecord*> recordsByLSN(
+        const std::vector<LogRecord>& records) const {
+        std::map<LSN, const LogRecord*> by_lsn;
+        for (const auto& record : records) {
+            by_lsn[record.lsn] = &record;
+        }
+        return by_lsn;
+    }
+
+    size_t countLoserTransactions(const RecoveryAnalysis& analysis) const {
+        size_t count = 0;
+        for (const auto& entry : analysis.active_transaction_table) {
+            if (isLoserTxn(entry.second)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     size_t countRedoRecords(const std::vector<LogRecord>& records) const {
         size_t count = 0;
         for (const auto& record : records) {
-            if (isTupleChangeRecord(record.type)) {
+            if (shouldRedoRecord(record)) {
                 count++;
+            }
+        }
+        return count;
+    }
+
+    size_t countUndoRecords(const std::vector<LogRecord>& records,
+                            const RecoveryAnalysis& analysis) const {
+        size_t count = 0;
+        auto by_lsn = recordsByLSN(records);
+        for (const auto& txn : analysis.active_transaction_table) {
+            if (!isLoserTxn(txn.second)) {
+                continue;
+            }
+
+            LSN lsn = txn.second.last_lsn;
+            while (lsn != 0) {
+                auto it = by_lsn.find(lsn);
+                if (it == by_lsn.end()) {
+                    throw std::runtime_error("Missing log record in prevLSN chain.");
+                }
+                const auto& record = *it->second;
+                if (record.type == LogRecordType::CLR) {
+                    lsn = record.undo_next_lsn;
+                    continue;
+                }
+                if (isTupleChangeRecord(record.type)) {
+                    count++;
+                }
+                lsn = record.prev_lsn;
             }
         }
         return count;
@@ -1130,47 +1614,221 @@ private:
 
     void redoPass(const std::vector<LogRecord>& records,
                   const RecoveryAnalysis& analysis) {
+        LSN min_rec_lsn = 0;
+        for (const auto& [page_id, rec_lsn] : analysis.dirty_page_table) {
+            if (min_rec_lsn == 0 || rec_lsn < min_rec_lsn) {
+                min_rec_lsn = rec_lsn;
+            }
+        }
+
+        if (min_rec_lsn == 0) {
+            std::cout << "ARIES REDO: DPT is empty; no page redo needed."
+                      << std::endl;
+            return;
+        }
+
         size_t applied = 0;
+        size_t examined = 0;
+        size_t skipped_by_dpt = 0;
+        size_t skipped_by_page_lsn = 0;
+        std::cout << "ARIES REDO: start from min recLSN "
+                  << min_rec_lsn << "." << std::endl;
         for (const auto& record : records) {
-            if (!isTupleChangeRecord(record.type)) {
+            if (!shouldRedoRecord(record)) {
                 continue;
             }
-            if (analysis.committed_txns.find(record.txn_id) ==
-                analysis.committed_txns.end()) {
+            if (record.lsn < min_rec_lsn) {
+                skipped_by_dpt++;
                 continue;
             }
-            applyRedo(record.table_id,
-                      record.page_id,
-                      record.slot_id,
-                      record.type,
-                      record.after_tuple ? record.after_tuple->clone() : nullptr);
+
+            examined++;
+            auto dirty_page = analysis.dirty_page_table.find(record.page_id);
+            if (dirty_page == analysis.dirty_page_table.end() ||
+                record.lsn < dirty_page->second) {
+                skipped_by_dpt++;
+                continue;
+            }
+
+            auto& page = buffer_manager.getPage(record.page_id);
+            if (page->getPageLSN() >= record.lsn) {
+                skipped_by_page_lsn++;
+                continue;
+            }
+
+            applyRedo(record);
             printRedoAction(record);
             applied++;
         }
 
-        if (applied != 0) {
-            std::cout << "Restart recovery: REDO applied " << applied
-                      << " committed log record(s) because NO-FORCE may leave data pages stale."
-                      << std::endl;
+        std::cout << "ARIES REDO: examined " << examined
+                  << " redo record(s), skipped " << skipped_by_dpt
+                  << " by DPT/recLSN, skipped " << skipped_by_page_lsn
+                  << " by pageLSN, replayed " << applied
+                  << " history log record(s)." << std::endl;
+    }
+
+    void undoPass(const std::vector<LogRecord>& records,
+                  const RecoveryAnalysis& analysis) {
+        size_t applied = 0;
+        size_t ended_txns = 0;
+        auto by_lsn = recordsByLSN(records);
+        std::map<int, LSN> last_lsn_by_txn;
+        std::map<LSN, int> to_undo;
+
+        for (const auto& txn : analysis.active_transaction_table) {
+            int txn_id = txn.first;
+            const auto& entry = txn.second;
+
+            if (entry.status == RecoveryAnalysis::TxnStatus::COMMITTING) {
+                LSN end_lsn = appendRecoveryRecord(txn_id,
+                                                   LogRecordType::END,
+                                                   entry.last_lsn);
+                std::cout << "Recovery: txn " << txn_id
+                          << " had COMMIT but no END; wrote END LSN "
+                          << end_lsn << "." << std::endl;
+                ended_txns++;
+                continue;
+            }
+
+            if (!isLoserTxn(entry)) {
+                continue;
+            }
+
+            LSN txn_last_lsn = entry.last_lsn;
+            if (entry.status != RecoveryAnalysis::TxnStatus::ABORTING) {
+                LSN abort_lsn = appendRecoveryRecord(txn_id,
+                                                     LogRecordType::ABORT,
+                                                     txn_last_lsn);
+                txn_last_lsn = abort_lsn;
+                std::cout << "Recovery: txn " << txn_id
+                          << " was a loser; wrote ABORT LSN "
+                          << abort_lsn << " before undo." << std::endl;
+            }
+            last_lsn_by_txn[txn_id] = txn_last_lsn;
+            if (entry.last_lsn != 0) {
+                to_undo[entry.last_lsn] = txn_id;
+            }
+        }
+
+        while (!to_undo.empty()) {
+            auto next = std::prev(to_undo.end());
+            LSN lsn = next->first;
+            int txn_id = next->second;
+            to_undo.erase(next);
+
+            auto record_it = by_lsn.find(lsn);
+            if (record_it == by_lsn.end()) {
+                throw std::runtime_error("Missing log record in toUndo set.");
+            }
+
+            const auto& record = *record_it->second;
+            if (record.type == LogRecordType::CLR) {
+                if (record.undo_next_lsn != 0) {
+                    to_undo[record.undo_next_lsn] = txn_id;
+                }
+                continue;
+            }
+
+            if (isTupleChangeRecord(record.type)) {
+                LogRecord clr = makeClrRecord(txn_id,
+                                              last_lsn_by_txn[txn_id],
+                                              record);
+                LSN clr_lsn = log_manager.append(clr);
+                last_lsn_by_txn[txn_id] = clr_lsn;
+                applyRedo(clr);
+                printClrAction(clr, "restart undo");
+                applied++;
+            }
+
+            if (record.prev_lsn != 0) {
+                to_undo[record.prev_lsn] = txn_id;
+            }
+        }
+
+        for (const auto& loser : last_lsn_by_txn) {
+            LSN end_lsn = appendRecoveryRecord(loser.first,
+                                               LogRecordType::END,
+                                               loser.second);
+            std::cout << "Recovery: txn " << loser.first
+                      << " undo complete; wrote END LSN "
+                      << end_lsn << "." << std::endl;
+            ended_txns++;
+        }
+
+        if (applied != 0 || ended_txns != 0) {
+            std::cout << "ARIES UNDO: used toUndo and prevLSN/undoNextLSN chains, wrote "
+                      << applied
+                      << " CLR(s), and ended "
+                      << ended_txns
+                      << " transaction(s)." << std::endl;
         }
     }
 
-    void applyRedo(TableId table_id,
-                   PageID page_id,
-                   size_t slot_id,
-                   LogRecordType type,
-                   std::unique_ptr<Tuple> after_tuple) {
-        auto& page = buffer_manager.getPage(page_id);
-        if (page->getTableId() != table_id) {
+    LSN appendRecoveryRecord(int txn_id,
+                             LogRecordType type,
+                             LSN prev_lsn) {
+        LogRecord record{type, txn_id};
+        record.prev_lsn = prev_lsn;
+        LSN record_lsn = log_manager.append(record);
+        forceLogUpTo(record_lsn);
+        return record_lsn;
+    }
+
+    LogRecord makeClrRecord(int txn_id,
+                            LSN prev_lsn,
+                            const LogRecord& undone_record) {
+        if (!isTupleChangeRecord(undone_record.type)) {
+            throw std::runtime_error("CLR requested for non-update log record.");
+        }
+
+        LogRecord clr{LogRecordType::CLR, txn_id};
+        clr.prev_lsn = prev_lsn;
+        clr.undo_next_lsn = undone_record.prev_lsn;
+        clr.undo_type = undone_record.type;
+        clr.table_id = undone_record.table_id;
+        clr.page_id = undone_record.page_id;
+        clr.slot_id = undone_record.slot_id;
+        if (undone_record.type != LogRecordType::INSERT) {
+            if (!undone_record.before_tuple) {
+                throw std::runtime_error("Cannot build CLR without before image.");
+            }
+            clr.after_tuple = undone_record.before_tuple->clone();
+        }
+        return clr;
+    }
+
+    void applyRedo(const LogRecord& record) {
+        applyRecordToPage(record);
+        buffer_manager.flushPage(record.page_id);
+    }
+
+    void applyRecordToPage(const LogRecord& record) {
+        auto& page = buffer_manager.getPage(record.page_id);
+        if (page->getTableId() != record.table_id) {
             throw std::runtime_error("WAL redo page ownership mismatch.");
         }
-        if (type == LogRecordType::DELETE) {
-            page->deleteTuple(slot_id);
-        } else if (!after_tuple ||
-                   !page->putTupleAtSlot(slot_id, std::move(after_tuple))) {
+
+        if (record.type == LogRecordType::CLR) {
+            if (record.undo_type == LogRecordType::INSERT) {
+                page->deleteTuple(record.slot_id);
+            } else if (!record.after_tuple ||
+                       !page->putTupleAtSlot(record.slot_id,
+                                             record.after_tuple->clone())) {
+                throw std::runtime_error("Unable to redo CLR operation.");
+            }
+            page->setPageLSN(std::max(page->getPageLSN(), record.lsn));
+            return;
+        }
+
+        if (record.type == LogRecordType::DELETE) {
+            page->deleteTuple(record.slot_id);
+        } else if (!record.after_tuple ||
+                   !page->putTupleAtSlot(record.slot_id,
+                                         record.after_tuple->clone())) {
             throw std::runtime_error("Unable to redo WAL operation.");
         }
-        buffer_manager.flushPage(page_id);
+        page->setPageLSN(std::max(page->getPageLSN(), record.lsn));
     }
 
     void printRedoAction(const LogRecord& record) const {
@@ -1182,16 +1840,35 @@ private:
 
         if (record.type == LogRecordType::INSERT) {
             std::cout << " -> insert tuple after-image";
-            if (record.after_tuple) {
-                std::cout << " " << tupleToString(*record.after_tuple);
-            }
         } else if (record.type == LogRecordType::UPDATE) {
             std::cout << " -> write tuple after-image";
-            if (record.after_tuple) {
-                std::cout << " " << tupleToString(*record.after_tuple);
-            }
         } else if (record.type == LogRecordType::DELETE) {
             std::cout << " -> delete tuple";
+        } else if (record.type == LogRecordType::CLR) {
+            std::cout << " -> redo undo of "
+                      << logRecordName(record.undo_type)
+                      << ", undoNextLSN " << record.undo_next_lsn;
+        }
+        std::cout << std::endl;
+    }
+
+    void printClrAction(const LogRecord& clr, const std::string& reason) const {
+        std::cout << "  CLR txn " << clr.txn_id
+                  << " LSN " << clr.lsn
+                  << " prevLSN " << clr.prev_lsn
+                  << " undoNextLSN " << clr.undo_next_lsn
+                  << " for " << logRecordName(clr.undo_type)
+                  << " during " << reason
+                  << ": table " << clr.table_id
+                  << ", page " << clr.page_id
+                  << ", slot " << clr.slot_id;
+
+        if (clr.undo_type == LogRecordType::INSERT) {
+            std::cout << " -> delete inserted tuple";
+        } else if (clr.undo_type == LogRecordType::UPDATE) {
+            std::cout << " -> restore tuple before-image";
+        } else if (clr.undo_type == LogRecordType::DELETE) {
+            std::cout << " -> restore deleted tuple before-image";
         }
         std::cout << std::endl;
     }
@@ -1277,8 +1954,21 @@ public:
 
     void flushWritePage(TableId, PageID page_id) {
         if (recovery_manager.isActive()) {
-            std::cout << "NO-STEAL: page " << page_id
-                      << " stays dirty only in memory; flush is blocked." << std::endl;
+            if (!recovery_manager.shouldCrashAt(CrashPoint::AFTER_STEAL_PAGE_FLUSH)) {
+                return;
+            }
+            std::cout << "STEAL: trying to flush uncommitted page "
+                      << page_id << " before COMMIT." << std::endl;
+            buffer_manager.flushPage(page_id, "uncommitted STEAL");
+            std::cout << "STEAL: page " << page_id
+                      << " reached disk before COMMIT."
+                      << std::endl;
+            recovery_manager.crashIfRequested(
+                CrashPoint::AFTER_STEAL_PAGE_FLUSH,
+                "Simulated crash after uncommitted page " +
+                std::to_string(page_id) +
+                " reached disk via STEAL, before COMMIT"
+            );
             return;
         }
         buffer_manager.flushPage(page_id);
@@ -1290,9 +1980,6 @@ public:
         page->setTableId(table_id);
         page->setNextPage(INVALID_PAGE_ID);
         buffer_manager.flushPage(page_id);
-
-        std::cout << "Allocated page " << page_id
-                  << " for table " << table_id << "." << std::endl;
         return page_id;
     }
 
@@ -1436,7 +2123,7 @@ public:
 
         if (page_manager.recoveryActive()) {
             throw std::runtime_error(
-                "INSERT requiring a new page inside a WAL transaction is not supported."
+                "INSERT requiring a new page inside a WAL transaction is not supported in v61."
             );
         }
 
@@ -2606,6 +3293,7 @@ public:
 
 class BuzzDB {
 public:
+    LogManager log_manager;
     BufferManager buffer_manager;
     RecoveryManager recovery_manager;
     PageManager page_manager;
@@ -2614,7 +3302,9 @@ public:
     TxnPtr active_txn;
 
 public:
-    BuzzDB() : recovery_manager(buffer_manager),
+    BuzzDB() : log_manager(),
+               buffer_manager(log_manager),
+               recovery_manager(buffer_manager, log_manager),
                page_manager(buffer_manager, recovery_manager),
                catalog(buffer_manager, page_manager) {
         recovery_manager.recover();
@@ -2723,7 +3413,6 @@ public:
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
-                                     bool printResult = true,
                                      int crashAfterStatement = 0) {
         int statementsSeen = 0;
         for (const auto& statement : statements) {
@@ -2762,7 +3451,7 @@ public:
             if (std::regex_match(statement, matches, insertRegex)) {
                 const std::string tableName = matches[1];
                 const std::string valuesText = matches[2];
-                insertRow(tableName, split(valuesText, ','), printResult);
+                insertRow(tableName, split(valuesText, ','), false);
                 statementFinished();
                 continue;
             }
@@ -2787,7 +3476,7 @@ public:
                     std::move(predicate),
                     {{setColumn, *field}}
                 );
-                executeStatementOperator(updateOp, printResult);
+                executeStatementOperator(updateOp, false);
                 statementFinished();
                 continue;
             }
@@ -2803,7 +3492,7 @@ public:
                 auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
                 TableHeap tableHeap(metadata, page_manager);
                 DeleteOperator deleteOp(tableHeap, std::move(predicate));
-                executeStatementOperator(deleteOp, printResult);
+                executeStatementOperator(deleteOp, false);
                 statementFinished();
                 continue;
             }
@@ -2947,6 +3636,32 @@ void checkBookingInvariant(BuzzDB& db) {
         }
     }
 
+    for (const auto& hold : holds) {
+        if (hold->fields[holdStatusColumn]->asString() != "open") {
+            continue;
+        }
+
+        int holdSeatId = hold->fields[holdSeatIdColumn]->asInt();
+        std::string holdCustomer = hold->fields[holdCustomerColumn]->asString();
+
+        bool foundHeldSeat = false;
+        for (const auto& seat : seats) {
+            if (seat->fields[seatIdColumn]->asInt() == holdSeatId &&
+                seat->fields[seatStatusColumn]->asString() == "held" &&
+                seat->fields[seatCustomerColumn]->asString() == holdCustomer) {
+                foundHeldSeat = true;
+                break;
+            }
+        }
+
+        if (!foundHeldSeat) {
+            std::cout << "Invariant violation: open hold for seat id "
+                      << holdSeatId << " and customer " << holdCustomer
+                      << " has no matching held seat." << std::endl;
+            ok = false;
+        }
+    }
+
     if (ok) {
         std::cout << "Booking invariant holds." << std::endl;
     }
@@ -2957,37 +3672,63 @@ int main() {
 
     auto start = std::chrono::high_resolution_clock::now();
 
+    std::cout << "Setup: 256-byte pages and 16 slots create more heap pages from booking.txt.\n";
+
     {
         BuzzDB db;
         DatabaseImporter::importFile(db, "booking.txt");
 
         try {
-            std::cout << "\nTxn 1: try holding 1A for garcia, then ABORT.\n";
+            std::cout << "\nTxn 1: dirty two seat pages, force ABORT log, then crash before CLRs or END.\n";
+            db.crashAt(CrashPoint::AFTER_ABORT_LOG_FORCE);
             db.executeStatementsAndQueries({
                 "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1A",
                 "UPDATE seats SET customer = garcia WHERE seat_no = 1A",
+                "UPDATE seats SET status = held WHERE seat_no = 2A",
+                "UPDATE seats SET customer = garcia WHERE seat_no = 2A",
                 "ABORT",
             });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
 
-            std::cout << "\nTxn 2: hold 1B for zhang, then COMMIT.\n";
+    std::cout << "\nRestart after crash 1: finish ABORTING txn with no CLRs, then crash after one CLR.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nTxn 2: dirty two seat pages, force ABORT and first CLR, then crash before END.\n";
+            db.crashAt(CrashPoint::AFTER_FIRST_CLR_DURING_ABORT);
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1A",
+                "UPDATE seats SET customer = garcia WHERE seat_no = 1A",
+                "UPDATE seats SET status = held WHERE seat_no = 2A",
+                "UPDATE seats SET customer = garcia WHERE seat_no = 2A",
+                "ABORT",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after crash 2: follow durable CLR undoNextLSN, then crash after COMMIT before END.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nTxn 3: hold 1B and 2B, force COMMIT log, then crash before END.\n";
+            db.crashAt(CrashPoint::AFTER_COMMIT_LOG_FORCE);
             db.executeStatementsAndQueries({
                 "BEGIN",
                 "UPDATE seats SET status = held WHERE seat_no = 1B",
                 "UPDATE seats SET customer = zhang WHERE seat_no = 1B",
                 "INSERT INTO holds VALUES (1, 2, zhang, open)",
-                "COMMIT",
-            });
-
-            std::cout << "\nTxn 3: hold 1C for patel, then COMMIT.\n"
-                      << "Crash point: after txn 3 COMMIT log is forced, "
-                      << "before dirty data pages reach disk (NO-FORCE).\n";
-            db.crashAt(CrashPoint::AFTER_COMMIT_LOG_FORCE);
-            db.executeStatementsAndQueries({
-                "BEGIN",
-                "UPDATE seats SET status = held WHERE seat_no = 1C",
-                "UPDATE seats SET customer = patel WHERE seat_no = 1C",
-                "INSERT INTO holds VALUES (2, 3, patel, open)",
+                "UPDATE seats SET status = held WHERE seat_no = 2B",
+                "UPDATE seats SET customer = nguyen WHERE seat_no = 2B",
+                "INSERT INTO holds VALUES (2, 6, nguyen, open)",
                 "COMMIT",
             });
         } catch (const std::runtime_error& crash) {
@@ -2995,7 +3736,31 @@ int main() {
         }
     }
 
-    std::cout << "\nRestart after crash\n";
+    std::cout << "\nRestart after crash 3: finish COMMITTING txn, then run loser insert/delete/update work.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nTxn 4: dirty seat and hold pages, then crash before COMMIT.\n";
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1C",
+                "UPDATE seats SET customer = patel WHERE seat_no = 1C",
+                "INSERT INTO holds VALUES (3, 3, patel, open)",
+                "DELETE FROM holds WHERE id = 1",
+                "UPDATE seats SET status = held WHERE seat_no = 2C",
+            });
+            std::cout << "Crash point: txn 4 has loser UPDATE, INSERT, and DELETE records; STEAL flushes one uncommitted page before COMMIT.\n";
+            db.crashAt(CrashPoint::AFTER_STEAL_PAGE_FLUSH);
+            db.executeStatementsAndQueries({
+                "UPDATE seats SET customer = lee WHERE seat_no = 2C",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after crash 4: redo history, undo loser, and check tables.\n";
     {
         BuzzDB db;
         db.executeStatementsAndQueries({
