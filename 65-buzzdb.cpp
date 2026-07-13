@@ -220,8 +220,8 @@ std::string tupleToString(const Tuple& tuple) {
     return output.str();
 }
 
-static constexpr size_t PAGE_SIZE = 256;  // Small pages make DPT/pageLSN behavior visible.
-static constexpr size_t MAX_SLOTS = 16;   // Keep the slot directory small enough for 256-byte pages.
+static constexpr size_t PAGE_SIZE = 4096;
+static constexpr size_t MAX_SLOTS = 512;
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
 
 using PageID = uint16_t;
@@ -3989,7 +3989,7 @@ int main() {
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Setup: recovery baseline before concurrency control.\n";
+    std::cout << "Recovery baseline before concurrency control chapter\n";
 
     {
         BuzzDB db;
