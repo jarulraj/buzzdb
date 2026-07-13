@@ -1608,10 +1608,11 @@ public:
         log_manager.writeMasterRecord(begin_lsn);
         std::cout << "CHECKPOINT: wrote BEGIN_CHECKPOINT LSN "
                   << begin_lsn << " and END_CHECKPOINT LSN "
-                  << end_lsn << " with ATT="
-                  << end_record.checkpoint_att.size()
-                  << " DPT=" << end_record.checkpoint_dpt.size()
-                  << "." << std::endl;
+                  << end_lsn << " with checkpoint snapshot."
+                  << std::endl;
+        printCheckpointTables("CHECKPOINT snapshot:",
+                              end_record.checkpoint_att,
+                              end_record.checkpoint_dpt);
         std::cout << "CHECKPOINT: master now points to LSN "
                   << begin_lsn << " at log offset "
                   << log_manager.getLogOffset(begin_lsn)
@@ -1733,6 +1734,35 @@ private:
         return false;
     }
 
+    void printCheckpointTables(
+        const std::string& label,
+        const RecoveryAnalysis::ActiveTransactionTable& att,
+        const RecoveryAnalysis::DirtyPageTable& dpt) const {
+        std::cout << label << std::endl;
+        if (att.empty()) {
+            std::cout << "  ATT: empty" << std::endl;
+        } else {
+            std::cout << "  ATT:" << std::endl;
+            for (const auto& [txn_id, entry] : att) {
+                std::cout << "    txn " << txn_id
+                          << " " << recoveryTxnStatusName(entry.status)
+                          << " lastLSN " << entry.last_lsn
+                          << std::endl;
+            }
+        }
+
+        if (dpt.empty()) {
+            std::cout << "  DPT: empty" << std::endl;
+        } else {
+            std::cout << "  DPT:" << std::endl;
+            for (const auto& [page_id, rec_lsn] : dpt) {
+                std::cout << "    page " << page_id
+                          << " recLSN " << rec_lsn
+                          << std::endl;
+            }
+        }
+    }
+
     void printCheckpointStart(const MasterRecord& master_record,
                               const std::vector<LogRecord>& records) const {
         if (master_record.checkpoint_begin_lsn == 0) {
@@ -1741,12 +1771,10 @@ private:
             return;
         }
 
-        size_t checkpoint_att_size = 0;
-        size_t checkpoint_dpt_size = 0;
+        const LogRecord* checkpoint_record = nullptr;
         for (const auto& record : records) {
             if (record.type == LogRecordType::END_CHECKPOINT) {
-                checkpoint_att_size = record.checkpoint_att.size();
-                checkpoint_dpt_size = record.checkpoint_dpt.size();
+                checkpoint_record = &record;
                 break;
             }
         }
@@ -1755,10 +1783,14 @@ private:
                   << " (log offset "
                   << master_record.checkpoint_begin_offset << ")."
                   << std::endl;
-        std::cout << "ARIES analysis: loaded checkpoint snapshot ATT="
-                  << checkpoint_att_size
-                  << " DPT=" << checkpoint_dpt_size
-                  << "." << std::endl;
+        if (checkpoint_record == nullptr) {
+            std::cout << "ARIES analysis: checkpoint END record not found; "
+                      << "no checkpoint snapshot loaded." << std::endl;
+            return;
+        }
+        printCheckpointTables("ARIES analysis: loaded checkpoint snapshot:",
+                              checkpoint_record->checkpoint_att,
+                              checkpoint_record->checkpoint_dpt);
     }
 
     bool isDirtyPage(PageID page_id) const {
