@@ -8,6 +8,7 @@
 #include <sstream>
 #include <optional>
 #include <regex>
+#include <algorithm>
 #include <stdexcept>
 #include <cassert>
 #include <cerrno>
@@ -3715,6 +3716,117 @@ struct TxnContext {
 
 using TxnPtr = std::shared_ptr<TxnContext>;
 
+enum class LockMode { S, X };
+
+enum class LockResourceType { TABLE, KEY };
+
+struct LockResource {
+    LockResourceType type;
+    TableId table_id;
+    std::string column_name;
+    std::string key_value;
+
+    static LockResource table(TableId table_id) {
+        return {LockResourceType::TABLE, table_id, "", ""};
+    }
+
+    static LockResource key(TableId table_id,
+                            std::string column_name,
+                            std::string key_value) {
+        return {
+            LockResourceType::KEY,
+            table_id,
+            std::move(column_name),
+            std::move(key_value)
+        };
+    }
+
+    bool operator<(const LockResource& other) const {
+        if (type != other.type) {
+            return static_cast<int>(type) < static_cast<int>(other.type);
+        }
+        if (table_id != other.table_id) {
+            return table_id < other.table_id;
+        }
+        if (column_name != other.column_name) {
+            return column_name < other.column_name;
+        }
+        return key_value < other.key_value;
+    }
+};
+
+class LockManager {
+private:
+    struct LockGrant {
+        int txn_id;
+        LockMode mode;
+    };
+
+    std::map<LockResource, std::vector<LockGrant>> locks;
+
+public:
+    struct LockRequestResult {
+        bool granted = false;
+        std::string reason;
+    };
+
+    LockRequestResult tryAcquire(int txn_id,
+                                 const LockResource& resource,
+                                 LockMode mode) {
+        auto& grants = locks[resource];
+        for (const auto& grant : grants) {
+            if (grant.txn_id != txn_id && !compatible(mode, grant.mode)) {
+                return {
+                    false,
+                    "txn " + std::to_string(grant.txn_id) +
+                    " holds " + modeName(grant.mode)
+                };
+            }
+        }
+
+        for (auto& grant : grants) {
+            if (grant.txn_id == txn_id) {
+                if (grant.mode == LockMode::S && mode == LockMode::X) {
+                    grant.mode = LockMode::X;
+                }
+                return {true, ""};
+            }
+        }
+
+        grants.push_back({txn_id, mode});
+        return {true, ""};
+    }
+
+    void releaseAll(int txn_id) {
+        for (auto it = locks.begin(); it != locks.end();) {
+            auto& grants = it->second;
+            grants.erase(
+                std::remove_if(
+                    grants.begin(),
+                    grants.end(),
+                    [txn_id](const LockGrant& grant) {
+                        return grant.txn_id == txn_id;
+                    }),
+                grants.end()
+            );
+            if (grants.empty()) {
+                it = locks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    static std::string modeName(LockMode mode) {
+        return mode == LockMode::S ? "S" : "X";
+    }
+
+private:
+    static bool compatible(LockMode requested, LockMode held) {
+        return requested == LockMode::S && held == LockMode::S;
+    }
+};
+
 class TransactionManager {
 public:
     TxnPtr begin(int txn_id) {
@@ -3741,6 +3853,7 @@ public:
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
+    LockManager lock_manager;
     TxnPtr active_txn;
 
 public:
@@ -3760,6 +3873,7 @@ public:
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
+        acquireStatementLocks(txn, statement);
         recovery_manager.setCurrentTransaction(txn->id);
         try {
             executeStatementsAndQueries({statement});
@@ -3774,12 +3888,14 @@ public:
         requireRunningTransaction(txn);
         recovery_manager.commit(txn->id);
         txn_manager.commit(*txn);
+        lock_manager.releaseAll(txn->id);
     }
 
     void abort(const TxnPtr& txn) {
         requireRunningTransaction(txn);
         recovery_manager.abort(txn->id);
         txn_manager.abort(*txn);
+        lock_manager.releaseAll(txn->id);
     }
 
     void begin() {
@@ -3825,6 +3941,121 @@ public:
         if (!txn || txn->state != TxnContext::RUNNING) {
             throw std::runtime_error("Statement requires a running transaction.");
         }
+    }
+
+    static LockResource tableResource(const TableMetadata& metadata) {
+        return LockResource::table(metadata.table_id);
+    }
+
+    static LockResource keyResource(const TableMetadata& metadata,
+                                    const std::string& columnName,
+                                    const std::string& value) {
+        return LockResource::key(metadata.table_id, columnName, value);
+    }
+
+    static std::string keyResourceLabel(const std::string& tableName,
+                                        const std::string& columnName,
+                                        const std::string& value) {
+        return "row " + tableName + "." + columnName + "=" + value;
+    }
+
+    static std::string tableResourceLabel(const std::string& tableName) {
+        return "table " + tableName;
+    }
+
+    void acquireStatementLocks(const TxnPtr& txn,
+                               const std::string& statement) {
+        std::smatch matches;
+
+        std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*[^\\s;]+\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, updateRegex)) {
+            const std::string tableName = matches[1];
+            const std::string columnName = matches[2];
+            const std::string value = matches[3];
+            auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::X,
+                        keyResource(metadata, columnName, value),
+                        keyResourceLabel(tableName, columnName, value));
+            return;
+        }
+
+        std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, deleteRegex)) {
+            const std::string tableName = matches[1];
+            const std::string columnName = matches[2];
+            const std::string value = matches[3];
+            auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::X,
+                        keyResource(metadata, columnName, value),
+                        keyResourceLabel(tableName, columnName, value));
+            return;
+        }
+
+        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\(.*\\)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, insertRegex)) {
+            const std::string tableName = matches[1];
+            auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::X,
+                        tableResource(metadata),
+                        tableResourceLabel(tableName));
+            return;
+        }
+
+        std::regex selectRowRegex("^\\s*SELECT\\s+.*\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                                  std::regex_constants::icase);
+        if (std::regex_match(statement, matches, selectRowRegex)) {
+            const std::string tableName = matches[1];
+            const std::string columnName = matches[2];
+            const std::string value = matches[3];
+            auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::S,
+                        keyResource(metadata, columnName, value),
+                        keyResourceLabel(tableName, columnName, value));
+            return;
+        }
+
+        std::regex selectTableRegex("^\\s*SELECT\\s+.*\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*).*$",
+                                    std::regex_constants::icase);
+        if (std::regex_match(statement, matches, selectTableRegex)) {
+            const std::string tableName = matches[1];
+            auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::S,
+                        tableResource(metadata),
+                        tableResourceLabel(tableName));
+        }
+    }
+
+    void acquireLock(const TxnPtr& txn,
+                     LockMode mode,
+                     const LockResource& resource,
+                     const std::string& resourceLabel) {
+        auto result = lock_manager.tryAcquire(txn->id, resource, mode);
+        if (result.granted) {
+            std::cout << "Lock txn " << txn->id
+                      << " " << LockManager::modeName(mode)
+                      << " on " << resourceLabel
+                      << " granted." << std::endl;
+            return;
+        }
+
+        std::cout << "Lock txn " << txn->id
+                  << " " << LockManager::modeName(mode)
+                  << " on " << resourceLabel
+                  << " blocked; " << result.reason
+                  << "." << std::endl;
+        throw std::runtime_error(
+            "LOCK WAIT: txn " + std::to_string(txn->id) +
+            " waits for " + LockManager::modeName(mode) +
+            " on " + resourceLabel + "; " + result.reason + "."
+        );
     }
 
     static std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
@@ -3930,6 +4161,10 @@ public:
                 checkpoint();
                 statementFinished();
                 continue;
+            }
+
+            if (active_txn) {
+                acquireStatementLocks(active_txn, statement);
             }
 
             std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
@@ -4107,7 +4342,7 @@ int main() {
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Dirty reads cause cascading aborts\n";
+    std::cout << "Strict S/X locks: prevent dirty reads before they cause cascading aborts\n";
 
     BuzzDB db;
     DatabaseImporter::importFile(db, "booking.txt");
@@ -4124,30 +4359,37 @@ int main() {
 
     std::cout << "\nA dependent transaction wants to confirm that booking by reading 1A.\n";
     auto dependent = db.beginTransaction();
-    if (seatIsHeldFor(db, dependent, "1A", "garcia")) {
-        std::cout << "\nTxn " << dependent->id
-                  << " sees the dirty held/garcia state and inserts a matching hold.\n";
-        db.execute(dependent, "INSERT INTO holds VALUES (1, 1, garcia, open)");
-    } else {
-        std::cout << "\nTxn " << dependent->id
-                  << " sees no booking to confirm and skips INSERT INTO holds.\n";
+    bool readBlocked = false;
+    try {
+        if (seatIsHeldFor(db, dependent, "1A", "garcia")) {
+            std::cout << "Unexpected dirty booking confirmation.\n";
+        }
+    } catch (const std::runtime_error& error) {
+        readBlocked = true;
+        std::cout << error.what() << std::endl;
     }
+    if (!readBlocked) {
+        throw std::runtime_error("Expected strict locking to block the dirty read.");
+    }
+    std::cout << "Txn " << dependent->id
+              << " cannot decide whether to insert a hold until txn "
+              << booking->id << " finishes.\n";
 
     std::cout << "\nThe booking transaction aborts.\n";
     db.abort(booking);
 
-    std::cout << "\nIntermediate state after txn " << booking->id
-              << " aborts but before txn " << dependent->id
-              << " aborts:\n";
-    db.executeStatementsAndQueries({
-        "SELECT {*} FROM seats WHERE seat_no = 1A",
-        "SELECT {*} FROM holds",
-    });
-
-    std::cout << "\nThe seat is no longer booked, but the derived hold still exists.\n";
-    std::cout << "Because that hold depended on dirty data, txn "
-              << dependent->id << " must abort too.\n";
-    db.abort(dependent);
+    std::cout << "\nAfter the abort releases the X lock, txn "
+              << dependent->id << " gets the S lock and rereads 1A.\n";
+    if (seatIsHeldFor(db, dependent, "1A", "garcia")) {
+        std::cout << "\nTxn " << dependent->id
+                  << " sees a held seat and inserts a matching hold.\n";
+        db.execute(dependent, "INSERT INTO holds VALUES (1, 1, garcia, open)");
+    } else {
+        std::cout << "\nSeat 1A is available again, so txn "
+                  << dependent->id
+                  << " skips INSERT INTO holds and commits read-only.\n";
+    }
+    db.commit(dependent);
 
     std::cout << "\nFinal committed state:\n";
     db.executeStatementsAndQueries({
@@ -4155,9 +4397,10 @@ int main() {
         "SELECT {*} FROM holds",
     });
 
-    std::cout << "\nProblem: txn " << dependent->id
-              << " read dirty data from txn " << booking->id
-              << ", created derived state, and then had to cascade-abort.\n";
+    std::cout << "\nResult: txn "
+              << dependent->id
+              << " got the lock only after txn " << booking->id
+              << " finished, saw no booking to confirm, and inserted no hold.\n";
 
     auto end = std::chrono::high_resolution_clock::now();
 
