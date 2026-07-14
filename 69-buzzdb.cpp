@@ -3754,6 +3754,64 @@ struct LockResource {
     }
 };
 
+class DirectedGraph {
+public:
+    void setOutgoingEdges(int from, const std::vector<int>& to_nodes) {
+        adjacency[from] = to_nodes;
+        for (int to : to_nodes) {
+            adjacency[to];
+        }
+    }
+
+    void removeNode(int node) {
+        adjacency.erase(node);
+        for (auto& entry : adjacency) {
+            auto& edges = entry.second;
+            edges.erase(
+                std::remove(edges.begin(), edges.end(), node),
+                edges.end()
+            );
+        }
+    }
+
+    std::vector<int> cycleFrom(int node) const {
+        std::vector<int> path;
+        std::map<int, bool> visited;
+        if (findCycleToTarget(node, node, visited, path)) {
+            path.push_back(node);
+            return path;
+        }
+        return {};
+    }
+
+private:
+    std::map<int, std::vector<int>> adjacency;
+
+    bool findCycleToTarget(int current,
+                           int target,
+                           std::map<int, bool>& visited,
+                           std::vector<int>& path) const {
+        visited[current] = true;
+        path.push_back(current);
+
+        auto it = adjacency.find(current);
+        if (it != adjacency.end()) {
+            for (int next : it->second) {
+                if (next == target) {
+                    return true;
+                }
+                if (!visited[next] &&
+                    findCycleToTarget(next, target, visited, path)) {
+                    return true;
+                }
+            }
+        }
+
+        path.pop_back();
+        return false;
+    }
+};
+
 class LockManager {
 private:
     struct LockGrant {
@@ -3762,17 +3820,24 @@ private:
     };
 
     std::map<LockResource, std::vector<LockGrant>> locks;
+    DirectedGraph waits_for;
     std::mutex latch;
     std::condition_variable lock_cv;
 
 public:
     struct LockRequestResult {
         bool granted = false;
+        bool deadlock = false;
         std::string reason;
+        std::vector<int> blockers;
+        std::vector<int> cycle;
     };
 
     struct AcquireResult {
         bool waited = false;
+        bool deadlock = false;
+        std::vector<int> blockers;
+        std::vector<int> cycle;
     };
 
     AcquireResult acquire(int txn_id,
@@ -3784,11 +3849,25 @@ public:
         while (true) {
             auto attempt = tryAcquireLocked(txn_id, resource, mode);
             if (attempt.granted) {
-                return {waited};
+                waits_for.removeNode(txn_id);
+                AcquireResult result;
+                result.waited = waited;
+                return result;
             }
+            waits_for.setOutgoingEdges(txn_id, attempt.blockers);
             if (!waited) {
                 waited = true;
                 onWait(attempt.reason);
+            }
+            auto cycle = waits_for.cycleFrom(txn_id);
+            if (!cycle.empty()) {
+                waits_for.removeNode(txn_id);
+                AcquireResult result;
+                result.waited = waited;
+                result.deadlock = true;
+                result.blockers = std::move(attempt.blockers);
+                result.cycle = std::move(cycle);
+                return result;
             }
             lock_cv.wait(guard);
         }
@@ -3797,6 +3876,7 @@ public:
     void releaseAll(int txn_id) {
         std::lock_guard<std::mutex> guard(latch);
         bool released = false;
+        waits_for.removeNode(txn_id);
         for (auto it = locks.begin(); it != locks.end();) {
             auto& grants = it->second;
             auto old_size = grants.size();
@@ -3830,33 +3910,58 @@ private:
                                        const LockResource& resource,
                                        LockMode mode) {
         auto& grants = locks[resource];
-        for (const auto& grant : grants) {
-            if (grant.txn_id != txn_id && !compatible(mode, grant.mode)) {
-                return {
-                    false,
-                    "txn " + std::to_string(grant.txn_id) +
-                    " holds " + modeName(grant.mode)
-                };
-            }
+        auto blockers = blockersForLocked(txn_id, grants, mode);
+        if (!blockers.empty()) {
+            LockRequestResult result;
+            result.reason = "txn " + std::to_string(blockers.front()) +
+                            " holds an incompatible lock";
+            result.blockers = std::move(blockers);
+            return result;
         }
 
+        LockRequestResult result;
         for (auto& grant : grants) {
             if (grant.txn_id == txn_id) {
                 if (grant.mode == LockMode::S && mode == LockMode::X) {
                     grant.mode = LockMode::X;
                 }
-                return {true, ""};
+                result.granted = true;
+                return result;
             }
         }
 
         grants.push_back({txn_id, mode});
-        return {true, ""};
+        result.granted = true;
+        return result;
+    }
+
+    static std::vector<int> blockersForLocked(int txn_id,
+                                              const std::vector<LockGrant>& grants,
+                                              LockMode mode) {
+        std::vector<int> blockers;
+        for (const auto& grant : grants) {
+            if (grant.txn_id != txn_id && !compatible(mode, grant.mode)) {
+                blockers.push_back(grant.txn_id);
+            }
+        }
+        return blockers;
     }
 
     static bool compatible(LockMode requested, LockMode held) {
         return requested == LockMode::S && held == LockMode::S;
     }
 };
+
+std::string txnCycleLabel(const std::vector<int>& cycle) {
+    std::string label;
+    for (int txn_id : cycle) {
+        if (!label.empty()) {
+            label += " -> ";
+        }
+        label += "txn " + std::to_string(txn_id);
+    }
+    return label;
+}
 
 class TransactionManager {
 public:
@@ -4115,6 +4220,18 @@ public:
                           << " waits; " << reason
                           << "." << std::endl;
             });
+
+        if (result.deadlock) {
+            std::cout << "Deadlock detected in waits-for graph: "
+                      << txnCycleLabel(result.cycle)
+                      << ". Choosing txn " << txn->id
+                      << " as victim." << std::endl;
+            abort(txn);
+            throw std::runtime_error(
+                "DEADLOCK: txn " + std::to_string(txn->id) +
+                " chosen as victim"
+            );
+        }
 
         std::cout << "Lock txn " << txn->id
                   << " " << LockManager::modeName(mode)
@@ -4405,96 +4522,85 @@ bool seatIsHeldFor(BuzzDB& db,
     throw std::runtime_error("Unknown seat: " + seatNo);
 }
 
+void runDeadlockWorkload(BuzzDB& db) {
+    auto txn1 = db.beginTransaction();
+    auto txn2 = db.beginTransaction();
+
+    std::cout << "\nTxn " << txn1->id << " starts booking 1A for garcia. Txn "
+              << txn2->id << " starts booking 1B for patel.\n";
+    db.execute(txn1, "UPDATE seats SET status = held WHERE seat_no = 1A");
+    db.execute(txn1, "UPDATE seats SET customer = garcia WHERE seat_no = 1A");
+    db.execute(txn2, "UPDATE seats SET status = held WHERE seat_no = 1B");
+    db.execute(txn2, "UPDATE seats SET customer = patel WHERE seat_no = 1B");
+
+    // Run txn 1's second request in another thread so it can block while
+    // txn 2 later makes the request that closes the waits-for cycle.
+    std::cout << "\nTxn " << txn1->id
+              << " now tries to add 1B to garcia's booking and waits behind txn "
+              << txn2->id << ".\n";
+    auto txn1SecondUpdate = std::async(std::launch::async, [&]() {
+        db.execute(txn1, "UPDATE seats SET status = held WHERE seat_no = 1B");
+        db.execute(txn1, "UPDATE seats SET customer = garcia WHERE seat_no = 1B");
+        db.execute(txn1, "INSERT INTO holds VALUES (1, 1, garcia, open)");
+        db.execute(txn1, "INSERT INTO holds VALUES (2, 2, garcia, open)");
+        std::cout << "\nTxn " << txn1->id
+                  << " resumes after the victim releases locks and records garcia's holds.\n";
+        db.commit(txn1);
+    });
+
+    // If txn 1 has not finished quickly, it is waiting in LockManager.
+    if (txn1SecondUpdate.wait_for(std::chrono::milliseconds(100)) !=
+        std::future_status::timeout) {
+        txn1SecondUpdate.get();
+        throw std::runtime_error("Expected txn 1 to wait for txn 2's tuple lock.");
+    }
+
+    // This request creates txn 1 -> txn 2 and txn 2 -> txn 1 in the waits-for graph.
+    std::cout << "\nTxn " << txn2->id
+              << " now tries to add 1A to patel's booking, closing the waits-for cycle.\n";
+    try {
+        db.execute(txn2, "UPDATE seats SET status = held WHERE seat_no = 1A");
+        db.commit(txn2);
+        throw std::runtime_error("Expected deadlock detection when txn 2 requested 1A.");
+    } catch (const std::runtime_error& error) {
+        // BuzzDB aborts the requesting transaction when LockManager reports a deadlock.
+        if (txn2->state != TxnContext::ABORTED) {
+            throw;
+        }
+    }
+
+    // Txn 2's abort releases 1B, so txn 1 wakes up and commits.
+    txn1SecondUpdate.get();
+}
+
 int main() {
     try {
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Blocking strict S/X locks: wait for access\n";
+    std::cout << "Deadlock detection inside the lock manager\n";
 
     BuzzDB db;
     DatabaseImporter::importFile(db, "booking.txt");
 
-    std::cout << "\nInitial committed state of seat 1A:\n";
+    std::cout << "\nInitial committed state of seats 1A and 1B:\n";
     db.executeStatementsAndQueries({
         "SELECT {*} FROM seats WHERE seat_no = 1A",
+        "SELECT {*} FROM seats WHERE seat_no = 1B",
     });
 
-    std::cout << "\nTwo transaction threads start.\n";
-    std::promise<void> writerHasDirtyUpdate;
-    auto writerHasDirtyUpdateFuture = writerHasDirtyUpdate.get_future();
-    std::promise<void> writerMayAbort;
-    auto writerMayAbortFuture = writerMayAbort.get_future();
-    std::exception_ptr writerError;
-
-    // Keep the writer transaction open after it takes the X lock, so the
-    // reader has a real conflicting lock to wait on.
-    std::thread writerThread([&]() {
-        try {
-            std::cout << "\nWriter txn updates 1A but does not commit.\n";
-            auto txn = db.beginTransaction();
-            db.execute(txn, "UPDATE seats SET status = held WHERE seat_no = 1A");
-            db.execute(txn, "UPDATE seats SET customer = garcia WHERE seat_no = 1A");
-            writerHasDirtyUpdate.set_value();
-
-            writerMayAbortFuture.wait();
-            std::cout << "\nWriter txn aborts after the reader has had to wait.\n";
-            db.abort(txn);
-        } catch (...) {
-            writerError = std::current_exception();
-            try {
-                writerHasDirtyUpdate.set_exception(writerError);
-            } catch (const std::future_error&) {
-            }
-        }
-    });
-
-    try {
-        writerHasDirtyUpdateFuture.get();
-    } catch (...) {
-        writerThread.join();
-        throw;
-    }
-
-    std::cout << "\nReader txn tries to read 1A.\n";
-    // Run the reader separately because a real lock wait blocks the caller
-    // inside LockManager::acquire.
-    auto reader = std::async(std::launch::async, [&db]() {
-        auto txn = db.beginTransaction();
-        if (seatIsHeldFor(db, txn, "1A", "garcia")) {
-            throw std::runtime_error("Reader saw a dirty held seat.");
-        }
-
-        std::cout << "\nThe reader saw only committed state and found no booking to confirm.\n";
-        db.commit(txn);
-    });
-
-    // If the reader has not finished quickly, it is waiting on the writer's
-    // tuple lock rather than seeing dirty data.
-    if (reader.wait_for(std::chrono::milliseconds(100)) !=
-        std::future_status::timeout) {
-        writerMayAbort.set_value();
-        writerThread.join();
-        reader.get();
-        throw std::runtime_error("Expected reader to wait for the writer's tuple lock.");
-    }
-
-    std::cout << "\nReader is still waiting on the writer's tuple lock.\n";
-    // Aborting the writer releases its X lock; LockManager wakes the reader.
-    writerMayAbort.set_value();
-    writerThread.join();
-    reader.get();
-    if (writerError) {
-        std::rethrow_exception(writerError);
-    }
+    runDeadlockWorkload(db);
 
     std::cout << "\nFinal committed state:\n";
     db.executeStatementsAndQueries({
         "SELECT {*} FROM seats WHERE seat_no = 1A",
+        "SELECT {*} FROM seats WHERE seat_no = 1B",
         "SELECT {*} FROM holds",
     });
 
-    std::cout << "\nResult: the reader waited for the writer to finish and never saw dirty data.\n";
+    std::cout << "\nResult: the waits-for graph found the cycle, "
+              << "the lock manager chose a victim, and the survivor committed "
+              << "the matching seat and hold rows.\n";
 
     auto end = std::chrono::high_resolution_clock::now();
 
