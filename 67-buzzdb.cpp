@@ -3718,27 +3718,22 @@ using TxnPtr = std::shared_ptr<TxnContext>;
 
 enum class LockMode { S, X };
 
-enum class LockResourceType { TABLE, KEY };
+enum class LockResourceType { TABLE, TUPLE };
 
 struct LockResource {
     LockResourceType type;
     TableId table_id;
-    std::string column_name;
-    std::string key_value;
+    PageID page_id;
+    size_t slot_id;
 
     static LockResource table(TableId table_id) {
-        return {LockResourceType::TABLE, table_id, "", ""};
+        return {LockResourceType::TABLE, table_id, INVALID_PAGE_ID, 0};
     }
 
-    static LockResource key(TableId table_id,
-                            std::string column_name,
-                            std::string key_value) {
-        return {
-            LockResourceType::KEY,
-            table_id,
-            std::move(column_name),
-            std::move(key_value)
-        };
+    static LockResource tuple(TableId table_id,
+                              PageID page_id,
+                              size_t slot_id) {
+        return {LockResourceType::TUPLE, table_id, page_id, slot_id};
     }
 
     bool operator<(const LockResource& other) const {
@@ -3748,10 +3743,10 @@ struct LockResource {
         if (table_id != other.table_id) {
             return table_id < other.table_id;
         }
-        if (column_name != other.column_name) {
-            return column_name < other.column_name;
+        if (page_id != other.page_id) {
+            return page_id < other.page_id;
         }
-        return key_value < other.key_value;
+        return slot_id < other.slot_id;
     }
 };
 
@@ -3947,20 +3942,65 @@ public:
         return LockResource::table(metadata.table_id);
     }
 
-    static LockResource keyResource(const TableMetadata& metadata,
-                                    const std::string& columnName,
-                                    const std::string& value) {
-        return LockResource::key(metadata.table_id, columnName, value);
+    static LockResource tupleResource(const TableMetadata& metadata,
+                                      PageID pageId,
+                                      size_t slot) {
+        return LockResource::tuple(metadata.table_id, pageId, slot);
     }
 
-    static std::string keyResourceLabel(const std::string& tableName,
-                                        const std::string& columnName,
-                                        const std::string& value) {
-        return "row " + tableName + "." + columnName + "=" + value;
+    static std::string tupleResourceLabel(const std::string& tableName,
+                                          PageID pageId,
+                                          size_t slot) {
+        return "tuple " + tableName +
+               "[page=" + std::to_string(pageId) +
+               ", slot=" + std::to_string(slot) + "]";
     }
 
     static std::string tableResourceLabel(const std::string& tableName) {
         return "table " + tableName;
+    }
+
+    static bool sameFieldValue(const Field& left, const Field& right) {
+        if (left.getType() != right.getType()) {
+            return false;
+        }
+
+        switch (left.getType()) {
+            case INT:
+                return left.asInt() == right.asInt();
+            case FLOAT:
+                return left.asFloat() == right.asFloat();
+            case STRING:
+                return left.asString() == right.asString();
+        }
+        throw std::runtime_error("Unsupported field type.");
+    }
+
+    void acquireMatchingTupleLocks(const TxnPtr& txn,
+                                   LockMode mode,
+                                   TableMetadata& metadata,
+                                   const std::string& columnName,
+                                   const std::string& value) {
+        const size_t column = static_cast<size_t>(
+            metadata.schema.getColumnIndex(columnName));
+        auto target = parseFieldValue(metadata.schema.columns[column].type, value);
+        TableHeap tableHeap(metadata, page_manager);
+
+        for (PageID pageId = tableHeap.firstPage();
+             pageId != INVALID_PAGE_ID;
+             pageId = tableHeap.nextPage(pageId)) {
+            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
+                auto tuple = tableHeap.getTuple(pageId, slot);
+                if (!tuple || !sameFieldValue(*tuple->fields[column], *target)) {
+                    continue;
+                }
+
+                acquireLock(txn,
+                            mode,
+                            tupleResource(metadata, pageId, slot),
+                            tupleResourceLabel(metadata.name, pageId, slot));
+            }
+        }
     }
 
     void acquireStatementLocks(const TxnPtr& txn,
@@ -3974,10 +4014,7 @@ public:
             const std::string columnName = matches[2];
             const std::string value = matches[3];
             auto& metadata = catalog.getTable(tableName);
-            acquireLock(txn,
-                        LockMode::X,
-                        keyResource(metadata, columnName, value),
-                        keyResourceLabel(tableName, columnName, value));
+            acquireMatchingTupleLocks(txn, LockMode::X, metadata, columnName, value);
             return;
         }
 
@@ -3988,10 +4025,7 @@ public:
             const std::string columnName = matches[2];
             const std::string value = matches[3];
             auto& metadata = catalog.getTable(tableName);
-            acquireLock(txn,
-                        LockMode::X,
-                        keyResource(metadata, columnName, value),
-                        keyResourceLabel(tableName, columnName, value));
+            acquireMatchingTupleLocks(txn, LockMode::X, metadata, columnName, value);
             return;
         }
 
@@ -4014,10 +4048,7 @@ public:
             const std::string columnName = matches[2];
             const std::string value = matches[3];
             auto& metadata = catalog.getTable(tableName);
-            acquireLock(txn,
-                        LockMode::S,
-                        keyResource(metadata, columnName, value),
-                        keyResourceLabel(tableName, columnName, value));
+            acquireMatchingTupleLocks(txn, LockMode::S, metadata, columnName, value);
             return;
         }
 
