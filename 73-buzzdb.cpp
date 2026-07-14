@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
+#include <thread>
 #include <stdexcept>
 #include <cassert>
 #include <cerrno>
@@ -3720,18 +3722,25 @@ using TxnPtr = std::shared_ptr<TxnContext>;
 
 enum class LockMode { S, X };
 
-enum class LockResourceType { TUPLE };
+enum class LockResourceType { TUPLE, PREDICATE };
 
 struct LockResource {
     LockResourceType type;
     TableId table_id;
     PageID page_id;
     size_t slot_id;
+    std::string value;
 
     static LockResource tuple(TableId table_id,
                               PageID page_id,
                               size_t slot_id) {
-        return {LockResourceType::TUPLE, table_id, page_id, slot_id};
+        return {LockResourceType::TUPLE, table_id, page_id, slot_id, ""};
+    }
+
+    static LockResource predicate(TableId table_id,
+                                  PageID column,
+                                  const std::string& value) {
+        return {LockResourceType::PREDICATE, table_id, column, 0, value};
     }
 
     bool operator<(const LockResource& other) const {
@@ -3744,7 +3753,10 @@ struct LockResource {
         if (page_id != other.page_id) {
             return page_id < other.page_id;
         }
-        return slot_id < other.slot_id;
+        if (slot_id != other.slot_id) {
+            return slot_id < other.slot_id;
+        }
+        return value < other.value;
     }
 };
 
@@ -4118,12 +4130,26 @@ public:
         return LockResource::tuple(metadata.table_id, pageId, slot);
     }
 
+    static LockResource predicateResource(const TableMetadata& metadata,
+                                          const std::string& columnName,
+                                          const std::string& value) {
+        auto column = static_cast<PageID>(
+            metadata.schema.getColumnIndex(columnName));
+        return LockResource::predicate(metadata.table_id, column, value);
+    }
+
     static std::string tupleResourceLabel(const std::string& tableName,
                                           PageID pageId,
                                           size_t slot) {
         return "tuple " + tableName +
                "[page=" + std::to_string(pageId) +
                ", slot=" + std::to_string(slot) + "]";
+    }
+
+    static std::string predicateResourceLabel(const std::string& tableName,
+                                              const std::string& columnName,
+                                              const std::string& value) {
+        return "predicate " + tableName + "." + columnName + "=" + value;
     }
 
     static bool sameFieldValue(const Field& left, const Field& right) {
@@ -4202,6 +4228,28 @@ public:
         }
     }
 
+    void acquirePredicateLock(const TxnPtr& txn,
+                              LockMode mode,
+                              TableMetadata& metadata,
+                              const std::string& columnName,
+                              const std::string& value) {
+        acquireLock(txn,
+                    mode,
+                    predicateResource(metadata, columnName, value),
+                    predicateResourceLabel(metadata.name, columnName, value));
+    }
+
+    static std::optional<size_t> findColumnIndexIfExists(
+            const TableSchema& schema,
+            const std::string& columnName) {
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            if (schema.columns[i].name == columnName) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
     void acquireStatementLocks(const TxnPtr& txn,
                                const std::string& statement) {
         std::smatch matches;
@@ -4228,9 +4276,21 @@ public:
             return;
         }
 
-        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\(.*\\)\\s*;?\\s*$",
+        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
                                std::regex_constants::icase);
         if (std::regex_match(statement, matches, insertRegex)) {
+            const std::string tableName = matches[1];
+            const std::string valuesText = matches[2];
+            auto& metadata = catalog.getTable(tableName);
+            auto statusColumn = findColumnIndexIfExists(metadata.schema, "status");
+            auto values = split(valuesText, ',');
+            if (statusColumn && values.size() == metadata.schema.columns.size()) {
+                acquirePredicateLock(txn,
+                                     LockMode::X,
+                                     metadata,
+                                     "status",
+                                     values[*statusColumn]);
+            }
             return;
         }
 
@@ -4241,6 +4301,7 @@ public:
             const std::string columnName = matches[2];
             const std::string value = matches[3];
             auto& metadata = catalog.getTable(tableName);
+            acquirePredicateLock(txn, LockMode::S, metadata, columnName, value);
             acquireMatchingTupleLocks(txn, LockMode::S, metadata, columnName, value);
             return;
         }
@@ -4556,7 +4617,7 @@ int main() {
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Phantom reads with tuple locks\n";
+    std::cout << "Predicate locks prevent phantoms\n";
 
     BuzzDB db;
     DatabaseImporter::importFile(db, "booking.txt");
@@ -4565,22 +4626,46 @@ int main() {
     std::cout << "\nT1 first scan: available seats.\n";
     db.execute(txn1, "SELECT {*} FROM seats WHERE status = available");
 
-    auto txn2 = db.beginTransaction();
-    std::cout << "\nT2 inserts a new available seat 3A while T1 is still open.\n";
-    db.execute(txn2, "INSERT INTO seats VALUES (9, 1, 3A, available, unassigned)");
-    db.commit(txn2);
+    std::cout << "\nT2 tries to insert a new available seat 3A.\n";
+    std::atomic<bool> txn2Finished{false};
+    std::exception_ptr txn2Error;
+    std::thread txn2Thread([&]() {
+        try {
+            auto txn2 = db.beginTransaction();
+            db.execute(txn2, "INSERT INTO seats VALUES (9, 1, 3A, available, unassigned)");
+            db.commit(txn2);
+        } catch (...) {
+            txn2Error = std::current_exception();
+        }
+        txn2Finished = true;
+    });
 
-    std::cout << "\nT1 repeats the same predicate scan.\n";
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (txn2Finished) {
+        txn2Thread.join();
+        if (txn2Error) {
+            std::rethrow_exception(txn2Error);
+        }
+        throw std::runtime_error("Expected T2 insert to wait for T1's predicate lock.");
+    }
+
+    std::cout << "\nT2 is waiting on X(predicate seats.status=available).\n";
+    std::cout << "\nT1 repeats the same predicate scan before it commits.\n";
     db.execute(txn1, "SELECT {*} FROM seats WHERE status = available");
     db.commit(txn1);
 
+    txn2Thread.join();
+    if (txn2Error) {
+        std::rethrow_exception(txn2Error);
+    }
+
     std::cout << "\nFinal committed state:\n";
     db.executeStatementsAndQueries({
-        "SELECT {*} FROM seats WHERE status = available",
+        "SELECT {*} FROM seats WHERE seat_no = 3A",
     });
 
-    std::cout << "\nResult: T1 locked the available tuples it saw, "
-              << "but tuple locks did not protect the gap where seat 3A was inserted.\n";
+    std::cout << "\nResult: T1's S(predicate seats.status=available) "
+              << "kept T2's matching insert out until T1 finished.\n";
 
     auto end = std::chrono::high_resolution_clock::now();
 
