@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <mutex>
 #include <condition_variable>
-#include <future>
+#include <atomic>
 #include <thread>
 #include <stdexcept>
 #include <cassert>
@@ -4539,19 +4539,29 @@ int main() {
 
     std::cout << "\nTxn " << txn1->id
               << " decides to book 1B and requests an S->X upgrade.\n";
-    auto txn1Booking = std::async(std::launch::async, [&]() {
-        db.execute(txn1, "UPDATE seats SET status = held WHERE seat_no = 1B");
-        db.execute(txn1, "UPDATE seats SET customer = garcia WHERE seat_no = 1B");
-        db.execute(txn1, "INSERT INTO holds VALUES (1, 2, garcia, open)");
-        std::cout << "\nTxn " << txn1->id
-                  << " continues after txn " << txn2->id
-                  << " is aborted and records garcia's hold.\n";
-        db.commit(txn1);
+    std::atomic<bool> txn1Finished{false};
+    std::exception_ptr txn1Error;
+    std::thread txn1Thread([&]() {
+        try {
+            db.execute(txn1, "UPDATE seats SET status = held WHERE seat_no = 1B");
+            db.execute(txn1, "UPDATE seats SET customer = garcia WHERE seat_no = 1B");
+            db.execute(txn1, "INSERT INTO holds VALUES (1, 2, garcia, open)");
+            std::cout << "\nTxn " << txn1->id
+                      << " continues after txn " << txn2->id
+                      << " is aborted and records garcia's hold.\n";
+            db.commit(txn1);
+        } catch (...) {
+            txn1Error = std::current_exception();
+        }
+        txn1Finished = true;
     });
 
-    if (txn1Booking.wait_for(std::chrono::milliseconds(100)) !=
-        std::future_status::timeout) {
-        txn1Booking.get();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (txn1Finished) {
+        txn1Thread.join();
+        if (txn1Error) {
+            std::rethrow_exception(txn1Error);
+        }
         throw std::runtime_error("Expected txn 1 to wait for txn 2's S lock.");
     }
 
@@ -4569,7 +4579,10 @@ int main() {
         }
     }
 
-    txn1Booking.get();
+    txn1Thread.join();
+    if (txn1Error) {
+        std::rethrow_exception(txn1Error);
+    }
 
     std::cout << "\nFinal committed state:\n";
     db.executeStatementsAndQueries({

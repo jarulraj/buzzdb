@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <mutex>
 #include <condition_variable>
-#include <future>
 #include <thread>
 #include <stdexcept>
 #include <cassert>
@@ -4421,11 +4420,13 @@ int main() {
     });
 
     std::cout << "\nTwo transaction threads start.\n";
-    std::promise<void> writerHasDirtyUpdate;
-    auto writerHasDirtyUpdateFuture = writerHasDirtyUpdate.get_future();
-    std::promise<void> writerMayAbort;
-    auto writerMayAbortFuture = writerMayAbort.get_future();
+    std::mutex controlMutex;
+    std::condition_variable controlCv;
+    bool writerHasDirtyUpdate = false;
+    bool writerMayAbort = false;
+    bool readerFinished = false;
     std::exception_ptr writerError;
+    std::exception_ptr readerError;
 
     // Keep the writer transaction open after it takes the X lock, so the
     // reader has a real conflicting lock to wait on.
@@ -4435,57 +4436,99 @@ int main() {
             auto txn = db.beginTransaction();
             db.execute(txn, "UPDATE seats SET status = held WHERE seat_no = 1A");
             db.execute(txn, "UPDATE seats SET customer = garcia WHERE seat_no = 1A");
-            writerHasDirtyUpdate.set_value();
+            {
+                std::lock_guard<std::mutex> guard(controlMutex);
+                writerHasDirtyUpdate = true;
+            }
+            controlCv.notify_all();
 
-            writerMayAbortFuture.wait();
+            {
+                std::unique_lock<std::mutex> guard(controlMutex);
+                controlCv.wait(guard, [&]() { return writerMayAbort; });
+            }
             std::cout << "\nWriter txn aborts after the reader has had to wait.\n";
             db.abort(txn);
         } catch (...) {
-            writerError = std::current_exception();
-            try {
-                writerHasDirtyUpdate.set_exception(writerError);
-            } catch (const std::future_error&) {
+            {
+                std::lock_guard<std::mutex> guard(controlMutex);
+                writerError = std::current_exception();
+                writerHasDirtyUpdate = true;
+                writerMayAbort = true;
             }
+            controlCv.notify_all();
         }
     });
 
-    try {
-        writerHasDirtyUpdateFuture.get();
-    } catch (...) {
-        writerThread.join();
-        throw;
+    {
+        std::unique_lock<std::mutex> guard(controlMutex);
+        controlCv.wait(guard, [&]() { return writerHasDirtyUpdate; });
+        if (writerError) {
+            guard.unlock();
+            writerThread.join();
+            std::rethrow_exception(writerError);
+        }
     }
 
     std::cout << "\nReader txn tries to read 1A.\n";
     // Run the reader separately because a real lock wait blocks the caller
     // inside LockManager::acquire.
-    auto reader = std::async(std::launch::async, [&db]() {
-        auto txn = db.beginTransaction();
-        if (seatIsHeldFor(db, txn, "1A", "garcia")) {
-            throw std::runtime_error("Reader saw a dirty held seat.");
-        }
+    std::thread readerThread([&]() {
+        try {
+            auto txn = db.beginTransaction();
+            if (seatIsHeldFor(db, txn, "1A", "garcia")) {
+                throw std::runtime_error("Reader saw a dirty held seat.");
+            }
 
-        std::cout << "\nThe reader saw only committed state and found no booking to confirm.\n";
-        db.commit(txn);
+            std::cout << "\nThe reader saw only committed state and found no booking to confirm.\n";
+            db.commit(txn);
+        } catch (...) {
+            std::lock_guard<std::mutex> guard(controlMutex);
+            readerError = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> guard(controlMutex);
+            readerFinished = true;
+        }
+        controlCv.notify_all();
     });
 
     // If the reader has not finished quickly, it is waiting on the writer's
     // tuple lock rather than seeing dirty data.
-    if (reader.wait_for(std::chrono::milliseconds(100)) !=
-        std::future_status::timeout) {
-        writerMayAbort.set_value();
-        writerThread.join();
-        reader.get();
-        throw std::runtime_error("Expected reader to wait for the writer's tuple lock.");
+    {
+        std::unique_lock<std::mutex> guard(controlMutex);
+        if (controlCv.wait_for(
+                guard,
+                std::chrono::milliseconds(100),
+                [&]() { return readerFinished; })) {
+            writerMayAbort = true;
+            guard.unlock();
+            controlCv.notify_all();
+            writerThread.join();
+            readerThread.join();
+            if (readerError) {
+                std::rethrow_exception(readerError);
+            }
+            if (writerError) {
+                std::rethrow_exception(writerError);
+            }
+            throw std::runtime_error("Expected reader to wait for the writer's tuple lock.");
+        }
     }
 
     std::cout << "\nReader is still waiting on the writer's tuple lock.\n";
     // Aborting the writer releases its X lock; LockManager wakes the reader.
-    writerMayAbort.set_value();
+    {
+        std::lock_guard<std::mutex> guard(controlMutex);
+        writerMayAbort = true;
+    }
+    controlCv.notify_all();
     writerThread.join();
-    reader.get();
+    readerThread.join();
     if (writerError) {
         std::rethrow_exception(writerError);
+    }
+    if (readerError) {
+        std::rethrow_exception(readerError);
     }
 
     std::cout << "\nFinal committed state:\n";

@@ -3720,7 +3720,7 @@ struct TxnContext {
 
 using TxnPtr = std::shared_ptr<TxnContext>;
 
-enum class LockMode { S, X };
+enum class LockMode { IS, IX, S, SIX, X };
 
 enum class LockResourceType { TABLE, TUPLE };
 
@@ -3840,6 +3840,20 @@ public:
         std::vector<int> cycle;
     };
 
+    bool hasLock(int txn_id, const LockResource& resource, LockMode mode) {
+        std::lock_guard<std::mutex> guard(latch);
+        auto it = locks.find(resource);
+        if (it == locks.end()) {
+            return false;
+        }
+        for (const auto& grant : it->second) {
+            if (grant.txn_id == txn_id && grant.mode == mode) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     AcquireResult acquire(int txn_id,
                           const LockResource& resource,
                           LockMode mode,
@@ -3902,7 +3916,19 @@ public:
     }
 
     static std::string modeName(LockMode mode) {
-        return mode == LockMode::S ? "S" : "X";
+        switch (mode) {
+            case LockMode::IS:
+                return "IS";
+            case LockMode::IX:
+                return "IX";
+            case LockMode::S:
+                return "S";
+            case LockMode::SIX:
+                return "SIX";
+            case LockMode::X:
+                return "X";
+        }
+        throw std::runtime_error("Unknown lock mode.");
     }
 
 private:
@@ -3910,7 +3936,15 @@ private:
                                        const LockResource& resource,
                                        LockMode mode) {
         auto& grants = locks[resource];
-        auto blockers = blockersForLocked(txn_id, grants, mode);
+        LockMode effectiveMode = mode;
+        for (const auto& grant : grants) {
+            if (grant.txn_id == txn_id) {
+                effectiveMode = coalescedMode(grant.mode, mode);
+                break;
+            }
+        }
+
+        auto blockers = blockersForLocked(txn_id, grants, effectiveMode);
         if (!blockers.empty()) {
             LockRequestResult result;
             result.reason = "txn " + std::to_string(blockers.front()) +
@@ -3919,25 +3953,24 @@ private:
             return result;
         }
 
-        LockRequestResult result;
         for (auto& grant : grants) {
             if (grant.txn_id == txn_id) {
-                if (grant.mode == LockMode::S && mode == LockMode::X) {
-                    grant.mode = LockMode::X;
-                }
+                grant.mode = effectiveMode;
+                LockRequestResult result;
                 result.granted = true;
                 return result;
             }
         }
 
-        grants.push_back({txn_id, mode});
+        grants.push_back({txn_id, effectiveMode});
+        LockRequestResult result;
         result.granted = true;
         return result;
     }
 
-    static std::vector<int> blockersForLocked(int txn_id,
-                                              const std::vector<LockGrant>& grants,
-                                              LockMode mode) {
+    std::vector<int> blockersForLocked(int txn_id,
+                                       const std::vector<LockGrant>& grants,
+                                       LockMode mode) const {
         std::vector<int> blockers;
         for (const auto& grant : grants) {
             if (grant.txn_id != txn_id && !compatible(mode, grant.mode)) {
@@ -3948,20 +3981,53 @@ private:
     }
 
     static bool compatible(LockMode requested, LockMode held) {
-        return requested == LockMode::S && held == LockMode::S;
+        switch (requested) {
+            case LockMode::IS:
+                return held != LockMode::X;
+            case LockMode::IX:
+                return held == LockMode::IS || held == LockMode::IX;
+            case LockMode::S:
+                return held == LockMode::IS || held == LockMode::S;
+            case LockMode::SIX:
+                return held == LockMode::IS;
+            case LockMode::X:
+                return false;
+        }
+        throw std::runtime_error("Unknown lock mode.");
+    }
+
+    static bool strongerOrEqual(LockMode held, LockMode requested) {
+        if (held == requested || held == LockMode::X) {
+            return true;
+        }
+        if (held == LockMode::SIX) {
+            return requested == LockMode::S ||
+                   requested == LockMode::IX ||
+                   requested == LockMode::IS;
+        }
+        if (held == LockMode::S) {
+            return requested == LockMode::IS;
+        }
+        if (held == LockMode::IX) {
+            return requested == LockMode::IS;
+        }
+        return false;
+    }
+
+    static LockMode coalescedMode(LockMode held, LockMode requested) {
+        if (strongerOrEqual(held, requested)) {
+            return held;
+        }
+        if (strongerOrEqual(requested, held)) {
+            return requested;
+        }
+        if ((held == LockMode::S && requested == LockMode::IX) ||
+            (held == LockMode::IX && requested == LockMode::S)) {
+            return LockMode::SIX;
+        }
+        return requested;
     }
 };
-
-std::string txnCycleLabel(const std::vector<int>& cycle) {
-    std::string label;
-    for (int txn_id : cycle) {
-        if (!label.empty()) {
-            label += " -> ";
-        }
-        label += "txn " + std::to_string(txn_id);
-    }
-    return label;
-}
 
 class TransactionManager {
 public:
@@ -4117,6 +4183,17 @@ public:
         throw std::runtime_error("Unsupported field type.");
     }
 
+    static std::string txnCycleLabel(const std::vector<int>& cycle) {
+        std::ostringstream output;
+        for (size_t i = 0; i < cycle.size(); i++) {
+            if (i != 0) {
+                output << " -> ";
+            }
+            output << "txn " << cycle[i];
+        }
+        return output.str();
+    }
+
     void acquireMatchingTupleLocks(const TxnPtr& txn,
                                    LockMode mode,
                                    TableMetadata& metadata,
@@ -4155,6 +4232,10 @@ public:
             const std::string columnName = matches[2];
             const std::string value = matches[3];
             auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::IX,
+                        tableResource(metadata),
+                        tableResourceLabel(tableName));
             acquireMatchingTupleLocks(txn, LockMode::X, metadata, columnName, value);
             return;
         }
@@ -4166,6 +4247,10 @@ public:
             const std::string columnName = matches[2];
             const std::string value = matches[3];
             auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::IX,
+                        tableResource(metadata),
+                        tableResourceLabel(tableName));
             acquireMatchingTupleLocks(txn, LockMode::X, metadata, columnName, value);
             return;
         }
@@ -4176,7 +4261,7 @@ public:
             const std::string tableName = matches[1];
             auto& metadata = catalog.getTable(tableName);
             acquireLock(txn,
-                        LockMode::X,
+                        LockMode::IX,
                         tableResource(metadata),
                         tableResourceLabel(tableName));
             return;
@@ -4189,6 +4274,10 @@ public:
             const std::string columnName = matches[2];
             const std::string value = matches[3];
             auto& metadata = catalog.getTable(tableName);
+            acquireLock(txn,
+                        LockMode::IS,
+                        tableResource(metadata),
+                        tableResourceLabel(tableName));
             acquireMatchingTupleLocks(txn, LockMode::S, metadata, columnName, value);
             return;
         }
@@ -4209,13 +4298,27 @@ public:
                      LockMode mode,
                      const LockResource& resource,
                      const std::string& resourceLabel) {
+        bool tupleUpgrade = mode == LockMode::X &&
+                            lock_manager.hasLock(txn->id, resource, LockMode::S);
+        bool tableSixUpgrade = mode == LockMode::IX &&
+                               lock_manager.hasLock(txn->id, resource, LockMode::S);
+        bool coveredBySix = mode == LockMode::IX &&
+                            lock_manager.hasLock(txn->id, resource, LockMode::SIX);
+        std::string requestLabel = LockManager::modeName(mode);
+        if (tupleUpgrade) {
+            requestLabel = "S->X upgrade";
+        } else if (tableSixUpgrade) {
+            requestLabel = "S+IX -> SIX";
+        } else if (coveredBySix) {
+            requestLabel = "IX covered by SIX";
+        }
         auto result = lock_manager.acquire(
             txn->id,
             resource,
             mode,
             [&](const std::string& reason) {
                 std::cout << "Lock txn " << txn->id
-                          << " " << LockManager::modeName(mode)
+                          << " " << requestLabel
                           << " on " << resourceLabel
                           << " waits; " << reason
                           << "." << std::endl;
@@ -4234,7 +4337,7 @@ public:
         }
 
         std::cout << "Lock txn " << txn->id
-                  << " " << LockManager::modeName(mode)
+                  << " " << requestLabel
                   << " on " << resourceLabel;
         if (result.waited) {
             std::cout << " granted after wait." << std::endl;
@@ -4496,124 +4599,77 @@ public:
     }
 };
 
-bool seatIsHeldFor(BuzzDB& db,
-                   const TxnPtr& txn,
-                   const std::string& seatNo,
-                   const std::string& customer) {
-    db.execute(txn, "SELECT {*} FROM seats WHERE seat_no = " + seatNo);
-
-    auto& seatsMetadata = db.catalog.getTable("seats");
-    TableHeap seatsHeap(seatsMetadata, db.page_manager);
-    auto seatNoColumn = static_cast<size_t>(
-        seatsMetadata.schema.getColumnIndex("seat_no"));
-    auto statusColumn = static_cast<size_t>(
-        seatsMetadata.schema.getColumnIndex("status"));
-    auto customerColumn = static_cast<size_t>(
-        seatsMetadata.schema.getColumnIndex("customer"));
-
-    for (auto& seat : seatsHeap.readAllTuples()) {
-        if (seat->fields[seatNoColumn]->asString() != seatNo) {
-            continue;
-        }
-        return seat->fields[statusColumn]->asString() == "held" &&
-               seat->fields[customerColumn]->asString() == customer;
-    }
-
-    throw std::runtime_error("Unknown seat: " + seatNo);
-}
-
-void runDeadlockWorkload(BuzzDB& db) {
-    auto txn1 = db.beginTransaction();
-    auto txn2 = db.beginTransaction();
-
-    std::cout << "\nTxn " << txn1->id << " starts booking 1A for garcia. Txn "
-              << txn2->id << " starts booking 1B for patel.\n";
-    db.execute(txn1, "UPDATE seats SET status = held WHERE seat_no = 1A");
-    db.execute(txn1, "UPDATE seats SET customer = garcia WHERE seat_no = 1A");
-    db.execute(txn2, "UPDATE seats SET status = held WHERE seat_no = 1B");
-    db.execute(txn2, "UPDATE seats SET customer = patel WHERE seat_no = 1B");
-
-    // Run txn 1's second request in another thread so it can block while
-    // txn 2 later makes the request that closes the waits-for cycle.
-    std::cout << "\nTxn " << txn1->id
-              << " now tries to add 1B to garcia's booking and waits behind txn "
-              << txn2->id << ".\n";
-    std::atomic<bool> txn1Finished{false};
-    std::exception_ptr txn1Error;
-    std::thread txn1Thread([&]() {
-        try {
-            db.execute(txn1, "UPDATE seats SET status = held WHERE seat_no = 1B");
-            db.execute(txn1, "UPDATE seats SET customer = garcia WHERE seat_no = 1B");
-            db.execute(txn1, "INSERT INTO holds VALUES (1, 1, garcia, open)");
-            db.execute(txn1, "INSERT INTO holds VALUES (2, 2, garcia, open)");
-            std::cout << "\nTxn " << txn1->id
-                      << " resumes after the victim releases locks and records garcia's holds.\n";
-            db.commit(txn1);
-        } catch (...) {
-            txn1Error = std::current_exception();
-        }
-        txn1Finished = true;
-    });
-
-    // If txn 1 has not finished quickly, it is waiting in LockManager.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (txn1Finished) {
-        txn1Thread.join();
-        if (txn1Error) {
-            std::rethrow_exception(txn1Error);
-        }
-        throw std::runtime_error("Expected txn 1 to wait for txn 2's tuple lock.");
-    }
-
-    // This request creates txn 1 -> txn 2 and txn 2 -> txn 1 in the waits-for graph.
-    std::cout << "\nTxn " << txn2->id
-              << " now tries to add 1A to patel's booking, closing the waits-for cycle.\n";
-    try {
-        db.execute(txn2, "UPDATE seats SET status = held WHERE seat_no = 1A");
-        db.commit(txn2);
-        throw std::runtime_error("Expected deadlock detection when txn 2 requested 1A.");
-    } catch (const std::runtime_error& error) {
-        // BuzzDB aborts the requesting transaction when LockManager reports a deadlock.
-        if (txn2->state != TxnContext::ABORTED) {
-            throw;
-        }
-    }
-
-    // Txn 2's abort releases 1B, so txn 1 wakes up and commits.
-    txn1Thread.join();
-    if (txn1Error) {
-        std::rethrow_exception(txn1Error);
-    }
-}
-
 int main() {
     try {
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Deadlock detection inside the lock manager\n";
+    std::cout << "Intention locks for table and tuple locking\n";
 
     BuzzDB db;
     DatabaseImporter::importFile(db, "booking.txt");
 
-    std::cout << "\nInitial committed state of seats 1A and 1B:\n";
+    std::cout << "\nInitial committed state:\n";
     db.executeStatementsAndQueries({
         "SELECT {*} FROM seats WHERE seat_no = 1A",
         "SELECT {*} FROM seats WHERE seat_no = 1B",
+        "SELECT {*} FROM seats WHERE seat_no = 1C",
+        "SELECT {*} FROM seats WHERE seat_no = 1D",
     });
 
-    runDeadlockWorkload(db);
+    std::cout << "\nSlide-shaped interaction with three transactions:\n";
+
+    auto txn1 = db.beginTransaction();
+    std::cout << "\nT1 scans all seats, then updates one seat.\n";
+    db.execute(txn1, "SELECT {*} FROM seats");
+    db.execute(txn1, "UPDATE seats SET status = held WHERE seat_no = 1D");
+    db.execute(txn1, "UPDATE seats SET customer = garcia WHERE seat_no = 1D");
+    db.execute(txn1, "INSERT INTO holds VALUES (1, 4, garcia, open)");
+
+    auto txn2 = db.beginTransaction();
+    std::cout << "\nT2 point-reads 1A while T1 holds SIX(table seats).\n";
+    db.execute(txn2, "SELECT {*} FROM seats WHERE seat_no = 1A");
+    db.commit(txn2);
+
+    std::cout << "\nT3 tries to scan all seats and waits behind T1's SIX(table seats).\n";
+    std::atomic<bool> txn3Finished{false};
+    std::exception_ptr txn3Error;
+    std::thread txn3Thread([&]() {
+        try {
+            auto txn3 = db.beginTransaction();
+            db.execute(txn3, "SELECT {*} FROM seats");
+            db.commit(txn3);
+        } catch (...) {
+            txn3Error = std::current_exception();
+        }
+        txn3Finished = true;
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (txn3Finished) {
+        txn3Thread.join();
+        if (txn3Error) {
+            std::rethrow_exception(txn3Error);
+        }
+        throw std::runtime_error("Expected T3 scan to wait for T1's SIX table lock.");
+    }
+
+    std::cout << "\nT3 is waiting at S(table seats); commit T1.\n";
+    db.commit(txn1);
+    txn3Thread.join();
+    if (txn3Error) {
+        std::rethrow_exception(txn3Error);
+    }
 
     std::cout << "\nFinal committed state:\n";
     db.executeStatementsAndQueries({
-        "SELECT {*} FROM seats WHERE seat_no = 1A",
-        "SELECT {*} FROM seats WHERE seat_no = 1B",
+        "SELECT {*} FROM seats WHERE seat_no = 1D",
         "SELECT {*} FROM holds",
     });
 
-    std::cout << "\nResult: the waits-for graph found the cycle, "
-              << "the lock manager chose a victim, and the survivor committed "
-              << "the matching seat and hold rows.\n";
+    std::cout << "\nResult: T1 used SIX(table seats) plus X(tuple 1D), "
+              << "T2 can still use IS(table seats)+S(tuple 1A), "
+              << "and T3's full S(table seats) scan waits.\n";
 
     auto end = std::chrono::high_resolution_clock::now();
 
