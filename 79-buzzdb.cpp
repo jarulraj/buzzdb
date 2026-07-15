@@ -4069,6 +4069,9 @@ class ConcurrencyControlPolicy {
 public:
     virtual ~ConcurrencyControlPolicy() = default;
     virtual std::string name() const = 0;
+    virtual bool usesPrivateWorkspace() const {
+        return false;
+    }
     virtual void begin(int txn_id) = 0;
     virtual ConcurrencyControlResult beforeAccess(
         const ConcurrencyControlRequest& request) = 0;
@@ -4171,6 +4174,10 @@ public:
         return "Optimistic Concurrency Control";
     }
 
+    bool usesPrivateWorkspace() const override {
+        return true;
+    }
+
     void begin(int txn_id) override {
         std::lock_guard<std::mutex> guard(latch);
         active_txns[txn_id] = TxnState{++logical_clock, {}, {}};
@@ -4266,20 +4273,90 @@ public:
 };
 
 class TransactionManager {
+private:
+    LockManager lock_manager;
+    std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
+    std::map<int, std::vector<std::string>> private_workspaces;
+
 public:
+    TransactionManager() {
+        useTwoPhaseLockingPolicy();
+    }
+
+    void useTwoPhaseLockingPolicy() {
+        concurrency_control_policy =
+            std::make_unique<TwoPhaseLockingPolicy>(lock_manager);
+        private_workspaces.clear();
+    }
+
+    void useOptimisticConcurrencyControlPolicy() {
+        concurrency_control_policy =
+            std::make_unique<OptimisticConcurrencyControlPolicy>();
+        private_workspaces.clear();
+    }
+
+    std::string concurrencyControlPolicyName() const {
+        return concurrency_control_policy->name();
+    }
+
+    bool usesPrivateWorkspace() const {
+        return concurrency_control_policy->usesPrivateWorkspace();
+    }
+
     TxnPtr begin(int txn_id) {
         std::cout << "BEGIN txn " << txn_id << std::endl;
-        return std::make_shared<TxnContext>(TxnContext{txn_id});
+        auto txn = std::make_shared<TxnContext>(TxnContext{txn_id});
+        private_workspaces[txn_id] = {};
+        concurrency_control_policy->begin(txn_id);
+        return txn;
+    }
+
+    ConcurrencyControlResult requestAccess(
+            const TxnPtr& txn,
+            AccessType type,
+            const std::vector<ConcurrencyControlResource>& resources) {
+        if (!txn || resources.empty()) {
+            return {};
+        }
+        return concurrency_control_policy->beforeAccess({
+            txn->id,
+            type,
+            resources
+        });
+    }
+
+    void bufferWrite(const TxnContext& txn, const std::string& statement) {
+        private_workspaces[txn.id].push_back(statement);
+        std::cout << "Private workspace for txn " << txn.id
+                  << " buffers: " << statement << std::endl;
+    }
+
+    const std::vector<std::string>& privateWorkspace(
+            const TxnContext& txn) const {
+        static const std::vector<std::string> empty_workspace;
+        auto it = private_workspaces.find(txn.id);
+        if (it == private_workspaces.end()) {
+            return empty_workspace;
+        }
+        return it->second;
+    }
+
+    ConcurrencyControlResult prepareCommit(const TxnContext& txn) {
+        return concurrency_control_policy->beforeCommit(txn.id);
     }
 
     void commit(TxnContext& txn) {
         txn.state = TxnContext::COMMITTED;
         std::cout << "COMMIT txn " << txn.id << std::endl;
+        concurrency_control_policy->afterCommit(txn.id);
+        private_workspaces.erase(txn.id);
     }
 
     void abort(TxnContext& txn) {
         txn.state = TxnContext::ABORTED;
         std::cout << "ABORT txn " << txn.id << std::endl;
+        concurrency_control_policy->abort(txn.id);
+        private_workspaces.erase(txn.id);
     }
 };
 
@@ -4291,8 +4368,6 @@ public:
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
-    LockManager lock_manager;
-    std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
     TxnPtr active_txn;
 
 public:
@@ -4307,29 +4382,29 @@ public:
     }
 
     void useTwoPhaseLockingPolicy() {
-        concurrency_control_policy =
-            std::make_unique<TwoPhaseLockingPolicy>(lock_manager);
+        txn_manager.useTwoPhaseLockingPolicy();
     }
 
     void useOptimisticConcurrencyControlPolicy() {
-        concurrency_control_policy =
-            std::make_unique<OptimisticConcurrencyControlPolicy>();
+        txn_manager.useOptimisticConcurrencyControlPolicy();
     }
 
     std::string concurrencyControlPolicyName() const {
-        return concurrency_control_policy->name();
+        return txn_manager.concurrencyControlPolicyName();
     }
 
     TxnPtr beginTransaction() {
         int txn_id = recovery_manager.begin();
-        auto txn = txn_manager.begin(txn_id);
-        concurrency_control_policy->begin(txn_id);
-        return txn;
+        return txn_manager.begin(txn_id);
     }
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
         if (!acquireStatementAccess(txn, statement)) {
+            return;
+        }
+        if (txn_manager.usesPrivateWorkspace() && isWriteStatement(statement)) {
+            txn_manager.bufferWrite(*txn, statement);
             return;
         }
         recovery_manager.setCurrentTransaction(txn->id);
@@ -4343,20 +4418,18 @@ public:
     }
 
     void commit(const TxnPtr& txn) {
-        commitInternal(txn, {}, true);
+        commitInternal(txn, true);
     }
 
-    bool commitBuffered(const TxnPtr& txn,
-                        const std::vector<std::string>& bufferedStatements) {
-        return commitInternal(txn, bufferedStatements, false);
+    bool tryCommit(const TxnPtr& txn) {
+        return commitInternal(txn, false);
     }
 
 private:
     bool commitInternal(const TxnPtr& txn,
-                        const std::vector<std::string>& bufferedStatements,
                         bool throwOnReject) {
         requireRunningTransaction(txn);
-        auto cc_result = concurrency_control_policy->beforeCommit(txn->id);
+        auto cc_result = txn_manager.prepareCommit(*txn);
         if (!cc_result.granted) {
             std::string detail = cc_result.detail.empty()
                 ? "Concurrency-control policy rejected COMMIT"
@@ -4371,18 +4444,17 @@ private:
             return false;
         }
 
-        for (const auto& statement : bufferedStatements) {
-            applyBufferedStatement(txn, statement);
+        for (const auto& statement : txn_manager.privateWorkspace(*txn)) {
+            installPrivateWorkspaceStatement(txn, statement);
         }
 
         recovery_manager.commit(txn->id);
         txn_manager.commit(*txn);
-        concurrency_control_policy->afterCommit(txn->id);
         return true;
     }
 
-    void applyBufferedStatement(const TxnPtr& txn,
-                                const std::string& statement) {
+    void installPrivateWorkspaceStatement(const TxnPtr& txn,
+                                          const std::string& statement) {
         recovery_manager.setCurrentTransaction(txn->id);
         try {
             executeStatementsAndQueries({statement});
@@ -4398,7 +4470,6 @@ public:
         requireRunningTransaction(txn);
         recovery_manager.abort(txn->id);
         txn_manager.abort(*txn);
-        concurrency_control_policy->abort(txn->id);
     }
 
     void begin() {
@@ -4444,6 +4515,12 @@ public:
         if (!txn || txn->state != TxnContext::RUNNING) {
             throw std::runtime_error("Statement requires a running transaction.");
         }
+    }
+
+    static bool isWriteStatement(const std::string& statement) {
+        std::regex writeRegex("^\\s*(UPDATE|DELETE|INSERT)\\b",
+                              std::regex_constants::icase);
+        return std::regex_search(statement, writeRegex);
     }
 
     static ConcurrencyControlResource tupleResource(const TableMetadata& metadata,
@@ -4650,11 +4727,7 @@ public:
                       << " access to " << resourceLabel(resource)
                       << "." << std::endl;
 
-            auto result = concurrency_control_policy->beforeAccess({
-                txn->id,
-                type,
-                {resource}
-            });
+            auto result = txn_manager.requestAccess(txn, type, {resource});
 
             if (result.deadlock) {
                 std::cout << "Deadlock detected in waits-for graph: "
@@ -5033,36 +5106,6 @@ void printTxnStates(const std::string& left_label,
               << txnStateName(right_txn) << std::endl;
 }
 
-struct BufferedOccWrite {
-    std::string statement;
-};
-
-bool bufferOccSeatUpdate(BuzzDB& db,
-                         const TxnPtr& txn,
-                         const std::string& seat_no,
-                         std::vector<BufferedOccWrite>& writes) {
-    auto resources = db.tupleResourcesForWhere("seats", "seat_no", seat_no);
-    std::cout << "OCC buffers UPDATE seats SET status = held WHERE seat_no = "
-              << seat_no << "." << std::endl;
-    if (!db.acquireTxnAccess(txn, AccessType::Write, resources)) {
-        return false;
-    }
-    writes.push_back({
-        "UPDATE seats SET status = held WHERE seat_no = " + seat_no
-    });
-    return true;
-}
-
-bool commitOccTxn(BuzzDB& db,
-                  const TxnPtr& txn,
-                  const std::vector<BufferedOccWrite>& writes) {
-    std::vector<std::string> statements;
-    for (const auto& write : writes) {
-        statements.push_back(write.statement);
-    }
-    return db.commitBuffered(txn, statements);
-}
-
 void runLowConflictSchedule(BuzzDB& db,
                             ConcurrencyControlPolicyKind policy_kind) {
     std::cout << "\nSchedule A: two transactions update different seats"
@@ -5091,15 +5134,21 @@ void runLowConflictSchedule(BuzzDB& db,
                 "different seats, but it still takes exclusive row locks.";
             break;
         case ConcurrencyControlPolicyKind::OptimisticConcurrencyControl: {
-            std::vector<BufferedOccWrite> t1_writes;
-            std::vector<BufferedOccWrite> t2_writes;
-            bufferOccSeatUpdate(db, t1, "1A", t1_writes);
-            bufferOccSeatUpdate(db, t2, "1B", t2_writes);
-            commitOccTxn(db, t1, t1_writes);
-            commitOccTxn(db, t2, t2_writes);
+            executeIfRunning(
+                db,
+                t1,
+                "UPDATE seats SET status = held WHERE seat_no = 1A"
+            );
+            executeIfRunning(
+                db,
+                t2,
+                "UPDATE seats SET status = held WHERE seat_no = 1B"
+            );
+            db.commit(t1);
+            db.commit(t2);
             interpretation =
                 "Interpretation: OCC validates successfully because the "
-                "buffered writes touch disjoint seats.";
+                "private-workspace writes touch disjoint seats.";
             break;
         }
     }
@@ -5155,12 +5204,18 @@ void runStaleReadSchedule(BuzzDB& db,
         }
         case ConcurrencyControlPolicyKind::OptimisticConcurrencyControl: {
             t2 = db.beginTransaction();
-            std::vector<BufferedOccWrite> t2_writes;
-            std::vector<BufferedOccWrite> t1_writes;
-            bufferOccSeatUpdate(db, t2, "1C", t2_writes);
-            commitOccTxn(db, t2, t2_writes);
-            bufferOccSeatUpdate(db, t1, "1D", t1_writes);
-            if (!commitOccTxn(db, t1, t1_writes)) {
+            executeIfRunning(
+                db,
+                t2,
+                "UPDATE seats SET status = held WHERE seat_no = 1C"
+            );
+            db.commit(t2);
+            executeIfRunning(
+                db,
+                t1,
+                "UPDATE seats SET status = held WHERE seat_no = 1D"
+            );
+            if (!db.tryCommit(t1)) {
                 std::cout << "OCC aborts T1 because its read of 1C "
                           << "was invalidated before validation."
                           << std::endl;
@@ -5227,14 +5282,20 @@ void runCrossedReadWriteSchedule(BuzzDB& db,
             break;
         }
         case ConcurrencyControlPolicyKind::OptimisticConcurrencyControl: {
-            std::vector<BufferedOccWrite> t1_writes;
-            std::vector<BufferedOccWrite> t2_writes;
             readSeatIfRunning(db, t1, "T1", "2A");
             readSeatIfRunning(db, t2, "T2", "2B");
-            bufferOccSeatUpdate(db, t1, "2B", t1_writes);
-            commitOccTxn(db, t1, t1_writes);
-            bufferOccSeatUpdate(db, t2, "2A", t2_writes);
-            if (!commitOccTxn(db, t2, t2_writes)) {
+            executeIfRunning(
+                db,
+                t1,
+                "UPDATE seats SET status = held WHERE seat_no = 2B"
+            );
+            db.commit(t1);
+            executeIfRunning(
+                db,
+                t2,
+                "UPDATE seats SET status = held WHERE seat_no = 2A"
+            );
+            if (!db.tryCommit(t2)) {
                 std::cout << "OCC aborts T2 because its read of 2B "
                           << "was invalidated before validation."
                           << std::endl;
@@ -5286,12 +5347,18 @@ void runReadMostlyNoConflictSchedule(BuzzDB& db,
                 "and write locks.";
             break;
         case ConcurrencyControlPolicyKind::OptimisticConcurrencyControl: {
-            std::vector<BufferedOccWrite> t2_writes;
-            std::vector<BufferedOccWrite> t3_writes;
-            bufferOccSeatUpdate(db, t2, "2C", t2_writes);
-            bufferOccSeatUpdate(db, t3, "2D", t3_writes);
-            commitOccTxn(db, t2, t2_writes);
-            commitOccTxn(db, t3, t3_writes);
+            executeIfRunning(
+                db,
+                t2,
+                "UPDATE seats SET status = held WHERE seat_no = 2C"
+            );
+            executeIfRunning(
+                db,
+                t3,
+                "UPDATE seats SET status = held WHERE seat_no = 2D"
+            );
+            db.commit(t2);
+            db.commit(t3);
             db.commit(t1);
             interpretation =
                 "Interpretation: OCC gets the same commits without taking "
@@ -5331,8 +5398,9 @@ int main() {
         std::cout << "The same interleaved schedules run from an empty "
                   << "database under each policy." << std::endl;
         std::cout << "OCC records read/write sets during the read phase, "
-                  << "validates at commit, and installs buffered writes only "
-                  << "after validation succeeds." << std::endl;
+                  << "keeps writes in each transaction's private workspace, "
+                  << "and installs them only after validation succeeds."
+                  << std::endl;
 
         runPolicyComparison(ConcurrencyControlPolicyKind::TwoPhaseLocking);
         runPolicyComparison(

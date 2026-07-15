@@ -4068,20 +4068,59 @@ public:
 };
 
 class TransactionManager {
+private:
+    LockManager lock_manager;
+    std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
+
 public:
+    TransactionManager() {
+        useTwoPhaseLockingPolicy();
+    }
+
+    void useTwoPhaseLockingPolicy() {
+        concurrency_control_policy =
+            std::make_unique<TwoPhaseLockingPolicy>(lock_manager);
+    }
+
+    std::string concurrencyControlPolicyName() const {
+        return concurrency_control_policy->name();
+    }
+
     TxnPtr begin(int txn_id) {
         std::cout << "BEGIN txn " << txn_id << std::endl;
-        return std::make_shared<TxnContext>(TxnContext{txn_id});
+        auto txn = std::make_shared<TxnContext>(TxnContext{txn_id});
+        concurrency_control_policy->begin(txn_id);
+        return txn;
+    }
+
+    ConcurrencyControlResult requestAccess(
+            const TxnPtr& txn,
+            AccessType type,
+            const std::vector<ConcurrencyControlResource>& resources) {
+        if (!txn || resources.empty()) {
+            return {};
+        }
+        return concurrency_control_policy->beforeAccess({
+            txn->id,
+            type,
+            resources
+        });
+    }
+
+    ConcurrencyControlResult prepareCommit(const TxnContext& txn) {
+        return concurrency_control_policy->beforeCommit(txn.id);
     }
 
     void commit(TxnContext& txn) {
         txn.state = TxnContext::COMMITTED;
         std::cout << "COMMIT txn " << txn.id << std::endl;
+        concurrency_control_policy->afterCommit(txn.id);
     }
 
     void abort(TxnContext& txn) {
         txn.state = TxnContext::ABORTED;
         std::cout << "ABORT txn " << txn.id << std::endl;
+        concurrency_control_policy->abort(txn.id);
     }
 };
 
@@ -4093,8 +4132,6 @@ public:
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
-    LockManager lock_manager;
-    std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
     TxnPtr active_txn;
 
 public:
@@ -4109,19 +4146,16 @@ public:
     }
 
     void useTwoPhaseLockingPolicy() {
-        concurrency_control_policy =
-            std::make_unique<TwoPhaseLockingPolicy>(lock_manager);
+        txn_manager.useTwoPhaseLockingPolicy();
     }
 
     std::string concurrencyControlPolicyName() const {
-        return concurrency_control_policy->name();
+        return txn_manager.concurrencyControlPolicyName();
     }
 
     TxnPtr beginTransaction() {
         int txn_id = recovery_manager.begin();
-        auto txn = txn_manager.begin(txn_id);
-        concurrency_control_policy->begin(txn_id);
-        return txn;
+        return txn_manager.begin(txn_id);
     }
 
     void execute(const TxnPtr& txn, const std::string& statement) {
@@ -4139,7 +4173,7 @@ public:
 
     void commit(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        auto cc_result = concurrency_control_policy->beforeCommit(txn->id);
+        auto cc_result = txn_manager.prepareCommit(*txn);
         if (!cc_result.granted) {
             abort(txn);
             throw std::runtime_error(
@@ -4149,14 +4183,12 @@ public:
         }
         recovery_manager.commit(txn->id);
         txn_manager.commit(*txn);
-        concurrency_control_policy->afterCommit(txn->id);
     }
 
     void abort(const TxnPtr& txn) {
         requireRunningTransaction(txn);
         recovery_manager.abort(txn->id);
         txn_manager.abort(*txn);
-        concurrency_control_policy->abort(txn->id);
     }
 
     void begin() {
@@ -4380,11 +4412,7 @@ public:
                       << " access to " << resourceLabel(resource)
                       << "." << std::endl;
 
-            auto result = concurrency_control_policy->beforeAccess({
-                txn->id,
-                type,
-                {resource}
-            });
+            auto result = txn_manager.requestAccess(txn, type, {resource});
 
             if (result.deadlock) {
                 std::cout << "Deadlock detected in waits-for graph: "
