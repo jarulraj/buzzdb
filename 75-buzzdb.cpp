@@ -4902,6 +4902,34 @@ static std::string recoveryClass(const ScheduleAnalysis& analysis) {
     return "not recoverable";
 }
 
+static std::string recoveryLadderRung(const ScheduleAnalysis& analysis) {
+    if (analysis.strict) {
+        return "STRICT";
+    }
+    if (analysis.avoids_cascading_aborts) {
+        return "CASCADELESS";
+    }
+    if (analysis.recoverable) {
+        return "RECOVERABLE";
+    }
+    return "NOT RECOVERABLE";
+}
+
+// This ladder classifies recovery safety after aborts or crashes. It is related
+// to locking behavior, but it is not the same thing as the SQL isolation level.
+static void printRecoveryLadder() {
+    std::cout << "\nRecovery-safety ladder, strongest to weakest:\n";
+    std::cout << "  STRICT\n";
+    std::cout << "    -> CASCADELESS\n";
+    std::cout << "       -> RECOVERABLE\n";
+    std::cout << "          -> NOT RECOVERABLE\n";
+    std::cout << "This ladder asks whether commit/abort order is safe if a "
+              << "transaction aborts.\n";
+    std::cout << "Isolation levels ask what concurrent data a transaction is "
+              << "allowed to observe.\n";
+    std::cout << "Conflict-serializability is a separate conflict-graph property.\n";
+}
+
 static void printScheduleResult(const std::string& label, bool value) {
     std::cout << "  " << label << ": "
               << (value ? "yes" : "no") << std::endl;
@@ -4939,6 +4967,7 @@ static void printScheduleAnalysis(
     std::cout << std::endl;
 
     std::cout << "Recovery class: " << recoveryClass(analysis) << std::endl;
+    std::cout << "Ladder rung: " << recoveryLadderRung(analysis) << std::endl;
     printScheduleResult("Conflict-serializable",
                         analysis.conflict_serializable);
     printScheduleResult("Recoverable", analysis.recoverable);
@@ -4952,6 +4981,7 @@ int main() {
     auto start = std::chrono::high_resolution_clock::now();
 
     std::cout << "Schedule properties: recovery and serializability\n";
+    printRecoveryLadder();
 
     BuzzDB db;
     DatabaseImporter::importFile(db, "booking.txt");
