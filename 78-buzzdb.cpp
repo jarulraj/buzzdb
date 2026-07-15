@@ -4877,7 +4877,7 @@ enum class ConcurrencyControlPolicyKind {
     TimestampOrdering
 };
 
-void resetDemoDatabaseFiles() {
+void resetDatabaseFiles() {
     std::remove(database_filename.c_str());
     std::remove(log_filename.c_str());
     std::remove(master_record_filename.c_str());
@@ -5165,7 +5165,7 @@ void runReadMostlyNoConflictSchedule(BuzzDB& db,
 }
 
 void runPolicyComparison(ConcurrencyControlPolicyKind policy_kind) {
-    resetDemoDatabaseFiles();
+    resetDatabaseFiles();
 
     BuzzDB db;
     usePolicy(db, policy_kind);
