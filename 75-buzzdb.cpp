@@ -4696,6 +4696,13 @@ public:
 
 enum class ScheduleOpType { READ, WRITE, COMMIT, ABORT };
 
+enum class RecoverabilityLevel {
+    NotRecoverable,
+    Recoverable,
+    Cascadeless,
+    Strict
+};
+
 struct ScheduleOperation {
     int txn_id;
     ScheduleOpType type;
@@ -4715,6 +4722,7 @@ struct ScheduleAnalysis {
     bool recoverable = true;
     bool avoids_cascading_aborts = true;
     bool strict = true;
+    RecoverabilityLevel recoverability_level = RecoverabilityLevel::Strict;
 };
 
 static std::string scheduleOperationLabel(const ScheduleOperation& operation) {
@@ -4886,33 +4894,45 @@ static ScheduleAnalysis analyzeSchedule(
         }
     }
 
+    if (analysis.strict) {
+        analysis.recoverability_level = RecoverabilityLevel::Strict;
+    } else if (analysis.avoids_cascading_aborts) {
+        analysis.recoverability_level = RecoverabilityLevel::Cascadeless;
+    } else if (analysis.recoverable) {
+        analysis.recoverability_level = RecoverabilityLevel::Recoverable;
+    } else {
+        analysis.recoverability_level = RecoverabilityLevel::NotRecoverable;
+    }
+
     return analysis;
 }
 
-static std::string recoveryClass(const ScheduleAnalysis& analysis) {
-    if (analysis.strict) {
-        return "strict, cascadeless, recoverable";
+static std::string recoverabilityLevelName(RecoverabilityLevel level) {
+    switch (level) {
+        case RecoverabilityLevel::NotRecoverable:
+            return "NOT RECOVERABLE";
+        case RecoverabilityLevel::Recoverable:
+            return "RECOVERABLE";
+        case RecoverabilityLevel::Cascadeless:
+            return "CASCADELESS";
+        case RecoverabilityLevel::Strict:
+            return "STRICT";
     }
-    if (analysis.avoids_cascading_aborts) {
-        return "cascadeless and recoverable, but not strict";
-    }
-    if (analysis.recoverable) {
-        return "recoverable only";
-    }
-    return "not recoverable";
+    return "UNKNOWN";
 }
 
-static std::string recoveryLadderRung(const ScheduleAnalysis& analysis) {
-    if (analysis.strict) {
-        return "STRICT";
+static std::string recoverabilityLevelDescription(RecoverabilityLevel level) {
+    switch (level) {
+        case RecoverabilityLevel::NotRecoverable:
+            return "a reader can commit before the dirty writer finishes";
+        case RecoverabilityLevel::Recoverable:
+            return "dirty reads may happen, but dependent commits are delayed";
+        case RecoverabilityLevel::Cascadeless:
+            return "dirty reads are avoided";
+        case RecoverabilityLevel::Strict:
+            return "dirty reads and dirty writes are avoided";
     }
-    if (analysis.avoids_cascading_aborts) {
-        return "CASCADELESS";
-    }
-    if (analysis.recoverable) {
-        return "RECOVERABLE";
-    }
-    return "NOT RECOVERABLE";
+    return "unknown";
 }
 
 // This ladder classifies recovery safety after aborts or crashes. It is related
@@ -4966,10 +4986,15 @@ static void printScheduleAnalysis(
     }
     std::cout << std::endl;
 
-    std::cout << "Recovery class: " << recoveryClass(analysis) << std::endl;
-    std::cout << "Ladder rung: " << recoveryLadderRung(analysis) << std::endl;
-    printScheduleResult("Conflict-serializable",
-                        analysis.conflict_serializable);
+    std::cout << "RecoverabilityLevel: "
+              << recoverabilityLevelName(analysis.recoverability_level)
+              << " (" << recoverabilityLevelDescription(
+                         analysis.recoverability_level)
+              << ")" << std::endl;
+    if (!analysis.conflict_serializable) {
+        std::cout << "  Conflict-serializable: no "
+                  << "(separate conflict-graph property)" << std::endl;
+    }
     printScheduleResult("Recoverable", analysis.recoverable);
     printScheduleResult("Cascadeless", analysis.avoids_cascading_aborts);
     printScheduleResult("Strict", analysis.strict);
