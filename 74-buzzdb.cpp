@@ -4704,56 +4704,85 @@ int main() {
     BuzzDB db;
     DatabaseImporter::importFile(db, "booking.txt");
 
-    db.setIsolationLevel(IsolationLevel::RepeatableRead);
-    auto txn1 = db.beginTransaction();
-    std::cout << "\nRR1 first scan: available seats.\n";
-    db.execute(txn1, "SELECT {*} FROM seats WHERE status = available");
+    db.setIsolationLevel(IsolationLevel::ReadUncommitted);
+    auto ruWriter = db.beginTransaction();
+    std::cout << "\nRU1 updates 1A but does not commit.\n";
+    db.execute(ruWriter, "UPDATE seats SET status = held WHERE seat_no = 1A");
+    db.execute(ruWriter, "UPDATE seats SET customer = garcia WHERE seat_no = 1A");
 
-    auto txn2 = db.beginTransaction();
+    auto ruReader = db.beginTransaction();
+    std::cout << "\nRU2 reads 1A without taking a read lock, so it can see dirty data.\n";
+    db.execute(ruReader, "SELECT {*} FROM seats WHERE seat_no = 1A");
+    db.commit(ruReader);
+
+    std::cout << "\nRU1 aborts; the value RU2 saw was never committed.\n";
+    db.abort(ruWriter);
+
+    db.setIsolationLevel(IsolationLevel::ReadCommitted);
+    auto rcReader = db.beginTransaction();
+    std::cout << "\nRC1 first read of 1B.\n";
+    db.execute(rcReader, "SELECT {*} FROM seats WHERE seat_no = 1B");
+
+    auto rcWriter = db.beginTransaction();
+    std::cout << "\nRC2 updates and commits 1B after RC1's statement read lock is released.\n";
+    db.execute(rcWriter, "UPDATE seats SET status = held WHERE seat_no = 1B");
+    db.execute(rcWriter, "UPDATE seats SET customer = zhang WHERE seat_no = 1B");
+    db.commit(rcWriter);
+
+    std::cout << "\nRC1 reads 1B again and sees a different committed value.\n";
+    db.execute(rcReader, "SELECT {*} FROM seats WHERE seat_no = 1B");
+    db.commit(rcReader);
+
+    db.setIsolationLevel(IsolationLevel::RepeatableRead);
+    auto rrReader = db.beginTransaction();
+    std::cout << "\nRR1 first scan: available seats.\n";
+    db.execute(rrReader, "SELECT {*} FROM seats WHERE status = available");
+
+    auto rrWriter = db.beginTransaction();
     std::cout << "\nRR2 inserts available seat 3A while RR1 is still open.\n";
-    db.execute(txn2, "INSERT INTO seats VALUES (9, 1, 3A, available, unassigned)");
-    db.commit(txn2);
+    db.execute(rrWriter, "INSERT INTO seats VALUES (9, 1, 3A, available, unassigned)");
+    db.commit(rrWriter);
 
     std::cout << "\nRR1 repeats the same predicate scan and sees the phantom.\n";
-    db.execute(txn1, "SELECT {*} FROM seats WHERE status = available");
-    db.commit(txn1);
+    db.execute(rrReader, "SELECT {*} FROM seats WHERE status = available");
+    db.commit(rrReader);
 
     db.setIsolationLevel(IsolationLevel::Serializable);
-    auto txn3 = db.beginTransaction();
+    auto serialReader = db.beginTransaction();
     std::cout << "\nS1 first scan: available seats.\n";
-    db.execute(txn3, "SELECT {*} FROM seats WHERE status = available");
+    db.execute(serialReader, "SELECT {*} FROM seats WHERE status = available");
 
     std::cout << "\nS2 tries to insert available seat 3B.\n";
-    std::atomic<bool> txn4Finished{false};
-    std::exception_ptr txn4Error;
-    std::thread txn4Thread([&]() {
+    std::atomic<bool> serialWriterFinished{false};
+    std::exception_ptr serialWriterError;
+    std::thread serialWriterThread([&]() {
         try {
-            auto txn4 = db.beginTransaction();
-            db.execute(txn4, "INSERT INTO seats VALUES (10, 1, 3B, available, unassigned)");
-            db.commit(txn4);
+            auto serialWriter = db.beginTransaction();
+            db.execute(serialWriter, "INSERT INTO seats VALUES (10, 1, 3B, available, unassigned)");
+            db.commit(serialWriter);
         } catch (...) {
-            txn4Error = std::current_exception();
+            serialWriterError = std::current_exception();
         }
-        txn4Finished = true;
+        serialWriterFinished = true;
     });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (txn4Finished) {
-        txn4Thread.join();
-        if (txn4Error) {
-            std::rethrow_exception(txn4Error);
+    if (serialWriterFinished) {
+        serialWriterThread.join();
+        if (serialWriterError) {
+            std::rethrow_exception(serialWriterError);
         }
         throw std::runtime_error("Expected S2 insert to wait for S1's predicate lock.");
     }
 
     std::cout << "\nS2 is waiting on X(predicate seats.status=available).\n";
     std::cout << "\nS1 repeats the scan while S2 is blocked; 3B should not appear.\n";
-    db.execute(txn3, "SELECT {*} FROM seats WHERE status = available");
-    db.commit(txn3);
+    db.execute(serialReader, "SELECT {*} FROM seats WHERE status = available");
+    db.commit(serialReader);
 
-    txn4Thread.join();
-    if (txn4Error) {
-        std::rethrow_exception(txn4Error);
+    serialWriterThread.join();
+    if (serialWriterError) {
+        std::rethrow_exception(serialWriterError);
     }
 
     std::cout << "\nAfter S1 commits, S2 is allowed to insert 3B.\n";
@@ -4762,9 +4791,10 @@ int main() {
         "SELECT {*} FROM seats WHERE seat_no = 3B",
     });
 
-    std::cout << "\nResult: REPEATABLE READ allowed 3A to appear inside RR1; "
-              << "SERIALIZABLE kept 3B out of S1's repeated scan and allowed "
-              << "the insert only after S1 committed.\n";
+    std::cout << "\nResult: READ UNCOMMITTED allowed a dirty read; "
+              << "READ COMMITTED allowed a non-repeatable read; "
+              << "REPEATABLE READ still allowed a phantom; "
+              << "SERIALIZABLE delayed the matching insert until S1 committed.\n";
 
     auto end = std::chrono::high_resolution_clock::now();
 
