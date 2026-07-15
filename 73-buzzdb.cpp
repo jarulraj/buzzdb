@@ -4650,7 +4650,7 @@ int main() {
     }
 
     std::cout << "\nT2 is waiting on X(predicate seats.status=available).\n";
-    std::cout << "\nT1 repeats the same predicate scan before it commits.\n";
+    std::cout << "\nT1 repeats the scan while T2 is blocked; 3A should not appear.\n";
     db.execute(txn1, "SELECT {*} FROM seats WHERE status = available");
     db.commit(txn1);
 
@@ -4659,13 +4659,13 @@ int main() {
         std::rethrow_exception(txn2Error);
     }
 
-    std::cout << "\nFinal committed state:\n";
+    std::cout << "\nAfter T1 commits, T2 is allowed to insert 3A.\n";
     db.executeStatementsAndQueries({
         "SELECT {*} FROM seats WHERE seat_no = 3A",
     });
 
-    std::cout << "\nResult: T1's S(predicate seats.status=available) "
-              << "kept T2's matching insert out until T1 finished.\n";
+    std::cout << "\nResult: the phantom was avoided inside T1's transaction; "
+              << "the matching insert was delayed, not rejected.\n";
 
     auto end = std::chrono::high_resolution_clock::now();
 
