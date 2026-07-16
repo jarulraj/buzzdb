@@ -253,6 +253,16 @@ struct PageHeader {
     LSN page_lsn = 0;
 };
 
+// Single-version OCC metadata stored next to the current tuple image.
+struct TupleConcurrencyHeader {
+    uint64_t version = 0;
+    int writer_txn = 0;
+};
+
+static constexpr uint32_t TUPLE_CONCURRENCY_MAGIC = 0x4F434348; // "OCCH"
+static constexpr size_t TUPLE_CONCURRENCY_HEADER_BYTES =
+    sizeof(uint32_t) + sizeof(uint64_t) + sizeof(int32_t);
+
 struct Slot {
     bool empty = true;                 // Is the slot empty?    
     uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
@@ -266,6 +276,11 @@ static_assert(sizeof(Slot) * MAX_SLOTS + sizeof(PageHeader) < PAGE_SIZE,
 class SlottedPage {
 public:
     std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
+
+    struct StoredTuple {
+        TupleConcurrencyHeader header;
+        std::unique_ptr<Tuple> tuple;
+    };
 
     SlottedPage(){
         reset();
@@ -315,7 +330,7 @@ public:
     }
 
     std::optional<size_t> addTupleAndReturnSlot(std::unique_ptr<Tuple> tuple) {
-        auto bytes = tuple->serialize();
+        auto bytes = serializeTupleRecord({}, *tuple);
         auto slot_id = findAvailableSlot(bytes.size());
         if (!slot_id || !putSerializedTupleAtSlot(*slot_id, bytes)) {
             return std::nullopt;
@@ -324,20 +339,39 @@ public:
     }
 
     bool putTupleAtSlot(size_t slot_id, std::unique_ptr<Tuple> tuple) {
-        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
+        TupleConcurrencyHeader header;
+        auto current = getTupleRecord(slot_id);
+        if (current) {
+            header = current->header;
+        }
+        return putSerializedTupleAtSlot(
+            slot_id,
+            serializeTupleRecord(header, *tuple)
+        );
     }
 
     std::unique_ptr<Tuple> getTuple(size_t slot_id) const {
-        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
+        auto record = getTupleRecord(slot_id);
+        if (!record) {
             return nullptr;
         }
+        return std::move(record->tuple);
+    }
 
-        const auto& slot = slots()[slot_id];
-        assert(slot.offset != INVALID_VALUE);
-        assert(slot.length != INVALID_VALUE);
-        const char* tuple_data = page_data.get() + slot.offset;
-        std::istringstream iss(std::string(tuple_data, slot.length));
-        return Tuple::deserialize(iss);
+    std::optional<StoredTuple> getTupleRecord(size_t slot_id) const {
+        auto bytes = getRawRecord(slot_id);
+        if (!bytes) {
+            return std::nullopt;
+        }
+        return deserializeTupleRecord(*bytes);
+    }
+
+    std::optional<TupleConcurrencyHeader> getTupleHeader(size_t slot_id) const {
+        auto record = getTupleRecord(slot_id);
+        if (!record) {
+            return std::nullopt;
+        }
+        return record->header;
     }
 
     bool updateTuple(size_t slot_id, std::unique_ptr<Tuple> tuple) {
@@ -345,7 +379,27 @@ public:
             return false;
         }
 
-        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
+        TupleConcurrencyHeader header;
+        auto current = getTupleRecord(slot_id);
+        if (current) {
+            header = current->header;
+        }
+        return putSerializedTupleAtSlot(
+            slot_id,
+            serializeTupleRecord(header, *tuple)
+        );
+    }
+
+    bool updateTupleHeader(size_t slot_id,
+                           const TupleConcurrencyHeader& header) {
+        auto current = getTupleRecord(slot_id);
+        if (!current) {
+            return false;
+        }
+        return putSerializedTupleAtSlot(
+            slot_id,
+            serializeTupleRecord(header, *current->tuple)
+        );
     }
 
     void deleteTuple(size_t slot_id) {
@@ -373,6 +427,70 @@ private:
 
     const PageHeader* header() const {
         return reinterpret_cast<const PageHeader*>(page_data.get() + HEADER_OFFSET);
+    }
+
+    std::optional<std::string> getRawRecord(size_t slot_id) const {
+        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
+            return std::nullopt;
+        }
+
+        const auto& slot = slots()[slot_id];
+        assert(slot.offset != INVALID_VALUE);
+        assert(slot.length != INVALID_VALUE);
+        const char* tuple_data = page_data.get() + slot.offset;
+        return std::string(tuple_data, slot.length);
+    }
+
+    static void appendBytes(std::string& bytes,
+                            const void* value,
+                            size_t size) {
+        const char* raw = reinterpret_cast<const char*>(value);
+        bytes.append(raw, size);
+    }
+
+    template <typename T>
+    static T readBytes(const std::string& bytes, size_t& offset) {
+        if (offset + sizeof(T) > bytes.size()) {
+            throw std::runtime_error("Corrupt tuple concurrency header.");
+        }
+        T value{};
+        std::memcpy(&value, bytes.data() + offset, sizeof(T));
+        offset += sizeof(T);
+        return value;
+    }
+
+    static std::string serializeTupleRecord(
+            const TupleConcurrencyHeader& header,
+            Tuple& tuple) {
+        std::string bytes;
+        bytes.reserve(TUPLE_CONCURRENCY_HEADER_BYTES + tuple.getSize() + 32);
+        uint32_t magic = TUPLE_CONCURRENCY_MAGIC;
+        int32_t writer_txn = static_cast<int32_t>(header.writer_txn);
+        appendBytes(bytes, &magic, sizeof(magic));
+        appendBytes(bytes, &header.version, sizeof(header.version));
+        appendBytes(bytes, &writer_txn, sizeof(writer_txn));
+        bytes += tuple.serialize();
+        return bytes;
+    }
+
+    static StoredTuple deserializeTupleRecord(const std::string& bytes) {
+        TupleConcurrencyHeader header;
+        size_t tuple_offset = 0;
+
+        if (bytes.size() >= TUPLE_CONCURRENCY_HEADER_BYTES) {
+            size_t header_offset = 0;
+            uint32_t magic = readBytes<uint32_t>(bytes, header_offset);
+            if (magic == TUPLE_CONCURRENCY_MAGIC) {
+                header.version = readBytes<uint64_t>(bytes, header_offset);
+                header.writer_txn = static_cast<int>(
+                    readBytes<int32_t>(bytes, header_offset)
+                );
+                tuple_offset = header_offset;
+            }
+        }
+
+        std::istringstream tuple_input(bytes.substr(tuple_offset));
+        return {header, Tuple::deserialize(tuple_input)};
     }
 
     std::optional<size_t> findAvailableSlot(size_t tuple_size) const {
@@ -2517,6 +2635,25 @@ public:
         return readPage(page_id).getTuple(slot);
     }
 
+    std::optional<SlottedPage::StoredTuple> getTupleRecord(PageID page_id,
+                                                           size_t slot) {
+        return readPage(page_id).getTupleRecord(slot);
+    }
+
+    std::optional<TupleConcurrencyHeader> getTupleHeader(PageID page_id,
+                                                        size_t slot) {
+        return readPage(page_id).getTupleHeader(slot);
+    }
+
+    void updateTupleHeader(PageID page_id,
+                           size_t slot,
+                           const TupleConcurrencyHeader& header) {
+        if (!writePage(page_id).updateTupleHeader(slot, header)) {
+            throw std::runtime_error("Unable to update tuple concurrency header.");
+        }
+        flushWritePage(page_id);
+    }
+
     void updateTuple(PageID page_id, size_t slot, std::unique_ptr<Tuple> tuple) {
         if (page_manager.recoveryActive()) {
             auto before_tuple = getTuple(page_id, slot);
@@ -2702,6 +2839,17 @@ public:
             throw std::runtime_error("Unknown table: " + name);
         }
         return it->second;
+    }
+
+    TableMetadata& getTable(TableId table_id) {
+        for (auto& entry : tables_by_name) {
+            if (entry.second.table_id == table_id) {
+                return entry.second;
+            }
+        }
+        throw std::runtime_error(
+            "Unknown table id: " + std::to_string(table_id)
+        );
     }
 
 private:
@@ -4055,6 +4203,7 @@ struct ConcurrencyControlRequest {
     int txn_id;
     AccessType type;
     std::vector<ConcurrencyControlResource> resources;
+    uint64_t observed_version = 0;
 };
 
 struct ConcurrencyControlResult {
@@ -4078,6 +4227,17 @@ public:
     virtual ConcurrencyControlResult beforeCommit(int txn_id) = 0;
     virtual void afterCommit(int txn_id) = 0;
     virtual void abort(int txn_id) = 0;
+    virtual void bufferWrite(int, const std::string&) {}
+    virtual const std::vector<std::string>& privateWorkspace(int) const {
+        static const std::vector<std::string> empty_workspace;
+        return empty_workspace;
+    }
+    virtual uint64_t pendingCommitTimestamp(int) const {
+        return 0;
+    }
+    virtual std::vector<ConcurrencyControlResource> writeResources(int) const {
+        return {};
+    }
 };
 
 class TwoPhaseLockingPolicy : public ConcurrencyControlPolicy {
@@ -4130,37 +4290,17 @@ class OptimisticConcurrencyControlPolicy : public ConcurrencyControlPolicy {
 private:
     struct TxnState {
         uint64_t read_start_ts = 0;
-        std::set<ConcurrencyControlResource> read_set;
-        std::set<ConcurrencyControlResource> write_set;
-    };
-
-    struct CommittedTxn {
-        int txn_id = 0;
-        uint64_t commit_ts = 0;
-        std::set<ConcurrencyControlResource> write_set;
+        uint64_t pending_commit_ts = 0;
+        std::map<ConcurrencyControlResource, uint64_t> read_versions;
+        std::map<ConcurrencyControlResource, uint64_t> write_versions;
+        std::vector<std::string> private_workspace;
     };
 
     std::mutex latch;
     uint64_t logical_clock = 0;
     std::map<int, TxnState> active_txns;
-    std::vector<CommittedTxn> committed_txns;
-
-    static const ConcurrencyControlResource* firstIntersection(
-            const std::set<ConcurrencyControlResource>& left,
-            const std::set<ConcurrencyControlResource>& right) {
-        auto left_it = left.begin();
-        auto right_it = right.begin();
-        while (left_it != left.end() && right_it != right.end()) {
-            if (*left_it < *right_it) {
-                ++left_it;
-            } else if (*right_it < *left_it) {
-                ++right_it;
-            } else {
-                return &*left_it;
-            }
-        }
-        return nullptr;
-    }
+    std::function<std::optional<uint64_t>(const ConcurrencyControlResource&)>
+        tuple_version_reader;
 
     static ConcurrencyControlResult reject(const std::string& detail) {
         ConcurrencyControlResult result;
@@ -4169,7 +4309,49 @@ private:
         return result;
     }
 
+    static void rememberObservedVersion(
+            std::map<ConcurrencyControlResource, uint64_t>& versions,
+            const ConcurrencyControlResource& resource,
+            uint64_t observed_version) {
+        versions.insert({resource, observed_version});
+    }
+
+    ConcurrencyControlResult validateObservedVersions(
+            const std::map<ConcurrencyControlResource, uint64_t>& versions,
+            const std::string& set_name) const {
+        for (const auto& entry : versions) {
+            const auto& resource = entry.first;
+            uint64_t observed_version = entry.second;
+            auto current_version = tuple_version_reader(resource);
+            if (!current_version) {
+                return reject(
+                    "OCC validation failed: " +
+                    concurrencyResourceLabel(resource) +
+                    " from the " + set_name + " set is no longer present"
+                );
+            }
+            if (*current_version != observed_version) {
+                return reject(
+                    "OCC validation failed: " +
+                    concurrencyResourceLabel(resource) +
+                    " was tuple_version " +
+                    std::to_string(observed_version) +
+                    " when txn first touched it, but is now tuple_version " +
+                    std::to_string(*current_version)
+                );
+            }
+        }
+        return {};
+    }
+
 public:
+    void setTupleVersionReader(
+            std::function<std::optional<uint64_t>(
+                const ConcurrencyControlResource&)> reader) {
+        std::lock_guard<std::mutex> guard(latch);
+        tuple_version_reader = std::move(reader);
+    }
+
     std::string name() const override {
         return "Optimistic Concurrency Control";
     }
@@ -4180,7 +4362,9 @@ public:
 
     void begin(int txn_id) override {
         std::lock_guard<std::mutex> guard(latch);
-        active_txns[txn_id] = TxnState{++logical_clock, {}, {}};
+        TxnState state;
+        state.read_start_ts = ++logical_clock;
+        active_txns[txn_id] = std::move(state);
         std::cout << "OCC read phase starts for txn " << txn_id
                   << " at timestamp " << active_txns[txn_id].read_start_ts
                   << "." << std::endl;
@@ -4200,14 +4384,20 @@ public:
         auto& state = txn_it->second;
         for (const auto& resource : request.resources) {
             if (request.type == AccessType::Read) {
-                state.read_set.insert(resource);
+                rememberObservedVersion(state.read_versions,
+                                        resource,
+                                        request.observed_version);
             } else {
-                state.write_set.insert(resource);
+                rememberObservedVersion(state.write_versions,
+                                        resource,
+                                        request.observed_version);
             }
             std::cout << "OCC records txn " << request.txn_id
                       << " " << accessTypeName(request.type)
                       << " set item "
                       << concurrencyResourceLabel(resource)
+                      << " at tuple_version "
+                      << request.observed_version
                       << "." << std::endl;
         }
 
@@ -4224,38 +4414,29 @@ public:
             );
         }
 
-        const auto& state = txn_it->second;
+        auto& state = txn_it->second;
         std::cout << "OCC validation for txn " << txn_id
-                  << ": read set=" << state.read_set.size()
-                  << ", write set=" << state.write_set.size()
+                  << ": read set=" << state.read_versions.size()
+                  << ", write set=" << state.write_versions.size()
                   << "." << std::endl;
 
-        for (const auto& committed : committed_txns) {
-            if (committed.commit_ts <= state.read_start_ts) {
-                continue;
-            }
-            if (const auto* conflict =
-                    firstIntersection(committed.write_set, state.read_set)) {
-                return reject(
-                    "OCC validation failed: committed txn " +
-                    std::to_string(committed.txn_id) +
-                    " wrote " + concurrencyResourceLabel(*conflict) +
-                    ", which is in the read set"
-                );
-            }
-            if (const auto* conflict =
-                    firstIntersection(committed.write_set, state.write_set)) {
-                return reject(
-                    "OCC validation failed: committed txn " +
-                    std::to_string(committed.txn_id) +
-                    " wrote " + concurrencyResourceLabel(*conflict) +
-                    ", which is also in the write set"
-                );
-            }
+        if (!tuple_version_reader) {
+            return reject("OCC validation failed: no tuple-version reader is installed");
+        }
+
+        auto read_result = validateObservedVersions(state.read_versions,
+                                                    "read");
+        if (!read_result.granted) {
+            return read_result;
+        }
+        auto write_result = validateObservedVersions(state.write_versions,
+                                                     "write");
+        if (!write_result.granted) {
+            return write_result;
         }
 
         auto commit_ts = ++logical_clock;
-        committed_txns.push_back({txn_id, commit_ts, state.write_set});
+        state.pending_commit_ts = commit_ts;
         std::cout << "OCC validation passed for txn " << txn_id
                   << " at timestamp " << commit_ts << "." << std::endl;
         return {};
@@ -4270,13 +4451,50 @@ public:
         std::lock_guard<std::mutex> guard(latch);
         active_txns.erase(txn_id);
     }
+
+    void bufferWrite(int txn_id, const std::string& statement) override {
+        std::lock_guard<std::mutex> guard(latch);
+        active_txns[txn_id].private_workspace.push_back(statement);
+        std::cout << "Private workspace for txn " << txn_id
+                  << " buffers: " << statement << std::endl;
+    }
+
+    const std::vector<std::string>& privateWorkspace(
+            int txn_id) const override {
+        static const std::vector<std::string> empty_workspace;
+        auto it = active_txns.find(txn_id);
+        if (it == active_txns.end()) {
+            return empty_workspace;
+        }
+        return it->second.private_workspace;
+    }
+
+    uint64_t pendingCommitTimestamp(int txn_id) const override {
+        auto it = active_txns.find(txn_id);
+        if (it == active_txns.end()) {
+            return 0;
+        }
+        return it->second.pending_commit_ts;
+    }
+
+    std::vector<ConcurrencyControlResource> writeResources(
+            int txn_id) const override {
+        std::vector<ConcurrencyControlResource> resources;
+        auto it = active_txns.find(txn_id);
+        if (it == active_txns.end()) {
+            return resources;
+        }
+        for (const auto& entry : it->second.write_versions) {
+            resources.push_back(entry.first);
+        }
+        return resources;
+    }
 };
 
 class TransactionManager {
 private:
     LockManager lock_manager;
     std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
-    std::map<int, std::vector<std::string>> private_workspaces;
 
 public:
     TransactionManager() {
@@ -4286,13 +4504,22 @@ public:
     void useTwoPhaseLockingPolicy() {
         concurrency_control_policy =
             std::make_unique<TwoPhaseLockingPolicy>(lock_manager);
-        private_workspaces.clear();
     }
 
     void useOptimisticConcurrencyControlPolicy() {
         concurrency_control_policy =
             std::make_unique<OptimisticConcurrencyControlPolicy>();
-        private_workspaces.clear();
+    }
+
+    void setTupleVersionReader(
+            std::function<std::optional<uint64_t>(
+                const ConcurrencyControlResource&)> reader) {
+        auto* occ_policy =
+            dynamic_cast<OptimisticConcurrencyControlPolicy*>(
+                concurrency_control_policy.get());
+        if (occ_policy) {
+            occ_policy->setTupleVersionReader(std::move(reader));
+        }
     }
 
     std::string concurrencyControlPolicyName() const {
@@ -4306,7 +4533,6 @@ public:
     TxnPtr begin(int txn_id) {
         std::cout << "BEGIN txn " << txn_id << std::endl;
         auto txn = std::make_shared<TxnContext>(TxnContext{txn_id});
-        private_workspaces[txn_id] = {};
         concurrency_control_policy->begin(txn_id);
         return txn;
     }
@@ -4314,31 +4540,35 @@ public:
     ConcurrencyControlResult requestAccess(
             const TxnPtr& txn,
             AccessType type,
-            const std::vector<ConcurrencyControlResource>& resources) {
+            const std::vector<ConcurrencyControlResource>& resources,
+            uint64_t observed_version = 0) {
         if (!txn || resources.empty()) {
             return {};
         }
         return concurrency_control_policy->beforeAccess({
             txn->id,
             type,
-            resources
+            resources,
+            observed_version
         });
     }
 
     void bufferWrite(const TxnContext& txn, const std::string& statement) {
-        private_workspaces[txn.id].push_back(statement);
-        std::cout << "Private workspace for txn " << txn.id
-                  << " buffers: " << statement << std::endl;
+        concurrency_control_policy->bufferWrite(txn.id, statement);
     }
 
     const std::vector<std::string>& privateWorkspace(
             const TxnContext& txn) const {
-        static const std::vector<std::string> empty_workspace;
-        auto it = private_workspaces.find(txn.id);
-        if (it == private_workspaces.end()) {
-            return empty_workspace;
-        }
-        return it->second;
+        return concurrency_control_policy->privateWorkspace(txn.id);
+    }
+
+    uint64_t pendingCommitTimestamp(const TxnContext& txn) const {
+        return concurrency_control_policy->pendingCommitTimestamp(txn.id);
+    }
+
+    std::vector<ConcurrencyControlResource> writeResources(
+            const TxnContext& txn) const {
+        return concurrency_control_policy->writeResources(txn.id);
     }
 
     ConcurrencyControlResult prepareCommit(const TxnContext& txn) {
@@ -4349,14 +4579,12 @@ public:
         txn.state = TxnContext::COMMITTED;
         std::cout << "COMMIT txn " << txn.id << std::endl;
         concurrency_control_policy->afterCommit(txn.id);
-        private_workspaces.erase(txn.id);
     }
 
     void abort(TxnContext& txn) {
         txn.state = TxnContext::ABORTED;
         std::cout << "ABORT txn " << txn.id << std::endl;
         concurrency_control_policy->abort(txn.id);
-        private_workspaces.erase(txn.id);
     }
 };
 
@@ -4387,6 +4615,11 @@ public:
 
     void useOptimisticConcurrencyControlPolicy() {
         txn_manager.useOptimisticConcurrencyControlPolicy();
+        txn_manager.setTupleVersionReader(
+            [this](const ConcurrencyControlResource& resource) {
+                return tupleVersion(resource);
+            }
+        );
     }
 
     std::string concurrencyControlPolicyName() const {
@@ -4447,6 +4680,7 @@ private:
         for (const auto& statement : txn_manager.privateWorkspace(*txn)) {
             installPrivateWorkspaceStatement(txn, statement);
         }
+        publishOCCWriteHeaders(txn);
 
         recovery_manager.commit(txn->id);
         txn_manager.commit(*txn);
@@ -4534,6 +4768,50 @@ public:
         return concurrencyResourceLabel(resource);
     }
 
+    std::optional<uint64_t> tupleVersion(
+            const ConcurrencyControlResource& resource) {
+        auto& metadata = catalog.getTable(resource.table_id);
+        TableHeap tableHeap(metadata, page_manager);
+        auto header = tableHeap.getTupleHeader(resource.page_id,
+                                               resource.slot_id);
+        if (!header) {
+            return std::nullopt;
+        }
+        return header->version;
+    }
+
+    void publishTupleVersion(const ConcurrencyControlResource& resource,
+                             uint64_t version,
+                             int writer_txn) {
+        auto& metadata = catalog.getTable(resource.table_id);
+        TableHeap tableHeap(metadata, page_manager);
+        auto header = tableHeap.getTupleHeader(resource.page_id,
+                                               resource.slot_id);
+        if (!header) {
+            return;
+        }
+        header->version = version;
+        header->writer_txn = writer_txn;
+        tableHeap.updateTupleHeader(resource.page_id,
+                                    resource.slot_id,
+                                    *header);
+    }
+
+    void publishOCCWriteHeaders(const TxnPtr& txn) {
+        uint64_t commit_ts = txn_manager.pendingCommitTimestamp(*txn);
+        if (commit_ts == 0) {
+            return;
+        }
+
+        for (const auto& resource : txn_manager.writeResources(*txn)) {
+            publishTupleVersion(resource, commit_ts, txn->id);
+            std::cout << "OCC publishes "
+                      << resourceLabel(resource)
+                      << " as tuple_version " << commit_ts
+                      << "." << std::endl;
+        }
+    }
+
     static bool sameFieldValue(const Field& left, const Field& right) {
         if (left.getType() != right.getType()) {
             return false;
@@ -4576,8 +4854,9 @@ public:
              pageId != INVALID_PAGE_ID;
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple || !sameFieldValue(*tuple->fields[column], *target)) {
+                auto record = tableHeap.getTupleRecord(pageId, slot);
+                if (!record ||
+                    !sameFieldValue(*record->tuple->fields[column], *target)) {
                     continue;
                 }
                 resources.push_back(tupleResource(metadata, pageId, slot));
@@ -4601,15 +4880,17 @@ public:
              pageId != INVALID_PAGE_ID;
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple || !sameFieldValue(*tuple->fields[column], *target)) {
+                auto record = tableHeap.getTupleRecord(pageId, slot);
+                if (!record ||
+                    !sameFieldValue(*record->tuple->fields[column], *target)) {
                     continue;
                 }
 
                 if (!acquireTxnAccess(
                     txn,
                     type,
-                    {tupleResource(metadata, pageId, slot)}
+                    {tupleResource(metadata, pageId, slot)},
+                    record->header.version
                 )) {
                     return false;
                 }
@@ -4627,15 +4908,16 @@ public:
              pageId != INVALID_PAGE_ID;
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple) {
+                auto record = tableHeap.getTupleRecord(pageId, slot);
+                if (!record) {
                     continue;
                 }
 
                 if (!acquireTxnAccess(
                     txn,
                     type,
-                    {tupleResource(metadata, pageId, slot)}
+                    {tupleResource(metadata, pageId, slot)},
+                    record->header.version
                 )) {
                     return false;
                 }
@@ -4715,7 +4997,8 @@ public:
     bool acquireTxnAccess(
             const TxnPtr& txn,
             AccessType type,
-            const std::vector<ConcurrencyControlResource>& resources) {
+            const std::vector<ConcurrencyControlResource>& resources,
+            uint64_t observed_version = 0) {
         if (!txn || resources.empty()) {
             return true;
         }
@@ -4727,7 +5010,10 @@ public:
                       << " access to " << resourceLabel(resource)
                       << "." << std::endl;
 
-            auto result = txn_manager.requestAccess(txn, type, {resource});
+            auto result = txn_manager.requestAccess(txn,
+                                                    type,
+                                                    {resource},
+                                                    observed_version);
 
             if (result.deadlock) {
                 std::cout << "Deadlock detected in waits-for graph: "
@@ -5397,9 +5683,9 @@ int main() {
         std::cout << "2PL versus Optimistic Concurrency Control" << std::endl;
         std::cout << "The same interleaved schedules run from an empty "
                   << "database under each policy." << std::endl;
-        std::cout << "OCC records read/write sets during the read phase, "
+        std::cout << "OCC records tuple-header versions during the read phase, "
                   << "keeps writes in each transaction's private workspace, "
-                  << "and installs them only after validation succeeds."
+                  << "and installs them only if validation still sees the same versions."
                   << std::endl;
 
         runPolicyComparison(ConcurrencyControlPolicyKind::TwoPhaseLocking);

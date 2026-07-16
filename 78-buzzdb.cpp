@@ -253,6 +253,16 @@ struct PageHeader {
     LSN page_lsn = 0;
 };
 
+// Single-version TO metadata stored next to the current tuple image.
+struct TupleTimestampHeader {
+    uint64_t read_ts = 0;
+    uint64_t write_ts = 0;
+};
+
+static constexpr uint32_t TUPLE_TIMESTAMP_MAGIC = 0x544F5453; // "TOTS"
+static constexpr size_t TUPLE_TIMESTAMP_HEADER_BYTES =
+    sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t);
+
 struct Slot {
     bool empty = true;                 // Is the slot empty?    
     uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
@@ -266,6 +276,11 @@ static_assert(sizeof(Slot) * MAX_SLOTS + sizeof(PageHeader) < PAGE_SIZE,
 class SlottedPage {
 public:
     std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
+
+    struct StoredTuple {
+        TupleTimestampHeader header;
+        std::unique_ptr<Tuple> tuple;
+    };
 
     SlottedPage(){
         reset();
@@ -315,7 +330,7 @@ public:
     }
 
     std::optional<size_t> addTupleAndReturnSlot(std::unique_ptr<Tuple> tuple) {
-        auto bytes = tuple->serialize();
+        auto bytes = serializeTupleRecord({}, *tuple);
         auto slot_id = findAvailableSlot(bytes.size());
         if (!slot_id || !putSerializedTupleAtSlot(*slot_id, bytes)) {
             return std::nullopt;
@@ -324,20 +339,39 @@ public:
     }
 
     bool putTupleAtSlot(size_t slot_id, std::unique_ptr<Tuple> tuple) {
-        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
+        TupleTimestampHeader header;
+        auto current = getTupleRecord(slot_id);
+        if (current) {
+            header = current->header;
+        }
+        return putSerializedTupleAtSlot(
+            slot_id,
+            serializeTupleRecord(header, *tuple)
+        );
     }
 
     std::unique_ptr<Tuple> getTuple(size_t slot_id) const {
-        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
+        auto record = getTupleRecord(slot_id);
+        if (!record) {
             return nullptr;
         }
+        return std::move(record->tuple);
+    }
 
-        const auto& slot = slots()[slot_id];
-        assert(slot.offset != INVALID_VALUE);
-        assert(slot.length != INVALID_VALUE);
-        const char* tuple_data = page_data.get() + slot.offset;
-        std::istringstream iss(std::string(tuple_data, slot.length));
-        return Tuple::deserialize(iss);
+    std::optional<StoredTuple> getTupleRecord(size_t slot_id) const {
+        auto bytes = getRawRecord(slot_id);
+        if (!bytes) {
+            return std::nullopt;
+        }
+        return deserializeTupleRecord(*bytes);
+    }
+
+    std::optional<TupleTimestampHeader> getTupleHeader(size_t slot_id) const {
+        auto record = getTupleRecord(slot_id);
+        if (!record) {
+            return std::nullopt;
+        }
+        return record->header;
     }
 
     bool updateTuple(size_t slot_id, std::unique_ptr<Tuple> tuple) {
@@ -345,7 +379,27 @@ public:
             return false;
         }
 
-        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
+        TupleTimestampHeader header;
+        auto current = getTupleRecord(slot_id);
+        if (current) {
+            header = current->header;
+        }
+        return putSerializedTupleAtSlot(
+            slot_id,
+            serializeTupleRecord(header, *tuple)
+        );
+    }
+
+    bool updateTupleHeader(size_t slot_id,
+                           const TupleTimestampHeader& header) {
+        auto current = getTupleRecord(slot_id);
+        if (!current) {
+            return false;
+        }
+        return putSerializedTupleAtSlot(
+            slot_id,
+            serializeTupleRecord(header, *current->tuple)
+        );
     }
 
     void deleteTuple(size_t slot_id) {
@@ -373,6 +427,67 @@ private:
 
     const PageHeader* header() const {
         return reinterpret_cast<const PageHeader*>(page_data.get() + HEADER_OFFSET);
+    }
+
+    std::optional<std::string> getRawRecord(size_t slot_id) const {
+        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
+            return std::nullopt;
+        }
+
+        const auto& slot = slots()[slot_id];
+        assert(slot.offset != INVALID_VALUE);
+        assert(slot.length != INVALID_VALUE);
+        const char* tuple_data = page_data.get() + slot.offset;
+        return std::string(tuple_data, slot.length);
+    }
+
+    static void appendBytes(std::string& bytes,
+                            const void* value,
+                            size_t size) {
+        const char* raw = reinterpret_cast<const char*>(value);
+        bytes.append(raw, size);
+    }
+
+    template <typename T>
+    static T readBytes(const std::string& bytes, size_t& offset) {
+        if (offset + sizeof(T) > bytes.size()) {
+            throw std::runtime_error("Corrupt tuple timestamp header.");
+        }
+        T value{};
+        std::memcpy(&value, bytes.data() + offset, sizeof(T));
+        offset += sizeof(T);
+        return value;
+    }
+
+    static std::string serializeTupleRecord(
+            const TupleTimestampHeader& header,
+            Tuple& tuple) {
+        std::string bytes;
+        bytes.reserve(TUPLE_TIMESTAMP_HEADER_BYTES + tuple.getSize() + 32);
+        uint32_t magic = TUPLE_TIMESTAMP_MAGIC;
+        appendBytes(bytes, &magic, sizeof(magic));
+        appendBytes(bytes, &header.read_ts, sizeof(header.read_ts));
+        appendBytes(bytes, &header.write_ts, sizeof(header.write_ts));
+        bytes += tuple.serialize();
+        return bytes;
+    }
+
+    static StoredTuple deserializeTupleRecord(const std::string& bytes) {
+        TupleTimestampHeader header;
+        size_t tuple_offset = 0;
+
+        if (bytes.size() >= TUPLE_TIMESTAMP_HEADER_BYTES) {
+            size_t header_offset = 0;
+            uint32_t magic = readBytes<uint32_t>(bytes, header_offset);
+            if (magic == TUPLE_TIMESTAMP_MAGIC) {
+                header.read_ts = readBytes<uint64_t>(bytes, header_offset);
+                header.write_ts = readBytes<uint64_t>(bytes, header_offset);
+                tuple_offset = header_offset;
+            }
+        }
+
+        std::istringstream tuple_input(bytes.substr(tuple_offset));
+        return {header, Tuple::deserialize(tuple_input)};
     }
 
     std::optional<size_t> findAvailableSlot(size_t tuple_size) const {
@@ -2517,6 +2632,25 @@ public:
         return readPage(page_id).getTuple(slot);
     }
 
+    std::optional<SlottedPage::StoredTuple> getTupleRecord(PageID page_id,
+                                                           size_t slot) {
+        return readPage(page_id).getTupleRecord(slot);
+    }
+
+    std::optional<TupleTimestampHeader> getTupleHeader(PageID page_id,
+                                                       size_t slot) {
+        return readPage(page_id).getTupleHeader(slot);
+    }
+
+    void updateTupleHeader(PageID page_id,
+                           size_t slot,
+                           const TupleTimestampHeader& header) {
+        if (!writePage(page_id).updateTupleHeader(slot, header)) {
+            throw std::runtime_error("Unable to update tuple timestamp header.");
+        }
+        flushWritePage(page_id);
+    }
+
     void updateTuple(PageID page_id, size_t slot, std::unique_ptr<Tuple> tuple) {
         if (page_manager.recoveryActive()) {
             auto before_tuple = getTuple(page_id, slot);
@@ -2702,6 +2836,17 @@ public:
             throw std::runtime_error("Unknown table: " + name);
         }
         return it->second;
+    }
+
+    TableMetadata& getTable(TableId table_id) {
+        for (auto& entry : tables_by_name) {
+            if (entry.second.table_id == table_id) {
+                return entry.second;
+            }
+        }
+        throw std::runtime_error(
+            "Unknown table id: " + std::to_string(table_id)
+        );
     }
 
 private:
@@ -3795,6 +3940,13 @@ struct ConcurrencyControlResource {
     }
 };
 
+static std::string concurrencyResourceLabel(
+        const ConcurrencyControlResource& resource) {
+    return "tuple table=" + std::to_string(resource.table_id) +
+           "[page=" + std::to_string(resource.page_id) +
+           ", slot=" + std::to_string(resource.slot_id) + "]";
+}
+
 class DirectedGraph {
 public:
     void setOutgoingEdges(int from, const std::vector<int>& to_nodes) {
@@ -4048,6 +4200,7 @@ struct ConcurrencyControlRequest {
     int txn_id;
     AccessType type;
     std::vector<ConcurrencyControlResource> resources;
+    TupleTimestampHeader observed_header;
 };
 
 struct ConcurrencyControlResult {
@@ -4056,6 +4209,7 @@ struct ConcurrencyControlResult {
     bool deadlock = false;
     std::vector<int> cycle;
     std::string detail;
+    std::map<ConcurrencyControlResource, TupleTimestampHeader> header_updates;
 };
 
 class ConcurrencyControlPolicy {
@@ -4118,15 +4272,9 @@ public:
 
 class TimestampOrderingPolicy : public ConcurrencyControlPolicy {
 private:
-    struct ResourceTimestamp {
-        uint64_t read_ts = 0;
-        uint64_t write_ts = 0;
-    };
-
     std::mutex latch;
     uint64_t next_ts = 1;
     std::map<int, uint64_t> txn_timestamps;
-    std::map<ConcurrencyControlResource, ResourceTimestamp> resource_timestamps;
 
     static ConcurrencyControlResult abortResult(const std::string& detail) {
         ConcurrencyControlResult result;
@@ -4160,45 +4308,50 @@ public:
         }
 
         uint64_t txn_ts = txn_it->second;
+        ConcurrencyControlResult result;
         for (const auto& resource : request.resources) {
-            auto& timestamps = resource_timestamps[resource];
+            auto updated_header = request.observed_header;
             // Basic TO only: no Thomas write rule and no private workspace.
             std::cout << "TO check: txn " << request.txn_id
                       << " TS=" << txn_ts
-                      << ", object readTS=" << timestamps.read_ts
-                      << ", object writeTS=" << timestamps.write_ts
+                      << ", " << concurrencyResourceLabel(resource)
+                      << " readTS=" << updated_header.read_ts
+                      << ", writeTS=" << updated_header.write_ts
                       << "." << std::endl;
 
             if (request.type == AccessType::Read) {
-                if (txn_ts < timestamps.write_ts) {
+                if (txn_ts < updated_header.write_ts) {
                     return abortResult(
                         "txn timestamp " + std::to_string(txn_ts) +
                         " is older than object writeTS " +
-                        std::to_string(timestamps.write_ts)
+                        std::to_string(updated_header.write_ts)
                     );
                 }
-                timestamps.read_ts = std::max(timestamps.read_ts, txn_ts);
+                updated_header.read_ts =
+                    std::max(updated_header.read_ts, txn_ts);
+                result.header_updates[resource] = updated_header;
                 continue;
             }
 
-            if (txn_ts < timestamps.read_ts) {
+            if (txn_ts < updated_header.read_ts) {
                 return abortResult(
                     "txn timestamp " + std::to_string(txn_ts) +
                     " is older than object readTS " +
-                    std::to_string(timestamps.read_ts)
+                    std::to_string(updated_header.read_ts)
                 );
             }
-            if (txn_ts < timestamps.write_ts) {
+            if (txn_ts < updated_header.write_ts) {
                 return abortResult(
                     "txn timestamp " + std::to_string(txn_ts) +
                     " is older than object writeTS " +
-                    std::to_string(timestamps.write_ts)
+                    std::to_string(updated_header.write_ts)
                 );
             }
-            timestamps.write_ts = txn_ts;
+            updated_header.write_ts = txn_ts;
+            result.header_updates[resource] = updated_header;
         }
 
-        return {};
+        return result;
     }
 
     ConcurrencyControlResult beforeCommit(int) override {
@@ -4250,14 +4403,16 @@ public:
     ConcurrencyControlResult requestAccess(
             const TxnPtr& txn,
             AccessType type,
-            const std::vector<ConcurrencyControlResource>& resources) {
+            const std::vector<ConcurrencyControlResource>& resources,
+            const TupleTimestampHeader& observed_header = {}) {
         if (!txn || resources.empty()) {
             return {};
         }
         return concurrency_control_policy->beforeAccess({
             txn->id,
             type,
-            resources
+            resources,
+            observed_header
         });
     }
 
@@ -4405,9 +4560,28 @@ public:
 
     static std::string resourceLabel(
             const ConcurrencyControlResource& resource) {
-        return "tuple table=" + std::to_string(resource.table_id) +
-               "[page=" + std::to_string(resource.page_id) +
-               ", slot=" + std::to_string(resource.slot_id) + "]";
+        return concurrencyResourceLabel(resource);
+    }
+
+    std::optional<TupleTimestampHeader> tupleTimestampHeader(
+            const ConcurrencyControlResource& resource) {
+        auto& metadata = catalog.getTable(resource.table_id);
+        TableHeap tableHeap(metadata, page_manager);
+        return tableHeap.getTupleHeader(resource.page_id, resource.slot_id);
+    }
+
+    void publishTupleTimestampHeader(
+            const ConcurrencyControlResource& resource,
+            const TupleTimestampHeader& header) {
+        auto& metadata = catalog.getTable(resource.table_id);
+        TableHeap tableHeap(metadata, page_manager);
+        tableHeap.updateTupleHeader(resource.page_id,
+                                    resource.slot_id,
+                                    header);
+        std::cout << "TO publishes " << resourceLabel(resource)
+                  << " readTS=" << header.read_ts
+                  << ", writeTS=" << header.write_ts
+                  << "." << std::endl;
     }
 
     static bool sameFieldValue(const Field& left, const Field& right) {
@@ -4451,15 +4625,17 @@ public:
              pageId != INVALID_PAGE_ID;
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple || !sameFieldValue(*tuple->fields[column], *target)) {
+                auto record = tableHeap.getTupleRecord(pageId, slot);
+                if (!record ||
+                    !sameFieldValue(*record->tuple->fields[column], *target)) {
                     continue;
                 }
 
                 if (!acquireTxnAccess(
                     txn,
                     type,
-                    {tupleResource(metadata, pageId, slot)}
+                    {tupleResource(metadata, pageId, slot)},
+                    record->header
                 )) {
                     return false;
                 }
@@ -4477,15 +4653,16 @@ public:
              pageId != INVALID_PAGE_ID;
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple) {
+                auto record = tableHeap.getTupleRecord(pageId, slot);
+                if (!record) {
                     continue;
                 }
 
                 if (!acquireTxnAccess(
                     txn,
                     type,
-                    {tupleResource(metadata, pageId, slot)}
+                    {tupleResource(metadata, pageId, slot)},
+                    record->header
                 )) {
                     return false;
                 }
@@ -4565,7 +4742,8 @@ public:
     bool acquireTxnAccess(
             const TxnPtr& txn,
             AccessType type,
-            const std::vector<ConcurrencyControlResource>& resources) {
+            const std::vector<ConcurrencyControlResource>& resources,
+            const TupleTimestampHeader& observed_header = {}) {
         if (!txn || resources.empty()) {
             return true;
         }
@@ -4577,7 +4755,10 @@ public:
                       << " access to " << resourceLabel(resource)
                       << "." << std::endl;
 
-            auto result = txn_manager.requestAccess(txn, type, {resource});
+            auto result = txn_manager.requestAccess(txn,
+                                                    type,
+                                                    {resource},
+                                                    observed_header);
 
             if (result.deadlock) {
                 std::cout << "Deadlock detected in waits-for graph: "
@@ -4598,6 +4779,10 @@ public:
                 std::cout << "." << std::endl;
                 abort(txn);
                 return false;
+            }
+
+            for (const auto& update : result.header_updates) {
+                publishTupleTimestampHeader(update.first, update.second);
             }
 
             std::cout << "CC policy " << concurrencyControlPolicyName()
@@ -5186,9 +5371,9 @@ int main() {
         std::cout << "2PL versus Timestamp Ordering" << std::endl;
         std::cout << "The same interleaved schedules run from an empty "
                   << "database under each policy." << std::endl;
-        std::cout << "Basic TO uses fixed transaction timestamps, per-object "
-                  << "readTS/writeTS, and aborts on violations instead of "
-                  << "waiting." << std::endl;
+        std::cout << "Basic TO uses fixed transaction timestamps, "
+                  << "tuple-header readTS/writeTS, and aborts on violations "
+                  << "instead of waiting." << std::endl;
 
         runPolicyComparison(ConcurrencyControlPolicyKind::TwoPhaseLocking);
         runPolicyComparison(ConcurrencyControlPolicyKind::TimestampOrdering);
