@@ -1388,32 +1388,12 @@ public:
             master_record.checkpoint_begin_lsn != 0
         );
         next_txn_id = std::max(next_txn_id, analysis.next_txn_id);
-        printCheckpointStart(master_record, records);
         const auto* recovery_records = &records;
         std::vector<LogRecord> full_log_records;
         if (needsRetainedLogForRecovery(master_record, records, analysis)) {
             full_log_records = log_manager.readAll();
             recovery_records = &full_log_records;
         }
-        std::cout << "ARIES analysis: "
-                  << countCommittedTransactions(*recovery_records)
-                  << " committed transaction(s), "
-                  << countLoserTransactions(analysis)
-                  << " loser transaction(s), "
-                  << records.size()
-                  << " analysis log record(s), "
-                  << countRedoRecords(*recovery_records)
-                  << " redo record(s), "
-                  << countUndoRecords(*recovery_records, analysis)
-                  << " undo record(s)." << std::endl;
-        if (recovery_records->size() != records.size()) {
-            std::cout << "ARIES recovery: retained log has "
-                      << recovery_records->size()
-                      << " record(s) for redo/undo chains before the checkpoint."
-                      << std::endl;
-        }
-        printActiveTransactionTable(analysis);
-        printDirtyPageTable(analysis);
         redoPass(*recovery_records, analysis);
         undoPass(*recovery_records, analysis);
     }
@@ -1432,11 +1412,7 @@ public:
         runtime_txns[txn_id] = RuntimeTxnState{};
         current_txn_id = txn_id;
         LogRecord begin_record{LogRecordType::BEGIN, txn_id};
-        LSN begin_lsn = appendTxnRecord(txn_id, begin_record);
-        std::cout << "\nLog txn " << txn_id
-                  << " BEGIN, LSN "
-                  << begin_lsn
-                  << " prevLSN 0" << std::endl;
+        appendTxnRecord(txn_id, begin_record);
         return txn_id;
     }
 
@@ -1448,33 +1424,13 @@ public:
     }
 
     void commit(int txn_id) {
-        auto& txn = runtimeTxn(txn_id);
-
         LogRecord commit_record{LogRecordType::COMMIT, txn_id};
         LSN commit_lsn = appendTxnRecord(txn_id, commit_record);
         forceLogUpTo(commit_lsn);
 
-        if (!txn.staged_records.empty()) {
-            std::cout << "Commit txn " << txn_id
-                      << ": forced COMMIT LSN "
-                      << commit_lsn << "; "
-                      << txn.staged_records.size()
-                      << " tuple-change record(s) are durable."
-                      << std::endl;
-        } else {
-            std::cout << "Commit txn " << txn_id
-                      << ": forced read-only COMMIT LSN "
-                      << commit_lsn
-                      << "."
-                      << std::endl;
-        }
-
         LogRecord end_record{LogRecordType::END, txn_id};
         LSN end_lsn = appendTxnRecord(txn_id, end_record);
         forceLogUpTo(end_lsn);
-        std::cout << "Log txn " << txn_id
-                  << " END, LSN " << end_lsn
-                  << " prevLSN " << end_record.prev_lsn << std::endl;
 
         runtime_txns.erase(txn_id);
         if (current_txn_id == txn_id) {
@@ -1496,9 +1452,6 @@ public:
         LogRecord abort_record{LogRecordType::ABORT, txn_id};
         LSN abort_lsn = appendTxnRecord(txn_id, abort_record);
         forceLogUpTo(abort_lsn);
-        std::cout << "Abort txn " << txn_id
-                  << ": forced ABORT LSN " << abort_lsn
-                  << "; undo begins." << std::endl;
 
         for (auto it = txn.staged_records.rbegin(); it != txn.staged_records.rend(); ++it) {
             LogRecord clr = makeClrRecord(txn_id,
@@ -1508,23 +1461,12 @@ public:
             txn.last_lsn = clr_lsn;
             rememberDirtyPage(clr.page_id, clr_lsn);
             applyRecordToPage(clr);
-            printClrAction(clr, "runtime abort");
         }
 
-        auto forced_pages = forceDirtyPages(txn);
-        std::cout << "Abort txn " << txn_id
-                  << ": restored "
-                  << txn.staged_records.size()
-                  << " operation(s), flushed "
-                  << forced_pages
-                  << " restored page(s)."
-                  << std::endl;
+        forceDirtyPages(txn);
         LogRecord end_record{LogRecordType::END, txn_id};
         LSN end_lsn = appendTxnRecord(txn_id, end_record);
         forceLogUpTo(end_lsn);
-        std::cout << "Log txn " << txn_id
-                  << " END, LSN " << end_lsn
-                  << " prevLSN " << end_record.prev_lsn << std::endl;
 
         runtime_txns.erase(txn_id);
         if (current_txn_id == txn_id) {
@@ -1609,28 +1551,11 @@ public:
 
         bool can_truncate = end_record.checkpoint_att.empty() &&
                             end_record.checkpoint_dpt.empty();
-        size_t removed_records = 0;
         if (can_truncate) {
-            removed_records = log_manager.truncateBefore(begin_lsn);
+            log_manager.truncateBefore(begin_lsn);
         }
 
         log_manager.writeMasterRecord(begin_lsn);
-        std::cout << "CHECKPOINT: wrote BEGIN_CHECKPOINT LSN "
-                  << begin_lsn << " and END_CHECKPOINT LSN "
-                  << end_lsn << "." << std::endl;
-        std::cout << "CHECKPOINT: master now points to LSN "
-                  << begin_lsn << " at log offset "
-                  << log_manager.getLogOffset(begin_lsn)
-                  << "." << std::endl;
-        if (can_truncate) {
-            std::cout << "CHECKPOINT: safe truncation removed "
-                      << removed_records
-                      << " older log record(s); no active txns or dirty pages "
-                      << "needed the prefix." << std::endl;
-        } else {
-            std::cout << "CHECKPOINT: skipped truncation because ATT or DPT "
-                      << "still needs older log records." << std::endl;
-        }
     }
 
     void crashAt(CrashPoint point) {
@@ -1652,8 +1577,6 @@ public:
 private:
     void initializeEmpty() {
         log_manager.reset();
-        std::cout << "Recovery: initialized empty WAL file "
-                  << log_filename << "." << std::endl;
     }
 
     bool databaseHasExistingPages() const {
@@ -1730,28 +1653,9 @@ private:
 
         LSN min_rec_lsn = minRecLSN(analysis);
         if (min_rec_lsn != 0 && min_rec_lsn < analysis_records.front().lsn) {
-            std::cout << "ARIES REDO: checkpoint DPT has recLSN "
-                      << min_rec_lsn
-                      << " before the checkpoint record, so redo/undo use the "
-                      << "retained log suffix." << std::endl;
             return true;
         }
         return false;
-    }
-
-    void printCheckpointStart(const MasterRecord& master_record,
-                              const std::vector<LogRecord>&) const {
-        if (master_record.checkpoint_begin_lsn == 0) {
-            std::cout << "ARIES analysis: no checkpoint master record; "
-                      << "scanning from log start." << std::endl;
-            return;
-        }
-
-        std::cout << "ARIES analysis: master record starts at checkpoint LSN "
-                  << master_record.checkpoint_begin_lsn
-                  << " (log offset "
-                  << master_record.checkpoint_begin_offset << ")."
-                  << std::endl;
     }
 
     RuntimeTxnState& runtimeTxn(int txn_id) {
@@ -1815,20 +1719,10 @@ private:
             std::move(after_tuple)
         };
         LSN record_lsn = appendTxnRecord(current_txn_id, record);
-        LSN prev_lsn = record.prev_lsn;
         rememberDirtyPage(page_id, record_lsn);
         auto& page = buffer_manager.getPage(page_id);
         page->setPageLSN(record_lsn);
         txn.staged_records.push_back(std::move(record));
-
-        std::cout << "Log txn " << current_txn_id
-                  << " " << logRecordName(type)
-                  << " LSN " << record_lsn
-                  << " prevLSN " << prev_lsn
-                  << " (table " << table_id
-                  << ", page " << page_id
-                  << ", slot " << slot_id << ")."
-                  << std::endl;
     }
 
     RecoveryAnalysis analysisPass(const std::vector<LogRecord>& records,
@@ -1902,17 +1796,6 @@ private:
         return analysis;
     }
 
-    size_t countCommittedTransactions(
-        const std::vector<LogRecord>& records) const {
-        std::set<int> committed_txns;
-        for (const auto& record : records) {
-            if (record.type == LogRecordType::COMMIT) {
-                committed_txns.insert(record.txn_id);
-            }
-        }
-        return committed_txns.size();
-    }
-
     bool isLoserTxn(const RecoveryAnalysis::ActiveTransactionEntry& entry) const {
         return entry.status == RecoveryAnalysis::TxnStatus::RUNNING ||
                entry.status == RecoveryAnalysis::TxnStatus::ABORTING;
@@ -1922,49 +1805,6 @@ private:
         return isRedoableRecord(record.type);
     }
 
-    std::string txnStatusName(RecoveryAnalysis::TxnStatus status) const {
-        switch (status) {
-            case RecoveryAnalysis::TxnStatus::RUNNING:
-                return "RUNNING";
-            case RecoveryAnalysis::TxnStatus::COMMITTING:
-                return "COMMITTING";
-            case RecoveryAnalysis::TxnStatus::ABORTING:
-                return "ABORTING";
-        }
-        throw std::runtime_error("Unknown transaction status.");
-    }
-
-    void printActiveTransactionTable(const RecoveryAnalysis& analysis) const {
-        if (analysis.active_transaction_table.empty()) {
-            std::cout << "ActiveTransactionTable after analysis: empty."
-                      << std::endl;
-            return;
-        }
-
-        std::cout << "ActiveTransactionTable after analysis:" << std::endl;
-        for (const auto& txn : analysis.active_transaction_table) {
-            std::cout << "  txn " << txn.first
-                      << " " << txnStatusName(txn.second.status)
-                      << " lastLSN " << txn.second.last_lsn
-                      << std::endl;
-        }
-    }
-
-    void printDirtyPageTable(const RecoveryAnalysis& analysis) const {
-        if (analysis.dirty_page_table.empty()) {
-            std::cout << "DirtyPageTable after analysis: empty."
-                      << std::endl;
-            return;
-        }
-
-        std::cout << "DirtyPageTable after analysis:" << std::endl;
-        for (const auto& [page_id, rec_lsn] : analysis.dirty_page_table) {
-            std::cout << "  page " << page_id
-                      << " recLSN " << rec_lsn
-                      << std::endl;
-        }
-    }
-
     std::map<LSN, const LogRecord*> recordsByLSN(
         const std::vector<LogRecord>& records) const {
         std::map<LSN, const LogRecord*> by_lsn;
@@ -1972,55 +1812,6 @@ private:
             by_lsn[record.lsn] = &record;
         }
         return by_lsn;
-    }
-
-    size_t countLoserTransactions(const RecoveryAnalysis& analysis) const {
-        size_t count = 0;
-        for (const auto& entry : analysis.active_transaction_table) {
-            if (isLoserTxn(entry.second)) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    size_t countRedoRecords(const std::vector<LogRecord>& records) const {
-        size_t count = 0;
-        for (const auto& record : records) {
-            if (shouldRedoRecord(record)) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    size_t countUndoRecords(const std::vector<LogRecord>& records,
-                            const RecoveryAnalysis& analysis) const {
-        size_t count = 0;
-        auto by_lsn = recordsByLSN(records);
-        for (const auto& txn : analysis.active_transaction_table) {
-            if (!isLoserTxn(txn.second)) {
-                continue;
-            }
-
-            LSN lsn = txn.second.last_lsn;
-            while (lsn != 0) {
-                auto it = by_lsn.find(lsn);
-                if (it == by_lsn.end()) {
-                    throw std::runtime_error("Missing log record in prevLSN chain.");
-                }
-                const auto& record = *it->second;
-                if (record.type == LogRecordType::CLR) {
-                    lsn = record.undo_next_lsn;
-                    continue;
-                }
-                if (isTupleChangeRecord(record.type)) {
-                    count++;
-                }
-                lsn = record.prev_lsn;
-            }
-        }
-        return count;
     }
 
     void redoPass(const std::vector<LogRecord>& records,
@@ -2033,56 +1824,34 @@ private:
         }
 
         if (min_rec_lsn == 0) {
-            std::cout << "ARIES REDO: DPT is empty; no page redo needed."
-                      << std::endl;
             return;
         }
 
-        size_t applied = 0;
-        size_t examined = 0;
-        size_t skipped_by_dpt = 0;
-        size_t skipped_by_page_lsn = 0;
-        std::cout << "ARIES REDO: start from min recLSN "
-                  << min_rec_lsn << "." << std::endl;
         for (const auto& record : records) {
             if (!shouldRedoRecord(record)) {
                 continue;
             }
             if (record.lsn < min_rec_lsn) {
-                skipped_by_dpt++;
                 continue;
             }
 
-            examined++;
             auto dirty_page = analysis.dirty_page_table.find(record.page_id);
             if (dirty_page == analysis.dirty_page_table.end() ||
                 record.lsn < dirty_page->second) {
-                skipped_by_dpt++;
                 continue;
             }
 
             auto& page = buffer_manager.getPage(record.page_id);
             if (page->getPageLSN() >= record.lsn) {
-                skipped_by_page_lsn++;
                 continue;
             }
 
             applyRedo(record);
-            printRedoAction(record);
-            applied++;
         }
-
-        std::cout << "ARIES REDO: examined " << examined
-                  << " redo record(s), skipped " << skipped_by_dpt
-                  << " by DPT/recLSN, skipped " << skipped_by_page_lsn
-                  << " by pageLSN, replayed " << applied
-                  << " history log record(s)." << std::endl;
     }
 
     void undoPass(const std::vector<LogRecord>& records,
                   const RecoveryAnalysis& analysis) {
-        size_t applied = 0;
-        size_t ended_txns = 0;
         auto by_lsn = recordsByLSN(records);
         std::map<int, LSN> last_lsn_by_txn;
         std::map<LSN, int> to_undo;
@@ -2092,13 +1861,9 @@ private:
             const auto& entry = txn.second;
 
             if (entry.status == RecoveryAnalysis::TxnStatus::COMMITTING) {
-                LSN end_lsn = appendRecoveryRecord(txn_id,
-                                                   LogRecordType::END,
-                                                   entry.last_lsn);
-                std::cout << "Recovery: txn " << txn_id
-                          << " had COMMIT but no END; wrote END LSN "
-                          << end_lsn << "." << std::endl;
-                ended_txns++;
+                appendRecoveryRecord(txn_id,
+                                     LogRecordType::END,
+                                     entry.last_lsn);
                 continue;
             }
 
@@ -2112,9 +1877,6 @@ private:
                                                      LogRecordType::ABORT,
                                                      txn_last_lsn);
                 txn_last_lsn = abort_lsn;
-                std::cout << "Recovery: txn " << txn_id
-                          << " was a loser; wrote ABORT LSN "
-                          << abort_lsn << " before undo." << std::endl;
             }
             last_lsn_by_txn[txn_id] = txn_last_lsn;
             if (entry.last_lsn != 0) {
@@ -2149,8 +1911,6 @@ private:
                 last_lsn_by_txn[txn_id] = clr_lsn;
                 rememberDirtyPage(clr.page_id, clr_lsn);
                 applyRedo(clr);
-                printClrAction(clr, "ARIES undo pass");
-                applied++;
             }
 
             if (record.prev_lsn != 0) {
@@ -2159,21 +1919,9 @@ private:
         }
 
         for (const auto& loser : last_lsn_by_txn) {
-            LSN end_lsn = appendRecoveryRecord(loser.first,
-                                               LogRecordType::END,
-                                               loser.second);
-            std::cout << "Recovery: txn " << loser.first
-                      << " undo complete; wrote END LSN "
-                      << end_lsn << "." << std::endl;
-            ended_txns++;
-        }
-
-        if (applied != 0 || ended_txns != 0) {
-            std::cout << "ARIES UNDO: used toUndo and prevLSN/undoNextLSN chains, wrote "
-                      << applied
-                      << " CLR(s), and ended "
-                      << ended_txns
-                      << " transaction(s)." << std::endl;
+            appendRecoveryRecord(loser.first,
+                                 LogRecordType::END,
+                                 loser.second);
         }
     }
 
@@ -2241,48 +1989,6 @@ private:
             throw std::runtime_error("Unable to redo WAL operation.");
         }
         page->setPageLSN(std::max(page->getPageLSN(), record.lsn));
-    }
-
-    void printRedoAction(const LogRecord& record) const {
-        std::cout << "  REDO " << logRecordName(record.type)
-                  << " log record for txn " << record.txn_id
-                  << ": table " << record.table_id
-                  << ", page " << record.page_id
-                  << ", slot " << record.slot_id;
-
-        if (record.type == LogRecordType::INSERT) {
-            std::cout << " -> insert tuple after-image";
-        } else if (record.type == LogRecordType::UPDATE) {
-            std::cout << " -> write tuple after-image";
-        } else if (record.type == LogRecordType::DELETE) {
-            std::cout << " -> delete tuple";
-        } else if (record.type == LogRecordType::CLR) {
-            std::cout << " -> redo undo of "
-                      << logRecordName(record.undo_type)
-                      << ", undoNextLSN " << record.undo_next_lsn;
-        }
-        std::cout << std::endl;
-    }
-
-    void printClrAction(const LogRecord& clr, const std::string& reason) const {
-        std::cout << "  CLR txn " << clr.txn_id
-                  << " LSN " << clr.lsn
-                  << " prevLSN " << clr.prev_lsn
-                  << " undoNextLSN " << clr.undo_next_lsn
-                  << " for " << logRecordName(clr.undo_type)
-                  << " during " << reason
-                  << ": table " << clr.table_id
-                  << ", page " << clr.page_id
-                  << ", slot " << clr.slot_id;
-
-        if (clr.undo_type == LogRecordType::INSERT) {
-            std::cout << " -> delete inserted tuple";
-        } else if (clr.undo_type == LogRecordType::UPDATE) {
-            std::cout << " -> restore tuple before-image";
-        } else if (clr.undo_type == LogRecordType::DELETE) {
-            std::cout << " -> restore deleted tuple before-image";
-        }
-        std::cout << std::endl;
     }
 
 };
@@ -2369,12 +2075,7 @@ public:
             if (!recovery_manager.shouldCrashAt(CrashPoint::AFTER_STEAL_PAGE_FLUSH)) {
                 return;
             }
-            std::cout << "STEAL: trying to flush uncommitted page "
-                      << page_id << " before COMMIT." << std::endl;
             buffer_manager.flushPage(page_id, "uncommitted STEAL");
-            std::cout << "STEAL: page " << page_id
-                      << " reached disk before COMMIT."
-                      << std::endl;
             recovery_manager.crashIfRequested(
                 CrashPoint::AFTER_STEAL_PAGE_FLUSH,
                 "Simulated crash after uncommitted page " +
@@ -2688,6 +2389,17 @@ public:
         return it->second;
     }
 
+    TableMetadata& getTable(TableId table_id) {
+        for (auto& entry : tables_by_name) {
+            if (entry.second.table_id == table_id) {
+                return entry.second;
+            }
+        }
+        throw std::runtime_error(
+            "Unknown table id: " + std::to_string(table_id)
+        );
+    }
+
 private:
     static std::string readPageText(const std::unique_ptr<SlottedPage>& page) {
         size_t length = 0;
@@ -2983,6 +2695,15 @@ public:
     virtual bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const = 0;
 };
 
+std::vector<std::unique_ptr<Field>> cloneFields(
+        const std::vector<std::unique_ptr<Field>>& fields) {
+    std::vector<std::unique_ptr<Field>> cloned;
+    for (const auto& field : fields) {
+        cloned.push_back(field->clone());
+    }
+    return cloned;
+}
+
 class SimplePredicate: public IPredicate {
 public:
     enum OperandType { DIRECT, INDIRECT };
@@ -3158,6 +2879,148 @@ public:
         } else {
             return {};
         }
+    }
+};
+
+class ProjectionOperator : public UnaryOperator {
+private:
+    std::vector<size_t> projected_attrs;
+    std::vector<std::unique_ptr<Field>> currentOutput;
+    bool has_next = false;
+
+public:
+    ProjectionOperator(Operator& input, std::vector<size_t> projected_attrs)
+        : UnaryOperator(input), projected_attrs(std::move(projected_attrs)) {}
+
+    void open() override {
+        input->open();
+        currentOutput.clear();
+        has_next = false;
+    }
+
+    bool next() override {
+        if (!input->next()) {
+            currentOutput.clear();
+            has_next = false;
+            return false;
+        }
+
+        auto input_tuple = input->getOutput();
+        currentOutput.clear();
+        for (auto attr_index : projected_attrs) {
+            if (attr_index >= input_tuple.size()) {
+                throw std::runtime_error("Projection attribute index out of range.");
+            }
+            currentOutput.push_back(input_tuple[attr_index]->clone());
+        }
+        has_next = true;
+        return true;
+    }
+
+    void close() override {
+        input->close();
+        currentOutput.clear();
+        has_next = false;
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        if (!has_next) {
+            return {};
+        }
+        return cloneFields(currentOutput);
+    }
+};
+
+class NestedLoopJoinOperator : public BinaryOperator {
+private:
+    size_t left_attr_index;
+    size_t right_attr_index;
+    std::vector<std::vector<std::unique_ptr<Field>>> rightTuples;
+    std::vector<std::unique_ptr<Field>> currentLeftTuple;
+    std::vector<std::unique_ptr<Field>> currentOutput;
+    size_t rightTupleIndex = 0;
+    bool has_left_tuple = false;
+    bool has_next = false;
+
+public:
+    NestedLoopJoinOperator(Operator& left,
+                           Operator& right,
+                           size_t left_attr_index,
+                           size_t right_attr_index)
+        : BinaryOperator(left, right),
+          left_attr_index(left_attr_index),
+          right_attr_index(right_attr_index) {}
+
+    void open() override {
+        input_left->open();
+        input_right->open();
+        rightTuples.clear();
+        while (input_right->next()) {
+            rightTuples.push_back(input_right->getOutput());
+        }
+        input_right->close();
+
+        currentLeftTuple.clear();
+        currentOutput.clear();
+        rightTupleIndex = 0;
+        has_left_tuple = false;
+        has_next = false;
+    }
+
+    bool next() override {
+        currentOutput.clear();
+        has_next = false;
+
+        while (true) {
+            if (!has_left_tuple) {
+                if (!input_left->next()) {
+                    return false;
+                }
+                currentLeftTuple = input_left->getOutput();
+                rightTupleIndex = 0;
+                has_left_tuple = true;
+            }
+
+            while (rightTupleIndex < rightTuples.size()) {
+                const auto& right_tuple = rightTuples[rightTupleIndex++];
+                if (left_attr_index >= currentLeftTuple.size() ||
+                    right_attr_index >= right_tuple.size()) {
+                    throw std::runtime_error(
+                        "Nested-loop join attribute index out of range."
+                    );
+                }
+                if (!(*currentLeftTuple[left_attr_index] ==
+                      *right_tuple[right_attr_index])) {
+                    continue;
+                }
+
+                currentOutput = cloneFields(currentLeftTuple);
+                for (const auto& field : right_tuple) {
+                    currentOutput.push_back(field->clone());
+                }
+                has_next = true;
+                return true;
+            }
+
+            has_left_tuple = false;
+        }
+    }
+
+    void close() override {
+        input_left->close();
+        rightTuples.clear();
+        currentLeftTuple.clear();
+        currentOutput.clear();
+        rightTupleIndex = 0;
+        has_left_tuple = false;
+        has_next = false;
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        if (!has_next) {
+            return {};
+        }
+        return cloneFields(currentOutput);
     }
 };
 
@@ -3356,6 +3219,36 @@ std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value)
     throw std::runtime_error("Unsupported field type.");
 }
 
+using TableRefId = uint32_t;
+constexpr TableRefId INVALID_TABLE_REF_ID = 0;
+
+struct TableRef {
+    TableRefId id = INVALID_TABLE_REF_ID;
+    TableId table_id = INVALID_TABLE_ID;
+    std::string alias;
+};
+
+struct ColumnRef {
+    TableRefId table_ref_id = INVALID_TABLE_REF_ID;
+    size_t column_index = 0;
+};
+
+struct JoinClause {
+    TableRefId input_table_ref_id = INVALID_TABLE_REF_ID;
+    ColumnRef left;
+    ColumnRef right;
+};
+
+struct FilterClause {
+    ColumnRef column;
+    std::unique_ptr<Field> value;
+};
+
+struct ColumnEqualityClause {
+    ColumnRef left;
+    ColumnRef right;
+};
+
 struct QueryComponents {
     std::string tableName;
     std::vector<int> selectAttributes;
@@ -3371,10 +3264,221 @@ struct QueryComponents {
     bool equalityCondition = false;
     int equalityAttributeIndex = -1;
     std::unique_ptr<Field> equalityValue;
+
+    TableRefId base_table_ref_id = INVALID_TABLE_REF_ID;
+    std::vector<TableRef> table_refs;
+    std::vector<ColumnRef> select_columns;
+    std::vector<JoinClause> joins;
+    std::vector<FilterClause> filters;
+    std::vector<ColumnEqualityClause> column_filters;
+    std::vector<std::string> output_names;
+
+    bool isJoinQuery() const {
+        return !joins.empty();
+    }
 };
+
+std::string stripOptionalBrackets(const std::string& value) {
+    if (value.size() >= 2 && value.front() == '[' && value.back() == ']') {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+std::string joinOutputName(const std::string& projection) {
+    std::regex minProjectionRegex(
+        "^\\s*MIN\\s*\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}\\s*$",
+        std::regex_constants::icase
+    );
+    std::regex columnProjectionRegex(
+        "^\\s*\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}\\s*$"
+    );
+    std::smatch matches;
+    if (std::regex_match(projection, matches, minProjectionRegex)) {
+        return "MIN(" + static_cast<std::string>(matches[1]) + "." +
+               static_cast<std::string>(matches[2]) + ")";
+    }
+    if (std::regex_match(projection, matches, columnProjectionRegex)) {
+        return static_cast<std::string>(matches[1]) + "." +
+               static_cast<std::string>(matches[2]);
+    }
+    throw std::runtime_error("Unsupported join projection: " + projection);
+}
+
+std::vector<std::string> splitOnAnd(const std::string& predicates) {
+    std::vector<std::string> parts;
+    std::regex andRegex("\\s+AND\\s+", std::regex_constants::icase);
+    for (std::sregex_token_iterator it(predicates.begin(),
+                                       predicates.end(),
+                                       andRegex,
+                                       -1);
+         it != std::sregex_token_iterator();
+         ++it) {
+        auto part = trim(*it);
+        if (!part.empty()) {
+            parts.push_back(part);
+        }
+    }
+    return parts;
+}
+
+QueryComponents parseJoinQuery(const std::string& query, Catalog& catalog) {
+    QueryComponents components;
+
+    std::regex fromRegex(
+        "^\\s*(?:(?:SELECT|PROJECT)\\s+)?(.+?)\\s+FROM\\s+"
+        "([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(?:AS\\s+)?((?!JOIN\\b|WHERE\\b)[A-Za-z_][A-Za-z0-9_]*))?"
+        "\\s+(.*)\\s*;?\\s*$",
+        std::regex_constants::icase
+    );
+    std::smatch matches;
+    if (!std::regex_match(query, matches, fromRegex)) {
+        throw std::runtime_error("Unsupported join query: " + query);
+    }
+
+    std::map<std::string, TableRefId> alias_to_table_ref_id;
+    auto tableIdForRef = [&](TableRefId table_ref_id) -> TableId {
+        for (const auto& table_ref : components.table_refs) {
+            if (table_ref.id == table_ref_id) {
+                return table_ref.table_id;
+            }
+        }
+        throw std::runtime_error(
+            "Unknown table reference id: " + std::to_string(table_ref_id)
+        );
+    };
+    auto addTableAlias = [&](const std::string& table_name,
+                             const std::string& alias) -> TableRefId {
+        auto& metadata = catalog.getTable(table_name);
+        TableRefId table_ref_id =
+            static_cast<TableRefId>(components.table_refs.size() + 1);
+        if (!alias_to_table_ref_id.insert({alias, table_ref_id}).second) {
+            throw std::runtime_error("Duplicate table alias: " + alias);
+        }
+        components.table_refs.push_back({
+            table_ref_id,
+            metadata.table_id,
+            alias
+        });
+        return table_ref_id;
+    };
+
+    auto resolveColumn = [&](const std::string& alias,
+                             const std::string& column_name) -> ColumnRef {
+        auto alias_it = alias_to_table_ref_id.find(alias);
+        if (alias_it == alias_to_table_ref_id.end()) {
+            throw std::runtime_error("Unknown table alias: " + alias);
+        }
+
+        auto& metadata = catalog.getTable(tableIdForRef(alias_it->second));
+        return {
+            alias_it->second,
+            static_cast<size_t>(metadata.schema.getColumnIndex(column_name))
+        };
+    };
+
+    const std::string left_table = matches[2];
+    const std::string left_alias = matches[3].matched
+        ? static_cast<std::string>(matches[3])
+        : left_table;
+    std::string rest = trim(matches[4]);
+
+    components.base_table_ref_id = addTableAlias(left_table, left_alias);
+
+    const std::string projection_list = matches[1];
+
+    std::regex joinClauseRegex(
+        "^\\s*JOIN\\s+([A-Za-z_][A-Za-z0-9_]*)"
+        "(?:\\s+(?:AS\\s+)?((?!ON\\b)[A-Za-z_][A-Za-z0-9_]*))?"
+        "\\s+ON\\s+\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}"
+        "\\s*=\\s*\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}"
+        "(.*)$",
+        std::regex_constants::icase
+    );
+    while (std::regex_match(rest, matches, joinClauseRegex)) {
+        const std::string table_name = matches[1];
+        const std::string alias = matches[2].matched
+            ? static_cast<std::string>(matches[2])
+            : table_name;
+        TableRefId input_table_ref_id = addTableAlias(table_name, alias);
+        components.joins.push_back({
+            input_table_ref_id,
+            resolveColumn(matches[3], matches[4]),
+            resolveColumn(matches[5], matches[6])
+        });
+        rest = trim(matches[7]);
+    }
+    if (components.joins.empty()) {
+        throw std::runtime_error("Join query must include at least one JOIN.");
+    }
+
+    std::regex whereRegex("^WHERE\\s+(.+)$", std::regex_constants::icase);
+    if (std::regex_match(rest, matches, whereRegex)) {
+        for (const auto& predicate : splitOnAnd(matches[1])) {
+            std::regex columnPredicateRegex(
+                "^\\s*\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}\\s*=\\s*"
+                "\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}\\s*$"
+            );
+            std::regex valuePredicateRegex(
+                "^\\s*\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}\\s*=\\s*"
+                "([^\\s;]+)\\s*$"
+            );
+            if (std::regex_match(predicate, matches, columnPredicateRegex)) {
+                components.column_filters.push_back({
+                    resolveColumn(matches[1], matches[2]),
+                    resolveColumn(matches[3], matches[4])
+                });
+                continue;
+            }
+            if (std::regex_match(predicate, matches, valuePredicateRegex)) {
+                auto column = resolveColumn(matches[1], matches[2]);
+                auto& metadata = catalog.getTable(tableIdForRef(column.table_ref_id));
+                const auto& column_schema =
+                    metadata.schema.columns[column.column_index];
+                components.filters.push_back({
+                    column,
+                    parseFieldValue(
+                        column_schema.type,
+                        stripOptionalBrackets(matches[3])
+                    )
+                });
+                continue;
+            }
+            throw std::runtime_error("Unsupported WHERE predicate: " + predicate);
+        }
+        rest.clear();
+    }
+    if (!trim(rest).empty()) {
+        throw std::runtime_error("Unexpected join query text: " + rest);
+    }
+
+    std::regex projectionRegex(
+        "(?:MIN\\s*)?\\{([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\}",
+        std::regex_constants::icase
+    );
+    for (std::sregex_iterator it(projection_list.begin(),
+                                 projection_list.end(),
+                                 projectionRegex);
+         it != std::sregex_iterator();
+         ++it) {
+        const std::string alias = (*it)[1];
+        const std::string column_name = (*it)[2];
+        components.select_columns.push_back(resolveColumn(alias, column_name));
+        components.output_names.push_back(joinOutputName((*it)[0]));
+    }
+    if (components.select_columns.empty()) {
+        throw std::runtime_error("Join query must project at least one column.");
+    }
+
+    return components;
+}
 
 QueryComponents parseQuery(const std::string& query, Catalog& catalog) {
     QueryComponents components;
+
+    if (std::regex_search(query, std::regex("\\bJOIN\\b", std::regex_constants::icase))) {
+        return parseJoinQuery(query, catalog);
+    }
 
     std::regex selectAllRegex(
         "^\\s*\\{\\*\\}\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+))?\\s*$",
@@ -3486,6 +3590,155 @@ void printColumnHeader(const QueryComponents& components,
         std::cout << name << " ";
     }
     std::cout << std::endl;
+}
+
+struct QueryResult {
+    size_t row_count = 0;
+    std::vector<std::vector<std::unique_ptr<Field>>> sample_rows;
+};
+
+size_t physicalOffset(const ColumnRef& column,
+                      const std::map<TableRefId, size_t>& table_offsets) {
+    auto offset = table_offsets.find(column.table_ref_id);
+    if (offset == table_offsets.end()) {
+        throw std::runtime_error("Column references a table not yet joined.");
+    }
+    return offset->second + column.column_index;
+}
+
+const TableRef& tableRefForId(const QueryComponents& components,
+                              TableRefId table_ref_id) {
+    for (const auto& table_ref : components.table_refs) {
+        if (table_ref.id == table_ref_id) {
+            return table_ref;
+        }
+    }
+    throw std::runtime_error(
+        "Unknown table reference id: " + std::to_string(table_ref_id)
+    );
+}
+
+QueryResult executeJoinQuery(const QueryComponents& components,
+                             Catalog& catalog,
+                             PageManager& page_manager,
+                             size_t sample_limit = 5) {
+    if (components.base_table_ref_id == INVALID_TABLE_REF_ID) {
+        throw std::runtime_error("Join query is missing a base table.");
+    }
+
+    std::map<TableRefId, size_t> table_offsets;
+    std::map<TableRefId, size_t> table_widths;
+    std::vector<std::unique_ptr<TableHeap>> heaps;
+    std::vector<std::unique_ptr<ScanOperator>> scans;
+    std::vector<std::unique_ptr<NestedLoopJoinOperator>> joinOpBuffers;
+
+    auto addScan = [&](TableRefId table_ref_id) -> ScanOperator& {
+        const auto& table_ref = tableRefForId(components, table_ref_id);
+        auto& metadata = catalog.getTable(table_ref.table_id);
+        table_widths[table_ref_id] = metadata.schema.columns.size();
+        heaps.push_back(std::make_unique<TableHeap>(metadata, page_manager));
+        scans.push_back(std::make_unique<ScanOperator>(*heaps.back()));
+        return *scans.back();
+    };
+
+    Operator* rootOp = &addScan(components.base_table_ref_id);
+    table_offsets[components.base_table_ref_id] = 0;
+    size_t output_width = table_widths[components.base_table_ref_id];
+
+    for (const auto& join : components.joins) {
+        auto& right_scan = addScan(join.input_table_ref_id);
+
+        size_t left_attr_index = 0;
+        size_t right_attr_index = 0;
+        if (table_offsets.find(join.left.table_ref_id) != table_offsets.end() &&
+            join.right.table_ref_id == join.input_table_ref_id) {
+            left_attr_index = physicalOffset(join.left, table_offsets);
+            right_attr_index = join.right.column_index;
+        } else if (table_offsets.find(join.right.table_ref_id) != table_offsets.end() &&
+                   join.left.table_ref_id == join.input_table_ref_id) {
+            left_attr_index = physicalOffset(join.right, table_offsets);
+            right_attr_index = join.left.column_index;
+        } else {
+            throw std::runtime_error(
+                "JOIN must connect the new input table to an earlier table."
+            );
+        }
+
+        joinOpBuffers.push_back(std::make_unique<NestedLoopJoinOperator>(
+            *rootOp,
+            right_scan,
+            left_attr_index,
+            right_attr_index
+        ));
+        rootOp = joinOpBuffers.back().get();
+        table_offsets[join.input_table_ref_id] = output_width;
+        output_width += table_widths[join.input_table_ref_id];
+    }
+
+    std::optional<SelectOperator> selectOpBuffer;
+    if (!components.filters.empty() || !components.column_filters.empty()) {
+        auto predicate = std::make_unique<ComplexPredicate>(
+            ComplexPredicate::LogicOperator::AND
+        );
+        for (const auto& filter : components.filters) {
+            predicate->addPredicate(std::make_unique<SimplePredicate>(
+                SimplePredicate::Operand(physicalOffset(filter.column, table_offsets)),
+                SimplePredicate::Operand(filter.value->clone()),
+                SimplePredicate::ComparisonOperator::EQ
+            ));
+        }
+        for (const auto& filter : components.column_filters) {
+            predicate->addPredicate(std::make_unique<SimplePredicate>(
+                SimplePredicate::Operand(physicalOffset(filter.left, table_offsets)),
+                SimplePredicate::Operand(physicalOffset(filter.right, table_offsets)),
+                SimplePredicate::ComparisonOperator::EQ
+            ));
+        }
+        selectOpBuffer.emplace(*rootOp, std::move(predicate));
+        rootOp = &*selectOpBuffer;
+    }
+
+    std::optional<ProjectionOperator> projectionOpBuffer;
+    std::vector<size_t> projected_attrs;
+    for (const auto& column : components.select_columns) {
+        projected_attrs.push_back(physicalOffset(column, table_offsets));
+    }
+    projectionOpBuffer.emplace(*rootOp, std::move(projected_attrs));
+    rootOp = &*projectionOpBuffer;
+
+    QueryResult result;
+    rootOp->open();
+    while (rootOp->next()) {
+        auto output = rootOp->getOutput();
+        if (result.sample_rows.size() < sample_limit) {
+            result.sample_rows.push_back(std::move(output));
+        }
+        result.row_count++;
+    }
+    rootOp->close();
+    return result;
+}
+
+void printJoinQueryResult(const QueryComponents& components,
+                          const QueryResult& result) {
+    std::cout << "Join operator: NestedLoopJoin" << std::endl;
+    std::cout << "Rows: " << result.row_count << std::endl;
+    std::cout << "Sample rows:" << std::endl;
+    if (!components.output_names.empty()) {
+        std::cout << "  ";
+        for (const auto& name : components.output_names) {
+            std::cout << name << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    for (const auto& row : result.sample_rows) {
+        std::cout << "  ";
+        for (const auto& field : row) {
+            std::cout << fieldToString(*field) << " ";
+        }
+        std::cout << std::endl;
+    }
 }
 
 void executeQuery(const QueryComponents& components, 
@@ -3754,10 +4007,6 @@ using TxnPtr = std::shared_ptr<TxnContext>;
 
 enum class LockMode { IS, IX, S, X };
 
-enum class IsolationLevel {
-    RepeatableRead
-};
-
 enum class ConcurrencyControlResourceKind { Table, Tuple };
 
 struct ConcurrencyControlResource {
@@ -3950,20 +4199,6 @@ public:
         }
     }
 
-    static std::string modeName(LockMode mode) {
-        switch (mode) {
-            case LockMode::IS:
-                return "IS";
-            case LockMode::IX:
-                return "IX";
-            case LockMode::S:
-                return "S";
-            case LockMode::X:
-                return "X";
-        }
-        throw std::runtime_error("Unknown lock mode.");
-    }
-
 private:
     LockRequestResult tryAcquireLocked(int txn_id,
                                        const ConcurrencyControlResource& resource,
@@ -4087,7 +4322,6 @@ struct ConcurrencyControlResult {
 class ConcurrencyControlPolicy {
 public:
     virtual ~ConcurrencyControlPolicy() = default;
-    virtual std::string name() const = 0;
     virtual void begin(int txn_id) = 0;
     virtual ConcurrencyControlResult beforeAccess(
         const ConcurrencyControlRequest& request) = 0;
@@ -4103,10 +4337,6 @@ private:
 public:
     explicit TwoPhaseLockingPolicy(LockManager& lock_manager)
         : lock_manager(lock_manager) {}
-
-    std::string name() const override {
-        return "Two-Phase Locking";
-    }
 
     void begin(int) override {}
 
@@ -4160,12 +4390,7 @@ public:
             std::make_unique<TwoPhaseLockingPolicy>(lock_manager);
     }
 
-    std::string concurrencyControlPolicyName() const {
-        return concurrency_control_policy->name();
-    }
-
     TxnPtr begin(int txn_id) {
-        std::cout << "BEGIN txn " << txn_id << std::endl;
         auto txn = std::make_shared<TxnContext>(TxnContext{txn_id});
         concurrency_control_policy->begin(txn_id);
         return txn;
@@ -4189,13 +4414,11 @@ public:
 
     void commit(TxnContext& txn) {
         txn.state = TxnContext::COMMITTED;
-        std::cout << "COMMIT txn " << txn.id << std::endl;
         concurrency_control_policy->afterCommit(txn.id);
     }
 
     void abort(TxnContext& txn) {
         txn.state = TxnContext::ABORTED;
-        std::cout << "ABORT txn " << txn.id << std::endl;
         concurrency_control_policy->abort(txn.id);
     }
 };
@@ -4209,7 +4432,6 @@ public:
     Catalog catalog;
     TransactionManager txn_manager;
     TxnPtr active_txn;
-    IsolationLevel isolation_level = IsolationLevel::RepeatableRead;
 
 public:
     BuzzDB() : log_manager(),
@@ -4224,22 +4446,6 @@ public:
 
     void useTwoPhaseLockingPolicy() {
         txn_manager.useTwoPhaseLockingPolicy();
-    }
-
-    std::string concurrencyControlPolicyName() const {
-        return txn_manager.concurrencyControlPolicyName();
-    }
-
-    static std::string isolationLevelName(IsolationLevel level) {
-        switch (level) {
-            case IsolationLevel::RepeatableRead:
-                return "REPEATABLE READ";
-        }
-        throw std::runtime_error("Unknown isolation level.");
-    }
-
-    std::string isolationLevelName() const {
-        return isolationLevelName(isolation_level);
     }
 
     TxnPtr beginTransaction() {
@@ -4339,17 +4545,6 @@ public:
         return ConcurrencyControlResource::table(metadata.table_id);
     }
 
-    static std::string resourceLabel(
-            const ConcurrencyControlResource& resource) {
-        if (resource.kind == ConcurrencyControlResourceKind::Table) {
-            return "table=" + std::to_string(resource.table_id);
-        }
-
-        return "tuple table=" + std::to_string(resource.table_id) +
-               "[page=" + std::to_string(resource.page_id) +
-               ", slot=" + std::to_string(resource.slot_id) + "]";
-    }
-
     static bool sameFieldValue(const Field& left, const Field& right) {
         if (left.getType() != right.getType()) {
             return false;
@@ -4364,17 +4559,6 @@ public:
                 return left.asString() == right.asString();
         }
         throw std::runtime_error("Unsupported field type.");
-    }
-
-    static std::string txnCycleLabel(const std::vector<int>& cycle) {
-        std::ostringstream output;
-        for (size_t i = 0; i < cycle.size(); i++) {
-            if (i != 0) {
-                output << " -> ";
-            }
-            output << "txn " << cycle[i];
-        }
-        return output.str();
     }
 
     void acquireMatchingTupleAccess(const TxnPtr& txn,
@@ -4529,19 +4713,9 @@ public:
         }
 
         for (const auto& lock : locks) {
-            std::cout << "CC policy " << concurrencyControlPolicyName()
-                      << ": txn " << txn->id
-                      << " requests " << LockManager::modeName(lock.mode)
-                      << " lock on " << resourceLabel(lock.resource)
-                      << "." << std::endl;
-
             auto result = txn_manager.requestAccess(txn, {lock});
 
             if (result.deadlock) {
-                std::cout << "Deadlock detected in waits-for graph: "
-                          << txnCycleLabel(result.cycle)
-                          << ". Choosing txn " << txn->id
-                          << " as victim." << std::endl;
                 abort(txn);
                 throw std::runtime_error(
                     "DEADLOCK: txn " + std::to_string(txn->id) +
@@ -4554,16 +4728,6 @@ public:
                     "Concurrency-control policy rejected access for txn " +
                     std::to_string(txn->id)
                 );
-            }
-
-            std::cout << "CC policy " << concurrencyControlPolicyName()
-                      << ": txn " << txn->id
-                      << " " << LockManager::modeName(lock.mode)
-                      << " lock on " << resourceLabel(lock.resource);
-            if (result.waited) {
-                std::cout << " granted after wait." << std::endl;
-            } else {
-                std::cout << " granted." << std::endl;
             }
         }
     }
@@ -4745,13 +4909,22 @@ public:
                 continue;
             }
 
-            std::regex selectRegex("^\\s*SELECT\\s+(.*)\\s*;?\\s*$",
+            std::regex selectRegex("^\\s*(?:SELECT|PROJECT)\\s+(.*)\\s*;?\\s*$",
                                    std::regex_constants::icase);
             if (std::regex_match(statement, matches, selectRegex)) {
                 const std::string queryText = matches[1];
                 auto components = parseQuery(queryText, catalog);
-                auto& metadata = catalog.getTable(components.tableName);
-                executeQuery(components, metadata, page_manager);
+                if (components.isJoinQuery()) {
+                    auto result = executeJoinQuery(
+                        components,
+                        catalog,
+                        page_manager
+                    );
+                    printJoinQueryResult(components, result);
+                } else {
+                    auto& metadata = catalog.getTable(components.tableName);
+                    executeQuery(components, metadata, page_manager);
+                }
                 statementFinished();
                 continue;
             }
@@ -4864,8 +5037,11 @@ void resetDatabaseFiles() {
 }
 
 const std::string imdb_data_filename = "imdb_large.txt";
-const std::string imdb_title_lookup_query =
-    "SELECT {*} FROM title WHERE id = 2008135";
+const std::string imdb_nested_loop_join_query =
+    "SELECT {t.title}, {kt.kind} "
+    "FROM title AS t "
+    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
+    "WHERE {t.id} = 2008135";
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
     if (db.isDatabaseEmpty()) {
@@ -4895,8 +5071,8 @@ void printImportResult(const ImportResult& result) {
     throw std::runtime_error("Importer finished without loading or skipping.");
 }
 
-void runImdbTitleLookup() {
-    std::cout << "\nIMDB Query: title lookup by id" << std::endl;
+void runImdbNestedLoopJoin() {
+    std::cout << "\nIMDB Query: title joined with kind_type" << std::endl;
 
     BuzzDB db;
     auto import_start = std::chrono::high_resolution_clock::now();
@@ -4910,11 +5086,11 @@ void runImdbTitleLookup() {
                   << import_elapsed.count() << " seconds" << std::endl;
     }
 
-    auto reader = db.beginTransaction();
+    auto join_reader = db.beginTransaction();
     auto query_start = std::chrono::high_resolution_clock::now();
-    db.execute(reader, imdb_title_lookup_query);
+    db.execute(join_reader, imdb_nested_loop_join_query);
     auto query_end = std::chrono::high_resolution_clock::now();
-    db.commit(reader);
+    db.commit(join_reader);
     std::chrono::duration<double> query_elapsed = query_end - query_start;
     std::cout << "Elapsed query processing time: "
               << query_elapsed.count() << " seconds" << std::endl;
@@ -4926,10 +5102,9 @@ void runImdbTitleLookup() {
 int main() {
     try {
 
-    std::cout << "IMDB title lookup\n";
-    std::cout << "Load IMDB once, then run one transactional lookup.\n";
+    std::cout << "IMDB nested-loop join\n";
 
-    runImdbTitleLookup();
+    runImdbNestedLoopJoin();
 
     return 0;
     } catch (const std::exception& error) {
