@@ -651,6 +651,52 @@ enum class LogRecordType {
     ABORT
 };
 
+enum class BufferRecoveryPolicy {
+    NoStealForce,
+    NoStealNoForce,
+    StealForce,
+    StealNoForce
+};
+
+constexpr BufferRecoveryPolicy kBufferRecoveryPolicy =
+    BufferRecoveryPolicy::StealNoForce;
+
+const char* bufferRecoveryPolicyName(BufferRecoveryPolicy policy) {
+    switch (policy) {
+        case BufferRecoveryPolicy::NoStealForce:
+            return "NO-STEAL/FORCE";
+        case BufferRecoveryPolicy::NoStealNoForce:
+            return "NO-STEAL/NO-FORCE";
+        case BufferRecoveryPolicy::StealForce:
+            return "STEAL/FORCE";
+        case BufferRecoveryPolicy::StealNoForce:
+            return "STEAL/NO-FORCE";
+    }
+    throw std::runtime_error("Unknown buffer recovery policy.");
+}
+
+const char* bufferRecoveryPolicyDetails(BufferRecoveryPolicy policy) {
+    switch (policy) {
+        case BufferRecoveryPolicy::NoStealForce:
+            return "FORCE writes committed pages at commit, and NO-STEAL keeps loser pages off disk: no redo or undo is needed.";
+        case BufferRecoveryPolicy::NoStealNoForce:
+            return "NO-FORCE may leave committed pages stale, so recovery may redo winners; NO-STEAL keeps loser pages off disk, so loser undo is not needed.";
+        case BufferRecoveryPolicy::StealForce:
+            return "STEAL may place loser updates on disk, so recovery may undo losers; FORCE writes committed pages at commit, so redo is not needed.";
+        case BufferRecoveryPolicy::StealNoForce:
+            return "NO-FORCE may leave committed pages stale and STEAL may place loser updates on disk, so recovery may redo winners and undo losers.";
+    }
+    throw std::runtime_error("Unknown buffer recovery policy.");
+}
+
+void printBufferRecoveryPolicy() {
+    std::cout << "Buffer recovery policy: "
+              << bufferRecoveryPolicyName(kBufferRecoveryPolicy) << "\n"
+              << "Policy effect: "
+              << bufferRecoveryPolicyDetails(kBufferRecoveryPolicy)
+              << std::endl;
+}
+
 bool isTupleChangeRecord(LogRecordType type);
 
 struct LogRecord {
@@ -3102,6 +3148,7 @@ int main() {
     try {
 
     auto start = std::chrono::high_resolution_clock::now();
+    printBufferRecoveryPolicy();
 
     {
         BuzzDB db;
