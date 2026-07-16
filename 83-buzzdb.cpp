@@ -3219,6 +3219,19 @@ std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value)
     throw std::runtime_error("Unsupported field type.");
 }
 
+std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                 const std::vector<std::string>& values) {
+    if (values.size() != schema.columns.size()) {
+        throw std::runtime_error("Wrong field count for table row.");
+    }
+
+    auto tuple = std::make_unique<Tuple>();
+    for (size_t i = 0; i < schema.columns.size(); i++) {
+        tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
+    }
+    return tuple;
+}
+
 using TableRefId = uint32_t;
 constexpr TableRefId INVALID_TABLE_REF_ID = 0;
 
@@ -4439,13 +4452,8 @@ public:
                recovery_manager(buffer_manager, log_manager),
                page_manager(buffer_manager, recovery_manager),
                catalog(buffer_manager, page_manager) {
-        useTwoPhaseLockingPolicy();
         recovery_manager.recover();
         catalog.load();
-    }
-
-    void useTwoPhaseLockingPolicy() {
-        txn_manager.useTwoPhaseLockingPolicy();
     }
 
     TxnPtr beginTransaction() {
@@ -4515,18 +4523,6 @@ public:
 
     void checkpoint() {
         recovery_manager.checkpoint();
-    }
-
-    bool createTable(const std::string& name, TableSchema schema) {
-        return catalog.createTable(name, std::move(schema));
-    }
-
-    bool isDatabaseEmpty() const {
-        return catalog.empty();
-    }
-
-    bool hasTable(const std::string& name) const {
-        return catalog.hasTable(name);
     }
 
     static void requireRunningTransaction(const TxnPtr& txn) {
@@ -4732,31 +4728,6 @@ public:
         }
     }
 
-    static std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
-        switch (type) {
-            case INT:
-                return std::make_unique<Field>(std::stoi(value));
-            case FLOAT:
-                return std::make_unique<Field>(std::stof(value));
-            case STRING:
-                return std::make_unique<Field>(value);
-        }
-        throw std::runtime_error("Unsupported field type.");
-    }
-
-    static std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
-                                            const std::vector<std::string>& values) {
-        if (values.size() != schema.columns.size()) {
-            throw std::runtime_error("Wrong field count for table row.");
-        }
-
-        auto tuple = std::make_unique<Tuple>();
-        for (size_t i = 0; i < schema.columns.size(); i++) {
-            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
-        }
-        return tuple;
-    }
-
     static std::unique_ptr<IPredicate> makeEqualityPredicate(const TableSchema& schema,
                                                             const std::string& columnName,
                                                             const std::string& value) {
@@ -4793,23 +4764,6 @@ public:
         InsertOperator insertOp(tableHeap);
         insertOp.setTupleToInsert(std::move(tuple));
         executeStatementOperator(insertOp, printResult);
-    }
-
-    void insertRowWithAppendHint(const std::string& tableName,
-                                 const std::vector<std::string>& values,
-                                 std::unordered_map<std::string, PageID>& append_pages) {
-        auto& metadata = catalog.getTable(tableName);
-        auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, page_manager);
-
-        auto cursor = append_pages.find(tableName);
-        if (cursor == append_pages.end()) {
-            cursor = append_pages.emplace(tableName, metadata.first_page).first;
-        }
-
-        if (!tableHeap.appendTuple(std::move(tuple), cursor->second)) {
-            throw std::runtime_error("Failed to import row into table: " + tableName);
-        }
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -4976,10 +4930,28 @@ private:
         return schema;
     }
 
+    static void appendRow(BuzzDB& db,
+                          const std::string& tableName,
+                          const std::vector<std::string>& values,
+                          std::unordered_map<std::string, PageID>& append_pages) {
+        auto& metadata = db.catalog.getTable(tableName);
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, db.page_manager);
+
+        auto cursor = append_pages.find(tableName);
+        if (cursor == append_pages.end()) {
+            cursor = append_pages.emplace(tableName, metadata.first_page).first;
+        }
+
+        if (!tableHeap.appendTuple(std::move(tuple), cursor->second)) {
+            throw std::runtime_error("Failed to import row into table: " + tableName);
+        }
+    }
+
 public:
     static ImportResult importFile(BuzzDB& db, const std::string& filename) {
         ImportResult result;
-        if (!db.isDatabaseEmpty()) {
+        if (!db.catalog.empty()) {
             result.skipped = true;
             result.reason = "database already has user tables";
             return result;
@@ -5008,7 +4980,7 @@ public:
                     throw std::runtime_error("Bad TABLE line: " + line);
                 }
                 const std::string tableName = tokens[1];
-                if (!db.createTable(tableName, parseTableSchema(tokens))) {
+                if (!db.catalog.createTable(tableName, parseTableSchema(tokens))) {
                     throw std::runtime_error("Duplicate TABLE declaration: " + tableName);
                 }
                 result.tables_created++;
@@ -5016,12 +4988,12 @@ public:
             }
 
             const std::string tableName = tokens[0];
-            if (!db.hasTable(tableName)) {
+            if (!db.catalog.hasTable(tableName)) {
                 throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
             }
 
             std::vector<std::string> values(tokens.begin() + 1, tokens.end());
-            db.insertRowWithAppendHint(tableName, values, append_pages);
+            appendRow(db, tableName, values, append_pages);
             result.rows_inserted++;
         }
 
@@ -5029,12 +5001,6 @@ public:
         return result;
     }
 };
-
-void resetDatabaseFiles() {
-    std::remove(database_filename.c_str());
-    std::remove(log_filename.c_str());
-    std::remove(master_record_filename.c_str());
-}
 
 const std::string imdb_data_filename = "imdb_large.txt";
 const std::string imdb_nested_loop_join_query =
@@ -5044,7 +5010,7 @@ const std::string imdb_nested_loop_join_query =
     "WHERE {t.id} = 2008135";
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
-    if (db.isDatabaseEmpty()) {
+    if (db.catalog.empty()) {
         return DatabaseImporter::importFile(db, imdb_data_filename);
     }
 
