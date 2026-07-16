@@ -2981,6 +2981,8 @@ class IPredicate {
 public:
     virtual ~IPredicate() = default;
     virtual bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const = 0;
+    virtual std::unique_ptr<IPredicate> clone() const = 0;
+    virtual std::string label(const TableSchema& schema) const = 0;
 };
 
 class SimplePredicate: public IPredicate {
@@ -2995,6 +2997,13 @@ public:
 
         Operand(std::unique_ptr<Field> value) : directValue(std::move(value)), type(DIRECT) {}
         Operand(size_t idx) : index(idx), type(INDIRECT) {}
+
+        Operand clone() const {
+            if (type == DIRECT) {
+                return Operand(directValue->clone());
+            }
+            return Operand(index);
+        }
     };
 
     Operand left_operand;
@@ -3004,7 +3013,7 @@ public:
     SimplePredicate(Operand left, Operand right, ComparisonOperator op)
         : left_operand(std::move(left)), right_operand(std::move(right)), comparison_operator(op) {}
 
-    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
+    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const override {
         const Field* leftField = nullptr;
         const Field* rightField = nullptr;
 
@@ -3053,8 +3062,50 @@ public:
         }
     }
 
+    std::unique_ptr<IPredicate> clone() const override {
+        return std::make_unique<SimplePredicate>(
+            left_operand.clone(),
+            right_operand.clone(),
+            comparison_operator
+        );
+    }
+
+    std::string label(const TableSchema& schema) const override {
+        return operandLabel(left_operand, schema) + " " +
+               operatorLabel(comparison_operator) + " " +
+               operandLabel(right_operand, schema);
+    }
 
 private:
+
+    static std::string operandLabel(const Operand& operand,
+                                    const TableSchema& schema) {
+        if (operand.type == DIRECT) {
+            return fieldToString(*operand.directValue);
+        }
+        if (operand.index >= schema.columns.size()) {
+            return "column#" + std::to_string(operand.index);
+        }
+        return schema.columns[operand.index].name;
+    }
+
+    static std::string operatorLabel(ComparisonOperator op) {
+        switch (op) {
+            case ComparisonOperator::EQ:
+                return "=";
+            case ComparisonOperator::NE:
+                return "!=";
+            case ComparisonOperator::GT:
+                return ">";
+            case ComparisonOperator::GE:
+                return ">=";
+            case ComparisonOperator::LT:
+                return "<";
+            case ComparisonOperator::LE:
+                return "<=";
+        }
+        throw std::runtime_error("Unknown comparison operator.");
+    }
 
     // Compares two values of the same type
     template<typename T>
@@ -3086,7 +3137,7 @@ public:
         predicates.push_back(std::move(predicate));
     }
 
-    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
+    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const override {
         
         if (logic_operator == AND) {
             for (const auto& pred : predicates) {
@@ -3106,6 +3157,28 @@ public:
         return false;
     }
 
+    std::unique_ptr<IPredicate> clone() const override {
+        auto copy = std::make_unique<ComplexPredicate>(logic_operator);
+        for (const auto& predicate : predicates) {
+            copy->addPredicate(predicate->clone());
+        }
+        return copy;
+    }
+
+    std::string label(const TableSchema& schema) const override {
+        if (predicates.empty()) {
+            return "TRUE";
+        }
+        std::ostringstream output;
+        const char* separator = logic_operator == AND ? " AND " : " OR ";
+        for (size_t i = 0; i < predicates.size(); i++) {
+            if (i != 0) {
+                output << separator;
+            }
+            output << "(" << predicates[i]->label(schema) << ")";
+        }
+        return output.str();
+    }
 
 };
 
@@ -3757,183 +3830,6 @@ struct ConcurrencyControlResult {
     std::string detail;
 };
 
-class MultiversionTimestampOrderingPolicy {
-private:
-    struct TxnState {
-        int timestamp = 0;
-        bool has_writes = false;
-    };
-
-    mutable std::mutex latch;
-    int next_timestamp = 1;
-    std::map<int, TxnState> active_txns;
-    std::map<int, int> txn_timestamps;
-    std::vector<int> active_timestamps;
-
-    void removeActiveTimestamp(int timestamp) {
-        auto it = std::find(
-            active_timestamps.begin(),
-            active_timestamps.end(),
-            timestamp
-        );
-        if (it != active_timestamps.end()) {
-            active_timestamps.erase(it);
-        }
-    }
-
-public:
-    std::string name() const {
-        return "Multiversion Timestamp Ordering";
-    }
-
-    void begin(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        int timestamp = next_timestamp++;
-        active_txns[txn_id] = {timestamp, false};
-        txn_timestamps[txn_id] = timestamp;
-        active_timestamps.push_back(timestamp);
-        std::cout << "MVTO assigns timestamp " << timestamp
-                  << " to txn " << txn_id << "." << std::endl;
-    }
-
-    ConcurrencyControlResult beforeCommit(int txn_id) const {
-        std::lock_guard<std::mutex> guard(latch);
-        if (active_txns.find(txn_id) == active_txns.end()) {
-            return {
-                false,
-                "txn " + std::to_string(txn_id) + " has no MVTO state"
-            };
-        }
-        return {};
-    }
-
-    void afterCommit(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        auto txn_it = active_txns.find(txn_id);
-        if (txn_it == active_txns.end()) {
-            return;
-        }
-        removeActiveTimestamp(txn_it->second.timestamp);
-        std::cout << "MVTO txn " << txn_id << " releases timestamp "
-                  << txn_it->second.timestamp;
-        if (txn_it->second.has_writes) {
-            std::cout << " after publishing version(s)";
-        }
-        std::cout << "." << std::endl;
-        active_txns.erase(txn_it);
-    }
-
-    void abort(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        auto txn_it = active_txns.find(txn_id);
-        if (txn_it == active_txns.end()) {
-            return;
-        }
-        removeActiveTimestamp(txn_it->second.timestamp);
-        active_txns.erase(txn_it);
-    }
-
-    void markWrite(int txn_id) {
-        std::lock_guard<std::mutex> guard(latch);
-        auto txn_it = active_txns.find(txn_id);
-        if (txn_it == active_txns.end()) {
-            throw std::runtime_error("transaction has no MVTO state");
-        }
-        txn_it->second.has_writes = true;
-    }
-
-    int timestamp(int txn_id) const {
-        std::lock_guard<std::mutex> guard(latch);
-        auto active_it = active_txns.find(txn_id);
-        if (active_it != active_txns.end()) {
-            return active_it->second.timestamp;
-        }
-        auto timestamp_it = txn_timestamps.find(txn_id);
-        if (timestamp_it == txn_timestamps.end()) {
-            throw std::runtime_error("transaction has no MVTO timestamp");
-        }
-        return timestamp_it->second;
-    }
-
-    int oldestActiveTimestamp() const {
-        std::lock_guard<std::mutex> guard(latch);
-        if (active_timestamps.empty()) {
-            return next_timestamp - 1;
-        }
-        return *std::min_element(active_timestamps.begin(),
-                                 active_timestamps.end());
-    }
-};
-
-class TransactionManager {
-private:
-    int next_txn_id = 1;
-    MultiversionTimestampOrderingPolicy mvto_policy;
-
-    static void requireRunningTransaction(const TxnContext& txn) {
-        if (txn.state != TxnContext::RUNNING) {
-            throw std::runtime_error(
-                "operation requires a running transaction"
-            );
-        }
-    }
-
-public:
-    std::string concurrencyControlPolicyName() const {
-        return mvto_policy.name();
-    }
-
-    TxnPtr begin() {
-        int txn_id = next_txn_id++;
-        std::cout << "BEGIN txn " << txn_id << std::endl;
-        auto txn = std::make_shared<TxnContext>(TxnContext{txn_id});
-        mvto_policy.begin(txn_id);
-        return txn;
-    }
-
-    ConcurrencyControlResult prepareCommit(const TxnContext& txn) const {
-        requireRunningTransaction(txn);
-        return mvto_policy.beforeCommit(txn.id);
-    }
-
-    bool commit(TxnContext& txn) {
-        auto result = prepareCommit(txn);
-        if (!result.granted) {
-            std::cout << result.detail << "; abort txn "
-                      << txn.id << "." << std::endl;
-            abort(txn);
-            return false;
-        }
-
-        txn.state = TxnContext::COMMITTED;
-        std::cout << "COMMIT txn " << txn.id << std::endl;
-        mvto_policy.afterCommit(txn.id);
-        return true;
-    }
-
-    void abort(TxnContext& txn) {
-        if (txn.state != TxnContext::RUNNING) {
-            return;
-        }
-        txn.state = TxnContext::ABORTED;
-        std::cout << "ABORT txn " << txn.id << std::endl;
-        mvto_policy.abort(txn.id);
-    }
-
-    int mvtoTimestamp(const TxnContext& txn) const {
-        return mvto_policy.timestamp(txn.id);
-    }
-
-    int oldestMVTOTimestamp() const {
-        return mvto_policy.oldestActiveTimestamp();
-    }
-
-    void markMVTOWrite(const TxnContext& txn) {
-        requireRunningTransaction(txn);
-        mvto_policy.markWrite(txn.id);
-    }
-};
-
 void resetDatabaseFiles() {
     std::remove(database_filename.c_str());
     std::remove(log_filename.c_str());
@@ -4076,11 +3972,6 @@ struct ColumnAssignment {
 };
 
 using TypedTupleUpdate = std::vector<ColumnAssignment>;
-
-struct PendingTupleVersion {
-    TupleId tuple_id;
-    TupleKey key;
-};
 
 std::string typedTupleUpdateLabel(const TableSchema& schema,
                                   const TypedTupleUpdate& changes) {
@@ -4321,6 +4212,13 @@ public:
     }
 };
 
+struct VersionedTupleRead {
+    TupleKey key;
+    TupleId tuple_id;
+    VersionedTupleHeader header;
+    std::unique_ptr<Tuple> tuple;
+};
+
 class VersionManager {
 private:
     struct TableDefinition {
@@ -4330,13 +4228,11 @@ private:
         ColumnId key_column_id = 0;
     };
 
-    TransactionManager txn_manager;
     VersionedTupleStore tuple_store;
     TableId next_table_id = FIRST_USER_TABLE_ID;
     std::map<TableId, TableDefinition> tables_by_id;
     std::map<std::string, TableId> table_ids_by_name;
     std::map<TupleKey, TupleId> version_heads;
-    std::map<int, std::string> txn_labels;
 
     static ColumnId checkedColumnId(const TableSchema& schema,
                                     const std::string& column_name) {
@@ -4349,32 +4245,14 @@ private:
         return static_cast<ColumnId>(column_index);
     }
 
-    std::string txnLabel(const TxnPtr& txn) const {
-        auto it = txn_labels.find(txn->id);
-        if (it == txn_labels.end()) {
-            return "txn " + std::to_string(txn->id);
-        }
-        return it->second;
-    }
-
     const TableDefinition& tableDefinition(TableId table_id) const {
         auto it = tables_by_id.find(table_id);
         if (it == tables_by_id.end()) {
             throw std::runtime_error(
-                "Unknown MVTO table id: " + std::to_string(table_id)
+                "Unknown table id: " + std::to_string(table_id)
             );
         }
         return it->second;
-    }
-
-    static std::string versionName(const TupleId& tuple_id) {
-        return tuple_id.label();
-    }
-
-    static std::string creatorLabel(int creator_txn) {
-        return creator_txn == 0 ?
-            std::string("bootstrap") :
-            "txn " + std::to_string(creator_txn);
     }
 
     TupleKey keyFromTuple(const TableDefinition& table,
@@ -4386,30 +4264,9 @@ private:
         );
     }
 
-    std::optional<TupleId> readableVersionTupleId(const TupleKey& key,
-                                               int timestamp,
-                                               int txn_id) const {
-        auto head = version_heads.find(key);
-        if (head == version_heads.end()) {
-            return std::nullopt;
-        }
-
-        TupleId tuple_id = head->second;
-        while (tuple_id.valid()) {
-            auto version = tuple_store.readVersion(tuple_id);
-            const auto& header = version.header;
-            if (header.wts <= timestamp &&
-                (header.committed || header.creator_txn == txn_id)) {
-                return tuple_id;
-            }
-            tuple_id = header.previous_version;
-        }
-        return std::nullopt;
-    }
-
-    std::optional<TupleId> predecessorForWriteTupleId(
+    std::optional<VersionedTupleRead> visibleTupleForKey(
             const TupleKey& key,
-            int timestamp) const {
+            int snapshot_ts) const {
         auto head = version_heads.find(key);
         if (head == version_heads.end()) {
             return std::nullopt;
@@ -4418,11 +4275,16 @@ private:
         TupleId tuple_id = head->second;
         while (tuple_id.valid()) {
             auto version = tuple_store.readVersion(tuple_id);
-            const auto& header = version.header;
-            if (header.committed && header.wts < timestamp) {
-                return tuple_id;
+            if (version.header.committed &&
+                version.header.wts <= snapshot_ts) {
+                return VersionedTupleRead{
+                    key,
+                    tuple_id,
+                    version.header,
+                    std::move(version.tuple)
+                };
             }
-            tuple_id = header.previous_version;
+            tuple_id = version.header.previous_version;
         }
         return std::nullopt;
     }
@@ -4470,6 +4332,10 @@ public:
         return tableDefinition(table_id).schema;
     }
 
+    std::string tableName(TableId table_id) const {
+        return tableDefinition(table_id).name;
+    }
+
     std::string keyLabel(const TupleKey& key) const {
         const auto& table = tableDefinition(key.table_id);
         std::ostringstream output;
@@ -4479,18 +4345,45 @@ public:
         return output.str();
     }
 
-    void loadTuple(TableId table_id,
-                   std::unique_ptr<Tuple> tuple) {
+    std::string predicateLabel(TableId table_id,
+                               const IPredicate& predicate) const {
         const auto& table = tableDefinition(table_id);
-        auto key = keyFromTuple(table, *tuple);
-        VersionedTupleHeader header;
-        auto tuple_id = tuple_store.insertVersion(header, *tuple);
-        version_heads[key] = tuple_id;
+        std::ostringstream output;
+        output << table.name << " WHERE "
+               << predicate.label(table.schema);
+        return output.str();
     }
 
     TupleKey keyFor(TableId table_id, const Field& key_value) const {
         const auto& table = tableDefinition(table_id);
         return TupleKey(table_id, table.key_column_id, key_value);
+    }
+
+    std::unique_ptr<IPredicate> makePredicate(
+            TableId table_id,
+            const TupleUpdate& clauses) const {
+        const auto& table = tableDefinition(table_id);
+        auto predicate = std::make_unique<ComplexPredicate>(
+            ComplexPredicate::AND
+        );
+        for (const auto& clause : clauses) {
+            ColumnId column_id = checkedColumnId(table.schema, clause.name);
+            if (table.schema.columns[column_id].type != clause.value.getType()) {
+                throw std::runtime_error(
+                    "Predicate value type does not match column type."
+                );
+            }
+            predicate->addPredicate(
+                std::make_unique<SimplePredicate>(
+                    SimplePredicate::Operand(
+                        static_cast<size_t>(column_id)
+                    ),
+                    SimplePredicate::Operand(clause.value.clone()),
+                    SimplePredicate::EQ
+                )
+            );
+        }
+        return predicate;
     }
 
     TypedTupleUpdate resolveUpdate(TableId table_id,
@@ -4509,167 +4402,125 @@ public:
         return typed_changes;
     }
 
-    std::string policyName() const {
-        return txn_manager.concurrencyControlPolicyName();
+    void loadTuple(TableId table_id, std::unique_ptr<Tuple> tuple) {
+        const auto& table = tableDefinition(table_id);
+        auto key = keyFromTuple(table, *tuple);
+        VersionedTupleHeader header;
+        auto tuple_id = tuple_store.insertVersion(header, *tuple);
+        version_heads[key] = tuple_id;
     }
 
-    TxnPtr beginTxn(const std::string& label) {
-        auto txn = txn_manager.begin();
-        txn_labels[txn->id] = label;
-        std::cout << label << " begins with timestamp "
-                  << txn_manager.mvtoTimestamp(*txn) << "." << std::endl;
-        return txn;
+    std::vector<VersionedTupleRead> readPredicate(
+            int txn_id,
+            int snapshot_ts,
+            TableId table_id,
+            const IPredicate& predicate) const {
+        const auto& table = tableDefinition(table_id);
+        std::vector<VersionedTupleRead> rows;
+        for (const auto& [key, head_tuple_id] : version_heads) {
+            (void)head_tuple_id;
+            if (key.table_id != table_id) {
+                continue;
+            }
+            auto visible = visibleTupleForKey(key, snapshot_ts);
+            if (!visible || !predicate.check(visible->tuple->fields)) {
+                continue;
+            }
+            rows.push_back(std::move(*visible));
+        }
+
+        std::cout << "txn " << txn_id << " reads predicate "
+                  << predicateLabel(table_id, predicate)
+                  << " at snapshot_ts=" << snapshot_ts
+                  << " -> " << rows.size() << " row(s)." << std::endl;
+        for (const auto& row : rows) {
+            std::cout << "  sees " << keyLabel(row.key)
+                      << " from " << row.tuple_id.label()
+                      << " [_wts=" << row.header.wts
+                      << ", _prev=" << row.header.previous_version.label()
+                      << "] " << tupleLabel(table.schema, *row.tuple)
+                      << "." << std::endl;
+        }
+        return rows;
     }
 
-    TxnPtr beginReadOnly(const std::string& label) {
-        std::cout << label << " READ ONLY" << std::endl;
-        return beginTxn(label);
+    std::unique_ptr<Tuple> buildUpdatedTuple(const TupleKey& key,
+                                             int snapshot_ts,
+                                             const TypedTupleUpdate& changes) const {
+        const auto& table = tableDefinition(key.table_id);
+        auto visible = visibleTupleForKey(key, snapshot_ts);
+        if (!visible) {
+            throw std::runtime_error(
+                "No visible version to update for " + keyLabel(key)
+            );
+        }
+        return mergeTupleByColumn(table.schema, visible->tuple.get(), changes);
     }
 
-    TxnPtr beginUpdater(const std::string& label) {
-        std::cout << label << " UPDATER" << std::endl;
-        return beginTxn(label);
-    }
-
-    std::optional<TupleId> readTuple(const TxnPtr& txn,
-                                      const TupleKey& key) {
-        int timestamp = txn_manager.mvtoTimestamp(*txn);
-        auto tuple_id = readableVersionTupleId(key, timestamp, txn->id);
-        if (!tuple_id) {
-            std::cout << txnLabel(txn) << " reads " << keyLabel(key)
-                      << " at ts=" << timestamp
-                      << " -> no visible version." << std::endl;
+    std::optional<int> latestCommittedWriteTimestamp(const TupleKey& key) const {
+        auto head = version_heads.find(key);
+        if (head == version_heads.end()) {
             return std::nullopt;
         }
 
-        auto version = tuple_store.readVersion(*tuple_id);
-        const auto& table = tableDefinition(key.table_id);
-        std::cout << txnLabel(txn) << " reads " << keyLabel(key)
-                  << " at ts=" << timestamp
-                  << " -> " << tupleLabel(table.schema, *version.tuple)
-                  << " from " << versionName(*tuple_id)
-                  << " [_wts=" << version.header.wts
-                  << ", _rts=" << version.header.rts
-                  << ", _prev=" << version.header.previous_version.label()
-                  << "]." << std::endl;
-
-        if (timestamp > version.header.rts) {
-            version.header.rts = timestamp;
-            tuple_store.updateHeader(*tuple_id, version.header);
-            std::cout << "  MVTO persists "
-                      << versionName(*tuple_id)
-                      << "._rts = " << timestamp << "." << std::endl;
+        TupleId tuple_id = head->second;
+        while (tuple_id.valid()) {
+            auto version = tuple_store.readVersion(tuple_id);
+            if (version.header.committed) {
+                return version.header.wts;
+            }
+            tuple_id = version.header.previous_version;
         }
-        return tuple_id;
+        return std::nullopt;
     }
 
-    std::optional<PendingTupleVersion> writeTuple(
-            const TxnPtr& txn,
-            const TupleKey& key,
-            const TupleUpdate& changes) {
-        int timestamp = txn_manager.mvtoTimestamp(*txn);
-        const auto& table = tableDefinition(key.table_id);
-        auto typed_changes = resolveUpdate(key.table_id, changes);
-        std::cout << txnLabel(txn) << " requests WRITE " << keyLabel(key)
-                  << " at ts=" << timestamp << " -> "
-                  << typedTupleUpdateLabel(table.schema, typed_changes)
-                  << "." << std::endl;
-
-        auto predecessor = predecessorForWriteTupleId(key, timestamp);
-        if (predecessor) {
-            auto predecessor_version = tuple_store.readVersion(*predecessor);
-            if (predecessor_version.header.rts > timestamp) {
-                std::cout << "  MVTO rejects write because "
-                          << versionName(*predecessor)
-                          << "._rts=" << predecessor_version.header.rts
-                          << " is greater than writer ts=" << timestamp
-                          << "." << std::endl;
-                txn_manager.abort(*txn);
-                return std::nullopt;
-            }
-        }
-
-        std::unique_ptr<Tuple> base_tuple;
-        if (predecessor) {
-            base_tuple = tuple_store.readVersion(*predecessor).tuple->clone();
-        }
-        auto new_tuple = mergeTupleByColumn(
-            table.schema,
-            base_tuple ? base_tuple.get() : nullptr,
-            typed_changes
-        );
-
-        txn_manager.markMVTOWrite(*txn);
+    void installCommittedVersion(int txn_id,
+                                 int commit_ts,
+                                 const TupleKey& key,
+                                 const Tuple& tuple) {
         VersionedTupleHeader header;
-        header.wts = timestamp;
-        header.rts = timestamp;
-        header.creator_txn = txn->id;
-        header.committed = false;
-        header.previous_version = predecessor.value_or(TupleId{});
-        auto tuple_id = tuple_store.insertVersion(header, *new_tuple);
+        header.wts = commit_ts;
+        header.rts = commit_ts;
+        header.creator_txn = txn_id;
+        header.committed = true;
+        auto head = version_heads.find(key);
+        if (head != version_heads.end()) {
+            header.previous_version = head->second;
+        }
+
+        auto tuple_id = tuple_store.insertVersion(header, tuple);
         version_heads[key] = tuple_id;
-
-        std::cout << "  MVTO accepts write; create active "
-                  << versionName(tuple_id)
-                  << " with persisted system columns "
-                  << "[_wts=_rts=" << timestamp
+        const auto& table = tableDefinition(key.table_id);
+        std::cout << "  install " << keyLabel(key)
+                  << " as " << tuple_id.label()
+                  << " [_wts=" << header.wts
                   << ", _prev=" << header.previous_version.label()
-                  << "]." << std::endl;
-        return PendingTupleVersion{tuple_id, key};
+                  << "] " << tupleLabel(table.schema, tuple)
+                  << "." << std::endl;
     }
 
-    void commitWrites(const TxnPtr& txn,
-                      const std::vector<PendingTupleVersion>& writes) {
-        auto ready = txn_manager.prepareCommit(*txn);
-        if (!ready.granted) {
-            std::cout << ready.detail << "; abort txn "
-                      << txn->id << "." << std::endl;
-            txn_manager.abort(*txn);
-            return;
-        }
-
-        std::cout << txnLabel(txn) << " publishes "
-                  << writes.size() << " physical version(s)." << std::endl;
-        for (const auto& write : writes) {
-            auto version = tuple_store.readVersion(write.tuple_id);
-            version.header.committed = true;
-            tuple_store.updateHeader(write.tuple_id, version.header);
-            std::cout << "  commit " << versionName(write.tuple_id)
-                      << " for " << keyLabel(write.key)
-                      << " by setting _committed=1." << std::endl;
-        }
-        txn_manager.commit(*txn);
-    }
-
-    void commitReadOnly(const TxnPtr& txn) {
-        txn_manager.commit(*txn);
-    }
-
-    void abortWrites(const TxnPtr& txn,
-                     const std::vector<PendingTupleVersion>& writes) {
-        std::cout << txnLabel(txn)
-                  << " aborts; discard active physical version(s)."
-                  << std::endl;
-        for (const auto& write : writes) {
-            auto version = tuple_store.readVersion(write.tuple_id);
-            auto head = version_heads.find(write.key);
-            if (head != version_heads.end() && head->second == write.tuple_id) {
-                if (version.header.previous_version.valid()) {
-                    head->second = version.header.previous_version;
-                } else {
-                    version_heads.erase(head);
-                }
+    std::vector<TupleKey> committedKeysMatching(
+            TableId table_id,
+            const IPredicate& predicate) const {
+        std::vector<TupleKey> keys;
+        for (const auto& [key, head_tuple_id] : version_heads) {
+            if (key.table_id != table_id) {
+                continue;
             }
-            tuple_store.eraseVersion(write.tuple_id);
-            std::cout << "  remove " << versionName(write.tuple_id)
-                      << " before it becomes visible." << std::endl;
-        }
-        txn_manager.abort(*txn);
-    }
 
-    void printTxnState(const std::string& label, const TxnPtr& txn) const {
-        std::cout << label << " final state: "
-                  << txnStateName(txn) << std::endl;
+            TupleId tuple_id = head_tuple_id;
+            while (tuple_id.valid()) {
+                auto version = tuple_store.readVersion(tuple_id);
+                if (version.header.committed) {
+                    if (predicate.check(version.tuple->fields)) {
+                        keys.push_back(key);
+                    }
+                    break;
+                }
+                tuple_id = version.header.previous_version;
+            }
+        }
+        return keys;
     }
 
     void printVersionChain(const TupleKey& key) const {
@@ -4686,63 +4537,496 @@ public:
         TupleId tuple_id = head->second;
         while (tuple_id.valid()) {
             auto version = tuple_store.readVersion(tuple_id);
-            std::cout << "  " << versionName(tuple_id)
+            std::cout << "  " << tuple_id.label()
                       << " [_wts=" << version.header.wts
                       << ", _rts=" << version.header.rts
                       << ", _prev=" << version.header.previous_version.label()
-                      << "] "
-                      << tupleLabel(table.schema, *version.tuple)
-                      << " by " << creatorLabel(version.header.creator_txn)
+                      << "] " << tupleLabel(table.schema, *version.tuple)
                       << (version.header.committed ? " committed" : " active")
                       << std::endl;
             tuple_id = version.header.previous_version;
         }
     }
+};
 
-    void collectGarbage(const std::string& label) {
-        int oldest_timestamp = txn_manager.oldestMVTOTimestamp();
-        std::cout << label << ": oldest_active_ts="
-                  << oldest_timestamp << std::endl;
+class SerializationGraph {
+private:
+    std::map<int, std::vector<int>> adjacency;
+    std::map<std::pair<int, int>, std::vector<std::string>> reasons;
 
-        size_t deleted = 0;
-        for (auto& [key, head_tuple_id] : version_heads) {
-            TupleId newer_tuple_id;
-            TupleId current_tuple_id = head_tuple_id;
-            while (current_tuple_id.valid()) {
-                auto current = tuple_store.readVersion(current_tuple_id);
-                bool reclaimable = false;
-                if (newer_tuple_id.valid() && current.header.committed) {
-                    auto newer = tuple_store.readVersion(newer_tuple_id);
-                    reclaimable = newer.header.committed &&
-                                  newer.header.wts <= oldest_timestamp;
+    bool findCycleToTarget(int current,
+                           int target,
+                           std::map<int, bool>& visited,
+                           std::vector<int>& path) const {
+        visited[current] = true;
+        path.push_back(current);
+
+        auto it = adjacency.find(current);
+        if (it != adjacency.end()) {
+            for (int next : it->second) {
+                if (next == target) {
+                    return true;
                 }
-
-                std::cout << "  " << versionName(current_tuple_id)
-                          << " for " << keyLabel(key)
-                          << " [_wts=" << current.header.wts
-                          << ", _rts=" << current.header.rts
-                          << "] -> "
-                          << (reclaimable ? "reclaimable" : "retain")
-                          << std::endl;
-
-                TupleId previous = current.header.previous_version;
-                if (reclaimable) {
-                    auto newer = tuple_store.readVersion(newer_tuple_id);
-                    newer.header.previous_version = previous;
-                    tuple_store.updateHeader(newer_tuple_id, newer.header);
-                    tuple_store.eraseVersion(current_tuple_id);
-                    deleted++;
-                    current_tuple_id = previous;
-                    continue;
+                if (!visited[next] &&
+                    findCycleToTarget(next, target, visited, path)) {
+                    return true;
                 }
-
-                newer_tuple_id = current_tuple_id;
-                current_tuple_id = previous;
             }
         }
 
-        std::cout << "  GC deleted " << deleted
-                  << " obsolete physical version row(s)." << std::endl;
+        path.pop_back();
+        return false;
+    }
+
+public:
+    bool addRWEdge(int from_txn_id,
+                   int to_txn_id,
+                   const std::string& reason) {
+        if (from_txn_id == to_txn_id) {
+            return false;
+        }
+
+        auto& edges = adjacency[from_txn_id];
+        adjacency[to_txn_id];
+        auto exists = std::find(edges.begin(), edges.end(), to_txn_id);
+        reasons[{from_txn_id, to_txn_id}].push_back(reason);
+        if (exists != edges.end()) {
+            return false;
+        }
+
+        edges.push_back(to_txn_id);
+        return true;
+    }
+
+    bool hasIncoming(int txn_id) const {
+        for (const auto& [from, edges] : adjacency) {
+            (void)from;
+            if (std::find(edges.begin(), edges.end(), txn_id) != edges.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool hasOutgoing(int txn_id) const {
+        auto it = adjacency.find(txn_id);
+        return it != adjacency.end() && !it->second.empty();
+    }
+
+    std::vector<int> cycleFrom(int node) const {
+        std::vector<int> path;
+        std::map<int, bool> visited;
+        if (findCycleToTarget(node, node, visited, path)) {
+            path.push_back(node);
+            return path;
+        }
+        return {};
+    }
+
+    void removeNode(int node) {
+        adjacency.erase(node);
+        for (auto& [from, edges] : adjacency) {
+            (void)from;
+            edges.erase(
+                std::remove(edges.begin(), edges.end(), node),
+                edges.end()
+            );
+        }
+
+        for (auto it = reasons.begin(); it != reasons.end();) {
+            if (it->first.first == node || it->first.second == node) {
+                it = reasons.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    static std::string cycleLabel(const std::vector<int>& cycle) {
+        std::ostringstream output;
+        for (size_t i = 0; i < cycle.size(); i++) {
+            if (i != 0) {
+                output << " -> ";
+            }
+            output << "txn " << cycle[i];
+        }
+        return output.str();
+    }
+};
+
+class ConcurrencyControlPolicy {
+public:
+    virtual ~ConcurrencyControlPolicy() = default;
+    virtual std::string name() const = 0;
+    virtual void begin(int txn_id) = 0;
+    virtual int snapshotTimestamp(int txn_id) const = 0;
+    virtual void recordPredicateRead(int txn_id,
+                                     TableId table_id,
+                                     const IPredicate& predicate) = 0;
+    virtual ConcurrencyControlResult recordWrite(int txn_id,
+                                                 const TupleKey& key,
+                                                 std::unique_ptr<Tuple> new_tuple) = 0;
+    virtual ConcurrencyControlResult beforeCommit(int txn_id) = 0;
+    virtual void afterCommit(int txn_id) = 0;
+    virtual void abort(int txn_id) = 0;
+};
+
+class SerializableSnapshotIsolationPolicy : public ConcurrencyControlPolicy {
+private:
+    enum class TxnStatus {
+        Running,
+        Committed,
+        Aborted
+    };
+
+    struct WriteIntent {
+        TupleKey key;
+        std::unique_ptr<Tuple> tuple;
+    };
+
+    struct TxnState {
+        int snapshot_ts = 0;
+        int commit_ts = 0;
+        TxnStatus status = TxnStatus::Running;
+        std::set<TupleKey> write_set;
+        std::vector<WriteIntent> writes;
+    };
+
+    struct SireadPredicate {
+        int txn_id = 0;
+        TableId table_id = INVALID_TABLE_ID;
+        std::unique_ptr<IPredicate> predicate;
+    };
+
+    VersionManager& version_manager;
+    int logical_clock = 0;
+    std::map<int, TxnState> txns;
+    std::vector<SireadPredicate> siread_predicates;
+    SerializationGraph rw_graph;
+
+    const TxnState& requireTxn(int txn_id) const {
+        auto it = txns.find(txn_id);
+        if (it == txns.end()) {
+            throw std::runtime_error("transaction has no SSI state");
+        }
+        return it->second;
+    }
+
+    TxnState& requireTxn(int txn_id) {
+        auto it = txns.find(txn_id);
+        if (it == txns.end()) {
+            throw std::runtime_error("transaction has no SSI state");
+        }
+        return it->second;
+    }
+
+    bool transactionsOverlap(int left_txn_id, int right_txn_id) const {
+        if (left_txn_id == right_txn_id) {
+            return false;
+        }
+
+        const auto& left = requireTxn(left_txn_id);
+        const auto& right = requireTxn(right_txn_id);
+        if (left.status == TxnStatus::Aborted ||
+            right.status == TxnStatus::Aborted) {
+            return false;
+        }
+        if (left.commit_ts != 0 && left.commit_ts <= right.snapshot_ts) {
+            return false;
+        }
+        if (right.commit_ts != 0 && right.commit_ts <= left.snapshot_ts) {
+            return false;
+        }
+        return true;
+    }
+
+    void maybeAddRWEdge(int reader_txn_id,
+                        int writer_txn_id,
+                        const TupleKey& key,
+                        TableId table_id,
+                        const IPredicate& predicate) {
+        if (!transactionsOverlap(reader_txn_id, writer_txn_id)) {
+            return;
+        }
+
+        std::string reason =
+            "writer updated " + version_manager.keyLabel(key) +
+            " matching SIREAD " +
+            version_manager.predicateLabel(table_id, predicate);
+        bool inserted = rw_graph.addRWEdge(
+            reader_txn_id,
+            writer_txn_id,
+            reason
+        );
+        if (inserted) {
+            std::cout << "  SSI graph adds rw-antidependency txn "
+                      << reader_txn_id << " -> txn " << writer_txn_id
+                      << " because " << reason << "." << std::endl;
+        }
+    }
+
+    static ConcurrencyControlResult reject(const std::string& detail) {
+        ConcurrencyControlResult result;
+        result.granted = false;
+        result.detail = detail;
+        return result;
+    }
+
+public:
+    explicit SerializableSnapshotIsolationPolicy(
+            VersionManager& version_manager)
+        : version_manager(version_manager) {}
+
+    std::string name() const override {
+        return "Serializable Snapshot Isolation";
+    }
+
+    void begin(int txn_id) override {
+        TxnState state;
+        state.snapshot_ts = logical_clock;
+        txns.emplace(txn_id, std::move(state));
+        std::cout << "SSI assigns snapshot_ts=" << logical_clock
+                  << " to txn " << txn_id << "." << std::endl;
+    }
+
+    int snapshotTimestamp(int txn_id) const override {
+        return requireTxn(txn_id).snapshot_ts;
+    }
+
+    void recordPredicateRead(int txn_id,
+                             TableId table_id,
+                             const IPredicate& predicate) override {
+        auto& state = requireTxn(txn_id);
+        if (state.status != TxnStatus::Running) {
+            throw std::runtime_error("SIREAD requires a running transaction");
+        }
+
+        siread_predicates.push_back({
+            txn_id,
+            table_id,
+            predicate.clone()
+        });
+        std::cout << "  SSI records SIREAD for txn " << txn_id
+                  << ": " << version_manager.predicateLabel(
+                         table_id,
+                         predicate)
+                  << "." << std::endl;
+
+        for (const auto& [writer_txn_id, writer_state] : txns) {
+            if (writer_txn_id == txn_id ||
+                writer_state.status == TxnStatus::Aborted) {
+                continue;
+            }
+            for (const auto& write : writer_state.writes) {
+                if (write.key.table_id != table_id) {
+                    continue;
+                }
+                if (predicate.check(write.tuple->fields)) {
+                    maybeAddRWEdge(
+                        txn_id,
+                        writer_txn_id,
+                        write.key,
+                        table_id,
+                        predicate
+                    );
+                }
+            }
+        }
+    }
+
+    ConcurrencyControlResult recordWrite(int txn_id,
+                                         const TupleKey& key,
+                                         std::unique_ptr<Tuple> new_tuple) override {
+        auto& state = requireTxn(txn_id);
+        if (state.status != TxnStatus::Running) {
+            return reject("write requires a running transaction");
+        }
+        if (!new_tuple) {
+            return reject("write requires a tuple image");
+        }
+
+        state.write_set.insert(key);
+
+        for (const auto& siread : siread_predicates) {
+            if (siread.txn_id == txn_id ||
+                siread.table_id != key.table_id) {
+                continue;
+            }
+            if (siread.predicate->check(new_tuple->fields)) {
+                maybeAddRWEdge(
+                    siread.txn_id,
+                    txn_id,
+                    key,
+                    siread.table_id,
+                    *siread.predicate
+                );
+            }
+        }
+        state.writes.push_back(WriteIntent{key, std::move(new_tuple)});
+        return {};
+    }
+
+    ConcurrencyControlResult beforeCommit(int txn_id) override {
+        auto& state = requireTxn(txn_id);
+        if (state.status != TxnStatus::Running) {
+            return reject("commit requires a running transaction");
+        }
+
+        for (const auto& key : state.write_set) {
+            auto latest_wts = version_manager.latestCommittedWriteTimestamp(key);
+            if (latest_wts && *latest_wts > state.snapshot_ts) {
+                return reject(
+                    "SSI first-committer-wins failed: " +
+                    version_manager.keyLabel(key) +
+                    " was committed after txn " +
+                    std::to_string(txn_id) + "'s snapshot"
+                );
+            }
+        }
+
+        auto cycle = rw_graph.cycleFrom(txn_id);
+        if (!cycle.empty()) {
+            return reject(
+                "SSI serialization graph cycle detected: " +
+                SerializationGraph::cycleLabel(cycle)
+            );
+        }
+
+        if (rw_graph.hasIncoming(txn_id) && rw_graph.hasOutgoing(txn_id)) {
+            return reject(
+                "SSI dangerous structure detected around txn " +
+                std::to_string(txn_id)
+            );
+        }
+
+        state.commit_ts = ++logical_clock;
+        std::cout << "SSI validation passes for txn " << txn_id
+                  << "; commit_ts=" << state.commit_ts << "."
+                  << std::endl;
+        return {};
+    }
+
+    void afterCommit(int txn_id) override {
+        auto& state = requireTxn(txn_id);
+        if (state.commit_ts == 0) {
+            throw std::runtime_error("transaction has no SSI commit timestamp");
+        }
+        std::cout << "txn " << txn_id << " publishes "
+                  << state.writes.size()
+                  << " physical version(s)." << std::endl;
+        for (const auto& write : state.writes) {
+            version_manager.installCommittedVersion(
+                txn_id,
+                state.commit_ts,
+                write.key,
+                *write.tuple
+            );
+        }
+        state.status = TxnStatus::Committed;
+    }
+
+    void abort(int txn_id) override {
+        auto it = txns.find(txn_id);
+        if (it == txns.end()) {
+            return;
+        }
+        it->second.status = TxnStatus::Aborted;
+        it->second.writes.clear();
+        rw_graph.removeNode(txn_id);
+        siread_predicates.erase(
+            std::remove_if(
+                siread_predicates.begin(),
+                siread_predicates.end(),
+                [txn_id](const SireadPredicate& siread) {
+                    return siread.txn_id == txn_id;
+                }),
+            siread_predicates.end()
+        );
+    }
+};
+
+class TransactionManager {
+private:
+    int next_txn_id = 1;
+    std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
+
+    static void requireRunningTransaction(const TxnContext& txn) {
+        if (txn.state != TxnContext::RUNNING) {
+            throw std::runtime_error(
+                "operation requires a running transaction"
+            );
+        }
+    }
+
+public:
+    explicit TransactionManager(VersionManager& version_manager) {
+        useSerializableSnapshotIsolation(version_manager);
+    }
+
+    void useSerializableSnapshotIsolation(VersionManager& version_manager) {
+        concurrency_control_policy =
+            std::make_unique<SerializableSnapshotIsolationPolicy>(
+                version_manager
+            );
+    }
+
+    std::string concurrencyControlPolicyName() const {
+        return concurrency_control_policy->name();
+    }
+
+    TxnPtr begin() {
+        int txn_id = next_txn_id++;
+        std::cout << "BEGIN txn " << txn_id << std::endl;
+        auto txn = std::make_shared<TxnContext>(TxnContext{txn_id});
+        concurrency_control_policy->begin(txn_id);
+        return txn;
+    }
+
+    int snapshotTimestamp(const TxnContext& txn) const {
+        requireRunningTransaction(txn);
+        return concurrency_control_policy->snapshotTimestamp(txn.id);
+    }
+
+    void recordPredicateRead(const TxnContext& txn,
+                             TableId table_id,
+                             const IPredicate& predicate) {
+        requireRunningTransaction(txn);
+        concurrency_control_policy->recordPredicateRead(
+            txn.id,
+            table_id,
+            predicate
+        );
+    }
+
+    ConcurrencyControlResult recordWrite(const TxnContext& txn,
+                                         const TupleKey& key,
+                                         std::unique_ptr<Tuple> new_tuple) {
+        requireRunningTransaction(txn);
+        return concurrency_control_policy->recordWrite(
+            txn.id,
+            key,
+            std::move(new_tuple)
+        );
+    }
+
+    ConcurrencyControlResult prepareCommit(const TxnContext& txn) {
+        requireRunningTransaction(txn);
+        return concurrency_control_policy->beforeCommit(txn.id);
+    }
+
+    void commit(TxnContext& txn) {
+        concurrency_control_policy->afterCommit(txn.id);
+        txn.state = TxnContext::COMMITTED;
+        std::cout << "COMMIT txn " << txn.id << std::endl;
+    }
+
+    void abort(TxnContext& txn) {
+        if (txn.state != TxnContext::RUNNING) {
+            return;
+        }
+        txn.state = TxnContext::ABORTED;
+        std::cout << "ABORT txn " << txn.id << std::endl;
+        concurrency_control_policy->abort(txn.id);
     }
 };
 
@@ -4849,132 +5133,251 @@ public:
     }
 };
 
-void runMVTO() {
+class BuzzDB {
+private:
+    VersionManager version_manager;
+    TransactionManager txn_manager;
+    std::map<int, std::string> txn_labels;
+
+    static void requireRunningTransaction(const TxnPtr& txn) {
+        if (!txn || txn->state != TxnContext::RUNNING) {
+            throw std::runtime_error(
+                "operation requires a running transaction"
+            );
+        }
+    }
+
+    std::string txnLabel(const TxnPtr& txn) const {
+        auto it = txn_labels.find(txn->id);
+        if (it == txn_labels.end()) {
+            return "txn " + std::to_string(txn->id);
+        }
+        return it->second;
+    }
+
+public:
+    BuzzDB()
+        : version_manager(),
+          txn_manager(version_manager) {}
+
+    void importDatabaseDump(
+            const std::string& filename,
+            const std::map<std::string, std::string>& key_columns_by_table) {
+        DatabaseImporter::importTables(
+            version_manager,
+            filename,
+            key_columns_by_table
+        );
+    }
+
+    TableId tableId(const std::string& table_name) const {
+        return version_manager.tableId(table_name);
+    }
+
+    ColumnId columnId(TableId table_id,
+                      const std::string& column_name) const {
+        return version_manager.columnId(table_id, column_name);
+    }
+
+    TupleKey keyFor(TableId table_id, const Field& key_value) const {
+        return version_manager.keyFor(table_id, key_value);
+    }
+
+    std::unique_ptr<IPredicate> makePredicate(
+            TableId table_id,
+            const TupleUpdate& clauses) const {
+        return version_manager.makePredicate(table_id, clauses);
+    }
+
+    std::string keyLabel(const TupleKey& key) const {
+        return version_manager.keyLabel(key);
+    }
+
+    std::string predicateLabel(TableId table_id,
+                               const IPredicate& predicate) const {
+        return version_manager.predicateLabel(table_id, predicate);
+    }
+
+    TxnPtr beginTransaction(const std::string& label = "") {
+        auto txn = txn_manager.begin();
+        if (!label.empty()) {
+            txn_labels[txn->id] = label;
+            std::cout << label << " is txn " << txn->id << "."
+                      << std::endl;
+        }
+        return txn;
+    }
+
+    std::vector<VersionedTupleRead> readPredicate(
+            const TxnPtr& txn,
+            TableId table_id,
+            const IPredicate& predicate) {
+        requireRunningTransaction(txn);
+        int snapshot_ts = txn_manager.snapshotTimestamp(*txn);
+        auto rows = version_manager.readPredicate(
+            txn->id,
+            snapshot_ts,
+            table_id,
+            predicate
+        );
+        txn_manager.recordPredicateRead(*txn, table_id, predicate);
+        return rows;
+    }
+
+    void updateTuple(const TxnPtr& txn,
+                     const TupleKey& key,
+                     const TupleUpdate& changes) {
+        requireRunningTransaction(txn);
+        int snapshot_ts = txn_manager.snapshotTimestamp(*txn);
+        auto typed_changes = version_manager.resolveUpdate(
+            key.table_id,
+            changes
+        );
+        auto new_tuple = version_manager.buildUpdatedTuple(
+            key,
+            snapshot_ts,
+            typed_changes
+        );
+
+        std::cout << txnLabel(txn) << " buffers WRITE "
+                  << version_manager.keyLabel(key)
+                  << " -> "
+                  << typedTupleUpdateLabel(
+                         version_manager.schemaFor(key.table_id),
+                         typed_changes)
+                  << "." << std::endl;
+
+        auto cc_result = txn_manager.recordWrite(
+            *txn,
+            key,
+            std::move(new_tuple)
+        );
+        if (!cc_result.granted) {
+            std::cout << cc_result.detail << " for txn " << txn->id
+                      << "." << std::endl;
+            abort(txn);
+            return;
+        }
+    }
+
+    bool tryCommit(const TxnPtr& txn) {
+        requireRunningTransaction(txn);
+        auto cc_result = txn_manager.prepareCommit(*txn);
+        if (!cc_result.granted) {
+            std::cout << cc_result.detail << " for txn " << txn->id
+                      << "." << std::endl;
+            abort(txn);
+            return false;
+        }
+
+        txn_manager.commit(*txn);
+        return true;
+    }
+
+    void abort(const TxnPtr& txn) {
+        if (!txn || txn->state != TxnContext::RUNNING) {
+            return;
+        }
+        txn_manager.abort(*txn);
+    }
+
+    std::vector<TupleKey> committedKeysMatching(
+            TableId table_id,
+            const IPredicate& predicate) const {
+        return version_manager.committedKeysMatching(table_id, predicate);
+    }
+
+    void printTxnState(const std::string& label, const TxnPtr& txn) const {
+        std::cout << label << " final state: "
+                  << txnStateName(txn) << std::endl;
+    }
+
+    void printVersionChain(const TupleKey& key) const {
+        version_manager.printVersionChain(key);
+    }
+};
+
+void runSSISchedule() {
     resetDatabaseFiles();
 
-    VersionManager version_manager;
-    DatabaseImporter::importTables(
-        version_manager,
+    std::cout << "Serializable Snapshot Isolation" << std::endl;
+    std::cout << "Schedule: SSI prevents write skew" << std::endl;
+    std::cout << "Invariant: Garcia may have at most one active seat "
+              << "assignment on this flight." << std::endl;
+    std::cout << "SSI keeps SIREAD predicates and aborts before commit when "
+              << "rw-antidependencies form a cycle or dangerous structure."
+              << std::endl;
+
+    BuzzDB db;
+    db.importDatabaseDump(
         "booking.txt",
-        {{"seats", "seat_no"}, {"holds", "id"}}
+        {{"seats", "seat_no"}}
     );
 
-    TableId seats_table = version_manager.tableId("seats");
-    TableId holds_table = version_manager.tableId("holds");
-    auto seat_1a = version_manager.keyFor(
+    TableId seats_table = db.tableId("seats");
+    auto held_by_garcia = db.makePredicate(
+        seats_table,
+        {{"status", "held"}, {"customer", "garcia"}}
+    );
+    TupleKey seat_1a = db.keyFor(
         seats_table,
         Field(std::string("1A"))
     );
-    auto seat_1b = version_manager.keyFor(
+    TupleKey seat_1b = db.keyFor(
         seats_table,
         Field(std::string("1B"))
     );
-    auto hold_1 = version_manager.keyFor(
-        holds_table,
-        Field(1)
-    );
 
-    std::cout << version_manager.policyName() << std::endl;
-    std::cout << "Each MVTO version is a physical "
-              << "slotted-page tuple with additional system columns."
-              << std::endl;
-    std::cout << "Reads choose the newest committed version with wts <= txn "
-              << "timestamp; writes create active versions unless they would "
-              << "invalidate a later read." << std::endl;
+    auto s1 = db.beginTransaction("S1");
+    auto s2 = db.beginTransaction("S2");
+    auto s1_rows = db.readPredicate(s1, seats_table, *held_by_garcia);
+    std::cout << "S1 sees "
+              << (s1_rows.empty() ? "no held seat for Garcia" : "a held seat")
+              << "." << std::endl;
+    auto s2_rows = db.readPredicate(s2, seats_table, *held_by_garcia);
+    std::cout << "S2 sees "
+              << (s2_rows.empty() ? "no held seat for Garcia" : "a held seat")
+              << "." << std::endl;
 
-    std::cout << "\nSchedule A: reader and writer coexist through versions"
-              << std::endl;
-    auto t1 = version_manager.beginReadOnly("T1_old_reader");
-    version_manager.readTuple(t1, seat_1a);
-    auto t2 = version_manager.beginUpdater("T2_writer");
-    auto t2_seat_write = version_manager.writeTuple(
-        t2,
+    db.updateTuple(
+        s1,
         seat_1a,
         {{"status", "held"}, {"customer", "garcia"}}
     );
-    auto t2_hold_write = version_manager.writeTuple(
-        t2,
-        hold_1,
-        {{"id", 1}, {"seat_id", 1}, {"customer", "garcia"}, {"status", "open"}}
-    );
-    std::vector<PendingTupleVersion> t2_writes;
-    if (t2_seat_write) {
-        t2_writes.push_back(*t2_seat_write);
-    }
-    if (t2_hold_write) {
-        t2_writes.push_back(*t2_hold_write);
-    }
-    if (!t2_writes.empty()) {
-        version_manager.commitWrites(t2, t2_writes);
-    }
-    version_manager.readTuple(t1, seat_1a);
-    auto t3 = version_manager.beginReadOnly("T3_new_reader");
-    version_manager.readTuple(t3, seat_1a);
-    version_manager.readTuple(t3, hold_1);
-    version_manager.commitReadOnly(t3);
-    version_manager.printTxnState("T1_old_reader", t1);
-    version_manager.printTxnState("T2_writer", t2);
-    version_manager.printTxnState("T3_new_reader", t3);
+    db.tryCommit(s1);
 
-    std::cout << "\nSchedule B: older reader can still use an older seat version"
-              << std::endl;
-    auto t4 = version_manager.beginUpdater("T4_writer");
-    auto t4_write = version_manager.writeTuple(
-        t4,
+    db.updateTuple(
+        s2,
         seat_1b,
-        {{"status", "held"}, {"customer", "patel"}}
+        {{"status", "held"}, {"customer", "garcia"}}
     );
-    if (t4_write) {
-        version_manager.commitWrites(t4, {*t4_write});
-    }
-    version_manager.readTuple(t1, seat_1b);
-    version_manager.printTxnState("T4_writer", t4);
+    db.tryCommit(s2);
 
-    std::cout << "\nSchedule C: late older writer still aborts"
-              << std::endl;
-    auto t5 = version_manager.beginUpdater("T5_old_writer");
-    auto t6 = version_manager.beginReadOnly("T6_later_reader");
-    version_manager.readTuple(t6, seat_1a);
-    auto t5_write = version_manager.writeTuple(
-        t5,
-        seat_1a,
-        {{"status", "held"}, {"customer", "patel"}}
+    auto assignments = db.committedKeysMatching(
+        seats_table,
+        *held_by_garcia
     );
-    if (!t5_write) {
-        std::cout << "T5_old_writer is aborted by MVTO." << std::endl;
+    std::cout << "Final Garcia assignments:";
+    if (assignments.empty()) {
+        std::cout << " none";
+    } else {
+        for (const auto& assignment : assignments) {
+            std::cout << " " << db.keyLabel(assignment);
+        }
     }
-    version_manager.commitReadOnly(t6);
-    version_manager.printTxnState("T5_old_writer", t5);
-    version_manager.printTxnState("T6_later_reader", t6);
-
-    std::cout << "\nSchedule D: aborted active version and version cleanup"
-              << std::endl;
-    auto t7 = version_manager.beginUpdater("T7_aborter");
-    auto t7_write = version_manager.writeTuple(
-        t7,
-        seat_1b,
-        {{"status", "held"}, {"customer", "chen"}}
-    );
-    if (t7_write) {
-        version_manager.abortWrites(t7, {*t7_write});
-    }
-    version_manager.printVersionChain(seat_1a);
-    version_manager.printVersionChain(seat_1b);
-    version_manager.printVersionChain(hold_1);
-    version_manager.collectGarbage("GC while T1_old_reader is active");
-    version_manager.commitReadOnly(t1);
-    version_manager.collectGarbage("GC after T1_old_reader commits");
-    version_manager.printVersionChain(seat_1a);
-    version_manager.printVersionChain(seat_1b);
-    version_manager.printVersionChain(hold_1);
-    version_manager.printTxnState("T1_old_reader", t1);
-    version_manager.printTxnState("T7_aborter", t7);
+    std::cout << std::endl;
+    std::cout << "Result: invariant preserved because SSI aborted one "
+              << "transaction before installing its write." << std::endl;
+    db.printTxnState("S1", s1);
+    db.printTxnState("S2", s2);
+    db.printVersionChain(seat_1a);
+    db.printVersionChain(seat_1b);
 }
 
 int main() {
     try {
         auto start = std::chrono::high_resolution_clock::now();
-        runMVTO();
+        runSSISchedule();
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         std::cout << "Elapsed time: "
