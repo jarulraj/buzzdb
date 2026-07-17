@@ -3694,6 +3694,31 @@ std::vector<std::string> split(const std::string& input, char delimiter) {
     return tokens;
 }
 
+std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                 const std::vector<std::string>& values) {
+    if (values.size() != schema.columns.size()) {
+        throw std::runtime_error("Wrong field count for table row.");
+    }
+
+    auto tuple = std::make_unique<Tuple>();
+    for (size_t i = 0; i < schema.columns.size(); i++) {
+        tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
+    }
+    return tuple;
+}
+
+std::unique_ptr<IPredicate> makeEqualityPredicate(const TableSchema& schema,
+                                                  const std::string& columnName,
+                                                  const std::string& value) {
+    auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
+    auto field = parseFieldValue(schema.columns[column].type, value);
+    return std::make_unique<SimplePredicate>(
+        SimplePredicate::Operand(column),
+        SimplePredicate::Operand(std::move(field)),
+        SimplePredicate::ComparisonOperator::EQ
+    );
+}
+
 
 void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
     if (crashAfterStatement <= 0) {
@@ -3708,32 +3733,218 @@ void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
     }
 }
 
-struct TxnContext {
+struct TransactionContext {
     int id;
     enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
 };
 
-using TxnPtr = std::shared_ptr<TxnContext>;
+using TxnPtr = std::shared_ptr<TransactionContext>;
 
 class TransactionManager {
 public:
     TxnPtr begin(int txn_id) {
         std::cout << "BEGIN txn " << txn_id << std::endl;
-        return std::make_shared<TxnContext>(TxnContext{txn_id});
+        return std::make_shared<TransactionContext>(TransactionContext{txn_id});
     }
 
-    void commit(TxnContext& txn) {
-        txn.state = TxnContext::COMMITTED;
+    void commit(TransactionContext& txn) {
+        txn.state = TransactionContext::COMMITTED;
         std::cout << "COMMIT txn " << txn.id << std::endl;
     }
 
-    void abort(TxnContext& txn) {
-        txn.state = TxnContext::ABORTED;
+    void abort(TransactionContext& txn) {
+        txn.state = TransactionContext::ABORTED;
         std::cout << "ABORT txn " << txn.id << std::endl;
     }
 };
 
-class BuzzDB {
+struct ParsedStatement {
+    enum class Kind { Insert, Update, Delete, Select };
+    Kind kind;
+    std::string tableName;
+    std::vector<std::string> values;
+    std::string setColumnName;
+    std::string setValue;
+    std::string whereColumnName;
+    std::string whereValue;
+    QueryComponents query;
+};
+
+class QueryParser {
+private:
+    Catalog& catalog;
+
+public:
+    explicit QueryParser(Catalog& catalog) : catalog(catalog) {}
+
+    ParsedStatement parseStatement(const std::string& statement) {
+        std::smatch matches;
+
+        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, insertRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Insert;
+            parsed.tableName = matches[1];
+            parsed.values = split(matches[2], ',');
+            return parsed;
+        }
+
+        std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, updateRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Update;
+            parsed.tableName = matches[1];
+            parsed.setColumnName = matches[2];
+            parsed.setValue = matches[3];
+            parsed.whereColumnName = matches[4];
+            parsed.whereValue = matches[5];
+            return parsed;
+        }
+
+        std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, deleteRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Delete;
+            parsed.tableName = matches[1];
+            parsed.whereColumnName = matches[2];
+            parsed.whereValue = matches[3];
+            return parsed;
+        }
+
+        std::regex selectRegex("^\\s*SELECT\\s+(.*)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, selectRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Select;
+            parsed.query = parseQuery(matches[1], catalog);
+            return parsed;
+        }
+
+        throw std::runtime_error("Unsupported statement: " + statement);
+    }
+};
+
+class QueryExecutor {
+private:
+    Catalog& catalog;
+    PageManager& page_manager;
+
+public:
+    QueryExecutor(Catalog& catalog, PageManager& page_manager)
+        : catalog(catalog),
+          page_manager(page_manager) {}
+
+    void execute(const ParsedStatement& statement) {
+        switch (statement.kind) {
+            case ParsedStatement::Kind::Insert:
+                insertRow(statement.tableName, statement.values, false);
+                return;
+            case ParsedStatement::Kind::Update:
+                executeUpdate(statement);
+                return;
+            case ParsedStatement::Kind::Delete:
+                executeDelete(statement);
+                return;
+            case ParsedStatement::Kind::Select:
+                executeSelect(statement);
+                return;
+        }
+        throw std::runtime_error("Unsupported parsed statement.");
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        auto& metadata = catalog.getTable(tableName);
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, page_manager);
+        InsertOperator insertOp(tableHeap);
+        insertOp.setTupleToInsert(std::move(tuple));
+        executeStatementOperator(insertOp, printResult);
+    }
+
+private:
+    void executeUpdate(const ParsedStatement& statement) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        const size_t setColumn = static_cast<size_t>(
+            metadata.schema.getColumnIndex(statement.setColumnName));
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        auto field = parseFieldValue(
+            metadata.schema.columns[setColumn].type,
+            statement.setValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        UpdateOperator updateOp(
+            tableHeap,
+            std::move(predicate),
+            {{setColumn, *field}}
+        );
+        executeStatementOperator(updateOp, false);
+    }
+
+    void executeDelete(const ParsedStatement& statement) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        DeleteOperator deleteOp(tableHeap, std::move(predicate));
+        executeStatementOperator(deleteOp, false);
+    }
+
+    void executeSelect(const ParsedStatement& statement) {
+        auto& metadata = catalog.getTable(statement.query.tableName);
+        executeQuery(statement.query, metadata, page_manager);
+    }
+
+    void executeStatementOperator(Operator& statementOperator, bool printResult) {
+        statementOperator.open();
+        while (statementOperator.next()) {
+            if (printResult) {
+                const auto& output = statementOperator.getOutput();
+                for (const auto& field : output) {
+                    field->print();
+                    std::cout << " ";
+                }
+                std::cout << std::endl;
+            }
+        }
+        statementOperator.close();
+    }
+};
+
+class QueryProcessor {
+private:
+    QueryParser parser;
+    QueryExecutor executor;
+
+public:
+    QueryProcessor(Catalog& catalog, PageManager& page_manager)
+        : parser(catalog),
+          executor(catalog, page_manager) {}
+
+    void execute(const std::string& statement) {
+        auto parsed = parser.parseStatement(statement);
+        executor.execute(parsed);
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        executor.insertRow(tableName, values, printResult);
+    }
+};
+
+class TransactionalStorageManager {
 public:
     LogManager log_manager;
     BufferManager buffer_manager;
@@ -3741,45 +3952,59 @@ public:
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
-    TxnPtr active_txn;
 
-public:
-    BuzzDB() : log_manager(),
-               buffer_manager(log_manager),
-               recovery_manager(buffer_manager, log_manager),
-               page_manager(buffer_manager, recovery_manager),
-               catalog(buffer_manager, page_manager) {
+    TransactionalStorageManager()
+        : log_manager(),
+          buffer_manager(log_manager),
+          recovery_manager(buffer_manager, log_manager),
+          page_manager(buffer_manager, recovery_manager),
+          catalog(buffer_manager, page_manager),
+          txn_manager() {
         recovery_manager.recover();
         catalog.load();
     }
+};
+
+class BuzzDB {
+public:
+    TransactionalStorageManager transactional_storage_manager;
+    QueryProcessor query_processor;
+    TxnPtr active_txn;
+
+public:
+    BuzzDB()
+        : transactional_storage_manager(),
+          query_processor(transactional_storage_manager.catalog,
+                          transactional_storage_manager.page_manager) {}
 
     TxnPtr beginTransaction() {
-        int txn_id = recovery_manager.begin();
-        return txn_manager.begin(txn_id);
+        int txn_id = transactional_storage_manager.recovery_manager.begin();
+        return transactional_storage_manager.txn_manager.begin(txn_id);
     }
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
-        recovery_manager.setCurrentTransaction(txn->id);
+        std::cout << statement << "\n";
+        transactional_storage_manager.recovery_manager.setCurrentTransaction(txn->id);
         try {
-            executeStatementsAndQueries({statement});
+            query_processor.execute(statement);
         } catch (...) {
-            recovery_manager.clearCurrentTransaction();
+            transactional_storage_manager.recovery_manager.clearCurrentTransaction();
             throw;
         }
-        recovery_manager.clearCurrentTransaction();
+        transactional_storage_manager.recovery_manager.clearCurrentTransaction();
     }
 
     void commit(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        recovery_manager.commit(txn->id);
-        txn_manager.commit(*txn);
+        transactional_storage_manager.recovery_manager.commit(txn->id);
+        transactional_storage_manager.txn_manager.commit(*txn);
     }
 
     void abort(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        recovery_manager.abort(txn->id);
-        txn_manager.abort(*txn);
+        transactional_storage_manager.recovery_manager.abort(txn->id);
+        transactional_storage_manager.txn_manager.abort(*txn);
     }
 
     void begin() {
@@ -3806,88 +4031,35 @@ public:
     }
 
     void crashAt(CrashPoint point) {
-        recovery_manager.crashAt(point);
+        transactional_storage_manager.recovery_manager.crashAt(point);
     }
 
     void checkpoint() {
-        recovery_manager.checkpoint();
+        transactional_storage_manager.recovery_manager.checkpoint();
     }
 
     bool createTable(const std::string& name, TableSchema schema) {
-        return catalog.createTable(name, std::move(schema));
+        return transactional_storage_manager.catalog.createTable(name, std::move(schema));
+    }
+
+    bool hasTable(const std::string& name) const {
+        return transactional_storage_manager.catalog.hasTable(name);
     }
 
     bool isDatabaseEmpty() const {
-        return catalog.empty();
+        return transactional_storage_manager.catalog.empty();
     }
 
     static void requireRunningTransaction(const TxnPtr& txn) {
-        if (!txn || txn->state != TxnContext::RUNNING) {
+        if (!txn || txn->state != TransactionContext::RUNNING) {
             throw std::runtime_error("Statement requires a running transaction.");
         }
-    }
-
-    static std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
-        switch (type) {
-            case INT:
-                return std::make_unique<Field>(std::stoi(value));
-            case FLOAT:
-                return std::make_unique<Field>(std::stof(value));
-            case STRING:
-                return std::make_unique<Field>(value);
-        }
-        throw std::runtime_error("Unsupported field type.");
-    }
-
-    static std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
-                                            const std::vector<std::string>& values) {
-        if (values.size() != schema.columns.size()) {
-            throw std::runtime_error("Wrong field count for table row.");
-        }
-
-        auto tuple = std::make_unique<Tuple>();
-        for (size_t i = 0; i < schema.columns.size(); i++) {
-            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
-        }
-        return tuple;
-    }
-
-    static std::unique_ptr<IPredicate> makeEqualityPredicate(const TableSchema& schema,
-                                                            const std::string& columnName,
-                                                            const std::string& value) {
-        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
-        auto field = parseFieldValue(schema.columns[column].type, value);
-        return std::make_unique<SimplePredicate>(
-            SimplePredicate::Operand(column),
-            SimplePredicate::Operand(std::move(field)),
-            SimplePredicate::ComparisonOperator::EQ
-        );
-    }
-
-    void executeStatementOperator(Operator& statementOperator, bool printResult) {
-        statementOperator.open();
-        while (statementOperator.next()) {
-            if (printResult) {
-                const auto& output = statementOperator.getOutput();
-                for (const auto& field : output) {
-                    field->print();
-                    std::cout << " ";
-                }
-                std::cout << std::endl;
-            }
-        }
-        statementOperator.close();
     }
 
     void insertRow(const std::string& tableName,
                    const std::vector<std::string>& values,
                    bool printResult = false) {
-        auto& metadata = catalog.getTable(tableName);
-        auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, page_manager);
-        InsertOperator insertOp(tableHeap);
-        insertOp.setTupleToInsert(std::move(tuple));
-        executeStatementOperator(insertOp, printResult);
+        query_processor.insertRow(tableName, values, printResult);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -3895,7 +4067,6 @@ public:
         int statementsSeen = 0;
         for (const auto& statement : statements) {
             std::cout << statement << "\n";
-            std::smatch matches;
             auto statementFinished = [&]() {
                 checkStatementCrashLimit(statementsSeen, crashAfterStatement);
             };
@@ -3932,69 +4103,8 @@ public:
                 continue;
             }
 
-            std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, insertRegex)) {
-                const std::string tableName = matches[1];
-                const std::string valuesText = matches[2];
-                insertRow(tableName, split(valuesText, ','), false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, updateRegex)) {
-                const std::string tableName = matches[1];
-                const std::string setColumnName = matches[2];
-                const std::string setValue = matches[3];
-                const std::string whereColumnName = matches[4];
-                const std::string whereValue = matches[5];
-
-                auto& metadata = catalog.getTable(tableName);
-                const size_t setColumn = static_cast<size_t>(
-                    metadata.schema.getColumnIndex(setColumnName));
-                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
-                auto field = parseFieldValue(metadata.schema.columns[setColumn].type, setValue);
-                TableHeap tableHeap(metadata, page_manager);
-                UpdateOperator updateOp(
-                    tableHeap,
-                    std::move(predicate),
-                    {{setColumn, *field}}
-                );
-                executeStatementOperator(updateOp, false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, deleteRegex)) {
-                const std::string tableName = matches[1];
-                const std::string whereColumnName = matches[2];
-                const std::string whereValue = matches[3];
-
-                auto& metadata = catalog.getTable(tableName);
-                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
-                TableHeap tableHeap(metadata, page_manager);
-                DeleteOperator deleteOp(tableHeap, std::move(predicate));
-                executeStatementOperator(deleteOp, false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex selectRegex("^\\s*SELECT\\s+(.*)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, selectRegex)) {
-                const std::string queryText = matches[1];
-                auto components = parseQuery(queryText, catalog);
-                auto& metadata = catalog.getTable(components.tableName);
-                executeQuery(components, metadata, page_manager);
-                statementFinished();
-                continue;
-            }
-
-            throw std::runtime_error("Unsupported statement: " + statement);
+            query_processor.execute(statement);
+            statementFinished();
         }
     }
 };
@@ -4066,7 +4176,7 @@ public:
             }
 
             const std::string tableName = tokens[0];
-            if (!db.catalog.hasTable(tableName)) {
+            if (!db.hasTable(tableName)) {
                 throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
             }
 
@@ -4082,8 +4192,8 @@ bool seatIsHeldFor(BuzzDB& db,
                    const std::string& customer) {
     db.execute(txn, "SELECT {*} FROM seats WHERE seat_no = " + seatNo);
 
-    auto& seatsMetadata = db.catalog.getTable("seats");
-    TableHeap seatsHeap(seatsMetadata, db.page_manager);
+    auto& seatsMetadata = db.transactional_storage_manager.catalog.getTable("seats");
+    TableHeap seatsHeap(seatsMetadata, db.transactional_storage_manager.page_manager);
     auto seatNoColumn = static_cast<size_t>(
         seatsMetadata.schema.getColumnIndex("seat_no"));
     auto statusColumn = static_cast<size_t>(

@@ -2423,8 +2423,10 @@ struct TableSchema {
     }
 };
 
-std::string trim(const std::string& input);
-std::vector<std::string> split(const std::string& input, char delimiter);
+struct TextUtil {
+    static std::string trim(const std::string& input);
+    static std::vector<std::string> split(const std::string& input, char delimiter);
+};
 
 // Catalog-owned table description.
 struct TableMetadata {
@@ -2463,6 +2465,10 @@ public:
 
     std::unique_ptr<Tuple> getTuple(PageID page_id, size_t slot) {
         return readPage(page_id).getTuple(slot);
+    }
+
+    TableMetadata& tableMetadata() {
+        return metadata;
     }
 
     void updateTuple(PageID page_id, size_t slot, std::unique_ptr<Tuple> tuple) {
@@ -2732,7 +2738,7 @@ private:
         PageID tables_first_page = INVALID_PAGE_ID;
         PageID columns_first_page = INVALID_PAGE_ID;
         while (std::getline(input, line)) {
-            auto tokens = split(line, '|');
+            auto tokens = TextUtil::split(line, '|');
             if (tokens.size() != 2) {
                 continue;
             }
@@ -2840,6 +2846,216 @@ private:
     }
 };
 
+struct TransactionContext {
+    int id;
+    enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
+};
+
+using TxnPtr = std::shared_ptr<TransactionContext>;
+
+struct TupleId {
+    TableId table_id;
+    PageID page_id;
+    size_t slot_id;
+};
+
+enum class LockMode { S, X };
+
+enum class LockResourceType { TABLE, TUPLE };
+
+struct LockResource {
+    LockResourceType type;
+    TableId table_id;
+    PageID page_id;
+    size_t slot_id;
+
+    static LockResource table(TableId table_id) {
+        return {LockResourceType::TABLE, table_id, INVALID_PAGE_ID, 0};
+    }
+
+    static LockResource tuple(TableId table_id,
+                              PageID page_id,
+                              size_t slot_id) {
+        return {LockResourceType::TUPLE, table_id, page_id, slot_id};
+    }
+
+    bool operator<(const LockResource& other) const {
+        if (type != other.type) {
+            return static_cast<int>(type) < static_cast<int>(other.type);
+        }
+        if (table_id != other.table_id) {
+            return table_id < other.table_id;
+        }
+        if (page_id != other.page_id) {
+            return page_id < other.page_id;
+        }
+        return slot_id < other.slot_id;
+    }
+};
+
+class LockManager {
+private:
+    struct LockGrant {
+        int txn_id;
+        LockMode mode;
+    };
+
+    std::map<LockResource, std::vector<LockGrant>> locks;
+
+public:
+    struct LockRequestResult {
+        bool granted = false;
+        std::string reason;
+    };
+
+    LockRequestResult tryAcquire(int txn_id,
+                                 const LockResource& resource,
+                                 LockMode mode) {
+        auto& grants = locks[resource];
+        for (const auto& grant : grants) {
+            if (grant.txn_id != txn_id && !compatible(mode, grant.mode)) {
+                return {
+                    false,
+                    "txn " + std::to_string(grant.txn_id) +
+                    " holds " + modeName(grant.mode)
+                };
+            }
+        }
+
+        for (auto& grant : grants) {
+            if (grant.txn_id == txn_id) {
+                if (grant.mode == LockMode::S && mode == LockMode::X) {
+                    grant.mode = LockMode::X;
+                }
+                return {true, ""};
+            }
+        }
+
+        grants.push_back({txn_id, mode});
+        return {true, ""};
+    }
+
+    void releaseAll(int txn_id) {
+        for (auto it = locks.begin(); it != locks.end();) {
+            auto& grants = it->second;
+            grants.erase(
+                std::remove_if(
+                    grants.begin(),
+                    grants.end(),
+                    [txn_id](const LockGrant& grant) {
+                        return grant.txn_id == txn_id;
+                    }),
+                grants.end()
+            );
+            if (grants.empty()) {
+                it = locks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    static std::string modeName(LockMode mode) {
+        return mode == LockMode::S ? "S" : "X";
+    }
+
+private:
+    static bool compatible(LockMode requested, LockMode held) {
+        return requested == LockMode::S && held == LockMode::S;
+    }
+};
+
+class TransactionManager {
+private:
+    LockManager lock_manager;
+
+public:
+    TxnPtr begin(int txn_id) {
+        std::cout << "BEGIN txn " << txn_id << std::endl;
+        return std::make_shared<TransactionContext>(TransactionContext{txn_id});
+    }
+
+    void commit(TransactionContext& txn) {
+        txn.state = TransactionContext::COMMITTED;
+        std::cout << "COMMIT txn " << txn.id << std::endl;
+        lock_manager.releaseAll(txn.id);
+    }
+
+    void abort(TransactionContext& txn) {
+        txn.state = TransactionContext::ABORTED;
+        std::cout << "ABORT txn " << txn.id << std::endl;
+        lock_manager.releaseAll(txn.id);
+    }
+
+    void beforeTupleRead(const TxnPtr& txn, const TupleId& tuple_id) {
+        if (!txn) {
+            return;
+        }
+        acquireLock(
+            txn,
+            LockMode::S,
+            LockResource::tuple(tuple_id.table_id, tuple_id.page_id, tuple_id.slot_id),
+            tupleResourceLabel(tuple_id)
+        );
+    }
+
+    void beforeTupleWrite(const TxnPtr& txn, const TupleId& tuple_id) {
+        if (!txn) {
+            return;
+        }
+        acquireLock(
+            txn,
+            LockMode::X,
+            LockResource::tuple(tuple_id.table_id, tuple_id.page_id, tuple_id.slot_id),
+            tupleResourceLabel(tuple_id)
+        );
+    }
+
+    void beforeTableInsert(const TxnPtr& txn, const TableMetadata& metadata) {
+        if (!txn) {
+            return;
+        }
+        acquireLock(
+            txn,
+            LockMode::X,
+            LockResource::table(metadata.table_id),
+            "table " + metadata.name
+        );
+    }
+
+private:
+    static std::string tupleResourceLabel(const TupleId& tuple_id) {
+        return "tuple table=" + std::to_string(tuple_id.table_id) +
+               "[page=" + std::to_string(tuple_id.page_id) +
+               ", slot=" + std::to_string(tuple_id.slot_id) + "]";
+    }
+
+    void acquireLock(const TxnPtr& txn,
+                     LockMode mode,
+                     const LockResource& resource,
+                     const std::string& resourceLabel) {
+        auto result = lock_manager.tryAcquire(txn->id, resource, mode);
+        if (result.granted) {
+            std::cout << "Lock txn " << txn->id
+                      << " " << LockManager::modeName(mode)
+                      << " on " << resourceLabel
+                      << " granted." << std::endl;
+            return;
+        }
+
+        std::cout << "Lock txn " << txn->id
+                  << " " << LockManager::modeName(mode)
+                  << " on " << resourceLabel
+                  << " blocked; " << result.reason
+                  << "." << std::endl;
+        throw std::runtime_error(
+            "LOCK WAIT: txn " + std::to_string(txn->id) +
+            " waits for " + LockManager::modeName(mode) +
+            " on " + resourceLabel + "; " + result.reason + "."
+        );
+    }
+};
+
 class Operator {
     public:
     virtual ~Operator() = default;
@@ -2885,13 +3101,20 @@ class BinaryOperator : public Operator {
 class ScanOperator : public Operator {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    TransactionManager* txn_manager;
     PageID currentPageId = INVALID_PAGE_ID;
     size_t currentSlotIndex = 0;
     std::unique_ptr<Tuple> currentTuple;
     size_t tuple_count = 0;
 
 public:
-    ScanOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+    ScanOperator(TableHeap& tableHeap,
+                 const TxnPtr& txn = nullptr,
+                 TransactionManager* txn_manager = nullptr)
+        : tableHeap(tableHeap),
+          txn(txn),
+          txn_manager(txn_manager) {}
 
     void open() override {
         currentPageId = tableHeap.firstPage();
@@ -2925,9 +3148,16 @@ private:
             }
 
             while (currentSlotIndex < MAX_SLOTS) {
-                auto tuple = tableHeap.getTuple(currentPageId, currentSlotIndex);
+                size_t slot = currentSlotIndex;
+                auto tuple = tableHeap.getTuple(currentPageId, slot);
                 currentSlotIndex++;
                 if (tuple) {
+                    if (txn_manager && txn) {
+                        txn_manager->beforeTupleRead(
+                            txn,
+                            {tableHeap.tableMetadata().table_id, currentPageId, slot}
+                        );
+                    }
                     currentTuple = std::move(tuple);
                     tuple_count++;
                     return;
@@ -3454,9 +3684,11 @@ void printColumnHeader(const QueryComponents& components,
 
 void executeQuery(const QueryComponents& components, 
                   TableMetadata& metadata,
-                  PageManager& page_manager) {
+                  PageManager& page_manager,
+                  const TxnPtr& txn = nullptr,
+                  TransactionManager* txn_manager = nullptr) {
     TableHeap tableHeap(metadata, page_manager);
-    ScanOperator scanOp(tableHeap);
+    ScanOperator scanOp(tableHeap, txn, txn_manager);
 
     Operator* rootOp = &scanOp;
 
@@ -3525,12 +3757,19 @@ void executeQuery(const QueryComponents& components,
 class InsertOperator : public Operator {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    TransactionManager* txn_manager;
     std::unique_ptr<Tuple> tupleToInsert;
     bool executed = false;
     size_t insertedCount = 0;
 
 public:
-    InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+    InsertOperator(TableHeap& tableHeap,
+                   const TxnPtr& txn = nullptr,
+                   TransactionManager* txn_manager = nullptr)
+        : tableHeap(tableHeap),
+          txn(txn),
+          txn_manager(txn_manager) {}
 
     void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
         tupleToInsert = std::move(tuple);
@@ -3546,6 +3785,11 @@ public:
             return false;
         }
 
+        if (tupleToInsert) {
+            if (txn_manager && txn) {
+                txn_manager->beforeTableInsert(txn, tableHeap.tableMetadata());
+            }
+        }
         if (tupleToInsert && tableHeap.addTuple(std::move(tupleToInsert))) {
             insertedCount = 1;
         }
@@ -3566,6 +3810,8 @@ public:
 class UpdateOperator : public Operator {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    TransactionManager* txn_manager;
     std::unique_ptr<IPredicate> predicate;
     std::vector<std::pair<size_t, Field>> assignments;
     bool executed = false;
@@ -3573,9 +3819,13 @@ private:
 
 public:
     UpdateOperator(TableHeap& tableHeap,
+                   const TxnPtr& txn,
+                   TransactionManager* txn_manager,
                    std::unique_ptr<IPredicate> predicate,
                    std::vector<std::pair<size_t, Field>> assignments)
         : tableHeap(tableHeap),
+          txn(txn),
+          txn_manager(txn_manager),
           predicate(std::move(predicate)),
           assignments(std::move(assignments)) {}
 
@@ -3594,10 +3844,26 @@ public:
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
                 auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple || !predicate->check(tuple->fields)) {
+                if (!tuple) {
                     continue;
                 }
 
+                if (txn_manager && txn) {
+                    txn_manager->beforeTupleRead(
+                        txn,
+                        {tableHeap.tableMetadata().table_id, pageId, slot}
+                    );
+                }
+                if (!predicate->check(tuple->fields)) {
+                    continue;
+                }
+
+                if (txn_manager && txn) {
+                    txn_manager->beforeTupleWrite(
+                        txn,
+                        {tableHeap.tableMetadata().table_id, pageId, slot}
+                    );
+                }
                 for (const auto& assignment : assignments) {
                     if (assignment.first >= tuple->fields.size()) {
                         throw std::runtime_error("UPDATE column is out of range.");
@@ -3625,14 +3891,20 @@ public:
 class DeleteOperator : public Operator {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    TransactionManager* txn_manager;
     std::unique_ptr<IPredicate> predicate;
     bool executed = false;
     size_t deletedCount = 0;
 
 public:
     DeleteOperator(TableHeap& tableHeap,
+                   const TxnPtr& txn,
+                   TransactionManager* txn_manager,
                    std::unique_ptr<IPredicate> predicate)
         : tableHeap(tableHeap),
+          txn(txn),
+          txn_manager(txn_manager),
           predicate(std::move(predicate)) {}
 
     void open() override {
@@ -3650,8 +3922,23 @@ public:
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
                 auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple || !predicate->check(tuple->fields)) {
+                if (!tuple) {
                     continue;
+                }
+                if (txn_manager && txn) {
+                    txn_manager->beforeTupleRead(
+                        txn,
+                        {tableHeap.tableMetadata().table_id, pageId, slot}
+                    );
+                }
+                if (!predicate->check(tuple->fields)) {
+                    continue;
+                }
+                if (txn_manager && txn) {
+                    txn_manager->beforeTupleWrite(
+                        txn,
+                        {tableHeap.tableMetadata().table_id, pageId, slot}
+                    );
                 }
                 tableHeap.deleteTuple(pageId, slot);
                 deletedCount++;
@@ -3671,7 +3958,7 @@ public:
     }
 };
 
-std::string trim(const std::string& input) {
+std::string TextUtil::trim(const std::string& input) {
     size_t start = 0;
     while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
         start++;
@@ -3685,16 +3972,15 @@ std::string trim(const std::string& input) {
     return input.substr(start, end - start);
 }
 
-std::vector<std::string> split(const std::string& input, char delimiter) {
+std::vector<std::string> TextUtil::split(const std::string& input, char delimiter) {
     std::vector<std::string> tokens;
     std::stringstream stream(input);
     std::string token;
     while (std::getline(stream, token, delimiter)) {
-        tokens.push_back(trim(token));
+        tokens.push_back(TextUtil::trim(token));
     }
     return tokens;
 }
-
 
 void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
     if (crashAfterStatement <= 0) {
@@ -3709,138 +3995,235 @@ void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
     }
 }
 
-struct TxnContext {
-    int id;
-    enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
+struct ParsedStatement {
+    enum class Kind { Insert, Update, Delete, Select };
+    Kind kind;
+    std::string tableName;
+    std::vector<std::string> values;
+    std::string setColumnName;
+    std::string setValue;
+    std::string whereColumnName;
+    std::string whereValue;
+    QueryComponents query;
 };
 
-using TxnPtr = std::shared_ptr<TxnContext>;
-
-enum class LockMode { S, X };
-
-enum class LockResourceType { TABLE, TUPLE };
-
-struct LockResource {
-    LockResourceType type;
-    TableId table_id;
-    PageID page_id;
-    size_t slot_id;
-
-    static LockResource table(TableId table_id) {
-        return {LockResourceType::TABLE, table_id, INVALID_PAGE_ID, 0};
-    }
-
-    static LockResource tuple(TableId table_id,
-                              PageID page_id,
-                              size_t slot_id) {
-        return {LockResourceType::TUPLE, table_id, page_id, slot_id};
-    }
-
-    bool operator<(const LockResource& other) const {
-        if (type != other.type) {
-            return static_cast<int>(type) < static_cast<int>(other.type);
-        }
-        if (table_id != other.table_id) {
-            return table_id < other.table_id;
-        }
-        if (page_id != other.page_id) {
-            return page_id < other.page_id;
-        }
-        return slot_id < other.slot_id;
-    }
-};
-
-class LockManager {
+class QueryParser {
 private:
-    struct LockGrant {
-        int txn_id;
-        LockMode mode;
-    };
-
-    std::map<LockResource, std::vector<LockGrant>> locks;
+    Catalog& catalog;
 
 public:
-    struct LockRequestResult {
-        bool granted = false;
-        std::string reason;
-    };
+    explicit QueryParser(Catalog& catalog) : catalog(catalog) {}
 
-    LockRequestResult tryAcquire(int txn_id,
-                                 const LockResource& resource,
-                                 LockMode mode) {
-        auto& grants = locks[resource];
-        for (const auto& grant : grants) {
-            if (grant.txn_id != txn_id && !compatible(mode, grant.mode)) {
-                return {
-                    false,
-                    "txn " + std::to_string(grant.txn_id) +
-                    " holds " + modeName(grant.mode)
-                };
-            }
+    ParsedStatement parseStatement(const std::string& statement) {
+        std::smatch matches;
+
+        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, insertRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Insert;
+            parsed.tableName = matches[1];
+            parsed.values = TextUtil::split(matches[2], ',');
+            return parsed;
         }
 
-        for (auto& grant : grants) {
-            if (grant.txn_id == txn_id) {
-                if (grant.mode == LockMode::S && mode == LockMode::X) {
-                    grant.mode = LockMode::X;
+        std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, updateRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Update;
+            parsed.tableName = matches[1];
+            parsed.setColumnName = matches[2];
+            parsed.setValue = matches[3];
+            parsed.whereColumnName = matches[4];
+            parsed.whereValue = matches[5];
+            return parsed;
+        }
+
+        std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, deleteRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Delete;
+            parsed.tableName = matches[1];
+            parsed.whereColumnName = matches[2];
+            parsed.whereValue = matches[3];
+            return parsed;
+        }
+
+        std::regex selectRegex("^\\s*SELECT\\s+(.*)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, selectRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Select;
+            parsed.query = parseQuery(matches[1], catalog);
+            return parsed;
+        }
+
+        throw std::runtime_error("Unsupported statement: " + statement);
+    }
+};
+
+class QueryExecutor {
+private:
+    Catalog& catalog;
+    PageManager& page_manager;
+
+public:
+    QueryExecutor(Catalog& catalog, PageManager& page_manager)
+        : catalog(catalog),
+          page_manager(page_manager) {}
+
+    void execute(const ParsedStatement& statement,
+                 const TxnPtr& txn = nullptr,
+                 TransactionManager* txn_manager = nullptr) {
+        switch (statement.kind) {
+            case ParsedStatement::Kind::Insert:
+                insertRow(statement.tableName, statement.values, false, txn, txn_manager);
+                return;
+            case ParsedStatement::Kind::Update:
+                executeUpdate(statement, txn, txn_manager);
+                return;
+            case ParsedStatement::Kind::Delete:
+                executeDelete(statement, txn, txn_manager);
+                return;
+            case ParsedStatement::Kind::Select:
+                executeSelect(statement, txn, txn_manager);
+                return;
+        }
+        throw std::runtime_error("Unsupported parsed statement.");
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false,
+                   const TxnPtr& txn = nullptr,
+                   TransactionManager* txn_manager = nullptr) {
+        auto& metadata = catalog.getTable(tableName);
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, page_manager);
+        InsertOperator insertOp(tableHeap, txn, txn_manager);
+        insertOp.setTupleToInsert(std::move(tuple));
+        executeStatementOperator(insertOp, printResult);
+    }
+
+private:
+    std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                     const std::vector<std::string>& values) {
+        if (values.size() != schema.columns.size()) {
+            throw std::runtime_error("Wrong field count for table row.");
+        }
+
+        auto tuple = std::make_unique<Tuple>();
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
+        }
+        return tuple;
+    }
+
+    std::unique_ptr<IPredicate> makeEqualityPredicate(
+        const TableSchema& schema,
+        const std::string& columnName,
+        const std::string& value) {
+        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
+        auto field = parseFieldValue(schema.columns[column].type, value);
+        return std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(column),
+            SimplePredicate::Operand(std::move(field)),
+            SimplePredicate::ComparisonOperator::EQ
+        );
+    }
+
+    void executeUpdate(const ParsedStatement& statement,
+                       const TxnPtr& txn,
+                       TransactionManager* txn_manager) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        const size_t setColumn = static_cast<size_t>(
+            metadata.schema.getColumnIndex(statement.setColumnName));
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        auto field = parseFieldValue(
+            metadata.schema.columns[setColumn].type,
+            statement.setValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        UpdateOperator updateOp(
+            tableHeap,
+            txn,
+            txn_manager,
+            std::move(predicate),
+            {{setColumn, *field}}
+        );
+        executeStatementOperator(updateOp, false);
+    }
+
+    void executeDelete(const ParsedStatement& statement,
+                       const TxnPtr& txn,
+                       TransactionManager* txn_manager) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        DeleteOperator deleteOp(tableHeap, txn, txn_manager, std::move(predicate));
+        executeStatementOperator(deleteOp, false);
+    }
+
+    void executeSelect(const ParsedStatement& statement,
+                       const TxnPtr& txn,
+                       TransactionManager* txn_manager) {
+        auto& metadata = catalog.getTable(statement.query.tableName);
+        executeQuery(statement.query, metadata, page_manager, txn, txn_manager);
+    }
+
+    void executeStatementOperator(Operator& statementOperator, bool printResult) {
+        statementOperator.open();
+        while (statementOperator.next()) {
+            if (printResult) {
+                const auto& output = statementOperator.getOutput();
+                for (const auto& field : output) {
+                    field->print();
+                    std::cout << " ";
                 }
-                return {true, ""};
+                std::cout << std::endl;
             }
         }
-
-        grants.push_back({txn_id, mode});
-        return {true, ""};
+        statementOperator.close();
     }
+};
 
-    void releaseAll(int txn_id) {
-        for (auto it = locks.begin(); it != locks.end();) {
-            auto& grants = it->second;
-            grants.erase(
-                std::remove_if(
-                    grants.begin(),
-                    grants.end(),
-                    [txn_id](const LockGrant& grant) {
-                        return grant.txn_id == txn_id;
-                    }),
-                grants.end()
-            );
-            if (grants.empty()) {
-                it = locks.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    static std::string modeName(LockMode mode) {
-        return mode == LockMode::S ? "S" : "X";
-    }
-
+class QueryProcessor {
 private:
-    static bool compatible(LockMode requested, LockMode held) {
-        return requested == LockMode::S && held == LockMode::S;
-    }
-};
+    QueryParser parser;
+    QueryExecutor executor;
 
-class TransactionManager {
 public:
-    TxnPtr begin(int txn_id) {
-        std::cout << "BEGIN txn " << txn_id << std::endl;
-        return std::make_shared<TxnContext>(TxnContext{txn_id});
+    QueryProcessor(Catalog& catalog, PageManager& page_manager)
+        : parser(catalog),
+          executor(catalog, page_manager) {}
+
+    void execute(const std::string& statement,
+                 const TxnPtr& txn = nullptr,
+                 TransactionManager* txn_manager = nullptr) {
+        auto parsed = parser.parseStatement(statement);
+        executor.execute(parsed, txn, txn_manager);
     }
 
-    void commit(TxnContext& txn) {
-        txn.state = TxnContext::COMMITTED;
-        std::cout << "COMMIT txn " << txn.id << std::endl;
-    }
-
-    void abort(TxnContext& txn) {
-        txn.state = TxnContext::ABORTED;
-        std::cout << "ABORT txn " << txn.id << std::endl;
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false,
+                   const TxnPtr& txn = nullptr,
+                   TransactionManager* txn_manager = nullptr) {
+        executor.insertRow(tableName, values, printResult, txn, txn_manager);
     }
 };
 
-class BuzzDB {
+class TransactionalStorageManager {
 public:
     LogManager log_manager;
     BufferManager buffer_manager;
@@ -3848,49 +4231,63 @@ public:
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
-    LockManager lock_manager;
-    TxnPtr active_txn;
 
-public:
-    BuzzDB() : log_manager(),
-               buffer_manager(log_manager),
-               recovery_manager(buffer_manager, log_manager),
-               page_manager(buffer_manager, recovery_manager),
-               catalog(buffer_manager, page_manager) {
+    TransactionalStorageManager()
+        : log_manager(),
+          buffer_manager(log_manager),
+          recovery_manager(buffer_manager, log_manager),
+          page_manager(buffer_manager, recovery_manager),
+          catalog(buffer_manager, page_manager),
+          txn_manager() {
         recovery_manager.recover();
         catalog.load();
     }
+};
+
+class BuzzDB {
+public:
+    TransactionalStorageManager transactional_storage_manager;
+    QueryProcessor query_processor;
+    TxnPtr active_txn;
+
+public:
+    BuzzDB()
+        : transactional_storage_manager(),
+          query_processor(transactional_storage_manager.catalog,
+                          transactional_storage_manager.page_manager) {}
 
     TxnPtr beginTransaction() {
-        int txn_id = recovery_manager.begin();
-        return txn_manager.begin(txn_id);
+        int txn_id = transactional_storage_manager.recovery_manager.begin();
+        return transactional_storage_manager.txn_manager.begin(txn_id);
     }
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
-        acquireStatementLocks(txn, statement);
-        recovery_manager.setCurrentTransaction(txn->id);
+        std::cout << statement << "\n";
+        transactional_storage_manager.recovery_manager.setCurrentTransaction(txn->id);
         try {
-            executeStatementsAndQueries({statement});
+            query_processor.execute(
+                statement,
+                txn,
+                &transactional_storage_manager.txn_manager
+            );
         } catch (...) {
-            recovery_manager.clearCurrentTransaction();
+            transactional_storage_manager.recovery_manager.clearCurrentTransaction();
             throw;
         }
-        recovery_manager.clearCurrentTransaction();
+        transactional_storage_manager.recovery_manager.clearCurrentTransaction();
     }
 
     void commit(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        recovery_manager.commit(txn->id);
-        txn_manager.commit(*txn);
-        lock_manager.releaseAll(txn->id);
+        transactional_storage_manager.recovery_manager.commit(txn->id);
+        transactional_storage_manager.txn_manager.commit(*txn);
     }
 
     void abort(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        recovery_manager.abort(txn->id);
-        txn_manager.abort(*txn);
-        lock_manager.releaseAll(txn->id);
+        transactional_storage_manager.recovery_manager.abort(txn->id);
+        transactional_storage_manager.txn_manager.abort(*txn);
     }
 
     void begin() {
@@ -3917,239 +4314,35 @@ public:
     }
 
     void crashAt(CrashPoint point) {
-        recovery_manager.crashAt(point);
+        transactional_storage_manager.recovery_manager.crashAt(point);
     }
 
     void checkpoint() {
-        recovery_manager.checkpoint();
+        transactional_storage_manager.recovery_manager.checkpoint();
     }
 
     bool createTable(const std::string& name, TableSchema schema) {
-        return catalog.createTable(name, std::move(schema));
+        return transactional_storage_manager.catalog.createTable(name, std::move(schema));
+    }
+
+    bool hasTable(const std::string& name) const {
+        return transactional_storage_manager.catalog.hasTable(name);
     }
 
     bool isDatabaseEmpty() const {
-        return catalog.empty();
+        return transactional_storage_manager.catalog.empty();
     }
 
     static void requireRunningTransaction(const TxnPtr& txn) {
-        if (!txn || txn->state != TxnContext::RUNNING) {
+        if (!txn || txn->state != TransactionContext::RUNNING) {
             throw std::runtime_error("Statement requires a running transaction.");
         }
-    }
-
-    static LockResource tableResource(const TableMetadata& metadata) {
-        return LockResource::table(metadata.table_id);
-    }
-
-    static LockResource tupleResource(const TableMetadata& metadata,
-                                      PageID pageId,
-                                      size_t slot) {
-        return LockResource::tuple(metadata.table_id, pageId, slot);
-    }
-
-    static std::string tupleResourceLabel(const std::string& tableName,
-                                          PageID pageId,
-                                          size_t slot) {
-        return "tuple " + tableName +
-               "[page=" + std::to_string(pageId) +
-               ", slot=" + std::to_string(slot) + "]";
-    }
-
-    static std::string tableResourceLabel(const std::string& tableName) {
-        return "table " + tableName;
-    }
-
-    static bool sameFieldValue(const Field& left, const Field& right) {
-        if (left.getType() != right.getType()) {
-            return false;
-        }
-
-        switch (left.getType()) {
-            case INT:
-                return left.asInt() == right.asInt();
-            case FLOAT:
-                return left.asFloat() == right.asFloat();
-            case STRING:
-                return left.asString() == right.asString();
-        }
-        throw std::runtime_error("Unsupported field type.");
-    }
-
-    void acquireMatchingTupleLocks(const TxnPtr& txn,
-                                   LockMode mode,
-                                   TableMetadata& metadata,
-                                   const std::string& columnName,
-                                   const std::string& value) {
-        const size_t column = static_cast<size_t>(
-            metadata.schema.getColumnIndex(columnName));
-        auto target = parseFieldValue(metadata.schema.columns[column].type, value);
-        TableHeap tableHeap(metadata, page_manager);
-
-        for (PageID pageId = tableHeap.firstPage();
-             pageId != INVALID_PAGE_ID;
-             pageId = tableHeap.nextPage(pageId)) {
-            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple || !sameFieldValue(*tuple->fields[column], *target)) {
-                    continue;
-                }
-
-                acquireLock(txn,
-                            mode,
-                            tupleResource(metadata, pageId, slot),
-                            tupleResourceLabel(metadata.name, pageId, slot));
-            }
-        }
-    }
-
-    void acquireStatementLocks(const TxnPtr& txn,
-                               const std::string& statement) {
-        std::smatch matches;
-
-        std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*[^\\s;]+\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                               std::regex_constants::icase);
-        if (std::regex_match(statement, matches, updateRegex)) {
-            const std::string tableName = matches[1];
-            const std::string columnName = matches[2];
-            const std::string value = matches[3];
-            auto& metadata = catalog.getTable(tableName);
-            acquireMatchingTupleLocks(txn, LockMode::X, metadata, columnName, value);
-            return;
-        }
-
-        std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                               std::regex_constants::icase);
-        if (std::regex_match(statement, matches, deleteRegex)) {
-            const std::string tableName = matches[1];
-            const std::string columnName = matches[2];
-            const std::string value = matches[3];
-            auto& metadata = catalog.getTable(tableName);
-            acquireMatchingTupleLocks(txn, LockMode::X, metadata, columnName, value);
-            return;
-        }
-
-        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\(.*\\)\\s*;?\\s*$",
-                               std::regex_constants::icase);
-        if (std::regex_match(statement, matches, insertRegex)) {
-            const std::string tableName = matches[1];
-            auto& metadata = catalog.getTable(tableName);
-            acquireLock(txn,
-                        LockMode::X,
-                        tableResource(metadata),
-                        tableResourceLabel(tableName));
-            return;
-        }
-
-        std::regex selectRowRegex("^\\s*SELECT\\s+.*\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                  std::regex_constants::icase);
-        if (std::regex_match(statement, matches, selectRowRegex)) {
-            const std::string tableName = matches[1];
-            const std::string columnName = matches[2];
-            const std::string value = matches[3];
-            auto& metadata = catalog.getTable(tableName);
-            acquireMatchingTupleLocks(txn, LockMode::S, metadata, columnName, value);
-            return;
-        }
-
-        std::regex selectTableRegex("^\\s*SELECT\\s+.*\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*).*$",
-                                    std::regex_constants::icase);
-        if (std::regex_match(statement, matches, selectTableRegex)) {
-            const std::string tableName = matches[1];
-            auto& metadata = catalog.getTable(tableName);
-            acquireLock(txn,
-                        LockMode::S,
-                        tableResource(metadata),
-                        tableResourceLabel(tableName));
-        }
-    }
-
-    void acquireLock(const TxnPtr& txn,
-                     LockMode mode,
-                     const LockResource& resource,
-                     const std::string& resourceLabel) {
-        auto result = lock_manager.tryAcquire(txn->id, resource, mode);
-        if (result.granted) {
-            std::cout << "Lock txn " << txn->id
-                      << " " << LockManager::modeName(mode)
-                      << " on " << resourceLabel
-                      << " granted." << std::endl;
-            return;
-        }
-
-        std::cout << "Lock txn " << txn->id
-                  << " " << LockManager::modeName(mode)
-                  << " on " << resourceLabel
-                  << " blocked; " << result.reason
-                  << "." << std::endl;
-        throw std::runtime_error(
-            "LOCK WAIT: txn " + std::to_string(txn->id) +
-            " waits for " + LockManager::modeName(mode) +
-            " on " + resourceLabel + "; " + result.reason + "."
-        );
-    }
-
-    static std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
-        switch (type) {
-            case INT:
-                return std::make_unique<Field>(std::stoi(value));
-            case FLOAT:
-                return std::make_unique<Field>(std::stof(value));
-            case STRING:
-                return std::make_unique<Field>(value);
-        }
-        throw std::runtime_error("Unsupported field type.");
-    }
-
-    static std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
-                                            const std::vector<std::string>& values) {
-        if (values.size() != schema.columns.size()) {
-            throw std::runtime_error("Wrong field count for table row.");
-        }
-
-        auto tuple = std::make_unique<Tuple>();
-        for (size_t i = 0; i < schema.columns.size(); i++) {
-            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
-        }
-        return tuple;
-    }
-
-    static std::unique_ptr<IPredicate> makeEqualityPredicate(const TableSchema& schema,
-                                                            const std::string& columnName,
-                                                            const std::string& value) {
-        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
-        auto field = parseFieldValue(schema.columns[column].type, value);
-        return std::make_unique<SimplePredicate>(
-            SimplePredicate::Operand(column),
-            SimplePredicate::Operand(std::move(field)),
-            SimplePredicate::ComparisonOperator::EQ
-        );
-    }
-
-    void executeStatementOperator(Operator& statementOperator, bool printResult) {
-        statementOperator.open();
-        while (statementOperator.next()) {
-            if (printResult) {
-                const auto& output = statementOperator.getOutput();
-                for (const auto& field : output) {
-                    field->print();
-                    std::cout << " ";
-                }
-                std::cout << std::endl;
-            }
-        }
-        statementOperator.close();
     }
 
     void insertRow(const std::string& tableName,
                    const std::vector<std::string>& values,
                    bool printResult = false) {
-        auto& metadata = catalog.getTable(tableName);
-        auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, page_manager);
-        InsertOperator insertOp(tableHeap);
-        insertOp.setTupleToInsert(std::move(tuple));
-        executeStatementOperator(insertOp, printResult);
+        query_processor.insertRow(tableName, values, printResult);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -4157,7 +4350,6 @@ public:
         int statementsSeen = 0;
         for (const auto& statement : statements) {
             std::cout << statement << "\n";
-            std::smatch matches;
             auto statementFinished = [&]() {
                 checkStatementCrashLimit(statementsSeen, crashAfterStatement);
             };
@@ -4194,73 +4386,12 @@ public:
                 continue;
             }
 
-            if (active_txn) {
-                acquireStatementLocks(active_txn, statement);
-            }
-
-            std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, insertRegex)) {
-                const std::string tableName = matches[1];
-                const std::string valuesText = matches[2];
-                insertRow(tableName, split(valuesText, ','), false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, updateRegex)) {
-                const std::string tableName = matches[1];
-                const std::string setColumnName = matches[2];
-                const std::string setValue = matches[3];
-                const std::string whereColumnName = matches[4];
-                const std::string whereValue = matches[5];
-
-                auto& metadata = catalog.getTable(tableName);
-                const size_t setColumn = static_cast<size_t>(
-                    metadata.schema.getColumnIndex(setColumnName));
-                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
-                auto field = parseFieldValue(metadata.schema.columns[setColumn].type, setValue);
-                TableHeap tableHeap(metadata, page_manager);
-                UpdateOperator updateOp(
-                    tableHeap,
-                    std::move(predicate),
-                    {{setColumn, *field}}
-                );
-                executeStatementOperator(updateOp, false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, deleteRegex)) {
-                const std::string tableName = matches[1];
-                const std::string whereColumnName = matches[2];
-                const std::string whereValue = matches[3];
-
-                auto& metadata = catalog.getTable(tableName);
-                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
-                TableHeap tableHeap(metadata, page_manager);
-                DeleteOperator deleteOp(tableHeap, std::move(predicate));
-                executeStatementOperator(deleteOp, false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex selectRegex("^\\s*SELECT\\s+(.*)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, selectRegex)) {
-                const std::string queryText = matches[1];
-                auto components = parseQuery(queryText, catalog);
-                auto& metadata = catalog.getTable(components.tableName);
-                executeQuery(components, metadata, page_manager);
-                statementFinished();
-                continue;
-            }
-
-            throw std::runtime_error("Unsupported statement: " + statement);
+            query_processor.execute(
+                statement,
+                active_txn,
+                active_txn ? &transactional_storage_manager.txn_manager : nullptr
+            );
+            statementFinished();
         }
     }
 };
@@ -4312,12 +4443,12 @@ public:
 
         std::string line;
         while (std::getline(inputFile, line)) {
-            line = trim(line);
+            line = TextUtil::trim(line);
             if (line.empty() || line[0] == '#') {
                 continue;
             }
 
-            auto tokens = split(line, '|');
+            auto tokens = TextUtil::split(line, '|');
             if (tokens.empty()) {
                 continue;
             }
@@ -4332,7 +4463,7 @@ public:
             }
 
             const std::string tableName = tokens[0];
-            if (!db.catalog.hasTable(tableName)) {
+            if (!db.hasTable(tableName)) {
                 throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
             }
 
@@ -4348,8 +4479,8 @@ bool seatIsHeldFor(BuzzDB& db,
                    const std::string& customer) {
     db.execute(txn, "SELECT {*} FROM seats WHERE seat_no = " + seatNo);
 
-    auto& seatsMetadata = db.catalog.getTable("seats");
-    TableHeap seatsHeap(seatsMetadata, db.page_manager);
+    auto& seatsMetadata = db.transactional_storage_manager.catalog.getTable("seats");
+    TableHeap seatsHeap(seatsMetadata, db.transactional_storage_manager.page_manager);
     auto seatNoColumn = static_cast<size_t>(
         seatsMetadata.schema.getColumnIndex("seat_no"));
     auto statusColumn = static_cast<size_t>(
