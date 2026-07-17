@@ -5004,10 +5004,11 @@ public:
 
 const std::string imdb_data_filename = "imdb_large.txt";
 const std::string imdb_nested_loop_join_query =
-    "SELECT {t.title}, {kt.kind} "
+    "SELECT {t.title}, {mii.info}, {it.info} "
     "FROM title AS t "
-    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-    "WHERE {t.id} = 2008135";
+    "JOIN movie_info_idx AS mii ON {t.id} = {mii.movie_id} "
+    "JOIN info_type AS it ON {mii.info_type_id} = {it.id} "
+    "WHERE {t.id} = 2008135 AND {it.info} = rating";
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
     if (db.catalog.empty()) {
@@ -5038,7 +5039,7 @@ void printImportResult(const ImportResult& result) {
 }
 
 void runImdbNestedLoopJoin() {
-    std::cout << "\nIMDB Query: title joined with kind_type" << std::endl;
+    std::cout << "\nIMDB Query: title joined with rating metadata" << std::endl;
 
     BuzzDB db;
     auto import_start = std::chrono::high_resolution_clock::now();
