@@ -2179,8 +2179,11 @@ struct TableSchema {
     }
 };
 
-std::string trim(const std::string& input);
-std::vector<std::string> split(const std::string& input, char delimiter);
+struct TextUtil {
+    static std::string trim(const std::string& input);
+    static std::vector<std::string> split(const std::string& input, char delimiter);
+};
+
 
 // Catalog-owned table description.
 struct TableMetadata {
@@ -2531,7 +2534,7 @@ private:
         PageID tables_first_page = INVALID_PAGE_ID;
         PageID columns_first_page = INVALID_PAGE_ID;
         while (std::getline(input, line)) {
-            auto tokens = split(line, '|');
+            auto tokens = TextUtil::split(line, '|');
             if (tokens.size() != 2) {
                 continue;
             }
@@ -3414,30 +3417,20 @@ private:
 
 };
 
-std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
-    switch (type) {
-        case INT:
-            return std::make_unique<Field>(std::stoi(value));
-        case FLOAT:
-            return std::make_unique<Field>(std::stof(value));
-        case STRING:
-            return std::make_unique<Field>(value);
+struct FieldParser {
+    static std::unique_ptr<Field> parseValue(FieldType type,
+                                             const std::string& value) {
+        switch (type) {
+            case INT:
+                return std::make_unique<Field>(std::stoi(value));
+            case FLOAT:
+                return std::make_unique<Field>(std::stof(value));
+            case STRING:
+                return std::make_unique<Field>(value);
+        }
+        throw std::runtime_error("Unsupported field type.");
     }
-    throw std::runtime_error("Unsupported field type.");
-}
-
-std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
-                                 const std::vector<std::string>& values) {
-    if (values.size() != schema.columns.size()) {
-        throw std::runtime_error("Wrong field count for table row.");
-    }
-
-    auto tuple = std::make_unique<Tuple>();
-    for (size_t i = 0; i < schema.columns.size(); i++) {
-        tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
-    }
-    return tuple;
-}
+};
 
 using TableRefId = uint32_t;
 constexpr TableRefId INVALID_TABLE_REF_ID = 0;
@@ -3445,6 +3438,7 @@ constexpr TableRefId INVALID_TABLE_REF_ID = 0;
 struct TableRef {
     TableRefId id = INVALID_TABLE_REF_ID;
     TableId table_id = INVALID_TABLE_ID;
+    std::string table_name;
     std::string alias;
 };
 
@@ -3483,6 +3477,8 @@ struct QueryComponents {
     int upperBound = std::numeric_limits<int>::max();
     bool equalityCondition = false;
     int equalityAttributeIndex = -1;
+    std::string equalityColumnName;
+    std::string equalityValueText;
     std::unique_ptr<Field> equalityValue;
 
     TableRefId base_table_ref_id = INVALID_TABLE_REF_ID;
@@ -3534,7 +3530,7 @@ std::vector<std::string> splitOnAnd(const std::string& predicates) {
                                        -1);
          it != std::sregex_token_iterator();
          ++it) {
-        auto part = trim(*it);
+        auto part = TextUtil::trim(*it);
         if (!part.empty()) {
             parts.push_back(part);
         }
@@ -3578,6 +3574,7 @@ QueryComponents parseJoinQuery(const std::string& query, Catalog& catalog) {
         components.table_refs.push_back({
             table_ref_id,
             metadata.table_id,
+            table_name,
             alias
         });
         return table_ref_id;
@@ -3601,7 +3598,7 @@ QueryComponents parseJoinQuery(const std::string& query, Catalog& catalog) {
     const std::string left_alias = matches[3].matched
         ? static_cast<std::string>(matches[3])
         : left_table;
-    std::string rest = trim(matches[4]);
+    std::string rest = TextUtil::trim(matches[4]);
 
     components.base_table_ref_id = addTableAlias(left_table, left_alias);
 
@@ -3626,7 +3623,7 @@ QueryComponents parseJoinQuery(const std::string& query, Catalog& catalog) {
             resolveColumn(matches[3], matches[4]),
             resolveColumn(matches[5], matches[6])
         });
-        rest = trim(matches[7]);
+        rest = TextUtil::trim(matches[7]);
     }
     if (components.joins.empty()) {
         throw std::runtime_error("Join query must include at least one JOIN.");
@@ -3657,7 +3654,7 @@ QueryComponents parseJoinQuery(const std::string& query, Catalog& catalog) {
                     metadata.schema.columns[column.column_index];
                 components.filters.push_back({
                     column,
-                    parseFieldValue(
+                    FieldParser::parseValue(
                         column_schema.type,
                         matches[3]
                     )
@@ -3668,7 +3665,7 @@ QueryComponents parseJoinQuery(const std::string& query, Catalog& catalog) {
         }
         rest.clear();
     }
-    if (!trim(rest).empty()) {
+    if (!TextUtil::trim(rest).empty()) {
         throw std::runtime_error("Unexpected join query text: " + rest);
     }
 
@@ -3718,7 +3715,9 @@ QueryComponents parseQuery(const std::string& query, Catalog& catalog) {
             int column = metadata.schema.getColumnIndex(columnName);
             components.equalityCondition = true;
             components.equalityAttributeIndex = column;
-            components.equalityValue = parseFieldValue(
+            components.equalityColumnName = columnName;
+            components.equalityValueText = value;
+            components.equalityValue = FieldParser::parseValue(
                 metadata.schema.columns[static_cast<size_t>(column)].type,
                 value
             );
@@ -3771,6 +3770,80 @@ QueryComponents parseQuery(const std::string& query, Catalog& catalog) {
 
     return components;
 }
+
+
+struct ParsedStatement {
+    enum class Kind { Insert, Update, Delete, Select };
+    Kind kind;
+    std::string tableName;
+    std::vector<std::string> values;
+    std::string setColumnName;
+    std::string setValue;
+    std::string whereColumnName;
+    std::string whereValue;
+    QueryComponents query;
+};
+
+class QueryParser {
+private:
+    Catalog& catalog;
+
+public:
+    explicit QueryParser(Catalog& catalog) : catalog(catalog) {}
+
+    QueryComponents parseQueryText(const std::string& query) {
+        return parseQuery(query, catalog);
+    }
+
+    ParsedStatement parseStatement(const std::string& statement) {
+        std::smatch matches;
+
+        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, insertRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Insert;
+            parsed.tableName = matches[1];
+            parsed.values = TextUtil::split(matches[2], ',');
+            return parsed;
+        }
+
+        std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, updateRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Update;
+            parsed.tableName = matches[1];
+            parsed.setColumnName = matches[2];
+            parsed.setValue = matches[3];
+            parsed.whereColumnName = matches[4];
+            parsed.whereValue = matches[5];
+            return parsed;
+        }
+
+        std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, deleteRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Delete;
+            parsed.tableName = matches[1];
+            parsed.whereColumnName = matches[2];
+            parsed.whereValue = matches[3];
+            return parsed;
+        }
+
+        std::regex selectRegex("^\\s*(?:SELECT|PROJECT)\\s+(.*)\\s*;?\\s*$",
+                               std::regex_constants::icase);
+        if (std::regex_match(statement, matches, selectRegex)) {
+            ParsedStatement parsed;
+            parsed.kind = ParsedStatement::Kind::Select;
+            parsed.query = parseQueryText(matches[1]);
+            return parsed;
+        }
+
+        throw std::runtime_error("Unsupported statement: " + statement);
+    }
+};
 
 std::string aggregateFunctionName(AggrFuncType function) {
     switch (function) {
@@ -5116,7 +5189,7 @@ public:
     }
 };
 
-std::string trim(const std::string& input) {
+std::string TextUtil::trim(const std::string& input) {
     size_t start = 0;
     while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
         start++;
@@ -5130,15 +5203,273 @@ std::string trim(const std::string& input) {
     return input.substr(start, end - start);
 }
 
-std::vector<std::string> split(const std::string& input, char delimiter) {
+std::vector<std::string> TextUtil::split(const std::string& input, char delimiter) {
     std::vector<std::string> tokens;
     std::stringstream stream(input);
     std::string token;
     while (std::getline(stream, token, delimiter)) {
-        tokens.push_back(trim(token));
+        tokens.push_back(TextUtil::trim(token));
     }
     return tokens;
 }
+
+
+class QueryOptimizer {
+private:
+    Catalog& catalog;
+    PageManager& page_manager;
+
+public:
+    QueryOptimizer(Catalog& catalog, PageManager& page_manager)
+        : catalog(catalog), page_manager(page_manager) {}
+
+    std::map<TableId, TableStats> analyzeQueryTables(
+            const QueryComponents& components) {
+        return ::analyzeQueryTables(components, catalog, page_manager);
+    }
+
+    JoinOrderPlan chooseGreedyJoinOrder(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            SelectivityModel model = SelectivityModel::Uniform) {
+        return ::chooseGreedyJoinOrder(components, stats, model);
+    }
+
+    std::vector<PhysicalJoinKind> physicalJoinKindsForPlan(
+            const JoinOrderPlan& plan) {
+        return ::physicalJoinKindsForPlan(plan);
+    }
+
+    void printJoinOrderPlan(const std::string& title,
+                            const JoinOrderPlan& plan) {
+        ::printJoinOrderPlan(title, plan, catalog);
+    }
+
+    SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            SelectivityModel model = SelectivityModel::MostCommonValues) {
+        return ::chooseSelingerLeftDeepJoinOrder(components, stats, model);
+    }
+
+    void printEqualityFilterEstimateComparison(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats) {
+        ::printEqualityFilterEstimateComparison(
+            components,
+            catalog,
+            page_manager,
+            stats
+        );
+    }
+};
+
+
+class QueryExecutor {
+private:
+    Catalog& catalog;
+    PageManager& page_manager;
+
+public:
+    QueryExecutor(Catalog& catalog, PageManager& page_manager)
+        : catalog(catalog), page_manager(page_manager) {}
+
+    void execute(const ParsedStatement& statement) {
+        switch (statement.kind) {
+            case ParsedStatement::Kind::Insert:
+                insertRow(statement.tableName, statement.values);
+                return;
+            case ParsedStatement::Kind::Update:
+                executeUpdate(statement);
+                return;
+            case ParsedStatement::Kind::Delete:
+                executeDelete(statement);
+                return;
+            case ParsedStatement::Kind::Select:
+                executeSelect(statement);
+                return;
+        }
+        throw std::runtime_error("Unsupported parsed statement.");
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        auto& metadata = catalog.getTable(tableName);
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, page_manager);
+        InsertOperator insertOp(tableHeap);
+        insertOp.setTupleToInsert(std::move(tuple));
+        executeStatementOperator(insertOp, printResult);
+    }
+
+    QueryResult executeJoinPlan(
+            const QueryComponents& components,
+            const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
+            size_t sample_limit = 5) {
+        return executeJoinQuery(
+            components,
+            catalog,
+            page_manager,
+            sample_limit,
+            physical_join_kinds
+        );
+    }
+
+    void printJoinPlanResult(const QueryComponents& components,
+                             const QueryResult& result) {
+        printJoinQueryResult(components, result);
+    }
+
+private:
+    std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                     const std::vector<std::string>& values) {
+        if (values.size() != schema.columns.size()) {
+            throw std::runtime_error("Wrong field count for table row.");
+        }
+        auto tuple = std::make_unique<Tuple>();
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            tuple->addField(FieldParser::parseValue(schema.columns[i].type, values[i]));
+        }
+        return tuple;
+    }
+
+    std::unique_ptr<IPredicate> makeEqualityPredicate(
+            const TableSchema& schema,
+            const std::string& columnName,
+            const std::string& value) {
+        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
+        auto field = FieldParser::parseValue(schema.columns[column].type, value);
+        return std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(column),
+            SimplePredicate::Operand(std::move(field)),
+            SimplePredicate::ComparisonOperator::EQ
+        );
+    }
+
+    void executeUpdate(const ParsedStatement& statement) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        const size_t setColumn = static_cast<size_t>(
+            metadata.schema.getColumnIndex(statement.setColumnName));
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        auto field = FieldParser::parseValue(
+            metadata.schema.columns[setColumn].type,
+            statement.setValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        UpdateOperator updateOp(
+            tableHeap,
+            std::move(predicate),
+            {{setColumn, *field}}
+        );
+        executeStatementOperator(updateOp, false);
+    }
+
+    void executeDelete(const ParsedStatement& statement) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        DeleteOperator deleteOp(tableHeap, std::move(predicate));
+        executeStatementOperator(deleteOp, false);
+    }
+
+    void executeSelect(const ParsedStatement& statement) {
+        if (statement.query.isJoinQuery()) {
+            auto result = executeJoinPlan(statement.query);
+            printJoinPlanResult(statement.query, result);
+            return;
+        }
+        auto& metadata = catalog.getTable(statement.query.tableName);
+        executeQuery(statement.query, metadata, page_manager);
+    }
+
+    void executeStatementOperator(Operator& statementOperator, bool printResult) {
+        statementOperator.open();
+        while (statementOperator.next()) {
+            if (printResult) {
+                const auto& output = statementOperator.getOutput();
+                for (const auto& field : output) {
+                    field->print();
+                    std::cout << " ";
+                }
+                std::cout << std::endl;
+            }
+        }
+        statementOperator.close();
+    }
+};
+
+
+class QueryProcessor {
+private:
+    QueryParser query_parser;
+    QueryOptimizer query_optimizer;
+    QueryExecutor query_executor;
+
+public:
+    QueryProcessor(Catalog& catalog, PageManager& page_manager)
+        : query_parser(catalog),
+          query_optimizer(catalog, page_manager),
+          query_executor(catalog, page_manager) {}
+
+    QueryOptimizer& optimizer() {
+        return query_optimizer;
+    }
+
+    ParsedStatement parseStatement(const std::string& statement) {
+        return query_parser.parseStatement(statement);
+    }
+
+    QueryComponents parseSelectStatement(const std::string& statement) {
+        return parseStatement(statement).query;
+    }
+
+    void execute(const ParsedStatement& statement) {
+        if (statement.kind == ParsedStatement::Kind::Select &&
+            statement.query.isJoinQuery()) {
+            auto stats = query_optimizer.analyzeQueryTables(statement.query);
+            auto plan = query_optimizer.chooseGreedyJoinOrder(
+                statement.query,
+                stats,
+                SelectivityModel::MostCommonValues
+            );
+            auto join_kinds = query_optimizer.physicalJoinKindsForPlan(plan);
+            auto result = query_executor.executeJoinPlan(
+                plan.components,
+                &join_kinds
+            );
+            query_executor.printJoinPlanResult(plan.components, result);
+            return;
+        }
+        query_executor.execute(statement);
+    }
+
+    QueryResult executeJoinPlan(
+            const QueryComponents& components,
+            const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
+            size_t sample_limit = 5) {
+        return query_executor.executeJoinPlan(
+            components,
+            physical_join_kinds,
+            sample_limit
+        );
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        query_executor.insertRow(tableName, values, printResult);
+    }
+};
+
 
 
 void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
@@ -5586,6 +5917,7 @@ public:
     RecoveryManager recovery_manager;
     PageManager page_manager;
     Catalog catalog;
+    QueryProcessor query_processor;
     TransactionManager txn_manager;
     TxnPtr active_txn;
 
@@ -5594,7 +5926,8 @@ public:
                buffer_manager(log_manager),
                recovery_manager(buffer_manager, log_manager),
                page_manager(buffer_manager, recovery_manager),
-               catalog(buffer_manager, page_manager) {
+               catalog(buffer_manager, page_manager),
+               query_processor(catalog, page_manager) {
         recovery_manager.recover();
         catalog.load();
     }
@@ -5606,17 +5939,17 @@ public:
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
-        acquireStatementLocks(txn, statement);
+        auto parsed = query_processor.parseStatement(statement);
+        acquireStatementLocks(txn, parsed);
         recovery_manager.setCurrentTransaction(txn->id);
         try {
-            executeStatementsAndQueries({statement});
+            query_processor.execute(parsed);
         } catch (...) {
             recovery_manager.clearCurrentTransaction();
             throw;
         }
         recovery_manager.clearCurrentTransaction();
     }
-
     void commit(const TxnPtr& txn) {
         requireRunningTransaction(txn);
         auto cc_result = txn_manager.prepareCommit(*txn);
@@ -5707,7 +6040,7 @@ public:
                                     const std::string& value) {
         const size_t column = static_cast<size_t>(
             metadata.schema.getColumnIndex(columnName));
-        auto target = parseFieldValue(metadata.schema.columns[column].type, value);
+        auto target = FieldParser::parseValue(metadata.schema.columns[column].type, value);
         TableHeap tableHeap(metadata, page_manager);
 
         acquireTxnLocks(
@@ -5752,95 +6085,60 @@ public:
     }
 
     static std::vector<std::string> queryTableNamesForReadLocks(
-            const std::string& statement) {
+            const QueryComponents& components) {
         std::vector<std::string> table_names;
         std::set<std::string> seen;
-        std::regex tableRegex(
-            "\\b(?:FROM|JOIN)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-            std::regex_constants::icase
-        );
-
-        for (std::sregex_iterator it(statement.begin(),
-                                     statement.end(),
-                                     tableRegex);
-             it != std::sregex_iterator();
-             ++it) {
-            std::string table_name = (*it)[1];
-            if (seen.insert(table_name).second) {
-                table_names.push_back(std::move(table_name));
+        if (components.isJoinQuery()) {
+            for (const auto& table_ref : components.table_refs) {
+                if (seen.insert(table_ref.table_name).second) {
+                    table_names.push_back(table_ref.table_name);
+                }
             }
+            return table_names;
         }
-
+        if (!components.tableName.empty()) {
+            table_names.push_back(components.tableName);
+        }
         return table_names;
     }
 
     void acquireStatementLocks(const TxnPtr& txn,
-                               const std::string& statement) {
-        std::smatch matches;
-
-        std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*[^\\s;]+\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                               std::regex_constants::icase);
-        if (std::regex_match(statement, matches, updateRegex)) {
-            const std::string tableName = matches[1];
-            const std::string columnName = matches[2];
-            const std::string value = matches[3];
-            auto& metadata = catalog.getTable(tableName);
-            acquireMatchingTupleAccess(
-                txn,
-                AccessType::Write,
-                metadata,
-                columnName,
-                value
-            );
-            return;
-        }
-
-        std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                               std::regex_constants::icase);
-        if (std::regex_match(statement, matches, deleteRegex)) {
-            const std::string tableName = matches[1];
-            const std::string columnName = matches[2];
-            const std::string value = matches[3];
-            auto& metadata = catalog.getTable(tableName);
-            acquireMatchingTupleAccess(
-                txn,
-                AccessType::Write,
-                metadata,
-                columnName,
-                value
-            );
-            return;
-        }
-
-        std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
-                               std::regex_constants::icase);
-        if (std::regex_match(statement, matches, insertRegex)) {
-            const std::string tableName = matches[1];
-            auto& metadata = catalog.getTable(tableName);
-            acquireTableIntentionAccess(txn, AccessType::Write, metadata);
-            return;
-        }
-
-        std::regex selectRowRegex("^\\s*SELECT\\s+.*\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                  std::regex_constants::icase);
-        if (std::regex_match(statement, matches, selectRowRegex)) {
-            const std::string tableName = matches[1];
-            const std::string columnName = matches[2];
-            const std::string value = matches[3];
-            auto& metadata = catalog.getTable(tableName);
-            acquireMatchingTupleAccess(
-                txn,
-                AccessType::Read,
-                metadata,
-                columnName,
-                value
-            );
-            return;
-        }
-
-        for (const auto& tableName : queryTableNamesForReadLocks(statement)) {
-            auto& metadata = catalog.getTable(tableName);
-            acquireTableAccess(txn, AccessType::Read, metadata);
+                               const ParsedStatement& statement) {
+        switch (statement.kind) {
+            case ParsedStatement::Kind::Update: {
+                auto& metadata = catalog.getTable(statement.tableName);
+                acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
+                                           statement.whereColumnName,
+                                           statement.whereValue);
+                return;
+            }
+            case ParsedStatement::Kind::Delete: {
+                auto& metadata = catalog.getTable(statement.tableName);
+                acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
+                                           statement.whereColumnName,
+                                           statement.whereValue);
+                return;
+            }
+            case ParsedStatement::Kind::Insert: {
+                auto& metadata = catalog.getTable(statement.tableName);
+                acquireTableIntentionAccess(txn, AccessType::Write, metadata);
+                return;
+            }
+            case ParsedStatement::Kind::Select: {
+                if (!statement.query.isJoinQuery() &&
+                    statement.query.equalityCondition) {
+                    auto& metadata = catalog.getTable(statement.query.tableName);
+                    acquireMatchingTupleAccess(txn, AccessType::Read, metadata,
+                                               statement.query.equalityColumnName,
+                                               statement.query.equalityValueText);
+                    return;
+                }
+                for (const auto& tableName : queryTableNamesForReadLocks(statement.query)) {
+                    auto& metadata = catalog.getTable(tableName);
+                    acquireTableAccess(txn, AccessType::Read, metadata);
+                }
+                return;
+            }
         }
     }
 
@@ -5875,7 +6173,7 @@ public:
                                                             const std::string& columnName,
                                                             const std::string& value) {
         auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
-        auto field = parseFieldValue(schema.columns[column].type, value);
+        auto field = FieldParser::parseValue(schema.columns[column].type, value);
         return std::make_unique<SimplePredicate>(
             SimplePredicate::Operand(column),
             SimplePredicate::Operand(std::move(field)),
@@ -5901,12 +6199,7 @@ public:
     void insertRow(const std::string& tableName,
                    const std::vector<std::string>& values,
                    bool printResult = false) {
-        auto& metadata = catalog.getTable(tableName);
-        auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, page_manager);
-        InsertOperator insertOp(tableHeap);
-        insertOp.setTupleToInsert(std::move(tuple));
-        executeStatementOperator(insertOp, printResult);
+        query_processor.insertRow(tableName, values, printResult);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -5914,7 +6207,6 @@ public:
         int statementsSeen = 0;
         for (const auto& statement : statements) {
             std::cout << statement << "\n";
-            std::smatch matches;
             auto statementFinished = [&]() {
                 checkStatementCrashLimit(statementsSeen, crashAfterStatement);
             };
@@ -5951,84 +6243,15 @@ public:
                 continue;
             }
 
+            auto parsed = query_processor.parseStatement(statement);
             if (active_txn) {
-                acquireStatementLocks(active_txn, statement);
+                acquireStatementLocks(active_txn, parsed);
             }
-
-            std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, insertRegex)) {
-                const std::string tableName = matches[1];
-                const std::string valuesText = matches[2];
-                insertRow(tableName, split(valuesText, ','), false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, updateRegex)) {
-                const std::string tableName = matches[1];
-                const std::string setColumnName = matches[2];
-                const std::string setValue = matches[3];
-                const std::string whereColumnName = matches[4];
-                const std::string whereValue = matches[5];
-
-                auto& metadata = catalog.getTable(tableName);
-                const size_t setColumn = static_cast<size_t>(
-                    metadata.schema.getColumnIndex(setColumnName));
-                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
-                auto field = parseFieldValue(metadata.schema.columns[setColumn].type, setValue);
-                TableHeap tableHeap(metadata, page_manager);
-                UpdateOperator updateOp(
-                    tableHeap,
-                    std::move(predicate),
-                    {{setColumn, *field}}
-                );
-                executeStatementOperator(updateOp, false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, deleteRegex)) {
-                const std::string tableName = matches[1];
-                const std::string whereColumnName = matches[2];
-                const std::string whereValue = matches[3];
-
-                auto& metadata = catalog.getTable(tableName);
-                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
-                TableHeap tableHeap(metadata, page_manager);
-                DeleteOperator deleteOp(tableHeap, std::move(predicate));
-                executeStatementOperator(deleteOp, false);
-                statementFinished();
-                continue;
-            }
-
-            std::regex selectRegex("^\\s*(?:SELECT|PROJECT)\\s+(.*)\\s*;?\\s*$",
-                                   std::regex_constants::icase);
-            if (std::regex_match(statement, matches, selectRegex)) {
-                const std::string queryText = matches[1];
-                auto components = parseQuery(queryText, catalog);
-                if (components.isJoinQuery()) {
-                    auto result = executeJoinQuery(
-                        components,
-                        catalog,
-                        page_manager
-                    );
-                    printJoinQueryResult(components, result);
-                } else {
-                    auto& metadata = catalog.getTable(components.tableName);
-                    executeQuery(components, metadata, page_manager);
-                }
-                statementFinished();
-                continue;
-            }
-
-            throw std::runtime_error("Unsupported statement: " + statement);
+            query_processor.execute(parsed);
+            statementFinished();
         }
     }
+
 };
 
 struct ImportResult {
@@ -6073,6 +6296,20 @@ private:
         return schema;
     }
 
+    static std::unique_ptr<Tuple> makeTuple(
+            const TableSchema& schema,
+            const std::vector<std::string>& values) {
+        if (values.size() != schema.columns.size()) {
+            throw std::runtime_error("Wrong field count for table row.");
+        }
+
+        auto tuple = std::make_unique<Tuple>();
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            tuple->addField(FieldParser::parseValue(schema.columns[i].type, values[i]));
+        }
+        return tuple;
+    }
+
     static void appendRow(BuzzDB& db,
                           const std::string& tableName,
                           const std::vector<std::string>& values,
@@ -6108,12 +6345,12 @@ public:
         std::unordered_map<std::string, PageID> append_pages;
         std::string line;
         while (std::getline(inputFile, line)) {
-            line = trim(line);
+            line = TextUtil::trim(line);
             if (line.empty() || line[0] == '#') {
                 continue;
             }
 
-            auto tokens = split(line, '|');
+            auto tokens = TextUtil::split(line, '|');
             if (tokens.empty()) {
                 continue;
             }
@@ -6194,17 +6431,6 @@ void printImportResult(const ImportResult& result) {
     throw std::runtime_error("Importer finished without loading or skipping.");
 }
 
-QueryComponents parseSelectStatement(const std::string& statement,
-                                     Catalog& catalog) {
-    std::smatch matches;
-    std::regex selectRegex("^\\s*(?:SELECT|PROJECT)\\s+(.*)\\s*;?\\s*$",
-                           std::regex_constants::icase);
-    if (!std::regex_match(statement, matches, selectRegex)) {
-        throw std::runtime_error("Expected SELECT statement.");
-    }
-    return parseQuery(matches[1], catalog);
-}
-
 struct TimedQueryResult {
     QueryResult result;
     double elapsed_seconds = 0.0;
@@ -6217,12 +6443,10 @@ TimedQueryResult executeJoinQueryInTransaction(
     auto txn = db.beginTransaction();
     try {
         auto query_start = std::chrono::high_resolution_clock::now();
-        auto result = executeJoinQuery(
+        auto result = db.query_processor.executeJoinPlan(
             components,
-            db.catalog,
-            db.page_manager,
-            0,
-            physical_join_kinds
+            physical_join_kinds,
+            0
         );
         auto query_end = std::chrono::high_resolution_clock::now();
         db.commit(txn);
@@ -6269,28 +6493,30 @@ void runImdbJoinOrdering() {
                   << import_elapsed.count() << " seconds" << std::endl;
     }
 
-    auto components = parseSelectStatement(imdb_join_query, db.catalog);
-    auto stats = analyzeQueryTables(components, db.catalog, db.page_manager);
+    auto components = db.query_processor.parseSelectStatement(imdb_join_query);
+    auto stats = db.query_processor.optimizer().analyzeQueryTables(components);
 
-    printEqualityFilterEstimateComparison(
+    db.query_processor.optimizer().printEqualityFilterEstimateComparison(
         components,
-        db.catalog,
-        db.page_manager,
         stats
     );
 
-    auto greedy_plan = chooseGreedyJoinOrder(
+    auto greedy_plan = db.query_processor.optimizer().chooseGreedyJoinOrder(
         components,
         stats,
         SelectivityModel::MostCommonValues
     );
-    auto selinger_result = chooseSelingerLeftDeepJoinOrder(
+    auto selinger_result =
+        db.query_processor.optimizer().chooseSelingerLeftDeepJoinOrder(
         components,
         stats,
         SelectivityModel::MostCommonValues
     );
     const auto& selinger_plan = selinger_result.plan;
-    printJoinOrderPlan("MCV-greedy optimizer order", greedy_plan, db.catalog);
+    db.query_processor.optimizer().printJoinOrderPlan(
+        "MCV-greedy optimizer order",
+        greedy_plan
+    );
     std::cout << "\nSelinger left-deep DP search:"
               << " kept " << selinger_result.states_kept
               << " state(s), considered "
@@ -6298,14 +6524,15 @@ void runImdbJoinOrdering() {
               << " candidate extension(s), estimated cost="
               << formatEstimate(selinger_result.estimated_cost)
               << std::endl;
-    printJoinOrderPlan(
+    db.query_processor.optimizer().printJoinOrderPlan(
         "Selinger left-deep DP order",
-        selinger_plan,
-        db.catalog
+        selinger_plan
     );
 
-    auto greedy_join_kinds = physicalJoinKindsForPlan(greedy_plan);
-    auto selinger_join_kinds = physicalJoinKindsForPlan(selinger_plan);
+    auto greedy_join_kinds =
+        db.query_processor.optimizer().physicalJoinKindsForPlan(greedy_plan);
+    auto selinger_join_kinds =
+        db.query_processor.optimizer().physicalJoinKindsForPlan(selinger_plan);
     std::cout << "\nQuery time comparison "
               << "(buffer pool cleared before each run):" << std::endl;
     db.buffer_manager.clearBufferPool();

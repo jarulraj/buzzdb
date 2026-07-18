@@ -2459,8 +2459,10 @@ struct TableSchema {
     }
 };
 
-std::string trim(const std::string& input);
-std::vector<std::string> split(const std::string& input, char delimiter);
+struct TextUtil {
+    static std::string trim(const std::string& input);
+    static std::vector<std::string> split(const std::string& input, char delimiter);
+};
 
 // Catalog-owned table description.
 struct TableMetadata {
@@ -2768,7 +2770,7 @@ private:
         PageID tables_first_page = INVALID_PAGE_ID;
         PageID columns_first_page = INVALID_PAGE_ID;
         while (std::getline(input, line)) {
-            auto tokens = split(line, '|');
+            auto tokens = TextUtil::split(line, '|');
             if (tokens.size() != 2) {
                 continue;
             }
@@ -3344,17 +3346,21 @@ private:
 
 };
 
-std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
-    switch (type) {
-        case INT:
-            return std::make_unique<Field>(std::stoi(value));
-        case FLOAT:
-            return std::make_unique<Field>(std::stof(value));
-        case STRING:
-            return std::make_unique<Field>(value);
+struct FieldParser {
+    static std::unique_ptr<Field> parseValue(FieldType type,
+                                             const std::string& value) {
+        switch (type) {
+            case INT:
+                return std::make_unique<Field>(std::stoi(value));
+            case FLOAT:
+                return std::make_unique<Field>(std::stof(value));
+            case STRING:
+                return std::make_unique<Field>(value);
+        }
+        throw std::runtime_error("Unsupported field type.");
     }
-    throw std::runtime_error("Unsupported field type.");
-}
+};
+
 
 struct QueryComponents {
     std::string tableName;
@@ -3394,7 +3400,7 @@ QueryComponents parseQuery(const std::string& query, Catalog& catalog) {
             int column = metadata.schema.getColumnIndex(columnName);
             components.equalityCondition = true;
             components.equalityAttributeIndex = column;
-            components.equalityValue = parseFieldValue(
+            components.equalityValue = FieldParser::parseValue(
                 metadata.schema.columns[static_cast<size_t>(column)].type,
                 value
             );
@@ -3707,7 +3713,7 @@ public:
     }
 };
 
-std::string trim(const std::string& input) {
+std::string TextUtil::trim(const std::string& input) {
     size_t start = 0;
     while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
         start++;
@@ -3721,12 +3727,12 @@ std::string trim(const std::string& input) {
     return input.substr(start, end - start);
 }
 
-std::vector<std::string> split(const std::string& input, char delimiter) {
+std::vector<std::string> TextUtil::split(const std::string& input, char delimiter) {
     std::vector<std::string> tokens;
     std::stringstream stream(input);
     std::string token;
     while (std::getline(stream, token, delimiter)) {
-        tokens.push_back(trim(token));
+        tokens.push_back(TextUtil::trim(token));
     }
     return tokens;
 }
@@ -4790,7 +4796,7 @@ private:
 
         auto tuple = std::make_unique<Tuple>();
         for (size_t i = 0; i < schema.columns.size(); i++) {
-            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
+            tuple->addField(FieldParser::parseValue(schema.columns[i].type, values[i]));
         }
         return tuple;
     }
@@ -4811,12 +4817,12 @@ public:
         std::map<std::string, TableId> imported_table_ids;
         std::string line;
         while (std::getline(inputFile, line)) {
-            line = trim(line);
+            line = TextUtil::trim(line);
             if (line.empty() || line[0] == '#') {
                 continue;
             }
 
-            auto tokens = split(line, '|');
+            auto tokens = TextUtil::split(line, '|');
             if (tokens[0] == "TABLE") {
                 const std::string table_name = tokens[1];
                 auto schema = parseTableSchema(tokens);

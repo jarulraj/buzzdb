@@ -3538,17 +3538,20 @@ private:
 
 };
 
-std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
-    switch (type) {
-        case INT:
-            return std::make_unique<Field>(std::stoi(value));
-        case FLOAT:
-            return std::make_unique<Field>(std::stof(value));
-        case STRING:
-            return std::make_unique<Field>(value);
+struct FieldParser {
+    static std::unique_ptr<Field> parseValue(FieldType type,
+                                             const std::string& value) {
+        switch (type) {
+            case INT:
+                return std::make_unique<Field>(std::stoi(value));
+            case FLOAT:
+                return std::make_unique<Field>(std::stof(value));
+            case STRING:
+                return std::make_unique<Field>(value);
+        }
+        throw std::runtime_error("Unsupported field type.");
     }
-    throw std::runtime_error("Unsupported field type.");
-}
+};
 
 struct QueryComponents {
     std::string tableName;
@@ -3566,81 +3569,6 @@ struct QueryComponents {
     int equalityAttributeIndex = -1;
     std::unique_ptr<Field> equalityValue;
 };
-
-QueryComponents parseQuery(const std::string& query, Catalog& catalog) {
-    QueryComponents components;
-
-    std::regex selectAllRegex(
-        "^\\s*\\{\\*\\}\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+))?\\s*$",
-        std::regex_constants::icase);
-    std::smatch selectAllMatches;
-    if (std::regex_match(query, selectAllMatches, selectAllRegex)) {
-        const std::string tableName = selectAllMatches[1];
-        const auto& metadata = catalog.getTable(tableName);
-
-        components.tableName = tableName;
-        for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
-            components.selectAttributes.push_back(static_cast<int>(i));
-        }
-        if (selectAllMatches[2].matched) {
-            const std::string columnName = selectAllMatches[2];
-            const std::string value = selectAllMatches[3];
-            int column = metadata.schema.getColumnIndex(columnName);
-            components.equalityCondition = true;
-            components.equalityAttributeIndex = column;
-            components.equalityValue = parseFieldValue(
-                metadata.schema.columns[static_cast<size_t>(column)].type,
-                value
-            );
-        }
-        return components;
-    }
-
-    std::regex queryRegex(
-        "^\\s*(SUM|COUNT)\\(([A-Za-z_][A-Za-z0-9_]*)\\)\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+GROUP\\s+BY\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*>\\s*(-?\\d+)\\s+and\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*<\\s*(-?\\d+))?\\s*$",
-        std::regex_constants::icase);
-    std::smatch matches;
-    if (!std::regex_match(query, matches, queryRegex)) {
-        throw std::runtime_error("Unsupported query: " + query);
-    }
-
-    std::string aggregateName = matches[1];
-    for (auto& ch : aggregateName) {
-        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    }
-    const std::string aggregateColumnName = matches[2];
-    const std::string tableName = matches[3];
-    const std::string groupByColumnName = matches[4];
-    const auto& metadata = catalog.getTable(tableName);
-
-    components.tableName = tableName;
-    components.aggregateOperation = true;
-    components.aggregateFunction = (aggregateName == "COUNT")
-        ? AggrFuncType::COUNT
-        : AggrFuncType::SUM;
-    components.aggregateAttributeIndex = metadata.schema.getColumnIndex(aggregateColumnName);
-    components.groupBy = true;
-    components.groupByAttributeIndex = metadata.schema.getColumnIndex(groupByColumnName);
-    components.selectAttributes.push_back(components.aggregateAttributeIndex);
-
-    if (matches[5].matched) {
-        const std::string lowerBoundColumnName = matches[5];
-        const int lowerBound = std::stoi(matches[6]);
-        const std::string upperBoundColumnName = matches[7];
-        const int upperBound = std::stoi(matches[8]);
-
-        if (lowerBoundColumnName != upperBoundColumnName) {
-            throw std::runtime_error("WHERE clause conditions apply to different columns.");
-        }
-
-        components.whereCondition = true;
-        components.whereAttributeIndex = metadata.schema.getColumnIndex(lowerBoundColumnName);
-        components.lowerBound = lowerBound;
-        components.upperBound = upperBound;
-    }
-
-    return components;
-}
 
 std::string aggregateFunctionName(AggrFuncType function) {
     switch (function) {
@@ -3982,19 +3910,6 @@ std::vector<std::string> TextUtil::split(const std::string& input, char delimite
     return tokens;
 }
 
-void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
-    if (crashAfterStatement <= 0) {
-        return;
-    }
-
-    statementsSeen++;
-    if (statementsSeen == crashAfterStatement) {
-        throw std::runtime_error(
-            "Simulated crash after statement " + std::to_string(statementsSeen)
-        );
-    }
-}
-
 struct ParsedStatement {
     enum class Kind { Insert, Update, Delete, Select };
     Kind kind;
@@ -4010,6 +3925,81 @@ struct ParsedStatement {
 class QueryParser {
 private:
     Catalog& catalog;
+
+    QueryComponents parseQuery(const std::string& query) {
+        QueryComponents components;
+
+        std::regex selectAllRegex(
+            "^\\s*\\{\\*\\}\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+))?\\s*$",
+            std::regex_constants::icase);
+        std::smatch selectAllMatches;
+        if (std::regex_match(query, selectAllMatches, selectAllRegex)) {
+            const std::string tableName = selectAllMatches[1];
+            const auto& metadata = catalog.getTable(tableName);
+
+            components.tableName = tableName;
+            for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
+                components.selectAttributes.push_back(static_cast<int>(i));
+            }
+            if (selectAllMatches[2].matched) {
+                const std::string columnName = selectAllMatches[2];
+                const std::string value = selectAllMatches[3];
+                int column = metadata.schema.getColumnIndex(columnName);
+                components.equalityCondition = true;
+                components.equalityAttributeIndex = column;
+                components.equalityValue = FieldParser::parseValue(
+                    metadata.schema.columns[static_cast<size_t>(column)].type,
+                    value
+                );
+            }
+            return components;
+        }
+
+        std::regex queryRegex(
+            "^\\s*(SUM|COUNT)\\(([A-Za-z_][A-Za-z0-9_]*)\\)\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+GROUP\\s+BY\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*>\\s*(-?\\d+)\\s+and\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*<\\s*(-?\\d+))?\\s*$",
+            std::regex_constants::icase);
+        std::smatch matches;
+        if (!std::regex_match(query, matches, queryRegex)) {
+            throw std::runtime_error("Unsupported query: " + query);
+        }
+
+        std::string aggregateName = matches[1];
+        for (auto& ch : aggregateName) {
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        }
+        const std::string aggregateColumnName = matches[2];
+        const std::string tableName = matches[3];
+        const std::string groupByColumnName = matches[4];
+        const auto& metadata = catalog.getTable(tableName);
+
+        components.tableName = tableName;
+        components.aggregateOperation = true;
+        components.aggregateFunction = (aggregateName == "COUNT")
+            ? AggrFuncType::COUNT
+            : AggrFuncType::SUM;
+        components.aggregateAttributeIndex = metadata.schema.getColumnIndex(aggregateColumnName);
+        components.groupBy = true;
+        components.groupByAttributeIndex = metadata.schema.getColumnIndex(groupByColumnName);
+        components.selectAttributes.push_back(components.aggregateAttributeIndex);
+
+        if (matches[5].matched) {
+            const std::string lowerBoundColumnName = matches[5];
+            const int lowerBound = std::stoi(matches[6]);
+            const std::string upperBoundColumnName = matches[7];
+            const int upperBound = std::stoi(matches[8]);
+
+            if (lowerBoundColumnName != upperBoundColumnName) {
+                throw std::runtime_error("WHERE clause conditions apply to different columns.");
+            }
+
+            components.whereCondition = true;
+            components.whereAttributeIndex = metadata.schema.getColumnIndex(lowerBoundColumnName);
+            components.lowerBound = lowerBound;
+            components.upperBound = upperBound;
+        }
+
+        return components;
+    }
 
 public:
     explicit QueryParser(Catalog& catalog) : catalog(catalog) {}
@@ -4056,7 +4046,7 @@ public:
         if (std::regex_match(statement, matches, selectRegex)) {
             ParsedStatement parsed;
             parsed.kind = ParsedStatement::Kind::Select;
-            parsed.query = parseQuery(matches[1], catalog);
+            parsed.query = parseQuery(matches[1]);
             return parsed;
         }
 
@@ -4116,7 +4106,7 @@ private:
 
         auto tuple = std::make_unique<Tuple>();
         for (size_t i = 0; i < schema.columns.size(); i++) {
-            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
+            tuple->addField(FieldParser::parseValue(schema.columns[i].type, values[i]));
         }
         return tuple;
     }
@@ -4126,7 +4116,7 @@ private:
         const std::string& columnName,
         const std::string& value) {
         auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
-        auto field = parseFieldValue(schema.columns[column].type, value);
+        auto field = FieldParser::parseValue(schema.columns[column].type, value);
         return std::make_unique<SimplePredicate>(
             SimplePredicate::Operand(column),
             SimplePredicate::Operand(std::move(field)),
@@ -4145,7 +4135,7 @@ private:
             statement.whereColumnName,
             statement.whereValue
         );
-        auto field = parseFieldValue(
+        auto field = FieldParser::parseValue(
             metadata.schema.columns[setColumn].type,
             statement.setValue
         );
@@ -4392,6 +4382,21 @@ public:
                 active_txn ? &transactional_storage_manager.txn_manager : nullptr
             );
             statementFinished();
+        }
+    }
+
+private:
+    static void checkStatementCrashLimit(int& statementsSeen,
+                                         int crashAfterStatement) {
+        if (crashAfterStatement <= 0) {
+            return;
+        }
+
+        statementsSeen++;
+        if (statementsSeen == crashAfterStatement) {
+            throw std::runtime_error(
+                "Simulated crash after statement " + std::to_string(statementsSeen)
+            );
         }
     }
 };
