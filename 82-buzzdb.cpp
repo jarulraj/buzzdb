@@ -3931,6 +3931,35 @@ private:
     }
 };
 
+class QueryProcessor {
+private:
+    QueryParser parser;
+    QueryExecutor executor;
+
+public:
+    QueryProcessor(Catalog& catalog, PageManager& page_manager)
+        : parser(catalog),
+          executor(catalog, page_manager) {}
+
+    ParsedStatement parseStatement(const std::string& statement) {
+        return parser.parseStatement(statement);
+    }
+
+    void execute(const ParsedStatement& statement) {
+        executor.execute(statement);
+    }
+
+    void execute(const std::string& statement) {
+        execute(parser.parseStatement(statement));
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        executor.insertRow(tableName, values, printResult);
+    }
+};
+
 
 struct TxnContext {
     int id;
@@ -4387,7 +4416,7 @@ public:
     }
 };
 
-class BuzzDB {
+class TransactionalStorageManager {
 public:
     LogManager log_manager;
     BufferManager buffer_manager;
@@ -4395,25 +4424,34 @@ public:
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
-    QueryParser query_parser;
-    QueryExecutor query_executor;
+
+    TransactionalStorageManager()
+        : log_manager(),
+          buffer_manager(log_manager),
+          recovery_manager(buffer_manager, log_manager),
+          page_manager(buffer_manager, recovery_manager),
+          catalog(buffer_manager, page_manager),
+          txn_manager() {
+        recovery_manager.recover();
+        catalog.load();
+    }
+};
+
+class BuzzDB {
+public:
+    TransactionalStorageManager transactional_storage_manager;
+    QueryProcessor query_processor;
     TxnPtr active_txn;
     IsolationLevel isolation_level = IsolationLevel::RepeatableRead;
 
 public:
-    BuzzDB() : log_manager(),
-               buffer_manager(log_manager),
-               recovery_manager(buffer_manager, log_manager),
-               page_manager(buffer_manager, recovery_manager),
-               catalog(buffer_manager, page_manager),
-               query_parser(catalog),
-               query_executor(catalog, page_manager) {
-        recovery_manager.recover();
-        catalog.load();
-    }
+    BuzzDB()
+        : transactional_storage_manager(),
+          query_processor(transactional_storage_manager.catalog,
+                          transactional_storage_manager.page_manager) {}
 
     std::string concurrencyControlPolicyName() const {
-        return txn_manager.concurrencyControlPolicyName();
+        return transactional_storage_manager.txn_manager.concurrencyControlPolicyName();
     }
 
     static std::string isolationLevelName(IsolationLevel level) {
@@ -4429,27 +4467,31 @@ public:
     }
 
     TxnPtr beginTransaction() {
-        int txn_id = recovery_manager.begin();
-        return txn_manager.begin(txn_id);
+        int txn_id =
+            transactional_storage_manager.recovery_manager.begin();
+        return transactional_storage_manager.txn_manager.begin(txn_id);
     }
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
-        auto parsed = query_parser.parseStatement(statement);
+        auto parsed = query_processor.parseStatement(statement);
         acquireStatementLocks(txn, parsed);
-        recovery_manager.setCurrentTransaction(txn->id);
+        transactional_storage_manager.recovery_manager.setCurrentTransaction(
+            txn->id
+        );
         try {
-            query_executor.execute(parsed);
+            query_processor.execute(parsed);
         } catch (...) {
-            recovery_manager.clearCurrentTransaction();
+            transactional_storage_manager.recovery_manager.clearCurrentTransaction();
             throw;
         }
-        recovery_manager.clearCurrentTransaction();
+        transactional_storage_manager.recovery_manager.clearCurrentTransaction();
     }
 
     void commit(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        auto cc_result = txn_manager.prepareCommit(*txn);
+        auto cc_result =
+            transactional_storage_manager.txn_manager.prepareCommit(*txn);
         if (!cc_result.granted) {
             abort(txn);
             throw std::runtime_error(
@@ -4457,14 +4499,14 @@ public:
                 std::to_string(txn->id)
             );
         }
-        recovery_manager.commit(txn->id);
-        txn_manager.commit(*txn);
+        transactional_storage_manager.recovery_manager.commit(txn->id);
+        transactional_storage_manager.txn_manager.commit(*txn);
     }
 
     void abort(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        recovery_manager.abort(txn->id);
-        txn_manager.abort(*txn);
+        transactional_storage_manager.recovery_manager.abort(txn->id);
+        transactional_storage_manager.txn_manager.abort(*txn);
     }
 
     void begin() {
@@ -4491,11 +4533,38 @@ public:
     }
 
     void crashAt(CrashPoint point) {
-        recovery_manager.crashAt(point);
+        transactional_storage_manager.recovery_manager.crashAt(point);
     }
 
     void checkpoint() {
-        recovery_manager.checkpoint();
+        transactional_storage_manager.recovery_manager.checkpoint();
+    }
+
+    Catalog& catalog() {
+        return transactional_storage_manager.catalog;
+    }
+
+    const Catalog& catalog() const {
+        return transactional_storage_manager.catalog;
+    }
+
+    PageManager& pageManager() {
+        return transactional_storage_manager.page_manager;
+    }
+
+    bool createTable(const std::string& name, TableSchema schema) {
+        return transactional_storage_manager.catalog.createTable(
+            name,
+            std::move(schema)
+        );
+    }
+
+    bool hasTable(const std::string& name) const {
+        return transactional_storage_manager.catalog.hasTable(name);
+    }
+
+    bool isDatabaseEmpty() const {
+        return transactional_storage_manager.catalog.empty();
     }
 
     static void requireRunningTransaction(const TxnPtr& txn) {
@@ -4560,7 +4629,10 @@ public:
         const size_t column = static_cast<size_t>(
             metadata.schema.getColumnIndex(columnName));
         auto target = FieldParser::parseValue(metadata.schema.columns[column].type, value);
-        TableHeap tableHeap(metadata, page_manager);
+        TableHeap tableHeap(
+            metadata,
+            transactional_storage_manager.page_manager
+        );
 
         acquireTxnLocks(
             txn,
@@ -4630,26 +4702,38 @@ public:
                                const ParsedStatement& statement) {
         switch (statement.kind) {
             case ParsedStatement::Kind::Update: {
-                auto& metadata = catalog.getTable(statement.tableName);
+                auto& metadata =
+                    transactional_storage_manager.catalog.getTable(
+                        statement.tableName
+                    );
                 acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
                                            statement.whereColumnName,
                                            statement.whereValue);
                 return;
             }
             case ParsedStatement::Kind::Delete: {
-                auto& metadata = catalog.getTable(statement.tableName);
+                auto& metadata =
+                    transactional_storage_manager.catalog.getTable(
+                        statement.tableName
+                    );
                 acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
                                            statement.whereColumnName,
                                            statement.whereValue);
                 return;
             }
             case ParsedStatement::Kind::Insert: {
-                auto& metadata = catalog.getTable(statement.tableName);
+                auto& metadata =
+                    transactional_storage_manager.catalog.getTable(
+                        statement.tableName
+                    );
                 acquireTableIntentionAccess(txn, AccessType::Write, metadata);
                 return;
             }
             case ParsedStatement::Kind::Select: {
-                auto& metadata = catalog.getTable(statement.query.tableName);
+                auto& metadata =
+                    transactional_storage_manager.catalog.getTable(
+                        statement.query.tableName
+                    );
                 if (statement.query.equalityCondition) {
                     acquireMatchingTupleAccess(txn, AccessType::Read, metadata,
                                                statement.query.equalityColumnName,
@@ -4676,7 +4760,11 @@ public:
                       << " lock on " << resourceLabel(lock.resource)
                       << "." << std::endl;
 
-            auto result = txn_manager.requestAccess(txn, {lock});
+            auto result =
+                transactional_storage_manager.txn_manager.requestAccess(
+                    txn,
+                    {lock}
+                );
 
             if (result.deadlock) {
                 std::cout << "Deadlock detected in waits-for graph: "
@@ -4712,7 +4800,7 @@ public:
     void insertRow(const std::string& tableName,
                    const std::vector<std::string>& values,
                    bool printResult = false) {
-        query_executor.insertRow(tableName, values, printResult);
+        query_processor.insertRow(tableName, values, printResult);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -4756,11 +4844,11 @@ public:
                 continue;
             }
 
-            auto parsed = query_parser.parseStatement(statement);
+            auto parsed = query_processor.parseStatement(statement);
             if (active_txn) {
                 acquireStatementLocks(active_txn, parsed);
             }
-            query_executor.execute(parsed);
+            query_processor.execute(parsed);
             statementFinished();
         }
     }
@@ -4841,9 +4929,9 @@ private:
                           const std::string& tableName,
                           const std::vector<std::string>& values,
                           std::unordered_map<std::string, PageID>& append_pages) {
-        auto& metadata = db.catalog.getTable(tableName);
+        auto& metadata = db.catalog().getTable(tableName);
         auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, db.page_manager);
+        TableHeap tableHeap(metadata, db.pageManager());
 
         auto cursor = append_pages.find(tableName);
         if (cursor == append_pages.end()) {
@@ -4858,7 +4946,7 @@ private:
 public:
     static ImportResult importFile(BuzzDB& db, const std::string& filename) {
         ImportResult result;
-        if (!db.catalog.empty()) {
+        if (!db.isDatabaseEmpty()) {
             result.skipped = true;
             result.reason = "database already has user tables";
             return result;
@@ -4887,7 +4975,7 @@ public:
                     throw std::runtime_error("Bad TABLE line: " + line);
                 }
                 const std::string tableName = tokens[1];
-                if (!db.catalog.createTable(tableName, parseTableSchema(tokens))) {
+                if (!db.createTable(tableName, parseTableSchema(tokens))) {
                     throw std::runtime_error("Duplicate TABLE declaration: " + tableName);
                 }
                 result.tables_created++;
@@ -4895,7 +4983,7 @@ public:
             }
 
             const std::string tableName = tokens[0];
-            if (!db.catalog.hasTable(tableName)) {
+            if (!db.hasTable(tableName)) {
                 throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
             }
 
@@ -4914,7 +5002,7 @@ const std::string imdb_title_lookup_query =
     "SELECT {*} FROM title WHERE id = 2008135";
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
-    if (db.catalog.empty()) {
+    if (db.isDatabaseEmpty()) {
         return DatabaseImporter::importFile(db, imdb_data_filename);
     }
 
