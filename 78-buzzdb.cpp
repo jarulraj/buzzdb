@@ -374,6 +374,10 @@ public:
         return record->header;
     }
 
+    bool hasTuple(size_t slot_id) const {
+        return slot_id < MAX_SLOTS && !slots()[slot_id].empty;
+    }
+
     bool updateTuple(size_t slot_id, std::unique_ptr<Tuple> tuple) {
         if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
             return false;
@@ -1470,7 +1474,7 @@ private:
     LogManager& log_manager;
     CrashPoint crash_point = CrashPoint::NONE;
     int next_txn_id = 1;
-    int current_txn_id = 0;
+    inline static thread_local int current_txn_id = 0;
     bool recovery_trace_enabled = false;
     std::map<int, RuntimeTxnState> runtime_txns;
     RecoveryAnalysis::DirtyPageTable dirty_page_table;
@@ -2644,6 +2648,10 @@ public:
         return readPage(page_id).getTupleHeader(slot);
     }
 
+    bool hasTuple(PageID page_id, size_t slot) {
+        return readPage(page_id).hasTuple(slot);
+    }
+
     void updateTupleHeader(PageID page_id,
                            size_t slot,
                            const TupleTimestampHeader& header) {
@@ -2760,6 +2768,10 @@ public:
         }
 
         return tuples;
+    }
+
+    const TableMetadata& tableMetadata() const {
+        return metadata;
     }
 
 private:
@@ -3039,6 +3051,39 @@ private:
     }
 };
 
+struct TxnContext {
+    int id;
+    enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
+};
+
+using TxnPtr = std::shared_ptr<TxnContext>;
+
+struct TupleId {
+    TableId table_id;
+    PageID page_id;
+    size_t slot_id;
+};
+
+class ConcurrencyControlHooks {
+public:
+    virtual ~ConcurrencyControlHooks() = default;
+    virtual void beforeTableRead(const TxnPtr& txn,
+                                 const TableMetadata& metadata) = 0;
+    virtual void beforeTupleRead(const TxnPtr& txn,
+                                 const TableMetadata& metadata,
+                                 PageID page_id,
+                                 size_t slot_id) = 0;
+    virtual void beforeTupleWrite(const TxnPtr& txn,
+                                  const TableMetadata& metadata,
+                                  PageID page_id,
+                                  size_t slot_id) = 0;
+    virtual void beforeTupleInsert(const TxnPtr& txn,
+                                   const TableMetadata& metadata,
+                                   const Tuple& tuple) = 0;
+};
+
+enum class ScanLockMode { None, Table, Tuple };
+
 class Operator {
     public:
     virtual ~Operator() = default;
@@ -3057,6 +3102,14 @@ class Operator {
     /// `next()` returns true, the Fields will contain the values for the
     /// next tuple. Each `Field` pointer in the vector stands for one attribute of the tuple.
     virtual std::vector<std::unique_ptr<Field>> getOutput() = 0;
+};
+
+class TupleLocationProvider {
+public:
+    virtual ~TupleLocationProvider() = default;
+    virtual std::optional<TupleId> currentTupleId() const = 0;
+    virtual const TableMetadata& currentTableMetadata() const = 0;
+    virtual std::unique_ptr<Tuple> reloadCurrentTuple() = 0;
 };
 
 class UnaryOperator : public Operator {
@@ -3081,21 +3134,40 @@ class BinaryOperator : public Operator {
     ~BinaryOperator() override = default;
 };
 
-class ScanOperator : public Operator {
+class ScanOperator : public Operator, public TupleLocationProvider {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    ConcurrencyControlHooks* cc_hooks;
+    ScanLockMode lock_mode;
     PageID currentPageId = INVALID_PAGE_ID;
     size_t currentSlotIndex = 0;
+    PageID outputPageId = INVALID_PAGE_ID;
+    size_t outputSlotIndex = 0;
+    bool outputLocationValid = false;
     std::unique_ptr<Tuple> currentTuple;
     size_t tuple_count = 0;
 
 public:
-    ScanOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+    ScanOperator(TableHeap& tableHeap,
+                 const TxnPtr& txn = nullptr,
+                 ConcurrencyControlHooks* cc_hooks = nullptr,
+                 ScanLockMode lock_mode = ScanLockMode::None)
+        : tableHeap(tableHeap),
+          txn(txn),
+          cc_hooks(cc_hooks),
+          lock_mode(lock_mode) {}
 
     void open() override {
         currentPageId = tableHeap.firstPage();
         currentSlotIndex = 0;
+        outputPageId = INVALID_PAGE_ID;
+        outputSlotIndex = 0;
+        outputLocationValid = false;
         currentTuple.reset();
+        if (cc_hooks && txn && lock_mode == ScanLockMode::Table) {
+            cc_hooks->beforeTableRead(txn, tableHeap.tableMetadata());
+        }
     }
 
     bool next() override {
@@ -3106,6 +3178,9 @@ public:
     void close() override {
         currentPageId = INVALID_PAGE_ID;
         currentSlotIndex = 0;
+        outputPageId = INVALID_PAGE_ID;
+        outputSlotIndex = 0;
+        outputLocationValid = false;
         currentTuple.reset();
     }
 
@@ -3116,17 +3191,51 @@ public:
         return {};
     }
 
+    std::optional<TupleId> currentTupleId() const override {
+        if (!outputLocationValid) {
+            return std::nullopt;
+        }
+        return TupleId{tableHeap.tableMetadata().table_id, outputPageId, outputSlotIndex};
+    }
+
+    const TableMetadata& currentTableMetadata() const override {
+        return tableHeap.tableMetadata();
+    }
+
+    std::unique_ptr<Tuple> reloadCurrentTuple() override {
+        if (!outputLocationValid) {
+            return nullptr;
+        }
+        return tableHeap.getTuple(outputPageId, outputSlotIndex);
+    }
+
 private:
     void loadNextTuple() {
+        outputLocationValid = false;
         while (currentPageId != INVALID_PAGE_ID) {
             if (currentSlotIndex >= MAX_SLOTS) {
                 currentSlotIndex = 0;
             }
 
             while (currentSlotIndex < MAX_SLOTS) {
-                auto tuple = tableHeap.getTuple(currentPageId, currentSlotIndex);
+                size_t slot = currentSlotIndex;
                 currentSlotIndex++;
+                if (!tableHeap.hasTuple(currentPageId, slot)) {
+                    continue;
+                }
+                if (cc_hooks && txn && lock_mode == ScanLockMode::Tuple) {
+                    cc_hooks->beforeTupleRead(
+                        txn,
+                        tableHeap.tableMetadata(),
+                        currentPageId,
+                        slot
+                    );
+                }
+                auto tuple = tableHeap.getTuple(currentPageId, slot);
                 if (tuple) {
+                    outputPageId = currentPageId;
+                    outputSlotIndex = slot;
+                    outputLocationValid = true;
                     currentTuple = std::move(tuple);
                     tuple_count++;
                     return;
@@ -3276,12 +3385,24 @@ public:
 class SelectOperator : public UnaryOperator {
 private:
     std::unique_ptr<IPredicate> predicate;
+    TxnPtr txn;
+    ConcurrencyControlHooks* cc_hooks;
+    TupleLocationProvider* location_provider;
     bool has_next;
     std::vector<std::unique_ptr<Field>> currentOutput;
 
 public:
-    SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate)
-        : UnaryOperator(input), predicate(std::move(predicate)), has_next(false) {}
+    SelectOperator(Operator& input,
+                   std::unique_ptr<IPredicate> predicate,
+                   const TxnPtr& txn = nullptr,
+                   ConcurrencyControlHooks* cc_hooks = nullptr,
+                   TupleLocationProvider* location_provider = nullptr)
+        : UnaryOperator(input),
+          predicate(std::move(predicate)),
+          txn(txn),
+          cc_hooks(cc_hooks),
+          location_provider(location_provider),
+          has_next(false) {}
 
     void open() override {
         input->open();
@@ -3293,6 +3414,27 @@ public:
         while (input->next()) {
             const auto& output = input->getOutput();
             if (predicate->check(output)) {
+                if (cc_hooks && txn && location_provider) {
+                    auto tuple_id = location_provider->currentTupleId();
+                    if (tuple_id) {
+                        cc_hooks->beforeTupleRead(
+                            txn,
+                            location_provider->currentTableMetadata(),
+                            tuple_id->page_id,
+                            tuple_id->slot_id
+                        );
+                        auto locked_tuple = location_provider->reloadCurrentTuple();
+                        if (!locked_tuple || !predicate->check(locked_tuple->fields)) {
+                            continue;
+                        }
+                        currentOutput.clear();
+                        for (const auto& field : locked_tuple->fields) {
+                            currentOutput.push_back(field->clone());
+                        }
+                        has_next = true;
+                        return true;
+                    }
+                }
                 currentOutput.clear();
                 for (const auto& field : output) {
                     currentOutput.push_back(field->clone());
@@ -3729,14 +3871,28 @@ void printColumnHeader(const QueryComponents& components,
 
 void executeQuery(const QueryComponents& components, 
                   TableMetadata& metadata,
-                  PageManager& page_manager) {
+                  PageManager& page_manager,
+                  const TxnPtr& txn = nullptr,
+                  ConcurrencyControlHooks* cc_hooks = nullptr,
+                  ScanLockMode scan_lock_mode = ScanLockMode::None) {
     TableHeap tableHeap(metadata, page_manager);
-    ScanOperator scanOp(tableHeap);
 
-    Operator* rootOp = &scanOp;
+    Operator* rootOp = nullptr;
 
+    std::optional<ScanOperator> scanOpBuffer;
     std::optional<SelectOperator> selectOpBuffer;
     std::optional<HashAggregationOperator> hashAggOpBuffer;
+
+    ScanLockMode scan_operator_lock_mode = scan_lock_mode;
+    bool lock_selected_tuples = components.equalityCondition &&
+                                txn &&
+                                cc_hooks &&
+                                scan_lock_mode == ScanLockMode::Tuple;
+    if (lock_selected_tuples) {
+        scan_operator_lock_mode = ScanLockMode::None;
+    }
+    scanOpBuffer.emplace(tableHeap, txn, cc_hooks, scan_operator_lock_mode);
+    rootOp = &*scanOpBuffer;
 
     if (components.equalityCondition) {
         auto predicate = std::make_unique<SimplePredicate>(
@@ -3745,7 +3901,13 @@ void executeQuery(const QueryComponents& components,
             SimplePredicate::ComparisonOperator::EQ
         );
 
-        selectOpBuffer.emplace(*rootOp, std::move(predicate));
+        selectOpBuffer.emplace(
+            *rootOp,
+            std::move(predicate),
+            lock_selected_tuples ? txn : nullptr,
+            lock_selected_tuples ? cc_hooks : nullptr,
+            lock_selected_tuples ? &*scanOpBuffer : nullptr
+        );
         rootOp = &*selectOpBuffer;
     } else if (components.whereAttributeIndex != -1) {
         auto predicate1 = std::make_unique<SimplePredicate>(
@@ -3800,12 +3962,19 @@ void executeQuery(const QueryComponents& components,
 class InsertOperator : public Operator {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    ConcurrencyControlHooks* cc_hooks;
     std::unique_ptr<Tuple> tupleToInsert;
     bool executed = false;
     size_t insertedCount = 0;
 
 public:
-    InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+    InsertOperator(TableHeap& tableHeap,
+                   const TxnPtr& txn = nullptr,
+                   ConcurrencyControlHooks* cc_hooks = nullptr)
+        : tableHeap(tableHeap),
+          txn(txn),
+          cc_hooks(cc_hooks) {}
 
     void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
         tupleToInsert = std::move(tuple);
@@ -3821,6 +3990,9 @@ public:
             return false;
         }
 
+        if (tupleToInsert && cc_hooks && txn) {
+            cc_hooks->beforeTupleInsert(txn, tableHeap.tableMetadata(), *tupleToInsert);
+        }
         if (tupleToInsert && tableHeap.addTuple(std::move(tupleToInsert))) {
             insertedCount = 1;
         }
@@ -3841,6 +4013,8 @@ public:
 class UpdateOperator : public Operator {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    ConcurrencyControlHooks* cc_hooks;
     std::unique_ptr<IPredicate> predicate;
     std::vector<std::pair<size_t, Field>> assignments;
     bool executed = false;
@@ -3848,9 +4022,13 @@ private:
 
 public:
     UpdateOperator(TableHeap& tableHeap,
+                   const TxnPtr& txn,
+                   ConcurrencyControlHooks* cc_hooks,
                    std::unique_ptr<IPredicate> predicate,
                    std::vector<std::pair<size_t, Field>> assignments)
         : tableHeap(tableHeap),
+          txn(txn),
+          cc_hooks(cc_hooks),
           predicate(std::move(predicate)),
           assignments(std::move(assignments)) {}
 
@@ -3868,11 +4046,26 @@ public:
              pageId != INVALID_PAGE_ID;
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
+                if (!tableHeap.hasTuple(pageId, slot)) {
+                    continue;
+                }
                 auto tuple = tableHeap.getTuple(pageId, slot);
                 if (!tuple || !predicate->check(tuple->fields)) {
                     continue;
                 }
 
+                if (cc_hooks && txn) {
+                    cc_hooks->beforeTupleWrite(
+                        txn,
+                        tableHeap.tableMetadata(),
+                        pageId,
+                        slot
+                    );
+                }
+                tuple = tableHeap.getTuple(pageId, slot);
+                if (!tuple || !predicate->check(tuple->fields)) {
+                    continue;
+                }
                 for (const auto& assignment : assignments) {
                     if (assignment.first >= tuple->fields.size()) {
                         throw std::runtime_error("UPDATE column is out of range.");
@@ -3900,14 +4093,20 @@ public:
 class DeleteOperator : public Operator {
 private:
     TableHeap& tableHeap;
+    TxnPtr txn;
+    ConcurrencyControlHooks* cc_hooks;
     std::unique_ptr<IPredicate> predicate;
     bool executed = false;
     size_t deletedCount = 0;
 
 public:
     DeleteOperator(TableHeap& tableHeap,
+                   const TxnPtr& txn,
+                   ConcurrencyControlHooks* cc_hooks,
                    std::unique_ptr<IPredicate> predicate)
         : tableHeap(tableHeap),
+          txn(txn),
+          cc_hooks(cc_hooks),
           predicate(std::move(predicate)) {}
 
     void open() override {
@@ -3924,7 +4123,22 @@ public:
              pageId != INVALID_PAGE_ID;
              pageId = tableHeap.nextPage(pageId)) {
             for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
+                if (!tableHeap.hasTuple(pageId, slot)) {
+                    continue;
+                }
                 auto tuple = tableHeap.getTuple(pageId, slot);
+                if (!tuple || !predicate->check(tuple->fields)) {
+                    continue;
+                }
+                if (cc_hooks && txn) {
+                    cc_hooks->beforeTupleWrite(
+                        txn,
+                        tableHeap.tableMetadata(),
+                        pageId,
+                        slot
+                    );
+                }
+                tuple = tableHeap.getTuple(pageId, slot);
                 if (!tuple || !predicate->check(tuple->fields)) {
                     continue;
                 }
@@ -3971,168 +4185,39 @@ std::vector<std::string> TextUtil::split(const std::string& input, char delimite
 }
 
 
-class QueryExecutor {
-private:
-    Catalog& catalog;
-    PageManager& page_manager;
-
-public:
-    QueryExecutor(Catalog& catalog, PageManager& page_manager)
-        : catalog(catalog),
-          page_manager(page_manager) {}
-
-    void execute(const ParsedStatement& statement) {
-        switch (statement.kind) {
-            case ParsedStatement::Kind::Insert:
-                insertRow(statement.tableName, statement.values);
-                return;
-            case ParsedStatement::Kind::Update:
-                executeUpdate(statement);
-                return;
-            case ParsedStatement::Kind::Delete:
-                executeDelete(statement);
-                return;
-            case ParsedStatement::Kind::Select:
-                executeSelect(statement);
-                return;
-        }
-        throw std::runtime_error("Unsupported parsed statement.");
-    }
-
-    void insertRow(const std::string& tableName,
-                   const std::vector<std::string>& values,
-                   bool printResult = false) {
-        auto& metadata = catalog.getTable(tableName);
-        auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, page_manager);
-        InsertOperator insertOp(tableHeap);
-        insertOp.setTupleToInsert(std::move(tuple));
-        executeStatementOperator(insertOp, printResult);
-    }
-
-private:
-    std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
-                                     const std::vector<std::string>& values) {
-        if (values.size() != schema.columns.size()) {
-            throw std::runtime_error("Wrong field count for table row.");
-        }
-
-        auto tuple = std::make_unique<Tuple>();
-        for (size_t i = 0; i < schema.columns.size(); i++) {
-            tuple->addField(FieldParser::parseValue(schema.columns[i].type, values[i]));
-        }
-        return tuple;
-    }
-
-    std::unique_ptr<IPredicate> makeEqualityPredicate(
-        const TableSchema& schema,
-        const std::string& columnName,
-        const std::string& value) {
-        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
-        auto field = FieldParser::parseValue(schema.columns[column].type, value);
-        return std::make_unique<SimplePredicate>(
-            SimplePredicate::Operand(column),
-            SimplePredicate::Operand(std::move(field)),
-            SimplePredicate::ComparisonOperator::EQ
-        );
-    }
-
-    void executeUpdate(const ParsedStatement& statement) {
-        auto& metadata = catalog.getTable(statement.tableName);
-        const size_t setColumn = static_cast<size_t>(
-            metadata.schema.getColumnIndex(statement.setColumnName));
-        auto predicate = makeEqualityPredicate(
-            metadata.schema,
-            statement.whereColumnName,
-            statement.whereValue
-        );
-        auto field = FieldParser::parseValue(
-            metadata.schema.columns[setColumn].type,
-            statement.setValue
-        );
-        TableHeap tableHeap(metadata, page_manager);
-        UpdateOperator updateOp(
-            tableHeap,
-            std::move(predicate),
-            {{setColumn, *field}}
-        );
-        executeStatementOperator(updateOp, false);
-    }
-
-    void executeDelete(const ParsedStatement& statement) {
-        auto& metadata = catalog.getTable(statement.tableName);
-        auto predicate = makeEqualityPredicate(
-            metadata.schema,
-            statement.whereColumnName,
-            statement.whereValue
-        );
-        TableHeap tableHeap(metadata, page_manager);
-        DeleteOperator deleteOp(tableHeap, std::move(predicate));
-        executeStatementOperator(deleteOp, false);
-    }
-
-    void executeSelect(const ParsedStatement& statement) {
-        auto& metadata = catalog.getTable(statement.query.tableName);
-        executeQuery(statement.query, metadata, page_manager);
-    }
-
-    void executeStatementOperator(Operator& statementOperator, bool printResult) {
-        statementOperator.open();
-        while (statementOperator.next()) {
-            if (printResult) {
-                const auto& output = statementOperator.getOutput();
-                for (const auto& field : output) {
-                    field->print();
-                    std::cout << " ";
-                }
-                std::cout << std::endl;
-            }
-        }
-        statementOperator.close();
-    }
-};
-
-
-struct TxnContext {
-    int id;
-    enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
-};
-
-using TxnPtr = std::shared_ptr<TxnContext>;
-
 enum class LockMode { S, X };
 
+enum class ConcurrencyControlResourceType { Table, Tuple };
+
 struct ConcurrencyControlResource {
+    ConcurrencyControlResourceType type;
     TableId table_id;
     PageID page_id;
     size_t slot_id;
 
+    static ConcurrencyControlResource table(TableId table_id) {
+        return {ConcurrencyControlResourceType::Table, table_id, INVALID_PAGE_ID, 0};
+    }
+
     static ConcurrencyControlResource tuple(TableId table_id,
                                             PageID page_id,
                                             size_t slot_id) {
-        return {table_id, page_id, slot_id};
+        return {ConcurrencyControlResourceType::Tuple, table_id, page_id, slot_id};
     }
 
     bool operator<(const ConcurrencyControlResource& other) const {
+        if (type != other.type) {
+            return static_cast<int>(type) < static_cast<int>(other.type);
+        }
         if (table_id != other.table_id) {
             return table_id < other.table_id;
         }
         if (page_id != other.page_id) {
             return page_id < other.page_id;
         }
-        if (slot_id != other.slot_id) {
-            return slot_id < other.slot_id;
-        }
-        return false;
+        return slot_id < other.slot_id;
     }
 };
-
-static std::string concurrencyResourceLabel(
-        const ConcurrencyControlResource& resource) {
-    return "tuple table=" + std::to_string(resource.table_id) +
-           "[page=" + std::to_string(resource.page_id) +
-           ", slot=" + std::to_string(resource.slot_id) + "]";
-}
 
 class DirectedGraph {
 public:
@@ -4207,6 +4292,7 @@ private:
 public:
     struct LockRequestResult {
         bool granted = false;
+        std::string reason;
         std::vector<int> blockers;
     };
 
@@ -4216,45 +4302,28 @@ public:
         std::vector<int> cycle;
     };
 
-    bool hasLock(int txn_id, const ConcurrencyControlResource& resource, LockMode mode) {
-        std::lock_guard<std::mutex> guard(latch);
-        auto it = locks.find(resource);
-        if (it == locks.end()) {
-            return false;
-        }
-        for (const auto& grant : it->second) {
-            if (grant.txn_id == txn_id && grant.mode == mode) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    AcquireResult acquire(int txn_id,
-                          const ConcurrencyControlResource& resource,
-                          LockMode mode) {
+    AcquireResult acquire(
+            int txn_id,
+            const ConcurrencyControlResource& resource,
+            LockMode mode,
+            const std::function<void(const std::string&)>& on_wait) {
         std::unique_lock<std::mutex> guard(latch);
         bool waited = false;
         while (true) {
             auto attempt = tryAcquireLocked(txn_id, resource, mode);
             if (attempt.granted) {
                 waits_for.removeNode(txn_id);
-                AcquireResult result;
-                result.waited = waited;
-                return result;
+                return {waited, false, {}};
             }
             waits_for.setOutgoingEdges(txn_id, attempt.blockers);
             if (!waited) {
                 waited = true;
+                on_wait(attempt.reason);
             }
             auto cycle = waits_for.cycleFrom(txn_id);
             if (!cycle.empty()) {
                 waits_for.removeNode(txn_id);
-                AcquireResult result;
-                result.waited = waited;
-                result.deadlock = true;
-                result.cycle = std::move(cycle);
-                return result;
+                return {waited, true, std::move(cycle)};
             }
             lock_cv.wait(guard);
         }
@@ -4288,54 +4357,40 @@ public:
         }
     }
 
-    static std::string modeName(LockMode mode) {
-        switch (mode) {
-            case LockMode::S:
-                return "S";
-            case LockMode::X:
-                return "X";
-        }
-        throw std::runtime_error("Unknown lock mode.");
-    }
-
 private:
     LockRequestResult tryAcquireLocked(int txn_id,
                                        const ConcurrencyControlResource& resource,
                                        LockMode mode) {
         auto& grants = locks[resource];
-        LockMode effectiveMode = mode;
-        for (const auto& grant : grants) {
-            if (grant.txn_id == txn_id) {
-                effectiveMode = coalescedMode(grant.mode, mode);
-                break;
-            }
-        }
-
-        auto blockers = blockersForLocked(txn_id, grants, effectiveMode);
+        auto blockers = blockersForLocked(txn_id, grants, mode);
         if (!blockers.empty()) {
             LockRequestResult result;
+            result.reason = "txn " + std::to_string(blockers.front()) +
+                            " holds an incompatible lock";
             result.blockers = std::move(blockers);
             return result;
         }
 
+        LockRequestResult result;
         for (auto& grant : grants) {
             if (grant.txn_id == txn_id) {
-                grant.mode = effectiveMode;
-                LockRequestResult result;
+                if (grant.mode == LockMode::S && mode == LockMode::X) {
+                    grant.mode = LockMode::X;
+                }
                 result.granted = true;
                 return result;
             }
         }
 
-        grants.push_back({txn_id, effectiveMode});
-        LockRequestResult result;
+        grants.push_back({txn_id, mode});
         result.granted = true;
         return result;
     }
 
-    std::vector<int> blockersForLocked(int txn_id,
-                                       const std::vector<LockGrant>& grants,
-                                       LockMode mode) const {
+    static std::vector<int> blockersForLocked(
+            int txn_id,
+            const std::vector<LockGrant>& grants,
+            LockMode mode) {
         std::vector<int> blockers;
         for (const auto& grant : grants) {
             if (grant.txn_id != txn_id && !compatible(mode, grant.mode)) {
@@ -4346,30 +4401,7 @@ private:
     }
 
     static bool compatible(LockMode requested, LockMode held) {
-        switch (requested) {
-            case LockMode::S:
-                return held == LockMode::S;
-            case LockMode::X:
-                return false;
-        }
-        throw std::runtime_error("Unknown lock mode.");
-    }
-
-    static bool strongerOrEqual(LockMode held, LockMode requested) {
-        if (held == requested || held == LockMode::X) {
-            return true;
-        }
-        return false;
-    }
-
-    static LockMode coalescedMode(LockMode held, LockMode requested) {
-        if (strongerOrEqual(held, requested)) {
-            return held;
-        }
-        if (strongerOrEqual(requested, held)) {
-            return requested;
-        }
-        return requested;
+        return requested == LockMode::S && held == LockMode::S;
     }
 };
 
@@ -4383,9 +4415,19 @@ static LockMode lockModeForAccess(AccessType type) {
     return type == AccessType::Read ? LockMode::S : LockMode::X;
 }
 
+static std::string concurrencyResourceLabel(
+        const ConcurrencyControlResource& resource) {
+    if (resource.type == ConcurrencyControlResourceType::Table) {
+        return "table table=" + std::to_string(resource.table_id);
+    }
+    return "tuple table=" + std::to_string(resource.table_id) +
+           "[page=" + std::to_string(resource.page_id) +
+           ", slot=" + std::to_string(resource.slot_id) + "]";
+}
+
 struct ConcurrencyControlRequest {
     int txn_id;
-    AccessType type;
+    AccessType access_type;
     std::vector<ConcurrencyControlResource> resources;
     TupleTimestampHeader observed_header;
 };
@@ -4428,10 +4470,14 @@ public:
     ConcurrencyControlResult beforeAccess(
             const ConcurrencyControlRequest& request) override {
         ConcurrencyControlResult policy_result;
-        LockMode mode = lockModeForAccess(request.type);
+        LockMode mode = lockModeForAccess(request.access_type);
 
         for (const auto& resource : request.resources) {
-            auto lock_result = lock_manager.acquire(request.txn_id, resource, mode);
+            auto lock_result = lock_manager.acquire(
+                request.txn_id,
+                resource,
+                mode,
+                [](const std::string&) {});
             policy_result.waited = policy_result.waited || lock_result.waited;
             if (lock_result.deadlock) {
                 policy_result.granted = false;
@@ -4498,7 +4544,6 @@ public:
         ConcurrencyControlResult result;
         for (const auto& resource : request.resources) {
             auto updated_header = request.observed_header;
-            // Basic TO only: no Thomas write rule and no private workspace.
             std::cout << "TO check: txn " << request.txn_id
                       << " TS=" << txn_ts
                       << ", " << concurrencyResourceLabel(resource)
@@ -4506,7 +4551,7 @@ public:
                       << ", writeTS=" << updated_header.write_ts
                       << "." << std::endl;
 
-            if (request.type == AccessType::Read) {
+            if (request.access_type == AccessType::Read) {
                 if (txn_ts < updated_header.write_ts) {
                     return abortResult(
                         "txn timestamp " + std::to_string(txn_ts) +
@@ -4556,10 +4601,37 @@ public:
     }
 };
 
-class TransactionManager {
+std::string txnCycleLabel(const std::vector<int>& cycle) {
+    std::string label;
+    for (int txn_id : cycle) {
+        if (!label.empty()) {
+            label += " -> ";
+        }
+        label += "txn " + std::to_string(txn_id);
+    }
+    return label;
+}
+
+class DeadlockError : public std::runtime_error {
+public:
+    explicit DeadlockError(const std::string& message)
+        : std::runtime_error(message) {}
+};
+
+class ConcurrencyControlAbort : public std::runtime_error {
+public:
+    explicit ConcurrencyControlAbort(const std::string& message)
+        : std::runtime_error(message) {}
+};
+
+class TransactionManager : public ConcurrencyControlHooks {
 private:
     LockManager lock_manager;
     std::unique_ptr<ConcurrencyControlPolicy> concurrency_control_policy;
+    std::function<std::optional<TupleTimestampHeader>(
+        const ConcurrencyControlResource&)> tuple_header_reader;
+    std::function<void(const ConcurrencyControlResource&,
+                       const TupleTimestampHeader&)> tuple_header_publisher;
 
 public:
     TransactionManager() {
@@ -4576,6 +4648,18 @@ public:
             std::make_unique<TimestampOrderingPolicy>();
     }
 
+    void setTupleTimestampHeaderReader(
+            std::function<std::optional<TupleTimestampHeader>(
+                const ConcurrencyControlResource&)> reader) {
+        tuple_header_reader = std::move(reader);
+    }
+
+    void setTupleTimestampHeaderPublisher(
+            std::function<void(const ConcurrencyControlResource&,
+                               const TupleTimestampHeader&)> publisher) {
+        tuple_header_publisher = std::move(publisher);
+    }
+
     std::string concurrencyControlPolicyName() const {
         return concurrency_control_policy->name();
     }
@@ -4585,22 +4669,6 @@ public:
         auto txn = std::make_shared<TxnContext>(TxnContext{txn_id});
         concurrency_control_policy->begin(txn_id);
         return txn;
-    }
-
-    ConcurrencyControlResult requestAccess(
-            const TxnPtr& txn,
-            AccessType type,
-            const std::vector<ConcurrencyControlResource>& resources,
-            const TupleTimestampHeader& observed_header = {}) {
-        if (!txn || resources.empty()) {
-            return {};
-        }
-        return concurrency_control_policy->beforeAccess({
-            txn->id,
-            type,
-            resources,
-            observed_header
-        });
     }
 
     ConcurrencyControlResult prepareCommit(const TxnContext& txn) {
@@ -4618,9 +4686,319 @@ public:
         std::cout << "ABORT txn " << txn.id << std::endl;
         concurrency_control_policy->abort(txn.id);
     }
+
+    void beforeTableRead(const TxnPtr& txn,
+                         const TableMetadata& metadata) override {
+        if (!txn) {
+            return;
+        }
+        requestAccess(
+            txn,
+            AccessType::Read,
+            {ConcurrencyControlResource::table(metadata.table_id)}
+        );
+    }
+
+    void beforeTupleRead(const TxnPtr& txn,
+                         const TableMetadata& metadata,
+                         PageID page_id,
+                         size_t slot_id) override {
+        if (!txn) {
+            return;
+        }
+        requestAccess(
+            txn,
+            AccessType::Read,
+            {ConcurrencyControlResource::tuple(metadata.table_id, page_id, slot_id)},
+            observedHeader(ConcurrencyControlResource::tuple(
+                metadata.table_id,
+                page_id,
+                slot_id
+            ))
+        );
+    }
+
+    void beforeTupleWrite(const TxnPtr& txn,
+                          const TableMetadata& metadata,
+                          PageID page_id,
+                          size_t slot_id) override {
+        if (!txn) {
+            return;
+        }
+        requestAccess(
+            txn,
+            AccessType::Write,
+            {ConcurrencyControlResource::tuple(metadata.table_id, page_id, slot_id)},
+            observedHeader(ConcurrencyControlResource::tuple(
+                metadata.table_id,
+                page_id,
+                slot_id
+            ))
+        );
+    }
+
+    void beforeTupleInsert(const TxnPtr& txn,
+                           const TableMetadata& metadata,
+                           const Tuple& tuple) override {
+        (void)txn;
+        (void)metadata;
+        (void)tuple;
+    }
+
+private:
+    static std::string resourceLabel(const ConcurrencyControlResource& resource) {
+        return concurrencyResourceLabel(resource);
+    }
+
+    TupleTimestampHeader observedHeader(
+            const ConcurrencyControlResource& resource) const {
+        if (resource.type != ConcurrencyControlResourceType::Tuple ||
+            !tuple_header_reader) {
+            return {};
+        }
+        auto header = tuple_header_reader(resource);
+        if (!header) {
+            return {};
+        }
+        return *header;
+    }
+
+    void requestAccess(
+            const TxnPtr& txn,
+            AccessType access_type,
+            const std::vector<ConcurrencyControlResource>& resources,
+            const TupleTimestampHeader& observed_header = {}) {
+        if (!txn || resources.empty()) {
+            return;
+        }
+
+        for (const auto& resource : resources) {
+            std::cout << "CC policy " << concurrencyControlPolicyName()
+                      << ": txn " << txn->id
+                      << " requests " << accessTypeName(access_type)
+                      << " access to " << resourceLabel(resource)
+                      << "." << std::endl;
+        }
+
+        auto result = concurrency_control_policy->beforeAccess({
+            txn->id,
+            access_type,
+            resources,
+            observed_header
+        });
+        if (result.deadlock) {
+            std::cout << "Deadlock detected in waits-for graph: "
+                      << txnCycleLabel(result.cycle)
+                      << ". Choosing txn " << txn->id
+                      << " as victim." << std::endl;
+            throw DeadlockError(
+                "DEADLOCK: txn " + std::to_string(txn->id) +
+                " chosen as victim"
+            );
+        }
+
+        if (!result.granted) {
+            std::cout << "CC policy " << concurrencyControlPolicyName()
+                      << ": txn " << txn->id << " aborts";
+            if (!result.detail.empty()) {
+                std::cout << " because " << result.detail;
+            }
+            std::cout << "." << std::endl;
+            throw ConcurrencyControlAbort(
+                result.detail.empty()
+                    ? "Concurrency-control policy rejected access for txn " +
+                          std::to_string(txn->id)
+                    : result.detail
+            );
+        }
+
+        for (const auto& update : result.header_updates) {
+            if (tuple_header_publisher) {
+                tuple_header_publisher(update.first, update.second);
+                std::cout << "TO publishes " << resourceLabel(update.first)
+                          << " readTS=" << update.second.read_ts
+                          << ", writeTS=" << update.second.write_ts
+                          << "." << std::endl;
+            }
+        }
+
+        for (const auto& resource : resources) {
+            std::cout << "CC policy " << concurrencyControlPolicyName()
+                      << ": txn " << txn->id
+                      << " " << accessTypeName(access_type)
+                      << " access to " << resourceLabel(resource);
+            if (result.waited) {
+                std::cout << " granted after wait." << std::endl;
+            } else {
+                std::cout << " granted." << std::endl;
+            }
+        }
+    }
 };
 
-class BuzzDB {
+class QueryExecutor {
+private:
+    Catalog& catalog;
+    PageManager& page_manager;
+
+public:
+    QueryExecutor(Catalog& catalog, PageManager& page_manager)
+        : catalog(catalog),
+          page_manager(page_manager) {}
+
+    void execute(const ParsedStatement& statement,
+                 const TxnPtr& txn = nullptr,
+                 TransactionManager* txn_manager = nullptr) {
+        switch (statement.kind) {
+            case ParsedStatement::Kind::Insert:
+                insertRow(statement.tableName, statement.values, false, txn, txn_manager);
+                return;
+            case ParsedStatement::Kind::Update:
+                executeUpdate(statement, txn, txn_manager);
+                return;
+            case ParsedStatement::Kind::Delete:
+                executeDelete(statement, txn, txn_manager);
+                return;
+            case ParsedStatement::Kind::Select:
+                executeSelect(statement, txn, txn_manager);
+                return;
+        }
+        throw std::runtime_error("Unsupported parsed statement.");
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false,
+                   const TxnPtr& txn = nullptr,
+                   TransactionManager* txn_manager = nullptr) {
+        auto& metadata = catalog.getTable(tableName);
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, page_manager);
+        InsertOperator insertOp(tableHeap, txn, txn_manager);
+        insertOp.setTupleToInsert(std::move(tuple));
+        executeStatementOperator(insertOp, printResult);
+    }
+
+private:
+    std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                     const std::vector<std::string>& values) {
+        if (values.size() != schema.columns.size()) {
+            throw std::runtime_error("Wrong field count for table row.");
+        }
+
+        auto tuple = std::make_unique<Tuple>();
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            tuple->addField(FieldParser::parseValue(schema.columns[i].type, values[i]));
+        }
+        return tuple;
+    }
+
+    std::unique_ptr<IPredicate> makeEqualityPredicate(
+        const TableSchema& schema,
+        const std::string& columnName,
+        const std::string& value) {
+        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
+        auto field = FieldParser::parseValue(schema.columns[column].type, value);
+        return std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(column),
+            SimplePredicate::Operand(std::move(field)),
+            SimplePredicate::ComparisonOperator::EQ
+        );
+    }
+
+    void executeUpdate(const ParsedStatement& statement,
+                       const TxnPtr& txn,
+                       TransactionManager* txn_manager) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        const size_t setColumn = static_cast<size_t>(
+            metadata.schema.getColumnIndex(statement.setColumnName));
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        auto field = FieldParser::parseValue(
+            metadata.schema.columns[setColumn].type,
+            statement.setValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        UpdateOperator updateOp(
+            tableHeap,
+            txn,
+            txn_manager,
+            std::move(predicate),
+            {{setColumn, *field}}
+        );
+        executeStatementOperator(updateOp, false);
+    }
+
+    void executeDelete(const ParsedStatement& statement,
+                       const TxnPtr& txn,
+                       TransactionManager* txn_manager) {
+        auto& metadata = catalog.getTable(statement.tableName);
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        TableHeap tableHeap(metadata, page_manager);
+        DeleteOperator deleteOp(tableHeap, txn, txn_manager, std::move(predicate));
+        executeStatementOperator(deleteOp, false);
+    }
+
+    void executeSelect(const ParsedStatement& statement,
+                       const TxnPtr& txn,
+                       TransactionManager* txn_manager) {
+        auto& metadata = catalog.getTable(statement.query.tableName);
+        ScanLockMode lock_mode = (txn_manager && txn)
+            ? ScanLockMode::Tuple
+            : ScanLockMode::None;
+        executeQuery(statement.query, metadata, page_manager, txn, txn_manager, lock_mode);
+    }
+
+    void executeStatementOperator(Operator& statementOperator, bool printResult) {
+        statementOperator.open();
+        while (statementOperator.next()) {
+            if (printResult) {
+                const auto& output = statementOperator.getOutput();
+                for (const auto& field : output) {
+                    field->print();
+                    std::cout << " ";
+                }
+                std::cout << std::endl;
+            }
+        }
+        statementOperator.close();
+    }
+};
+
+class QueryProcessor {
+private:
+    QueryParser parser;
+    QueryExecutor executor;
+
+public:
+    QueryProcessor(Catalog& catalog, PageManager& page_manager)
+        : parser(catalog),
+          executor(catalog, page_manager) {}
+
+    void execute(const std::string& statement,
+                 const TxnPtr& txn = nullptr,
+                 TransactionManager* txn_manager = nullptr) {
+        auto parsed = parser.parseStatement(statement);
+        executor.execute(parsed, txn, txn_manager);
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false,
+                   const TxnPtr& txn = nullptr,
+                   TransactionManager* txn_manager = nullptr) {
+        executor.insertRow(tableName, values, printResult, txn, txn_manager);
+    }
+};
+
+class TransactionalStorageManager {
 public:
     LogManager log_manager;
     BufferManager buffer_manager;
@@ -4628,75 +5006,94 @@ public:
     PageManager page_manager;
     Catalog catalog;
     TransactionManager txn_manager;
-    QueryParser query_parser;
-    QueryExecutor query_executor;
-    TxnPtr active_txn;
 
-public:
-    BuzzDB() : log_manager(),
-               buffer_manager(log_manager),
-               recovery_manager(buffer_manager, log_manager),
-               page_manager(buffer_manager, recovery_manager),
-               catalog(buffer_manager, page_manager),
-               query_parser(catalog),
-               query_executor(catalog, page_manager) {
-        useTwoPhaseLockingPolicy();
+    TransactionalStorageManager()
+        : log_manager(),
+          buffer_manager(log_manager),
+          recovery_manager(buffer_manager, log_manager),
+          page_manager(buffer_manager, recovery_manager),
+          catalog(buffer_manager, page_manager),
+          txn_manager() {
         recovery_manager.recover();
         catalog.load();
     }
+};
+
+class BuzzDB {
+public:
+    TransactionalStorageManager transactional_storage_manager;
+    QueryProcessor query_processor;
+    TxnPtr active_txn;
+
+public:
+    BuzzDB()
+        : transactional_storage_manager(),
+          query_processor(transactional_storage_manager.catalog,
+                          transactional_storage_manager.page_manager) {}
 
     void useTwoPhaseLockingPolicy() {
-        txn_manager.useTwoPhaseLockingPolicy();
+        transactional_storage_manager.txn_manager.useTwoPhaseLockingPolicy();
     }
 
     void useTimestampOrderingPolicy() {
-        txn_manager.useTimestampOrderingPolicy();
+        transactional_storage_manager.txn_manager.useTimestampOrderingPolicy();
+        configureTimestampHeaderAccessors();
     }
 
     std::string concurrencyControlPolicyName() const {
-        return txn_manager.concurrencyControlPolicyName();
+        return transactional_storage_manager.txn_manager.concurrencyControlPolicyName();
     }
 
     TxnPtr beginTransaction() {
-        int txn_id = recovery_manager.begin();
-        return txn_manager.begin(txn_id);
+        int txn_id = transactional_storage_manager.recovery_manager.begin();
+        return transactional_storage_manager.txn_manager.begin(txn_id);
     }
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
-        auto parsed = query_parser.parseStatement(statement);
-        if (!acquireStatementAccess(txn, parsed)) {
-            return;
-        }
-        recovery_manager.setCurrentTransaction(txn->id);
+        std::cout << statement << "\n";
+        transactional_storage_manager.recovery_manager.setCurrentTransaction(txn->id);
         try {
-            query_executor.execute(parsed);
+            query_processor.execute(
+                statement,
+                txn,
+                &transactional_storage_manager.txn_manager
+            );
+        } catch (const DeadlockError&) {
+            transactional_storage_manager.recovery_manager.abort(txn->id);
+            transactional_storage_manager.txn_manager.abort(*txn);
+            transactional_storage_manager.recovery_manager.clearCurrentTransaction();
+            return;
+        } catch (const ConcurrencyControlAbort&) {
+            transactional_storage_manager.recovery_manager.abort(txn->id);
+            transactional_storage_manager.txn_manager.abort(*txn);
+            transactional_storage_manager.recovery_manager.clearCurrentTransaction();
+            return;
         } catch (...) {
-            recovery_manager.clearCurrentTransaction();
+            transactional_storage_manager.recovery_manager.clearCurrentTransaction();
             throw;
         }
-        recovery_manager.clearCurrentTransaction();
+        transactional_storage_manager.recovery_manager.clearCurrentTransaction();
     }
 
     void commit(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        auto cc_result = txn_manager.prepareCommit(*txn);
+        auto cc_result = transactional_storage_manager.txn_manager.prepareCommit(*txn);
         if (!cc_result.granted) {
             abort(txn);
-            std::string detail = cc_result.detail.empty()
-                ? "Concurrency-control policy rejected COMMIT"
-                : cc_result.detail;
-            throw std::runtime_error(detail + " for txn " +
-                                     std::to_string(txn->id));
+            throw std::runtime_error(
+                "Concurrency-control policy rejected COMMIT for txn " +
+                std::to_string(txn->id)
+            );
         }
-        recovery_manager.commit(txn->id);
-        txn_manager.commit(*txn);
+        transactional_storage_manager.recovery_manager.commit(txn->id);
+        transactional_storage_manager.txn_manager.commit(*txn);
     }
 
     void abort(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        recovery_manager.abort(txn->id);
-        txn_manager.abort(*txn);
+        transactional_storage_manager.recovery_manager.abort(txn->id);
+        transactional_storage_manager.txn_manager.abort(*txn);
     }
 
     void begin() {
@@ -4723,19 +5120,44 @@ public:
     }
 
     void crashAt(CrashPoint point) {
-        recovery_manager.crashAt(point);
+        transactional_storage_manager.recovery_manager.crashAt(point);
     }
 
     void checkpoint() {
-        recovery_manager.checkpoint();
+        transactional_storage_manager.recovery_manager.checkpoint();
     }
 
     bool createTable(const std::string& name, TableSchema schema) {
-        return catalog.createTable(name, std::move(schema));
+        return transactional_storage_manager.catalog.createTable(name, std::move(schema));
+    }
+
+    bool hasTable(const std::string& name) const {
+        return transactional_storage_manager.catalog.hasTable(name);
     }
 
     bool isDatabaseEmpty() const {
-        return catalog.empty();
+        return transactional_storage_manager.catalog.empty();
+    }
+
+    std::optional<TupleTimestampHeader> tupleTimestampHeader(
+            const ConcurrencyControlResource& resource) {
+        auto& metadata =
+            transactional_storage_manager.catalog.getTable(resource.table_id);
+        TableHeap tableHeap(metadata,
+                            transactional_storage_manager.page_manager);
+        return tableHeap.getTupleHeader(resource.page_id, resource.slot_id);
+    }
+
+    void publishTupleTimestampHeader(
+            const ConcurrencyControlResource& resource,
+            const TupleTimestampHeader& header) {
+        auto& metadata =
+            transactional_storage_manager.catalog.getTable(resource.table_id);
+        TableHeap tableHeap(metadata,
+                            transactional_storage_manager.page_manager);
+        tableHeap.updateTupleHeader(resource.page_id,
+                                    resource.slot_id,
+                                    header);
     }
 
     static void requireRunningTransaction(const TxnPtr& txn) {
@@ -4744,218 +5166,10 @@ public:
         }
     }
 
-    static ConcurrencyControlResource tupleResource(const TableMetadata& metadata,
-                                      PageID pageId,
-                                      size_t slot) {
-        return ConcurrencyControlResource::tuple(metadata.table_id, pageId, slot);
-    }
-
-    static std::string resourceLabel(
-            const ConcurrencyControlResource& resource) {
-        return concurrencyResourceLabel(resource);
-    }
-
-    std::optional<TupleTimestampHeader> tupleTimestampHeader(
-            const ConcurrencyControlResource& resource) {
-        auto& metadata = catalog.getTable(resource.table_id);
-        TableHeap tableHeap(metadata, page_manager);
-        return tableHeap.getTupleHeader(resource.page_id, resource.slot_id);
-    }
-
-    void publishTupleTimestampHeader(
-            const ConcurrencyControlResource& resource,
-            const TupleTimestampHeader& header) {
-        auto& metadata = catalog.getTable(resource.table_id);
-        TableHeap tableHeap(metadata, page_manager);
-        tableHeap.updateTupleHeader(resource.page_id,
-                                    resource.slot_id,
-                                    header);
-        std::cout << "TO publishes " << resourceLabel(resource)
-                  << " readTS=" << header.read_ts
-                  << ", writeTS=" << header.write_ts
-                  << "." << std::endl;
-    }
-
-    static bool sameFieldValue(const Field& left, const Field& right) {
-        if (left.getType() != right.getType()) {
-            return false;
-        }
-
-        switch (left.getType()) {
-            case INT:
-                return left.asInt() == right.asInt();
-            case FLOAT:
-                return left.asFloat() == right.asFloat();
-            case STRING:
-                return left.asString() == right.asString();
-        }
-        throw std::runtime_error("Unsupported field type.");
-    }
-
-    static std::string txnCycleLabel(const std::vector<int>& cycle) {
-        std::ostringstream output;
-        for (size_t i = 0; i < cycle.size(); i++) {
-            if (i != 0) {
-                output << " -> ";
-            }
-            output << "txn " << cycle[i];
-        }
-        return output.str();
-    }
-
-    bool acquireMatchingTupleAccess(const TxnPtr& txn,
-                                    AccessType type,
-                                    TableMetadata& metadata,
-                                    const std::string& columnName,
-                                    const std::string& value) {
-        const size_t column = static_cast<size_t>(
-            metadata.schema.getColumnIndex(columnName));
-        auto target = FieldParser::parseValue(metadata.schema.columns[column].type, value);
-        TableHeap tableHeap(metadata, page_manager);
-
-        for (PageID pageId = tableHeap.firstPage();
-             pageId != INVALID_PAGE_ID;
-             pageId = tableHeap.nextPage(pageId)) {
-            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto record = tableHeap.getTupleRecord(pageId, slot);
-                if (!record ||
-                    !sameFieldValue(*record->tuple->fields[column], *target)) {
-                    continue;
-                }
-
-                if (!acquireTxnAccess(
-                    txn,
-                    type,
-                    {tupleResource(metadata, pageId, slot)},
-                    record->header
-                )) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    bool acquireAllTupleAccess(const TxnPtr& txn,
-                               AccessType type,
-                               TableMetadata& metadata) {
-        TableHeap tableHeap(metadata, page_manager);
-
-        for (PageID pageId = tableHeap.firstPage();
-             pageId != INVALID_PAGE_ID;
-             pageId = tableHeap.nextPage(pageId)) {
-            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto record = tableHeap.getTupleRecord(pageId, slot);
-                if (!record) {
-                    continue;
-                }
-
-                if (!acquireTxnAccess(
-                    txn,
-                    type,
-                    {tupleResource(metadata, pageId, slot)},
-                    record->header
-                )) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    bool acquireStatementAccess(const TxnPtr& txn,
-                                const ParsedStatement& statement) {
-        switch (statement.kind) {
-            case ParsedStatement::Kind::Update: {
-                auto& metadata = catalog.getTable(statement.tableName);
-                return acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
-                                                  statement.whereColumnName,
-                                                  statement.whereValue);
-            }
-            case ParsedStatement::Kind::Delete: {
-                auto& metadata = catalog.getTable(statement.tableName);
-                return acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
-                                                  statement.whereColumnName,
-                                                  statement.whereValue);
-            }
-            case ParsedStatement::Kind::Insert:
-                return true;
-            case ParsedStatement::Kind::Select: {
-                auto& metadata = catalog.getTable(statement.query.tableName);
-                if (statement.query.equalityCondition) {
-                    return acquireMatchingTupleAccess(txn, AccessType::Read, metadata,
-                                                      statement.query.equalityColumnName,
-                                                      statement.query.equalityValueText);
-                }
-                return acquireAllTupleAccess(txn, AccessType::Read, metadata);
-            }
-        }
-        return true;
-    }
-
-    bool acquireTxnAccess(
-            const TxnPtr& txn,
-            AccessType type,
-            const std::vector<ConcurrencyControlResource>& resources,
-            const TupleTimestampHeader& observed_header = {}) {
-        if (!txn || resources.empty()) {
-            return true;
-        }
-
-        for (const auto& resource : resources) {
-            std::cout << "CC policy " << concurrencyControlPolicyName()
-                      << ": txn " << txn->id
-                      << " requests " << accessTypeName(type)
-                      << " access to " << resourceLabel(resource)
-                      << "." << std::endl;
-
-            auto result = txn_manager.requestAccess(txn,
-                                                    type,
-                                                    {resource},
-                                                    observed_header);
-
-            if (result.deadlock) {
-                std::cout << "Deadlock detected in waits-for graph: "
-                          << txnCycleLabel(result.cycle)
-                          << ". Choosing txn " << txn->id
-                          << " as victim." << std::endl;
-                abort(txn);
-                return false;
-            }
-
-            if (!result.granted) {
-                std::cout << "CC policy " << concurrencyControlPolicyName()
-                          << ": txn " << txn->id
-                          << " aborts";
-                if (!result.detail.empty()) {
-                    std::cout << " because " << result.detail;
-                }
-                std::cout << "." << std::endl;
-                abort(txn);
-                return false;
-            }
-
-            for (const auto& update : result.header_updates) {
-                publishTupleTimestampHeader(update.first, update.second);
-            }
-
-            std::cout << "CC policy " << concurrencyControlPolicyName()
-                      << ": txn " << txn->id
-                      << " " << accessTypeName(type)
-                      << " access to " << resourceLabel(resource);
-            if (result.waited) {
-                std::cout << " granted after wait." << std::endl;
-            } else {
-                std::cout << " granted." << std::endl;
-            }
-        }
-        return true;
-    }
-
     void insertRow(const std::string& tableName,
                    const std::vector<std::string>& values,
                    bool printResult = false) {
-        query_executor.insertRow(tableName, values, printResult);
+        query_processor.insertRow(tableName, values, printResult);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -4999,22 +5213,48 @@ public:
                 continue;
             }
 
-            auto parsed = query_parser.parseStatement(statement);
-            if (active_txn) {
-                if (!acquireStatementAccess(active_txn, parsed)) {
-                    if (active_txn->state == TxnContext::ABORTED) {
-                        active_txn.reset();
-                    }
-                    statementFinished();
-                    continue;
+            try {
+                query_processor.execute(
+                    statement,
+                    active_txn,
+                    active_txn ? &transactional_storage_manager.txn_manager : nullptr
+                );
+            } catch (const DeadlockError&) {
+                if (active_txn) {
+                    transactional_storage_manager.recovery_manager.abort(active_txn->id);
+                    transactional_storage_manager.txn_manager.abort(*active_txn);
+                    active_txn.reset();
                 }
+                statementFinished();
+                continue;
+            } catch (const ConcurrencyControlAbort&) {
+                if (active_txn) {
+                    transactional_storage_manager.recovery_manager.abort(active_txn->id);
+                    transactional_storage_manager.txn_manager.abort(*active_txn);
+                    active_txn.reset();
+                }
+                statementFinished();
+                continue;
             }
-            query_executor.execute(parsed);
             statementFinished();
         }
     }
 
 private:
+    void configureTimestampHeaderAccessors() {
+        transactional_storage_manager.txn_manager.setTupleTimestampHeaderReader(
+            [this](const ConcurrencyControlResource& resource) {
+                return tupleTimestampHeader(resource);
+            }
+        );
+        transactional_storage_manager.txn_manager.setTupleTimestampHeaderPublisher(
+            [this](const ConcurrencyControlResource& resource,
+                   const TupleTimestampHeader& header) {
+                publishTupleTimestampHeader(resource, header);
+            }
+        );
+    }
+
     static void checkStatementCrashLimit(int& statementsSeen,
                                          int crashAfterStatement) {
         if (crashAfterStatement <= 0) {
@@ -5097,7 +5337,7 @@ public:
             }
 
             const std::string tableName = tokens[0];
-            if (!db.catalog.hasTable(tableName)) {
+            if (!db.hasTable(tableName)) {
                 throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
             }
 
