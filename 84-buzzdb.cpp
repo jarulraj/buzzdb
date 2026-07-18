@@ -4254,160 +4254,6 @@ std::vector<std::string> TextUtil::split(const std::string& input, char delimite
 }
 
 
-class QueryExecutor {
-private:
-    Catalog& catalog;
-    PageManager& page_manager;
-
-public:
-    QueryExecutor(Catalog& catalog, PageManager& page_manager)
-        : catalog(catalog),
-          page_manager(page_manager) {}
-
-    void execute(const ParsedStatement& statement,
-                 PhysicalJoinKind join_kind = PhysicalJoinKind::HashJoin) {
-        switch (statement.kind) {
-            case ParsedStatement::Kind::Insert:
-                insertRow(statement.tableName, statement.values);
-                return;
-            case ParsedStatement::Kind::Update:
-                executeUpdate(statement);
-                return;
-            case ParsedStatement::Kind::Delete:
-                executeDelete(statement);
-                return;
-            case ParsedStatement::Kind::Select:
-                executeSelect(statement, join_kind);
-                return;
-        }
-        throw std::runtime_error("Unsupported parsed statement.");
-    }
-
-    void insertRow(const std::string& tableName,
-                   const std::vector<std::string>& values,
-                   bool printResult = false) {
-        auto& metadata = catalog.getTable(tableName);
-        auto tuple = makeTuple(metadata.schema, values);
-        TableHeap tableHeap(metadata, page_manager);
-        InsertOperator insertOp(tableHeap);
-        insertOp.setTupleToInsert(std::move(tuple));
-        executeStatementOperator(insertOp, printResult);
-    }
-
-private:
-    std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
-                                     const std::vector<std::string>& values) {
-        if (values.size() != schema.columns.size()) {
-            throw std::runtime_error("Wrong field count for table row.");
-        }
-
-        auto tuple = std::make_unique<Tuple>();
-        for (size_t i = 0; i < schema.columns.size(); i++) {
-            tuple->addField(FieldParser::parseValue(schema.columns[i].type, values[i]));
-        }
-        return tuple;
-    }
-
-    std::unique_ptr<IPredicate> makeEqualityPredicate(
-        const TableSchema& schema,
-        const std::string& columnName,
-        const std::string& value) {
-        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
-        auto field = FieldParser::parseValue(schema.columns[column].type, value);
-        return std::make_unique<SimplePredicate>(
-            SimplePredicate::Operand(column),
-            SimplePredicate::Operand(std::move(field)),
-            SimplePredicate::ComparisonOperator::EQ
-        );
-    }
-
-    void executeUpdate(const ParsedStatement& statement) {
-        auto& metadata = catalog.getTable(statement.tableName);
-        const size_t setColumn = static_cast<size_t>(
-            metadata.schema.getColumnIndex(statement.setColumnName));
-        auto predicate = makeEqualityPredicate(
-            metadata.schema,
-            statement.whereColumnName,
-            statement.whereValue
-        );
-        auto field = FieldParser::parseValue(
-            metadata.schema.columns[setColumn].type,
-            statement.setValue
-        );
-        TableHeap tableHeap(metadata, page_manager);
-        UpdateOperator updateOp(
-            tableHeap,
-            std::move(predicate),
-            {{setColumn, *field}}
-        );
-        executeStatementOperator(updateOp, false);
-    }
-
-    void executeDelete(const ParsedStatement& statement) {
-        auto& metadata = catalog.getTable(statement.tableName);
-        auto predicate = makeEqualityPredicate(
-            metadata.schema,
-            statement.whereColumnName,
-            statement.whereValue
-        );
-        TableHeap tableHeap(metadata, page_manager);
-        DeleteOperator deleteOp(tableHeap, std::move(predicate));
-        executeStatementOperator(deleteOp, false);
-    }
-
-    void executeSelect(const ParsedStatement& statement,
-                       PhysicalJoinKind join_kind) {
-        if (statement.query.isJoinQuery()) {
-            auto result = executeJoinQuery(statement.query, catalog, page_manager, join_kind);
-            printJoinQueryResult(statement.query, result, join_kind);
-            return;
-        }
-        auto& metadata = catalog.getTable(statement.query.tableName);
-        executeQuery(statement.query, metadata, page_manager);
-    }
-
-    void executeStatementOperator(Operator& statementOperator, bool printResult) {
-        statementOperator.open();
-        while (statementOperator.next()) {
-            if (printResult) {
-                const auto& output = statementOperator.getOutput();
-                for (const auto& field : output) {
-                    field->print();
-                    std::cout << " ";
-                }
-                std::cout << std::endl;
-            }
-        }
-        statementOperator.close();
-    }
-};
-
-class QueryProcessor {
-private:
-    QueryParser query_parser;
-    QueryExecutor query_executor;
-
-public:
-    QueryProcessor(Catalog& catalog, PageManager& page_manager)
-        : query_parser(catalog),
-          query_executor(catalog, page_manager) {}
-
-    ParsedStatement parseStatement(const std::string& statement) {
-        return query_parser.parseStatement(statement);
-    }
-
-    void execute(const ParsedStatement& statement,
-                 PhysicalJoinKind join_kind) {
-        query_executor.execute(statement, join_kind);
-    }
-
-    void insertRow(const std::string& tableName,
-                   const std::vector<std::string>& values,
-                   bool printResult = false) {
-        query_executor.insertRow(tableName, values, printResult);
-    }
-};
-
 struct TxnContext {
     int id;
     enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
@@ -4700,14 +4546,6 @@ private:
 
 enum class AccessType { Read, Write };
 
-static LockMode tupleLockModeForAccess(AccessType type) {
-    return type == AccessType::Read ? LockMode::S : LockMode::X;
-}
-
-static LockMode tableIntentionModeForAccess(AccessType type) {
-    return type == AccessType::Read ? LockMode::IS : LockMode::IX;
-}
-
 static LockMode tableLockModeForAccess(AccessType type) {
     return type == AccessType::Read ? LockMode::S : LockMode::X;
 }
@@ -4852,10 +4690,406 @@ public:
         recovery_manager.recover();
         catalog.load();
     }
+
+    TxnPtr beginTransaction() {
+        int txn_id = recovery_manager.begin();
+        return txn_manager.begin(txn_id);
+    }
+
+    void commit(const TxnPtr& txn) {
+        requireRunningTransaction(txn);
+        auto cc_result = txn_manager.prepareCommit(*txn);
+        if (!cc_result.granted) {
+            abort(txn);
+            throw std::runtime_error(
+                "Concurrency-control policy rejected COMMIT for txn " +
+                std::to_string(txn->id)
+            );
+        }
+        recovery_manager.commit(txn->id);
+        txn_manager.commit(*txn);
+    }
+
+    void abort(const TxnPtr& txn) {
+        if (!txn || txn->state != TxnContext::RUNNING) {
+            return;
+        }
+        recovery_manager.abort(txn->id);
+        txn_manager.abort(*txn);
+    }
+
+    void crashAt(CrashPoint point) {
+        recovery_manager.crashAt(point);
+    }
+
+    void checkpoint() {
+        recovery_manager.checkpoint();
+    }
+
+    void requestTableAccess(const TxnPtr& txn,
+                            AccessType type,
+                            const TableMetadata& metadata) {
+        acquireTxnLocks(
+            txn,
+            {{tableResource(metadata), tableLockModeForAccess(type)}}
+        );
+    }
+
+    void runLoggedStatement(const TxnPtr& txn,
+                            const std::function<void()>& statement_body) {
+        requireRunningTransaction(txn);
+        recovery_manager.setCurrentTransaction(txn->id);
+        try {
+            statement_body();
+        } catch (...) {
+            recovery_manager.clearCurrentTransaction();
+            throw;
+        }
+        recovery_manager.clearCurrentTransaction();
+    }
+
+private:
+    static void requireRunningTransaction(const TxnPtr& txn) {
+        if (!txn || txn->state != TxnContext::RUNNING) {
+            throw std::runtime_error("Statement requires a running transaction.");
+        }
+    }
+
+    static ConcurrencyControlResource tableResource(
+            const TableMetadata& metadata) {
+        return ConcurrencyControlResource::table(metadata.table_id);
+    }
+
+    void acquireTxnLocks(
+            const TxnPtr& txn,
+            const std::vector<LockRequest>& locks) {
+        if (!txn || locks.empty()) {
+            return;
+        }
+
+        for (const auto& lock : locks) {
+            auto result = txn_manager.requestAccess(txn, {lock});
+
+            if (result.deadlock) {
+                abort(txn);
+                throw std::runtime_error(
+                    "DEADLOCK: txn " + std::to_string(txn->id) +
+                    " chosen as victim"
+                );
+            }
+
+            if (!result.granted) {
+                throw std::runtime_error(
+                    "Concurrency-control policy rejected access for txn " +
+                    std::to_string(txn->id)
+                );
+            }
+        }
+    }
+};
+
+class QueryExecutor {
+private:
+    TransactionalStorageManager& transactional_storage_manager;
+
+public:
+    explicit QueryExecutor(
+            TransactionalStorageManager& transactional_storage_manager)
+        : transactional_storage_manager(transactional_storage_manager) {}
+
+    void execute(const ParsedStatement& statement,
+                 const TxnPtr& txn,
+                 PhysicalJoinKind join_kind) {
+        requireRunningTransaction(txn);
+        switch (statement.kind) {
+            case ParsedStatement::Kind::Insert:
+                executeInsert(statement, txn);
+                return;
+            case ParsedStatement::Kind::Update:
+                executeUpdate(statement, txn);
+                return;
+            case ParsedStatement::Kind::Delete:
+                executeDelete(statement, txn);
+                return;
+            case ParsedStatement::Kind::Select:
+                executeSelect(statement, txn, join_kind);
+                return;
+        }
+        throw std::runtime_error("Unsupported parsed statement.");
+    }
+
+    void execute(const ParsedStatement& statement,
+                 PhysicalJoinKind join_kind) {
+        switch (statement.kind) {
+            case ParsedStatement::Kind::Insert:
+                insertRow(statement.tableName, statement.values);
+                return;
+            case ParsedStatement::Kind::Update:
+                executeUpdateBody(statement);
+                return;
+            case ParsedStatement::Kind::Delete:
+                executeDeleteBody(statement);
+                return;
+            case ParsedStatement::Kind::Select:
+                executeSelectBody(statement, join_kind);
+                return;
+        }
+        throw std::runtime_error("Unsupported parsed statement.");
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            tableName
+        );
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, transactional_storage_manager.page_manager);
+        InsertOperator insertOp(tableHeap);
+        insertOp.setTupleToInsert(std::move(tuple));
+        executeStatementOperator(insertOp, printResult);
+    }
+
+private:
+    static void requireRunningTransaction(const TxnPtr& txn) {
+        if (!txn || txn->state != TxnContext::RUNNING) {
+            throw std::runtime_error("SQL execution requires a running transaction.");
+        }
+    }
+
+    std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                     const std::vector<std::string>& values) {
+        if (values.size() != schema.columns.size()) {
+            throw std::runtime_error("Wrong field count for table row.");
+        }
+
+        auto tuple = std::make_unique<Tuple>();
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            tuple->addField(FieldParser::parseValue(
+                schema.columns[i].type,
+                values[i]
+            ));
+        }
+        return tuple;
+    }
+
+    std::unique_ptr<IPredicate> makeEqualityPredicate(
+            const TableSchema& schema,
+            const std::string& columnName,
+            const std::string& value) {
+        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
+        auto field = FieldParser::parseValue(schema.columns[column].type, value);
+        return std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(column),
+            SimplePredicate::Operand(std::move(field)),
+            SimplePredicate::ComparisonOperator::EQ
+        );
+    }
+
+    void executeInsert(const ParsedStatement& statement, const TxnPtr& txn) {
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            statement.tableName
+        );
+        transactional_storage_manager.requestTableAccess(
+            txn,
+            AccessType::Write,
+            metadata
+        );
+        transactional_storage_manager.runLoggedStatement(txn, [&]() {
+            insertRow(statement.tableName, statement.values);
+        });
+    }
+
+    void executeUpdate(const ParsedStatement& statement, const TxnPtr& txn) {
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            statement.tableName
+        );
+        transactional_storage_manager.requestTableAccess(
+            txn,
+            AccessType::Write,
+            metadata
+        );
+        transactional_storage_manager.runLoggedStatement(txn, [&]() {
+            executeUpdateBody(statement);
+        });
+    }
+
+    void executeDelete(const ParsedStatement& statement, const TxnPtr& txn) {
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            statement.tableName
+        );
+        transactional_storage_manager.requestTableAccess(
+            txn,
+            AccessType::Write,
+            metadata
+        );
+        transactional_storage_manager.runLoggedStatement(txn, [&]() {
+            executeDeleteBody(statement);
+        });
+    }
+
+    void executeSelect(const ParsedStatement& statement,
+                       const TxnPtr& txn,
+                       PhysicalJoinKind join_kind) {
+        requestSelectAccess(statement.query, txn);
+        transactional_storage_manager.runLoggedStatement(txn, [&]() {
+            executeSelectBody(statement, join_kind);
+        });
+    }
+
+    void requestSelectAccess(const QueryComponents& components,
+                             const TxnPtr& txn) {
+        std::set<TableId> locked_tables;
+        if (components.isJoinQuery()) {
+            for (const auto& table_ref : components.table_refs) {
+                if (!locked_tables.insert(table_ref.table_id).second) {
+                    continue;
+                }
+                auto& metadata =
+                    transactional_storage_manager.catalog.getTable(
+                        table_ref.table_id
+                    );
+                transactional_storage_manager.requestTableAccess(
+                    txn,
+                    AccessType::Read,
+                    metadata
+                );
+            }
+            return;
+        }
+
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            components.tableName
+        );
+        transactional_storage_manager.requestTableAccess(
+            txn,
+            AccessType::Read,
+            metadata
+        );
+    }
+
+    void executeUpdateBody(const ParsedStatement& statement) {
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            statement.tableName
+        );
+        const size_t setColumn = static_cast<size_t>(
+            metadata.schema.getColumnIndex(statement.setColumnName));
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        auto field = FieldParser::parseValue(
+            metadata.schema.columns[setColumn].type,
+            statement.setValue
+        );
+        TableHeap tableHeap(metadata, transactional_storage_manager.page_manager);
+        UpdateOperator updateOp(
+            tableHeap,
+            std::move(predicate),
+            {{setColumn, *field}}
+        );
+        executeStatementOperator(updateOp, false);
+    }
+
+    void executeDeleteBody(const ParsedStatement& statement) {
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            statement.tableName
+        );
+        auto predicate = makeEqualityPredicate(
+            metadata.schema,
+            statement.whereColumnName,
+            statement.whereValue
+        );
+        TableHeap tableHeap(metadata, transactional_storage_manager.page_manager);
+        DeleteOperator deleteOp(tableHeap, std::move(predicate));
+        executeStatementOperator(deleteOp, false);
+    }
+
+    void executeSelectBody(const ParsedStatement& statement,
+                           PhysicalJoinKind join_kind) {
+        if (statement.query.isJoinQuery()) {
+            auto result = executeJoinQuery(
+                statement.query,
+                transactional_storage_manager.catalog,
+                transactional_storage_manager.page_manager,
+                join_kind
+            );
+            printJoinQueryResult(statement.query, result, join_kind);
+            return;
+        }
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            statement.query.tableName
+        );
+        executeQuery(
+            statement.query,
+            metadata,
+            transactional_storage_manager.page_manager
+        );
+    }
+
+    void executeStatementOperator(Operator& statementOperator, bool printResult) {
+        statementOperator.open();
+        while (statementOperator.next()) {
+            if (printResult) {
+                const auto& output = statementOperator.getOutput();
+                for (const auto& field : output) {
+                    field->print();
+                    std::cout << " ";
+                }
+                std::cout << std::endl;
+            }
+        }
+        statementOperator.close();
+    }
+};
+
+class QueryProcessor {
+private:
+    QueryParser query_parser;
+    QueryExecutor query_executor;
+
+public:
+    explicit QueryProcessor(
+            TransactionalStorageManager& transactional_storage_manager)
+        : query_parser(transactional_storage_manager.catalog),
+          query_executor(transactional_storage_manager) {}
+
+    ParsedStatement parseStatement(const std::string& statement) {
+        return query_parser.parseStatement(statement);
+    }
+
+    void execute(const ParsedStatement& statement,
+                 const TxnPtr& txn,
+                 PhysicalJoinKind join_kind) {
+        query_executor.execute(statement, txn, join_kind);
+    }
+
+    void execute(const std::string& statement,
+                 const TxnPtr& txn,
+                 PhysicalJoinKind join_kind) {
+        execute(query_parser.parseStatement(statement), txn, join_kind);
+    }
+
+    void execute(const ParsedStatement& statement,
+                 PhysicalJoinKind join_kind) {
+        query_executor.execute(statement, join_kind);
+    }
+
+    void execute(const std::string& statement,
+                 PhysicalJoinKind join_kind) {
+        execute(query_parser.parseStatement(statement), join_kind);
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        query_executor.insertRow(tableName, values, printResult);
+    }
 };
 
 class BuzzDB {
-public:
+private:
     TransactionalStorageManager transactional_storage_manager;
     QueryProcessor query_processor;
     TxnPtr active_txn;
@@ -4864,13 +5098,10 @@ public:
 public:
     BuzzDB()
         : transactional_storage_manager(),
-          query_processor(transactional_storage_manager.catalog,
-                          transactional_storage_manager.page_manager) {}
+          query_processor(transactional_storage_manager) {}
 
     TxnPtr beginTransaction() {
-        int txn_id =
-            transactional_storage_manager.recovery_manager.begin();
-        return transactional_storage_manager.txn_manager.begin(txn_id);
+        return transactional_storage_manager.beginTransaction();
     }
 
     void useJoinKind(PhysicalJoinKind kind) {
@@ -4879,39 +5110,17 @@ public:
 
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
-        auto parsed = query_processor.parseStatement(statement);
-        acquireStatementLocks(txn, parsed);
-        transactional_storage_manager.recovery_manager.setCurrentTransaction(
-            txn->id
-        );
-        try {
-            query_processor.execute(parsed, join_kind);
-        } catch (...) {
-            transactional_storage_manager.recovery_manager.clearCurrentTransaction();
-            throw;
-        }
-        transactional_storage_manager.recovery_manager.clearCurrentTransaction();
+        query_processor.execute(statement, txn, join_kind);
     }
 
     void commit(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        auto cc_result =
-            transactional_storage_manager.txn_manager.prepareCommit(*txn);
-        if (!cc_result.granted) {
-            abort(txn);
-            throw std::runtime_error(
-                "Concurrency-control policy rejected COMMIT for txn " +
-                std::to_string(txn->id)
-            );
-        }
-        transactional_storage_manager.recovery_manager.commit(txn->id);
-        transactional_storage_manager.txn_manager.commit(*txn);
+        transactional_storage_manager.commit(txn);
     }
 
     void abort(const TxnPtr& txn) {
         requireRunningTransaction(txn);
-        transactional_storage_manager.recovery_manager.abort(txn->id);
-        transactional_storage_manager.txn_manager.abort(*txn);
+        transactional_storage_manager.abort(txn);
     }
 
     void begin() {
@@ -4938,11 +5147,11 @@ public:
     }
 
     void crashAt(CrashPoint point) {
-        transactional_storage_manager.recovery_manager.crashAt(point);
+        transactional_storage_manager.crashAt(point);
     }
 
     void checkpoint() {
-        transactional_storage_manager.recovery_manager.checkpoint();
+        transactional_storage_manager.checkpoint();
     }
 
     Catalog& catalog() {
@@ -4970,196 +5179,6 @@ public:
 
     bool isDatabaseEmpty() const {
         return transactional_storage_manager.catalog.empty();
-    }
-
-    static void requireRunningTransaction(const TxnPtr& txn) {
-        if (!txn || txn->state != TxnContext::RUNNING) {
-            throw std::runtime_error("Statement requires a running transaction.");
-        }
-    }
-
-    static ConcurrencyControlResource tupleResource(const TableMetadata& metadata,
-                                      PageID pageId,
-                                      size_t slot) {
-        return ConcurrencyControlResource::tuple(metadata.table_id, pageId, slot);
-    }
-
-    static ConcurrencyControlResource tableResource(const TableMetadata& metadata) {
-        return ConcurrencyControlResource::table(metadata.table_id);
-    }
-
-    static bool sameFieldValue(const Field& left, const Field& right) {
-        if (left.getType() != right.getType()) {
-            return false;
-        }
-
-        switch (left.getType()) {
-            case INT:
-                return left.asInt() == right.asInt();
-            case FLOAT:
-                return left.asFloat() == right.asFloat();
-            case STRING:
-                return left.asString() == right.asString();
-        }
-        throw std::runtime_error("Unsupported field type.");
-    }
-
-    void acquireMatchingTupleAccess(const TxnPtr& txn,
-                                    AccessType type,
-                                    TableMetadata& metadata,
-                                    const std::string& columnName,
-                                    const std::string& value) {
-        const size_t column = static_cast<size_t>(
-            metadata.schema.getColumnIndex(columnName));
-        auto target = FieldParser::parseValue(metadata.schema.columns[column].type, value);
-        TableHeap tableHeap(
-            metadata,
-            transactional_storage_manager.page_manager
-        );
-
-        acquireTxnLocks(
-            txn,
-            {{tableResource(metadata), tableIntentionModeForAccess(type)}}
-        );
-
-        for (PageID pageId = tableHeap.firstPage();
-             pageId != INVALID_PAGE_ID;
-             pageId = tableHeap.nextPage(pageId)) {
-            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = tableHeap.getTuple(pageId, slot);
-                if (!tuple || !sameFieldValue(*tuple->fields[column], *target)) {
-                    continue;
-                }
-
-                acquireTxnLocks(
-                    txn,
-                    {{tupleResource(metadata, pageId, slot),
-                      tupleLockModeForAccess(type)}}
-                );
-            }
-        }
-    }
-
-    void acquireTableAccess(const TxnPtr& txn,
-                            AccessType type,
-                            TableMetadata& metadata) {
-        acquireTxnLocks(
-            txn,
-            {{tableResource(metadata), tableLockModeForAccess(type)}}
-        );
-    }
-
-    void acquireTableIntentionAccess(const TxnPtr& txn,
-                                     AccessType type,
-                                     TableMetadata& metadata) {
-        acquireTxnLocks(
-            txn,
-            {{tableResource(metadata), tableIntentionModeForAccess(type)}}
-        );
-    }
-
-    static std::vector<std::string> queryTableNamesForReadLocks(
-            const QueryComponents& components) {
-        std::vector<std::string> table_names;
-        std::set<std::string> seen;
-        if (components.isJoinQuery()) {
-            for (const auto& table_ref : components.table_refs) {
-                if (seen.insert(table_ref.table_name).second) {
-                    table_names.push_back(table_ref.table_name);
-                }
-            }
-            return table_names;
-        }
-        if (!components.tableName.empty()) {
-            table_names.push_back(components.tableName);
-        }
-        return table_names;
-    }
-
-    void acquireStatementLocks(const TxnPtr& txn,
-                               const ParsedStatement& statement) {
-        switch (statement.kind) {
-            case ParsedStatement::Kind::Update: {
-                auto& metadata =
-                    transactional_storage_manager.catalog.getTable(
-                        statement.tableName
-                    );
-                acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
-                                           statement.whereColumnName,
-                                           statement.whereValue);
-                return;
-            }
-            case ParsedStatement::Kind::Delete: {
-                auto& metadata =
-                    transactional_storage_manager.catalog.getTable(
-                        statement.tableName
-                    );
-                acquireMatchingTupleAccess(txn, AccessType::Write, metadata,
-                                           statement.whereColumnName,
-                                           statement.whereValue);
-                return;
-            }
-            case ParsedStatement::Kind::Insert: {
-                auto& metadata =
-                    transactional_storage_manager.catalog.getTable(
-                        statement.tableName
-                    );
-                acquireTableIntentionAccess(txn, AccessType::Write, metadata);
-                return;
-            }
-            case ParsedStatement::Kind::Select: {
-                if (!statement.query.isJoinQuery() &&
-                    statement.query.equalityCondition) {
-                    auto& metadata =
-                        transactional_storage_manager.catalog.getTable(
-                            statement.query.tableName
-                        );
-                    acquireMatchingTupleAccess(txn, AccessType::Read, metadata,
-                                               statement.query.equalityColumnName,
-                                               statement.query.equalityValueText);
-                    return;
-                }
-                for (const auto& tableName : queryTableNamesForReadLocks(statement.query)) {
-                    auto& metadata =
-                        transactional_storage_manager.catalog.getTable(
-                            tableName
-                        );
-                    acquireTableAccess(txn, AccessType::Read, metadata);
-                }
-                return;
-            }
-        }
-    }
-
-    void acquireTxnLocks(
-            const TxnPtr& txn,
-            const std::vector<LockRequest>& locks) {
-        if (!txn || locks.empty()) {
-            return;
-        }
-
-        for (const auto& lock : locks) {
-            auto result =
-                transactional_storage_manager.txn_manager.requestAccess(
-                    txn,
-                    {lock}
-                );
-
-            if (result.deadlock) {
-                abort(txn);
-                throw std::runtime_error(
-                    "DEADLOCK: txn " + std::to_string(txn->id) +
-                    " chosen as victim"
-                );
-            }
-
-            if (!result.granted) {
-                throw std::runtime_error(
-                    "Concurrency-control policy rejected access for txn " +
-                    std::to_string(txn->id)
-                );
-            }
-        }
     }
 
     void insertRow(const std::string& tableName,
@@ -5209,16 +5228,22 @@ public:
                 continue;
             }
 
-            auto parsed = query_processor.parseStatement(statement);
             if (active_txn) {
-                acquireStatementLocks(active_txn, parsed);
+                execute(active_txn, statement);
+            } else {
+                query_processor.execute(statement, join_kind);
             }
-            query_processor.execute(parsed, join_kind);
             statementFinished();
         }
     }
 
 private:
+    static void requireRunningTransaction(const TxnPtr& txn) {
+        if (!txn || txn->state != TxnContext::RUNNING) {
+            throw std::runtime_error("Statement requires a running transaction.");
+        }
+    }
+
     static void checkStatementCrashLimit(int& statementsSeen,
                                          int crashAfterStatement) {
         if (crashAfterStatement <= 0) {
