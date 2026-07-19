@@ -4009,11 +4009,6 @@ std::string formatQError(double estimate, double actual) {
     return formatEstimate(value);
 }
 
-enum class SelectivityModel {
-    Uniform,
-    MostCommonValues
-};
-
 enum class PhysicalJoinKind {
     NestedLoopJoin,
     HashJoin
@@ -4874,18 +4869,15 @@ private:
 
     void applyEqualityFilterToRelation(RelationStats& relation,
                                        const TableStats& table_stats,
-                                       const FilterClause& filter,
-                                       SelectivityModel model) {
+                                       const FilterClause& filter) {
         const auto& base_column_stats =
             table_stats.columns.at(filter.column.column_index);
         double old_rows = relation.rows;
-        double new_rows = model == SelectivityModel::MostCommonValues
-            ? estimateEqualityFilterRowsWithMcv(
-                old_rows,
-                base_column_stats,
-                *filter.value
-            )
-            : estimateEqualityFilterRows(old_rows, base_column_stats);
+        double new_rows = estimateEqualityFilterRowsWithMcv(
+            old_rows,
+            base_column_stats,
+            *filter.value
+        );
 
         auto& filtered_column =
             relation.columns.at(filter.column.table_ref_id)
@@ -4908,8 +4900,7 @@ private:
     RelationStats makeBaseRelationStats(
             const QueryComponents& components,
             const TableRef& table_ref,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model) {
+            const std::map<TableId, TableStats>& stats) {
         const auto& table_stats = stats.at(table_ref.table_id);
         RelationStats relation;
         relation.rows = static_cast<double>(table_stats.row_count);
@@ -4942,8 +4933,7 @@ private:
             applyEqualityFilterToRelation(
                 relation,
                 table_stats,
-                filter,
-                model
+                filter
             );
         }
         return relation;
@@ -4951,15 +4941,13 @@ private:
 
     std::map<TableRefId, RelationStats> estimateBaseRelations(
             const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model) {
+            const std::map<TableId, TableStats>& stats) {
         std::map<TableRefId, RelationStats> relations;
         for (const auto& table_ref : components.table_refs) {
             relations[table_ref.id] = makeBaseRelationStats(
                 components,
                 table_ref,
-                stats,
-                model
+                stats
             );
         }
         return relations;
@@ -5229,32 +5217,6 @@ private:
         return counts;
     }
 
-    size_t countRowsMatchingFilter(const QueryComponents& components,
-                                   const FilterClause& filter) {
-        const auto& table_ref = tableRefForId(
-            components,
-            filter.column.table_ref_id
-        );
-        auto& metadata = catalog.getTable(table_ref.table_id);
-        TableHeap table_heap(metadata, page_manager);
-
-        size_t count = 0;
-        for (PageID page_id = table_heap.firstPage();
-             page_id != INVALID_PAGE_ID;
-             page_id = table_heap.nextPage(page_id)) {
-            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = table_heap.getTuple(page_id, slot);
-                if (!tuple ||
-                    filter.column.column_index >= tuple->fields.size() ||
-                    !(*tuple->fields[filter.column.column_index] == *filter.value)) {
-                    continue;
-                }
-                count++;
-            }
-        }
-        return count;
-    }
-
 public:
     QueryOptimizer(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
@@ -5278,17 +5240,6 @@ public:
             const ColumnRef& column) {
         const auto& table_ref = tableRefForId(components, column.table_ref_id);
         return stats.at(table_ref.table_id).columns.at(column.column_index);
-    }
-
-    double estimateEqualityFilterRows(double input_rows,
-                                      const ColumnStats& column_stats) {
-        if (input_rows <= 0.0 || column_stats.distinct_count == 0) {
-            return 0.0;
-        }
-        return clampEstimate(
-            input_rows / static_cast<double>(column_stats.distinct_count),
-            input_rows
-        );
     }
 
     double estimateEqualityFilterRowsWithMcv(double input_rows,
@@ -5347,10 +5298,9 @@ public:
         );
     }
 
-    std::map<TableRefId, double> estimateFilteredBaseRows(
+    std::map<TableRefId, double> estimateBasicMcvBaseRows(
             const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform) {
+            const std::map<TableId, TableStats>& stats) {
         std::map<TableRefId, double> estimates;
         for (const auto& table_ref : components.table_refs) {
             double rows = static_cast<double>(
@@ -5364,25 +5314,206 @@ public:
                     stats,
                     filter.column
                 );
-                rows = model == SelectivityModel::MostCommonValues
-                    ? estimateEqualityFilterRowsWithMcv(
-                        rows,
-                        column_stats,
-                        *filter.value
-                    )
-                    : estimateEqualityFilterRows(rows, column_stats);
+                rows = estimateEqualityFilterRowsWithMcv(
+                    rows,
+                    column_stats,
+                    *filter.value
+                );
             }
             estimates[table_ref.id] = rows;
         }
         return estimates;
     }
 
+    JoinOrderStepEstimate estimateBasicMcvJoinOrderStep(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            const std::map<TableRefId, double>& base_estimates,
+            const std::set<TableRefId>& joined_table_refs,
+            const JoinClause& join,
+            double current_rows,
+            double current_total_cost) {
+        auto columns = joinedAndInputColumns(join, joined_table_refs);
+        double right_rows = base_estimates.at(join.input_table_ref_id);
+        double output_rows = estimateJoinRows(
+            current_rows,
+            right_rows,
+            columnStatsFor(components, stats, columns.first),
+            columnStatsFor(components, stats, columns.second)
+        );
+        double nested_loop_cost = nestedLoopJoinCost(
+            current_total_cost,
+            current_rows,
+            right_rows,
+            output_rows
+        );
+        double hash_join_cost = hashJoinCost(
+            current_total_cost,
+            current_rows,
+            right_rows,
+            output_rows
+        );
+        PhysicalJoinKind chosen_join_kind =
+            nested_loop_cost <= hash_join_cost
+                ? PhysicalJoinKind::NestedLoopJoin
+                : PhysicalJoinKind::HashJoin;
+        double chosen_cost = chosen_join_kind == PhysicalJoinKind::NestedLoopJoin
+            ? nested_loop_cost
+            : hash_join_cost;
+
+        return {
+            join,
+            output_rows,
+            RelationStats{},
+            chosen_join_kind,
+            chosen_cost
+        };
+    }
+
+    JoinOrderPlan chooseBasicMcvGreedyJoinOrder(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            std::vector<std::string>* search_trace = nullptr) {
+        auto base_estimates = estimateBasicMcvBaseRows(components, stats);
+        auto edges = equalityEdgesForJoinOrdering(components);
+
+        std::optional<TableRefId> best_start_table_ref_id;
+        std::optional<JoinOrderStepEstimate> best_first_step;
+        std::vector<std::string> first_round_trace;
+        for (const auto& edge : edges) {
+            for (TableRefId start_table_ref_id :
+                 {edge.left.table_ref_id, edge.right.table_ref_id}) {
+                std::set<TableRefId> joined_table_refs{start_table_ref_id};
+                auto oriented = orientJoinEdge(edge, joined_table_refs);
+                if (!oriented) {
+                    continue;
+                }
+
+                auto step = estimateBasicMcvJoinOrderStep(
+                    components,
+                    stats,
+                    base_estimates,
+                    joined_table_refs,
+                    *oriented,
+                    base_estimates.at(start_table_ref_id),
+                    tupleScanCost(base_estimates.at(start_table_ref_id))
+                );
+                if (search_trace) {
+                    first_round_trace.push_back(greedyStartTraceLine(
+                        components,
+                        start_table_ref_id,
+                        step
+                    ));
+                }
+                if (!best_first_step ||
+                    betterJoinOrderStep(step, *best_first_step)) {
+                    best_start_table_ref_id = start_table_ref_id;
+                    best_first_step = step;
+                }
+            }
+        }
+
+        if (!best_start_table_ref_id || !best_first_step) {
+            throw std::runtime_error("Unable to choose a join order.");
+        }
+        if (search_trace) {
+            search_trace->push_back(
+                "Greedy round 1: evaluate every connected two-table start "
+                "(rank by lowest rows, then lowest cost)"
+            );
+            search_trace->insert(
+                search_trace->end(),
+                first_round_trace.begin(),
+                first_round_trace.end()
+            );
+            search_trace->push_back(greedyStartChoiceTraceLine(
+                components,
+                *best_start_table_ref_id,
+                *best_first_step
+            ));
+        }
+
+        std::vector<JoinClause> join_order{best_first_step->join};
+        std::vector<JoinOrderStepEstimate> steps{*best_first_step};
+        std::set<TableRefId> joined_table_refs{
+            *best_start_table_ref_id,
+            best_first_step->join.input_table_ref_id
+        };
+        double current_rows = best_first_step->output_rows;
+        double current_total_cost = best_first_step->chosen_cost;
+        size_t greedy_round = 2;
+
+        while (joined_table_refs.size() < components.table_refs.size()) {
+            std::optional<JoinOrderStepEstimate> best_step;
+            std::vector<std::string> round_trace;
+            for (const auto& edge : edges) {
+                auto oriented = orientJoinEdge(edge, joined_table_refs);
+                if (!oriented) {
+                    continue;
+                }
+
+                auto step = estimateBasicMcvJoinOrderStep(
+                    components,
+                    stats,
+                    base_estimates,
+                    joined_table_refs,
+                    *oriented,
+                    current_rows,
+                    current_total_cost
+                );
+                if (search_trace && greedy_round == 2) {
+                    round_trace.push_back(greedyCandidateTraceLine(
+                        components,
+                        joined_table_refs,
+                        step
+                    ));
+                }
+                if (!best_step || betterJoinOrderStep(step, *best_step)) {
+                    best_step = step;
+                }
+            }
+
+            if (!best_step) {
+                throw std::runtime_error("Join graph is disconnected.");
+            }
+            if (search_trace && greedy_round == 2) {
+                search_trace->push_back(
+                    "Greedy round 2: evaluate joins connected to {" +
+                    joinedTableRefsTraceLabel(components, joined_table_refs) + "}"
+                );
+                search_trace->insert(
+                    search_trace->end(),
+                    round_trace.begin(),
+                    round_trace.end()
+                );
+                search_trace->push_back(greedyChoiceTraceLine(
+                    components,
+                    joined_table_refs,
+                    *best_step
+                ));
+            }
+
+            join_order.push_back(best_step->join);
+            steps.push_back(*best_step);
+            joined_table_refs.insert(best_step->join.input_table_ref_id);
+            current_rows = best_step->output_rows;
+            current_total_cost = best_step->chosen_cost;
+            greedy_round++;
+        }
+
+        auto planned_components = makeJoinPlanComponents(
+            components,
+            *best_start_table_ref_id,
+            std::move(join_order)
+        );
+        return {std::move(planned_components), std::move(steps), current_rows};
+    }
+
     JoinOrderPlan chooseGreedyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform,
             std::vector<std::string>* search_trace = nullptr) {
-        auto base_relations = estimateBaseRelations(components, stats, model);
+        auto base_relations = estimateBaseRelations(components, stats);
         auto edges = equalityEdgesForJoinOrdering(components);
 
         std::optional<TableRefId> best_start_table_ref_id;
@@ -5547,9 +5678,8 @@ public:
 
     std::vector<PhysicalJoinKind> choosePhysicalJoinKindsForOrder(
             const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform) {
-        auto base_relations = estimateBaseRelations(components, stats, model);
+            const std::map<TableId, TableStats>& stats) {
+        auto base_relations = estimateBaseRelations(components, stats);
 
         std::vector<PhysicalJoinKind> kinds;
         std::set<TableRefId> joined_table_refs{components.base_table_ref_id};
@@ -5639,43 +5769,6 @@ public:
                   << std::endl;
     }
 
-    void printEqualityFilterEstimateComparison(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats) {
-        std::cout << "\nEquality filter q-error:" << std::endl;
-        for (const auto& filter : components.filters) {
-            const auto& table_ref = tableRefForId(
-                components,
-                filter.column.table_ref_id
-            );
-            const auto& table_stats = stats.at(table_ref.table_id);
-            const auto& column_stats = columnStatsFor(
-                components,
-                stats,
-                filter.column
-            );
-            double input_rows = static_cast<double>(table_stats.row_count);
-            double uniform_estimate = estimateEqualityFilterRows(
-                input_rows,
-                column_stats
-            );
-            double mcv_estimate = estimateEqualityFilterRowsWithMcv(
-                input_rows,
-                column_stats,
-                *filter.value
-            );
-            size_t actual_rows = countRowsMatchingFilter(components, filter);
-            double actual = static_cast<double>(actual_rows);
-            std::cout << "  " << columnRefLabel(components, catalog, filter.column)
-                      << " = " << fieldToString(*filter.value)
-                      << ": actual=" << actual_rows
-                      << " uniform=" << formatEstimate(uniform_estimate)
-                      << " q-error=" << formatQError(uniform_estimate, actual)
-                      << " mcv=" << formatEstimate(mcv_estimate)
-                      << " q-error=" << formatQError(mcv_estimate, actual)
-                      << std::endl;
-        }
-    }
 };
 
 
@@ -6578,8 +6671,7 @@ public:
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
             auto plan = query_optimizer.chooseGreedyJoinOrder(
                 statement.query,
-                stats,
-                SelectivityModel::MostCommonValues
+                stats
             );
             auto join_kinds = query_optimizer.physicalJoinKindsForPlan(plan);
             auto result = query_executor.executeJoinPlan(
@@ -6604,8 +6696,7 @@ public:
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
             auto plan = query_optimizer.chooseGreedyJoinOrder(
                 statement.query,
-                stats,
-                SelectivityModel::MostCommonValues
+                stats
             );
             auto join_kinds = query_optimizer.physicalJoinKindsForPlan(plan);
             auto result = query_executor.executeJoinPlan(
@@ -7029,52 +7120,79 @@ void runImdbJoinOrdering() {
     auto components = db.parseSelectStatement(imdb_join_query);
     auto stats = db.optimizer().analyzeQueryTables(components);
 
-    db.optimizer().printEqualityFilterEstimateComparison(
+    std::vector<std::string> basic_trace;
+    auto basic_plan = db.optimizer().chooseBasicMcvGreedyJoinOrder(
         components,
-        stats
+        stats,
+        &basic_trace
     );
+    std::cout << "\nGreedy decisions with base-table MCV estimates:"
+              << std::endl;
+    for (const auto& line : basic_trace) {
+        std::cout << line << std::endl;
+    }
 
-    std::vector<std::string> greedy_trace;
+    std::vector<std::string> propagated_trace;
     auto propagated_plan = db.optimizer().chooseGreedyJoinOrder(
         components,
         stats,
-        SelectivityModel::MostCommonValues,
-        &greedy_trace
+        &propagated_trace
     );
     std::cout << "\nGreedy decisions with propagated estimated RelationStats:"
               << std::endl;
-    for (const auto& line : greedy_trace) {
+    for (const auto& line : propagated_trace) {
         std::cout << line << std::endl;
     }
     db.optimizer().printJoinOrderPlan(
+        "Base-table MCV optimizer order",
+        basic_plan
+    );
+    db.optimizer().printJoinOrderPlan(
         "Propagated-stats optimizer order",
         propagated_plan
+    );
+    db.optimizer().printFinalJoinQError(
+        "Base-table MCV final join q-error",
+        basic_plan
     );
     db.optimizer().printFinalJoinQError(
         "Propagated-stats final join q-error",
         propagated_plan
     );
 
-    auto join_kinds =
+    auto basic_join_kinds =
+        db.optimizer().physicalJoinKindsForPlan(basic_plan);
+    auto propagated_join_kinds =
         db.optimizer().physicalJoinKindsForPlan(propagated_plan);
-    std::cout << "\nQuery time "
-              << "(buffer pool cleared before run):" << std::endl;
+    std::cout << "\nQuery time comparison "
+              << "(buffer pool cleared before each run):" << std::endl;
     db.clearBufferPool();
-    auto result = executeJoinQueryInTransaction(
+    auto basic_result = executeJoinQueryInTransaction(
+        db,
+        basic_plan.components,
+        &basic_join_kinds
+    );
+    db.clearBufferPool();
+    auto propagated_result = executeJoinQueryInTransaction(
         db,
         propagated_plan.components,
-        &join_kinds
+        &propagated_join_kinds
     );
-    printTimedQueryResult("Propagated-stats optimizer", result);
+    printTimedQueryResult("Base-table MCV optimizer", basic_result);
+    printTimedQueryResult("Propagated-stats optimizer", propagated_result);
+    if (basic_result.result.row_count != propagated_result.result.row_count) {
+        throw std::runtime_error("Join reordering changed the query result.");
+    }
 
-    std::cout << "\nResult: Greedy planning now propagates estimated row,"
-              << " NDV, uniqueness, and MCV stats through each join.\n";
+    std::cout << "\nResult: Propagating estimated row, NDV, uniqueness,"
+              << " and MCV stats through joins improves the cardinality"
+              << " estimates used by the same greedy search.\n";
 }
 
 int main() {
     try {
 
-    std::cout << "IMDB greedy optimizer with propagated estimated RelationStats\n";
+    std::cout << "IMDB greedy optimizer: base-table MCV vs propagated stats\n";
 
     runImdbJoinOrdering();
 

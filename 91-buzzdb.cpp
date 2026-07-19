@@ -4010,11 +4010,6 @@ std::string formatQError(double estimate, double actual) {
     return formatEstimate(value);
 }
 
-enum class SelectivityModel {
-    Uniform,
-    MostCommonValues
-};
-
 enum class PhysicalJoinKind {
     NestedLoopJoin,
     HashJoin
@@ -4916,18 +4911,15 @@ private:
 
     void applyEqualityFilterToRelation(RelationStats& relation,
                                        const TableStats& table_stats,
-                                       const FilterClause& filter,
-                                       SelectivityModel model) {
+                                       const FilterClause& filter) {
         const auto& base_column_stats =
             table_stats.columns.at(filter.column.column_index);
         double old_rows = relation.rows;
-        double new_rows = model == SelectivityModel::MostCommonValues
-            ? estimateEqualityFilterRowsWithMcv(
-                old_rows,
-                base_column_stats,
-                *filter.value
-            )
-            : estimateEqualityFilterRows(old_rows, base_column_stats);
+        double new_rows = estimateEqualityFilterRowsWithMcv(
+            old_rows,
+            base_column_stats,
+            *filter.value
+        );
 
         auto& filtered_column =
             relation.columns.at(filter.column.table_ref_id)
@@ -4950,8 +4942,7 @@ private:
     RelationStats makeBaseRelationStats(
             const QueryComponents& components,
             const TableRef& table_ref,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model) {
+            const std::map<TableId, TableStats>& stats) {
         const auto& table_stats = stats.at(table_ref.table_id);
         RelationStats relation;
         relation.rows = static_cast<double>(table_stats.row_count);
@@ -4984,8 +4975,7 @@ private:
             applyEqualityFilterToRelation(
                 relation,
                 table_stats,
-                filter,
-                model
+                filter
             );
         }
         return relation;
@@ -4993,15 +4983,13 @@ private:
 
     std::map<TableRefId, RelationStats> estimateBaseRelations(
             const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model) {
+            const std::map<TableId, TableStats>& stats) {
         std::map<TableRefId, RelationStats> relations;
         for (const auto& table_ref : components.table_refs) {
             relations[table_ref.id] = makeBaseRelationStats(
                 components,
                 table_ref,
-                stats,
-                model
+                stats
             );
         }
         return relations;
@@ -5314,32 +5302,6 @@ private:
         return counts;
     }
 
-    size_t countRowsMatchingFilter(const QueryComponents& components,
-                                   const FilterClause& filter) {
-        const auto& table_ref = tableRefForId(
-            components,
-            filter.column.table_ref_id
-        );
-        auto& metadata = catalog.getTable(table_ref.table_id);
-        TableHeap table_heap(metadata, page_manager);
-
-        size_t count = 0;
-        for (PageID page_id = table_heap.firstPage();
-             page_id != INVALID_PAGE_ID;
-             page_id = table_heap.nextPage(page_id)) {
-            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = table_heap.getTuple(page_id, slot);
-                if (!tuple ||
-                    filter.column.column_index >= tuple->fields.size() ||
-                    !(*tuple->fields[filter.column.column_index] == *filter.value)) {
-                    continue;
-                }
-                count++;
-            }
-        }
-        return count;
-    }
-
 public:
     QueryOptimizer(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
@@ -5363,17 +5325,6 @@ public:
             const ColumnRef& column) {
         const auto& table_ref = tableRefForId(components, column.table_ref_id);
         return stats.at(table_ref.table_id).columns.at(column.column_index);
-    }
-
-    double estimateEqualityFilterRows(double input_rows,
-                                      const ColumnStats& column_stats) {
-        if (input_rows <= 0.0 || column_stats.distinct_count == 0) {
-            return 0.0;
-        }
-        return clampEstimate(
-            input_rows / static_cast<double>(column_stats.distinct_count),
-            input_rows
-        );
     }
 
     double estimateEqualityFilterRowsWithMcv(double input_rows,
@@ -5432,42 +5383,11 @@ public:
         );
     }
 
-    std::map<TableRefId, double> estimateFilteredBaseRows(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform) {
-        std::map<TableRefId, double> estimates;
-        for (const auto& table_ref : components.table_refs) {
-            double rows = static_cast<double>(
-                stats.at(table_ref.table_id).row_count);
-            for (const auto& filter : components.filters) {
-                if (filter.column.table_ref_id != table_ref.id) {
-                    continue;
-                }
-                const auto& column_stats = columnStatsFor(
-                    components,
-                    stats,
-                    filter.column
-                );
-                rows = model == SelectivityModel::MostCommonValues
-                    ? estimateEqualityFilterRowsWithMcv(
-                        rows,
-                        column_stats,
-                        *filter.value
-                    )
-                    : estimateEqualityFilterRows(rows, column_stats);
-            }
-            estimates[table_ref.id] = rows;
-        }
-        return estimates;
-    }
-
     JoinOrderPlan chooseGreedyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform,
             std::vector<std::string>* search_trace = nullptr) {
-        auto base_relations = estimateBaseRelations(components, stats, model);
+        auto base_relations = estimateBaseRelations(components, stats);
         auto edges = equalityEdgesForJoinOrdering(components);
 
         std::optional<TableRefId> best_start_table_ref_id;
@@ -5619,7 +5539,6 @@ public:
     SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::MostCommonValues,
             std::vector<std::string>* search_trace = nullptr) {
         if (components.table_refs.empty() || components.table_refs.size() > 62) {
             throw std::runtime_error("Selinger DP supports 1..62 table refs.");
@@ -5638,7 +5557,7 @@ public:
 
         std::uint64_t full_mask =
             (1ULL << components.table_refs.size()) - 1ULL;
-        auto base_relations = estimateBaseRelations(components, stats, model);
+        auto base_relations = estimateBaseRelations(components, stats);
         auto edges = equalityEdgesForJoinOrdering(components);
 
         std::vector<std::optional<SelingerDpState>> best(full_mask + 1);
@@ -5779,14 +5698,12 @@ public:
     JoinOrderSearchResult chooseJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            JoinOrderSearchPolicy policy,
-            SelectivityModel model = SelectivityModel::MostCommonValues) {
+            JoinOrderSearchPolicy policy) {
         if (policy == JoinOrderSearchPolicy::Greedy) {
             std::vector<std::string> search_steps;
             auto plan = chooseGreedyJoinOrder(
                 components,
                 stats,
-                model,
                 &search_steps
             );
             double cost = estimatedPlanCost(plan);
@@ -5804,7 +5721,6 @@ public:
         auto result = chooseSelingerLeftDeepJoinOrder(
             components,
             stats,
-            model,
             &search_steps
         );
         return {
@@ -5855,9 +5771,8 @@ public:
 
     std::vector<PhysicalJoinKind> choosePhysicalJoinKindsForOrder(
             const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform) {
-        auto base_relations = estimateBaseRelations(components, stats, model);
+            const std::map<TableId, TableStats>& stats) {
+        auto base_relations = estimateBaseRelations(components, stats);
 
         std::vector<PhysicalJoinKind> kinds;
         std::set<TableRefId> joined_table_refs{components.base_table_ref_id};
@@ -5994,43 +5909,6 @@ public:
                   << std::endl;
     }
 
-    void printEqualityFilterEstimateComparison(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats) {
-        std::cout << "\nEquality filter q-error:" << std::endl;
-        for (const auto& filter : components.filters) {
-            const auto& table_ref = tableRefForId(
-                components,
-                filter.column.table_ref_id
-            );
-            const auto& table_stats = stats.at(table_ref.table_id);
-            const auto& column_stats = columnStatsFor(
-                components,
-                stats,
-                filter.column
-            );
-            double input_rows = static_cast<double>(table_stats.row_count);
-            double uniform_estimate = estimateEqualityFilterRows(
-                input_rows,
-                column_stats
-            );
-            double mcv_estimate = estimateEqualityFilterRowsWithMcv(
-                input_rows,
-                column_stats,
-                *filter.value
-            );
-            size_t actual_rows = countRowsMatchingFilter(components, filter);
-            double actual = static_cast<double>(actual_rows);
-            std::cout << "  " << columnRefLabel(components, catalog, filter.column)
-                      << " = " << fieldToString(*filter.value)
-                      << ": actual=" << actual_rows
-                      << " uniform=" << formatEstimate(uniform_estimate)
-                      << " q-error=" << formatQError(uniform_estimate, actual)
-                      << " mcv=" << formatEstimate(mcv_estimate)
-                      << " q-error=" << formatQError(mcv_estimate, actual)
-                      << std::endl;
-        }
-    }
 };
 
 
@@ -6933,8 +6811,7 @@ public:
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
             auto plan = query_optimizer.chooseGreedyJoinOrder(
                 statement.query,
-                stats,
-                SelectivityModel::MostCommonValues
+                stats
             );
             auto join_kinds = query_optimizer.physicalJoinKindsForPlan(plan);
             auto result = query_executor.executeJoinPlan(
@@ -6959,8 +6836,7 @@ public:
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
             auto plan = query_optimizer.chooseGreedyJoinOrder(
                 statement.query,
-                stats,
-                SelectivityModel::MostCommonValues
+                stats
             );
             auto join_kinds = query_optimizer.physicalJoinKindsForPlan(plan);
             auto result = query_executor.executeJoinPlan(
@@ -7384,22 +7260,15 @@ void runImdbJoinOrdering() {
     auto components = db.parseSelectStatement(imdb_join_query);
     auto stats = db.optimizer().analyzeQueryTables(components);
 
-    db.optimizer().printEqualityFilterEstimateComparison(
-        components,
-        stats
-    );
-
     auto greedy_search = db.optimizer().chooseJoinOrder(
         components,
         stats,
-        JoinOrderSearchPolicy::Greedy,
-        SelectivityModel::MostCommonValues
+        JoinOrderSearchPolicy::Greedy
     );
     auto selinger_search = db.optimizer().chooseJoinOrder(
         components,
         stats,
-        JoinOrderSearchPolicy::SelingerLeftDeepDP,
-        SelectivityModel::MostCommonValues
+        JoinOrderSearchPolicy::SelingerLeftDeepDP
     );
 
     db.optimizer().printJoinOrderSearchComparison(
