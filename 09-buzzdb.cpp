@@ -80,7 +80,11 @@ public:
         int type; in >> type;
         size_t length; in >> length;
         if (type == STRING) {
-            std::string val; in >> val;
+            // length includes the null terminator written during serialization,
+            // so subtract 1 to read only the actual string characters
+            std::string val(length - 1, '\0');
+            in.get(); // consume the ' ' delimeter
+            in.read(val.data(), length - 1);
             return std::make_unique<Field>(val);
         } else if (type == INT) {
             int val; in >> val;
