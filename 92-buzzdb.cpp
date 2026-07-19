@@ -4114,167 +4114,6 @@ struct BushyJoinOrderResult {
     std::vector<std::string> search_steps;
 };
 
-using MaterializedRow = std::vector<std::unique_ptr<Field>>;
-using MaterializedRows = std::vector<MaterializedRow>;
-
-bool rowMatchesTableFilters(const QueryComponents& components,
-                            TableRefId table_ref_id,
-                            const MaterializedRow& row) {
-    for (const auto& filter : components.filters) {
-        if (filter.column.table_ref_id != table_ref_id) {
-            continue;
-        }
-        if (filter.column.column_index >= row.size() ||
-            !(*row[filter.column.column_index] == *filter.value)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-MaterializedRows collectFilteredRows(const QueryComponents& components,
-                                     TableRefId table_ref_id,
-                                     Catalog& catalog,
-                                     PageManager& page_manager) {
-    const auto& table_ref = tableRefForId(components, table_ref_id);
-    auto& metadata = catalog.getTable(table_ref.table_id);
-    TableHeap table_heap(metadata, page_manager);
-
-    MaterializedRows rows;
-    for (PageID page_id = table_heap.firstPage();
-         page_id != INVALID_PAGE_ID;
-         page_id = table_heap.nextPage(page_id)) {
-        for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-            auto tuple = table_heap.getTuple(page_id, slot);
-            if (!tuple || !rowMatchesTableFilters(
-                    components,
-                    table_ref_id,
-                    tuple->fields)) {
-                continue;
-            }
-            rows.push_back(cloneFields(tuple->fields));
-        }
-    }
-    return rows;
-}
-
-struct MaterializedHashKey {
-    FieldType type;
-    int int_value = 0;
-    float float_value = 0.0f;
-    std::string string_value;
-
-    explicit MaterializedHashKey(const Field& field) : type(field.getType()) {
-        switch (type) {
-            case INT:
-                int_value = field.asInt();
-                break;
-            case FLOAT:
-                float_value = field.asFloat();
-                break;
-            case STRING:
-                string_value = field.asString();
-                break;
-        }
-    }
-
-    bool operator==(const MaterializedHashKey& other) const {
-        if (type != other.type) {
-            return false;
-        }
-        switch (type) {
-            case INT:
-                return int_value == other.int_value;
-            case FLOAT:
-                return float_value == other.float_value;
-            case STRING:
-                return string_value == other.string_value;
-        }
-        return false;
-    }
-};
-
-struct MaterializedHashKeyHasher {
-    std::size_t operator()(const MaterializedHashKey& key) const {
-        switch (key.type) {
-            case INT:
-                return std::hash<int>{}(key.int_value);
-            case FLOAT:
-                return std::hash<float>{}(key.float_value);
-            case STRING:
-                return std::hash<std::string>{}(key.string_value);
-        }
-        return 0;
-    }
-};
-
-MaterializedRows hashJoinRows(const MaterializedRows& left_rows,
-                              const MaterializedRows& right_rows,
-                              size_t left_attr_index,
-                              size_t right_attr_index) {
-    std::unordered_map<
-        MaterializedHashKey,
-        std::vector<size_t>,
-        MaterializedHashKeyHasher
-    > right_index;
-    for (size_t i = 0; i < right_rows.size(); i++) {
-        if (right_attr_index >= right_rows[i].size()) {
-            throw std::runtime_error("Actual join right attribute index out of range.");
-        }
-        right_index[MaterializedHashKey(*right_rows[i][right_attr_index])]
-            .push_back(i);
-    }
-
-    MaterializedRows output;
-    for (const auto& left_row : left_rows) {
-        if (left_attr_index >= left_row.size()) {
-            throw std::runtime_error("Actual join left attribute index out of range.");
-        }
-        auto matches = right_index.find(
-            MaterializedHashKey(*left_row[left_attr_index])
-        );
-        if (matches == right_index.end()) {
-            continue;
-        }
-
-        for (size_t right_row_index : matches->second) {
-            auto joined = cloneFields(left_row);
-            for (const auto& field : right_rows[right_row_index]) {
-                joined.push_back(field->clone());
-            }
-            output.push_back(std::move(joined));
-        }
-    }
-    return output;
-}
-
-bool rowMatchesFinalPredicates(
-        const QueryComponents& components,
-        const MaterializedRow& row,
-        const std::map<TableRefId, size_t>& table_offsets) {
-    for (const auto& filter : components.filters) {
-        size_t attr_index = physicalOffset(filter.column, table_offsets);
-        if (attr_index >= row.size() ||
-            !(*row[attr_index] == *filter.value)) {
-            return false;
-        }
-    }
-    for (const auto& filter : components.column_filters) {
-        size_t left_index = physicalOffset(filter.left, table_offsets);
-        size_t right_index = physicalOffset(filter.right, table_offsets);
-        if (left_index >= row.size() || right_index >= row.size() ||
-            !(*row[left_index] == *row[right_index])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-struct ActualJoinCounts {
-    std::vector<size_t> step_rows;
-    size_t final_rows = 0;
-};
-
 QueryResult executeJoinQuery(const QueryComponents& components,
                              Catalog& catalog,
                              PageManager& page_manager,
@@ -4926,22 +4765,22 @@ private:
         return 0.10 * std::max(0.0, tuples);
     }
 
-    static double nestedLoopJoinTreeCost(double left_total_cost,
-                                         double right_total_cost,
-                                         double left_rows,
-                                         double right_rows,
-                                         double output_rows) {
+    static double nestedLoopJoinCost(double left_total_cost,
+                                     double right_total_cost,
+                                     double left_rows,
+                                     double right_rows,
+                                     double output_rows) {
         return left_total_cost +
                right_total_cost +
                tupleComparisonCost(left_rows * right_rows) +
                tupleMaterializationCost(output_rows);
     }
 
-    static double hashJoinTreeCost(double left_total_cost,
-                                   double right_total_cost,
-                                   double left_rows,
-                                   double right_rows,
-                                   double output_rows) {
+    static double hashJoinCost(double left_total_cost,
+                               double right_total_cost,
+                               double left_rows,
+                               double right_rows,
+                               double output_rows) {
         return left_total_cost +
                right_total_cost +
                tupleHashCost(left_rows + right_rows) +
@@ -5249,14 +5088,14 @@ private:
         );
 
         double right_total_cost = tupleScanCost(right_relation.rows);
-        double nested_loop_cost = nestedLoopJoinTreeCost(
+        double nested_loop_cost = nestedLoopJoinCost(
             current_total_cost,
             right_total_cost,
             current_relation.rows,
             right_relation.rows,
             output_rows
         );
-        double hash_join_cost = hashJoinTreeCost(
+        double hash_join_cost = hashJoinCost(
             current_total_cost,
             right_total_cost,
             current_relation.rows,
@@ -5381,14 +5220,14 @@ private:
             output_rows
         );
 
-        double nested_loop_cost = nestedLoopJoinTreeCost(
+        double nested_loop_cost = nestedLoopJoinCost(
             left_cost,
             right_cost,
             left_relation.rows,
             right_relation.rows,
             output_rows
         );
-        double hash_join_cost = hashJoinTreeCost(
+        double hash_join_cost = hashJoinCost(
             left_cost,
             right_cost,
             left_relation.rows,
@@ -5502,53 +5341,6 @@ private:
                << ", rows=" << formatEstimate(state.relation.rows)
                << ", cost=" << formatEstimate(state.cost);
         return output.str();
-    }
-
-    ActualJoinCounts actualRowsForJoinPlan(const JoinOrderPlan& plan) {
-        std::map<TableRefId, MaterializedRows> base_rows;
-        std::map<TableRefId, size_t> table_widths;
-        for (const auto& table_ref : plan.components.table_refs) {
-            auto& metadata = catalog.getTable(table_ref.table_id);
-            table_widths[table_ref.id] = metadata.schema.columns.size();
-            base_rows[table_ref.id] = collectFilteredRows(
-                plan.components,
-                table_ref.id,
-                catalog,
-                page_manager
-            );
-        }
-
-        std::map<TableRefId, size_t> table_offsets;
-        table_offsets[plan.components.base_table_ref_id] = 0;
-        std::set<TableRefId> joined_table_refs{plan.components.base_table_ref_id};
-        size_t output_width = table_widths.at(plan.components.base_table_ref_id);
-        MaterializedRows current_rows =
-            std::move(base_rows[plan.components.base_table_ref_id]);
-
-        ActualJoinCounts counts;
-        for (const auto& step : plan.steps) {
-            auto columns = joinedAndInputColumns(step.join, joined_table_refs);
-            size_t left_attr_index = physicalOffset(columns.first, table_offsets);
-            size_t right_attr_index = columns.second.column_index;
-            current_rows = hashJoinRows(
-                current_rows,
-                base_rows.at(step.join.input_table_ref_id),
-                left_attr_index,
-                right_attr_index
-            );
-            counts.step_rows.push_back(current_rows.size());
-
-            table_offsets[step.join.input_table_ref_id] = output_width;
-            output_width += table_widths.at(step.join.input_table_ref_id);
-            joined_table_refs.insert(step.join.input_table_ref_id);
-        }
-
-        for (const auto& row : current_rows) {
-            if (rowMatchesFinalPredicates(plan.components, row, table_offsets)) {
-                counts.final_rows++;
-            }
-        }
-        return counts;
     }
 
 public:
@@ -6041,33 +5833,6 @@ public:
         std::vector<PhysicalJoinKind> kinds;
         for (const auto& step : plan.steps) {
             kinds.push_back(step.chosen_join_kind);
-        }
-        return kinds;
-    }
-
-    std::vector<PhysicalJoinKind> choosePhysicalJoinKindsForOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats) {
-        auto base_relations = estimateBaseRelations(components, stats);
-
-        std::vector<PhysicalJoinKind> kinds;
-        std::set<TableRefId> joined_table_refs{components.base_table_ref_id};
-        RelationStats current_relation =
-            base_relations.at(components.base_table_ref_id);
-        double current_total_cost = tupleScanCost(current_relation.rows);
-
-        for (const auto& join : components.joins) {
-            auto step = estimateJoinOrderStep(
-                base_relations,
-                joined_table_refs,
-                join,
-                current_relation,
-                current_total_cost
-            );
-            kinds.push_back(step.chosen_join_kind);
-            joined_table_refs.insert(join.input_table_ref_id);
-            current_relation = step.output_relation;
-            current_total_cost = step.chosen_cost;
         }
         return kinds;
     }

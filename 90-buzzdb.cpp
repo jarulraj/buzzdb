@@ -4731,20 +4731,24 @@ private:
         return 0.10 * std::max(0.0, tuples);
     }
 
-    static double nestedLoopJoinCost(double current_total_cost,
+    static double nestedLoopJoinCost(double left_total_cost,
+                                     double right_total_cost,
                                      double left_rows,
                                      double right_rows,
                                      double output_rows) {
-        return current_total_cost +
+        return left_total_cost +
+               right_total_cost +
                tupleComparisonCost(left_rows * right_rows) +
                tupleMaterializationCost(output_rows);
     }
 
-    static double hashJoinCost(double current_total_cost,
+    static double hashJoinCost(double left_total_cost,
+                               double right_total_cost,
                                double left_rows,
                                double right_rows,
                                double output_rows) {
-        return current_total_cost +
+        return left_total_cost +
+               right_total_cost +
                tupleHashCost(left_rows + right_rows) +
                tupleMaterializationCost(output_rows);
     }
@@ -5060,14 +5064,17 @@ private:
             output_rows
         );
 
+        double right_total_cost = tupleScanCost(right_relation.rows);
         double nested_loop_cost = nestedLoopJoinCost(
             current_total_cost,
+            right_total_cost,
             current_relation.rows,
             right_relation.rows,
             output_rows
         );
         double hash_join_cost = hashJoinCost(
             current_total_cost,
+            right_total_cost,
             current_relation.rows,
             right_relation.rows,
             output_rows
@@ -5341,14 +5348,17 @@ public:
             columnStatsFor(components, stats, columns.first),
             columnStatsFor(components, stats, columns.second)
         );
+        double right_total_cost = tupleScanCost(right_rows);
         double nested_loop_cost = nestedLoopJoinCost(
             current_total_cost,
+            right_total_cost,
             current_rows,
             right_rows,
             output_rows
         );
         double hash_join_cost = hashJoinCost(
             current_total_cost,
+            right_total_cost,
             current_rows,
             right_rows,
             output_rows
