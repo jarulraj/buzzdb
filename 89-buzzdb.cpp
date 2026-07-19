@@ -4417,10 +4417,104 @@ bool betterJoinOrderStep(const JoinOrderStepEstimate& candidate,
     return candidate.join.input_table_ref_id < incumbent.join.input_table_ref_id;
 }
 
+std::string columnTraceLabel(const QueryComponents& components,
+                             const ColumnRef& column,
+                             Catalog* catalog) {
+    const auto& table_ref = tableRefForId(components, column.table_ref_id);
+    if (!catalog) {
+        return table_ref.alias + ".c" + std::to_string(column.column_index);
+    }
+
+    const auto& metadata = catalog->getTable(table_ref.table_id);
+    return table_ref.alias + "." +
+           metadata.schema.columns[column.column_index].name;
+}
+
+std::string greedyStartTraceLine(const QueryComponents& components,
+                                 TableRefId start_table_ref_id,
+                                 const JoinOrderStepEstimate& step,
+                                 Catalog* trace_catalog) {
+    std::set<TableRefId> joined_table_refs{start_table_ref_id};
+    auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+    std::ostringstream output;
+    output << "    candidate base="
+           << tableRefForId(components, start_table_ref_id).alias
+           << ", add "
+           << tableRefForId(components, step.join.input_table_ref_id).alias
+           << " via "
+           << columnTraceLabel(components, columns.first, trace_catalog)
+           << " = "
+           << columnTraceLabel(components, columns.second, trace_catalog)
+           << " -> " << physicalJoinKindName(step.chosen_join_kind)
+           << ", rows=" << formatEstimate(step.output_rows)
+           << ", cost=" << formatEstimate(step.chosen_cost);
+    return output.str();
+}
+
+std::string greedyStartChoiceTraceLine(const QueryComponents& components,
+                                       TableRefId start_table_ref_id,
+                                       const JoinOrderStepEstimate& step,
+                                       Catalog* trace_catalog) {
+    std::string line = greedyStartTraceLine(
+        components,
+        start_table_ref_id,
+        step,
+        trace_catalog
+    );
+    return "    choose" + line.substr(std::string("    candidate").size());
+}
+
+std::string joinedTableRefsTraceLabel(const QueryComponents& components,
+                                      const std::set<TableRefId>& table_refs) {
+    std::ostringstream output;
+    bool first = true;
+    for (TableRefId table_ref_id : table_refs) {
+        if (!first) {
+            output << ", ";
+        }
+        output << tableRefForId(components, table_ref_id).alias;
+        first = false;
+    }
+    return output.str();
+}
+
+std::string greedyCandidateTraceLine(const QueryComponents& components,
+                                     const std::set<TableRefId>& joined_table_refs,
+                                     const JoinOrderStepEstimate& step,
+                                     Catalog* trace_catalog) {
+    auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+    std::ostringstream output;
+    output << "    candidate add "
+           << tableRefForId(components, step.join.input_table_ref_id).alias
+           << " via "
+           << columnTraceLabel(components, columns.first, trace_catalog)
+           << " = "
+           << columnTraceLabel(components, columns.second, trace_catalog)
+           << " -> " << physicalJoinKindName(step.chosen_join_kind)
+           << ", rows=" << formatEstimate(step.output_rows)
+           << ", cost=" << formatEstimate(step.chosen_cost);
+    return output.str();
+}
+
+std::string greedyChoiceTraceLine(const QueryComponents& components,
+                                  const std::set<TableRefId>& joined_table_refs,
+                                  const JoinOrderStepEstimate& step,
+                                  Catalog* trace_catalog) {
+    std::string line = greedyCandidateTraceLine(
+        components,
+        joined_table_refs,
+        step,
+        trace_catalog
+    );
+    return "    choose" + line.substr(std::string("    candidate").size());
+}
+
 JoinOrderPlan chooseGreedyJoinOrder(
         const QueryComponents& components,
         const std::map<TableId, TableStats>& stats,
-        SelectivityModel model = SelectivityModel::Uniform) {
+        SelectivityModel model = SelectivityModel::Uniform,
+        std::vector<std::string>* search_trace = nullptr,
+        Catalog* trace_catalog = nullptr) {
     auto base_estimates = estimateFilteredBaseRows(components, stats, model);
     std::map<TableRefId, double> base_page_estimates;
     for (const auto& table_ref : components.table_refs) {
@@ -4433,6 +4527,7 @@ JoinOrderPlan chooseGreedyJoinOrder(
 
     std::optional<TableRefId> best_start_table_ref_id;
     std::optional<JoinOrderStepEstimate> best_first_step;
+    std::vector<std::string> first_round_trace;
     for (const auto& edge : edges) {
         for (TableRefId start_table_ref_id :
              {edge.left.table_ref_id, edge.right.table_ref_id}) {
@@ -4453,6 +4548,14 @@ JoinOrderPlan chooseGreedyJoinOrder(
                 base_page_estimates.at(start_table_ref_id),
                 base_page_estimates.at(start_table_ref_id)
             );
+            if (search_trace) {
+                first_round_trace.push_back(greedyStartTraceLine(
+                    components,
+                    start_table_ref_id,
+                    step,
+                    trace_catalog
+                ));
+            }
             if (!best_first_step ||
                 betterJoinOrderStep(step, *best_first_step)) {
                 best_start_table_ref_id = start_table_ref_id;
@@ -4464,6 +4567,23 @@ JoinOrderPlan chooseGreedyJoinOrder(
     if (!best_start_table_ref_id || !best_first_step) {
         throw std::runtime_error("Unable to choose a join order.");
     }
+    if (search_trace) {
+        search_trace->push_back(
+            "Greedy round 1: evaluate every connected two-table start "
+            "(rank by lowest rows, then lowest cost)"
+        );
+        search_trace->insert(
+            search_trace->end(),
+            first_round_trace.begin(),
+            first_round_trace.end()
+        );
+        search_trace->push_back(greedyStartChoiceTraceLine(
+            components,
+            *best_start_table_ref_id,
+            *best_first_step,
+            trace_catalog
+        ));
+    }
 
     std::vector<JoinClause> join_order{best_first_step->join};
     std::vector<JoinOrderStepEstimate> steps{*best_first_step};
@@ -4474,9 +4594,11 @@ JoinOrderPlan chooseGreedyJoinOrder(
     double current_rows = best_first_step->output_rows;
     double current_pages = best_first_step->output_pages;
     double current_total_cost = best_first_step->chosen_cost;
+    size_t greedy_round = 2;
 
     while (joined_table_refs.size() < components.table_refs.size()) {
         std::optional<JoinOrderStepEstimate> best_step;
+        std::vector<std::string> round_trace;
         for (const auto& edge : edges) {
             auto oriented = orientJoinEdge(edge, joined_table_refs);
             if (!oriented) {
@@ -4494,6 +4616,14 @@ JoinOrderPlan chooseGreedyJoinOrder(
                 current_pages,
                 current_total_cost
             );
+            if (search_trace && greedy_round == 2) {
+                round_trace.push_back(greedyCandidateTraceLine(
+                    components,
+                    joined_table_refs,
+                    step,
+                    trace_catalog
+                ));
+            }
             if (!best_step || betterJoinOrderStep(step, *best_step)) {
                 best_step = step;
             }
@@ -4502,6 +4632,23 @@ JoinOrderPlan chooseGreedyJoinOrder(
         if (!best_step) {
             throw std::runtime_error("Join graph is disconnected.");
         }
+        if (search_trace && greedy_round == 2) {
+            search_trace->push_back(
+                "Greedy round 2: evaluate joins connected to {" +
+                joinedTableRefsTraceLabel(components, joined_table_refs) + "}"
+            );
+            search_trace->insert(
+                search_trace->end(),
+                round_trace.begin(),
+                round_trace.end()
+            );
+            search_trace->push_back(greedyChoiceTraceLine(
+                components,
+                joined_table_refs,
+                *best_step,
+                trace_catalog
+            ));
+        }
 
         join_order.push_back(best_step->join);
         steps.push_back(*best_step);
@@ -4509,6 +4656,7 @@ JoinOrderPlan chooseGreedyJoinOrder(
         current_rows = best_step->output_rows;
         current_pages = best_step->output_pages;
         current_total_cost = best_step->chosen_cost;
+        greedy_round++;
     }
 
     auto planned_components = makeJoinPlanComponents(
@@ -5340,8 +5488,15 @@ public:
     JoinOrderPlan chooseGreedyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform) {
-        return ::chooseGreedyJoinOrder(components, stats, model);
+            SelectivityModel model = SelectivityModel::Uniform,
+            std::vector<std::string>* search_trace = nullptr) {
+        return ::chooseGreedyJoinOrder(
+            components,
+            stats,
+            model,
+            search_trace,
+            search_trace ? &catalog : nullptr
+        );
     }
 
     std::vector<PhysicalJoinKind> physicalJoinKindsForPlan(
@@ -6732,11 +6887,17 @@ void runImdbJoinOrdering() {
         stats,
         SelectivityModel::Uniform
     );
+    std::vector<std::string> mcv_greedy_trace;
     auto mcv_plan = db.optimizer().chooseGreedyJoinOrder(
         components,
         stats,
-        SelectivityModel::MostCommonValues
+        SelectivityModel::MostCommonValues,
+        &mcv_greedy_trace
     );
+    std::cout << "\nMCV greedy first decision:" << std::endl;
+    for (const auto& line : mcv_greedy_trace) {
+        std::cout << line << std::endl;
+    }
     db.optimizer().printJoinOrderPlan(
         "Uniform-stats optimizer order",
         uniform_plan

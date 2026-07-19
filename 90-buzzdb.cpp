@@ -4229,6 +4229,30 @@ struct JoinOrderPlan {
     double final_estimate = 0.0;
 };
 
+enum class JoinOrderSearchPolicy {
+    Greedy,
+    SelingerLeftDeepDP
+};
+
+std::string joinOrderSearchPolicyName(JoinOrderSearchPolicy policy) {
+    switch (policy) {
+        case JoinOrderSearchPolicy::Greedy:
+            return "Greedy";
+        case JoinOrderSearchPolicy::SelingerLeftDeepDP:
+            return "Selinger left-deep DP";
+    }
+    throw std::runtime_error("Unknown join-order search policy.");
+}
+
+struct JoinOrderSearchResult {
+    JoinOrderSearchPolicy policy;
+    JoinOrderPlan plan;
+    double estimated_cost = 0.0;
+    size_t states_kept = 0;
+    size_t candidates_considered = 0;
+    std::vector<std::string> search_steps;
+};
+
 QueryComponents makeJoinPlanComponents(
         const QueryComponents& source,
         TableRefId base_table_ref_id,
@@ -4406,10 +4430,85 @@ bool betterJoinOrderStep(const JoinOrderStepEstimate& candidate,
     return candidate.join.input_table_ref_id < incumbent.join.input_table_ref_id;
 }
 
+std::string tableRefAlias(const QueryComponents& components,
+                          TableRefId table_ref_id) {
+    return tableRefForId(components, table_ref_id).alias;
+}
+
+std::string tableRefSetLabel(const QueryComponents& components,
+                             const std::set<TableRefId>& table_ref_ids) {
+    std::ostringstream output;
+    output << "{";
+    bool first = true;
+    for (const auto& table_ref : components.table_refs) {
+        if (table_ref_ids.find(table_ref.id) == table_ref_ids.end()) {
+            continue;
+        }
+        if (!first) {
+            output << ",";
+        }
+        output << table_ref.alias;
+        first = false;
+    }
+    output << "}";
+    return output.str();
+}
+
+std::string joinOrderStringFor(const QueryComponents& components,
+                               TableRefId base_table_ref_id,
+                               const std::vector<JoinClause>& join_order) {
+    std::ostringstream output;
+    output << tableRefAlias(components, base_table_ref_id);
+    for (const auto& join : join_order) {
+        output << " -> "
+               << tableRefAlias(components, join.input_table_ref_id);
+    }
+    return output.str();
+}
+
+std::string joinCandidateTraceLine(const QueryComponents& components,
+                                   Catalog& catalog,
+                                   const std::set<TableRefId>& joined_table_refs,
+                                   const JoinOrderStepEstimate& step) {
+    auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+    std::ostringstream output;
+    output << "add "
+           << tableRefAlias(components, step.join.input_table_ref_id)
+           << " via "
+           << columnRefLabel(components, catalog, columns.first)
+           << " = "
+           << columnRefLabel(components, catalog, columns.second)
+           << " -> "
+           << physicalJoinKindName(step.chosen_join_kind)
+           << ", rows=" << formatEstimate(step.output_rows)
+           << ", cost=" << formatEstimate(step.chosen_cost);
+    return output.str();
+}
+
+std::string startCandidateTraceLine(const QueryComponents& components,
+                                    Catalog& catalog,
+                                    TableRefId start_table_ref_id,
+                                    const JoinOrderStepEstimate& step) {
+    std::set<TableRefId> joined_table_refs{start_table_ref_id};
+    std::ostringstream output;
+    output << "base="
+           << tableRefAlias(components, start_table_ref_id)
+           << ", "
+           << joinCandidateTraceLine(
+               components,
+               catalog,
+               joined_table_refs,
+               step
+           );
+    return output.str();
+}
+
 JoinOrderPlan chooseGreedyJoinOrder(
         const QueryComponents& components,
         const std::map<TableId, TableStats>& stats,
-        SelectivityModel model = SelectivityModel::Uniform) {
+        SelectivityModel model = SelectivityModel::Uniform,
+        std::vector<std::string>* search_steps = nullptr,
+        Catalog* catalog = nullptr) {
     auto base_estimates = estimateFilteredBaseRows(components, stats, model);
     std::map<TableRefId, double> base_page_estimates;
     for (const auto& table_ref : components.table_refs) {
@@ -4422,6 +4521,7 @@ JoinOrderPlan chooseGreedyJoinOrder(
 
     std::optional<TableRefId> best_start_table_ref_id;
     std::optional<JoinOrderStepEstimate> best_first_step;
+    std::vector<std::pair<TableRefId, JoinOrderStepEstimate>> first_candidates;
     for (const auto& edge : edges) {
         for (TableRefId start_table_ref_id :
              {edge.left.table_ref_id, edge.right.table_ref_id}) {
@@ -4442,6 +4542,7 @@ JoinOrderPlan chooseGreedyJoinOrder(
                 base_page_estimates.at(start_table_ref_id),
                 base_page_estimates.at(start_table_ref_id)
             );
+            first_candidates.push_back({start_table_ref_id, step});
             if (!best_first_step ||
                 betterJoinOrderStep(step, *best_first_step)) {
                 best_start_table_ref_id = start_table_ref_id;
@@ -4452,6 +4553,33 @@ JoinOrderPlan chooseGreedyJoinOrder(
 
     if (!best_start_table_ref_id || !best_first_step) {
         throw std::runtime_error("Unable to choose a join order.");
+    }
+
+    if (search_steps && catalog) {
+        search_steps->push_back(
+            "Greedy round 1: evaluate every connected two-table start "
+            "(rank by lowest rows, then lowest cost)"
+        );
+        for (const auto& candidate : first_candidates) {
+            search_steps->push_back(
+                "  candidate " +
+                startCandidateTraceLine(
+                    components,
+                    *catalog,
+                    candidate.first,
+                    candidate.second
+                )
+            );
+        }
+        search_steps->push_back(
+            "  choose " +
+            startCandidateTraceLine(
+                components,
+                *catalog,
+                *best_start_table_ref_id,
+                *best_first_step
+            )
+        );
     }
 
     std::vector<JoinClause> join_order{best_first_step->join};
@@ -4466,6 +4594,7 @@ JoinOrderPlan chooseGreedyJoinOrder(
 
     while (joined_table_refs.size() < components.table_refs.size()) {
         std::optional<JoinOrderStepEstimate> best_step;
+        std::vector<JoinOrderStepEstimate> round_candidates;
         for (const auto& edge : edges) {
             auto oriented = orientJoinEdge(edge, joined_table_refs);
             if (!oriented) {
@@ -4483,6 +4612,7 @@ JoinOrderPlan chooseGreedyJoinOrder(
                 current_pages,
                 current_total_cost
             );
+            round_candidates.push_back(step);
             if (!best_step || betterJoinOrderStep(step, *best_step)) {
                 best_step = step;
             }
@@ -4490,6 +4620,36 @@ JoinOrderPlan chooseGreedyJoinOrder(
 
         if (!best_step) {
             throw std::runtime_error("Join graph is disconnected.");
+        }
+
+        if (search_steps && catalog) {
+            size_t round_number = steps.size() + 1;
+            search_steps->push_back(
+                "Greedy round " + std::to_string(round_number) +
+                ": joined " + tableRefSetLabel(components, joined_table_refs) +
+                "; evaluate connected extensions "
+                "(rank by lowest rows, then lowest cost)"
+            );
+            for (const auto& candidate : round_candidates) {
+                search_steps->push_back(
+                    "  candidate " +
+                    joinCandidateTraceLine(
+                        components,
+                        *catalog,
+                        joined_table_refs,
+                        candidate
+                    )
+                );
+            }
+            search_steps->push_back(
+                "  choose " +
+                joinCandidateTraceLine(
+                    components,
+                    *catalog,
+                    joined_table_refs,
+                    *best_step
+                )
+            );
         }
 
         join_order.push_back(best_step->join);
@@ -4581,6 +4741,21 @@ struct SelingerJoinOrderResult {
     double estimated_cost = 0.0;
 };
 
+std::string selingerStateTraceLine(const QueryComponents& components,
+                                   const SelingerDpState& state) {
+    std::ostringstream output;
+    output << tableRefSetLabel(components, state.joined_table_refs)
+           << ": order="
+           << joinOrderStringFor(
+               components,
+               state.base_table_ref_id,
+               state.join_order
+           )
+           << ", rows=" << formatEstimate(state.rows)
+           << ", cost=" << formatEstimate(state.cost);
+    return output.str();
+}
+
 bool betterSelingerState(const SelingerDpState& candidate,
                          const SelingerDpState& incumbent) {
     if (candidate.cost != incumbent.cost) {
@@ -4595,7 +4770,9 @@ bool betterSelingerState(const SelingerDpState& candidate,
 SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
         const QueryComponents& components,
         const std::map<TableId, TableStats>& stats,
-        SelectivityModel model = SelectivityModel::MostCommonValues) {
+        SelectivityModel model = SelectivityModel::MostCommonValues,
+        std::vector<std::string>* search_steps = nullptr,
+        Catalog* catalog = nullptr) {
     size_t table_count = components.table_refs.size();
     if (table_count == 0 || table_count >= 63) {
         throw std::runtime_error("Selinger DP supports 1..62 table refs.");
@@ -4617,6 +4794,9 @@ SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
     uint64_t full_mask = (1ULL << table_count) - 1ULL;
     std::vector<std::optional<SelingerDpState>> best(full_mask + 1);
     SelingerJoinOrderResult result;
+    std::vector<size_t> candidates_by_level(table_count + 1, 0);
+    std::vector<size_t> discarded_by_level(table_count + 1, 0);
+    std::vector<std::vector<std::string>> kept_by_level(table_count + 1);
 
     for (const auto& table_ref : components.table_refs) {
         uint64_t mask = bit_for_table_ref.at(table_ref.id);
@@ -4628,6 +4808,14 @@ SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
         state.cost = state.pages;
         best[mask] = std::move(state);
         result.states_kept++;
+        if (search_steps) {
+            kept_by_level[1].push_back(
+                "seed " + selingerStateTraceLine(
+                    components,
+                    *best[mask]
+                )
+            );
+        }
     }
 
     for (uint64_t mask = 1; mask <= full_mask; mask++) {
@@ -4669,12 +4857,42 @@ SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
             candidate.cost = step.chosen_cost;
 
             uint64_t next_mask = mask | input_bit;
+            size_t next_level = candidate.joined_table_refs.size();
             result.candidates_considered++;
+            candidates_by_level[next_level]++;
             if (!best[next_mask]) {
+                if (search_steps && catalog) {
+                    kept_by_level[next_level].push_back(
+                        "keep " +
+                        selingerStateTraceLine(components, candidate) +
+                        " by " +
+                        joinCandidateTraceLine(
+                            components,
+                            *catalog,
+                            current.joined_table_refs,
+                            step
+                        )
+                    );
+                }
                 best[next_mask] = std::move(candidate);
                 result.states_kept++;
             } else if (betterSelingerState(candidate, *best[next_mask])) {
+                if (search_steps && catalog) {
+                    kept_by_level[next_level].push_back(
+                        "replace " +
+                        selingerStateTraceLine(components, candidate) +
+                        " by " +
+                        joinCandidateTraceLine(
+                            components,
+                            *catalog,
+                            current.joined_table_refs,
+                            step
+                        )
+                    );
+                }
                 best[next_mask] = std::move(candidate);
+            } else {
+                discarded_by_level[next_level]++;
             }
         }
     }
@@ -4691,6 +4909,33 @@ SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
         stats,
         model
     );
+
+    if (search_steps) {
+        search_steps->clear();
+        search_steps->push_back(
+            "Selinger DP level 1: seed one state for each possible base table "
+            "(rank subset winners by lowest cumulative cost, then rows)"
+        );
+        for (const auto& line : kept_by_level[1]) {
+            search_steps->push_back("  " + line);
+        }
+
+        for (size_t level = 2; level <= table_count; level++) {
+            search_steps->push_back(
+                "Selinger DP level " + std::to_string(level) +
+                ": considered " +
+                std::to_string(candidates_by_level[level]) +
+                " extension(s), kept/replaced " +
+                std::to_string(kept_by_level[level].size()) +
+                " subset winner(s), discarded " +
+                std::to_string(discarded_by_level[level]) +
+                " higher-cost candidate(s)"
+            );
+            for (const auto& line : kept_by_level[level]) {
+                search_steps->push_back("  " + line);
+            }
+        }
+    }
     return result;
 }
 
@@ -4714,6 +4959,96 @@ std::string joinOrderString(const QueryComponents& components) {
         output << labels[i];
     }
     return output.str();
+}
+
+std::vector<std::string> joinOrderLabels(const QueryComponents& components) {
+    std::vector<std::string> labels;
+    labels.push_back(tableRefLabel(components, components.base_table_ref_id));
+    for (const auto& join : components.joins) {
+        labels.push_back(tableRefLabel(components, join.input_table_ref_id));
+    }
+    return labels;
+}
+
+double estimatedPlanCost(const JoinOrderPlan& plan) {
+    if (plan.steps.empty()) {
+        return 0.0;
+    }
+    return plan.steps.back().chosen_cost;
+}
+
+std::string firstJoinOrderDifference(
+        const JoinOrderSearchResult& left,
+        const JoinOrderSearchResult& right) {
+    auto left_labels = joinOrderLabels(left.plan.components);
+    auto right_labels = joinOrderLabels(right.plan.components);
+    size_t limit = std::min(left_labels.size(), right_labels.size());
+    for (size_t i = 0; i < limit; i++) {
+        if (left_labels[i] == right_labels[i]) {
+            continue;
+        }
+
+        std::ostringstream output;
+        if (i == 0) {
+            output << "base table: "
+                   << joinOrderSearchPolicyName(left.policy)
+                   << " starts at " << left_labels[i]
+                   << "; "
+                   << joinOrderSearchPolicyName(right.policy)
+                   << " starts at " << right_labels[i];
+            return output.str();
+        }
+
+        output << "step " << i << ": "
+               << joinOrderSearchPolicyName(left.policy)
+               << " adds " << left_labels[i]
+               << "; "
+               << joinOrderSearchPolicyName(right.policy)
+               << " adds " << right_labels[i];
+        return output.str();
+    }
+
+    if (left_labels.size() != right_labels.size()) {
+        return "orders have different lengths";
+    }
+    return "none; both policies chose the same order";
+}
+
+void printJoinOrderSearchComparison(
+        const JoinOrderSearchResult& greedy,
+        const JoinOrderSearchResult& selinger) {
+    std::cout << "\nJoin-order search policies:" << std::endl;
+    std::cout << "  estimates: MCV selectivity + physical join cost"
+              << std::endl;
+    std::cout << "  Greedy ranking: lowest next-step rows, then lowest cost"
+              << std::endl;
+    std::cout << "  Selinger ranking: lowest cumulative subset cost, then rows"
+              << std::endl;
+    std::cout << "  " << joinOrderSearchPolicyName(greedy.policy)
+              << ": follows one locally-best path"
+              << ", cost=" << formatEstimate(greedy.estimated_cost)
+              << ", final_est=" << formatEstimate(greedy.plan.final_estimate)
+              << ", order=" << joinOrderString(greedy.plan.components)
+              << std::endl;
+    std::cout << "  " << joinOrderSearchPolicyName(selinger.policy)
+              << ": enumerates left-deep subsets"
+              << ", states=" << selinger.states_kept
+              << ", candidates=" << selinger.candidates_considered
+              << ", cost=" << formatEstimate(selinger.estimated_cost)
+              << ", final_est=" << formatEstimate(selinger.plan.final_estimate)
+              << ", order=" << joinOrderString(selinger.plan.components)
+              << std::endl;
+    std::cout << "  first divergence: "
+              << firstJoinOrderDifference(greedy, selinger)
+              << std::endl;
+}
+
+void printJoinOrderSearchSteps(const JoinOrderSearchResult& result) {
+    std::cout << "\n" << joinOrderSearchPolicyName(result.policy)
+              << " search steps:" << std::endl;
+    for (const auto& step : result.search_steps) {
+        std::cout << "  " << step << std::endl;
+    }
 }
 
 void printJoinOrderPlan(const std::string& title,
@@ -5235,6 +5570,49 @@ public:
         return ::chooseGreedyJoinOrder(components, stats, model);
     }
 
+    JoinOrderSearchResult chooseJoinOrder(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            JoinOrderSearchPolicy policy,
+        SelectivityModel model = SelectivityModel::MostCommonValues) {
+        if (policy == JoinOrderSearchPolicy::Greedy) {
+            std::vector<std::string> search_steps;
+            auto plan = ::chooseGreedyJoinOrder(
+                components,
+                stats,
+                model,
+                &search_steps,
+                &catalog
+            );
+            double cost = estimatedPlanCost(plan);
+            return {
+                policy,
+                std::move(plan),
+                cost,
+                0,
+                0,
+                std::move(search_steps)
+            };
+        }
+
+        std::vector<std::string> search_steps;
+        auto result = ::chooseSelingerLeftDeepJoinOrder(
+            components,
+            stats,
+            model,
+            &search_steps,
+            &catalog
+        );
+        return {
+            policy,
+            std::move(result.plan),
+            result.estimated_cost,
+            result.states_kept,
+            result.candidates_considered,
+            std::move(search_steps)
+        };
+    }
+
     std::vector<PhysicalJoinKind> physicalJoinKindsForPlan(
             const JoinOrderPlan& plan) {
         return ::physicalJoinKindsForPlan(plan);
@@ -5243,6 +5621,17 @@ public:
     void printJoinOrderPlan(const std::string& title,
                             const JoinOrderPlan& plan) {
         ::printJoinOrderPlan(title, plan, catalog);
+    }
+
+    void printJoinOrderSearchComparison(
+            const JoinOrderSearchResult& greedy,
+            const JoinOrderSearchResult& selinger) {
+        ::printJoinOrderSearchComparison(greedy, selinger);
+    }
+
+    void printJoinOrderSearchSteps(
+            const JoinOrderSearchResult& result) {
+        ::printJoinOrderSearchSteps(result);
     }
 
     SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
@@ -6638,28 +7027,36 @@ void runImdbJoinOrdering() {
         stats
     );
 
-    auto greedy_plan = db.optimizer().chooseGreedyJoinOrder(
+    auto greedy_search = db.optimizer().chooseJoinOrder(
         components,
         stats,
+        JoinOrderSearchPolicy::Greedy,
         SelectivityModel::MostCommonValues
     );
-    auto selinger_result =
-        db.optimizer().chooseSelingerLeftDeepJoinOrder(
+    auto selinger_search = db.optimizer().chooseJoinOrder(
         components,
         stats,
+        JoinOrderSearchPolicy::SelingerLeftDeepDP,
         SelectivityModel::MostCommonValues
     );
-    const auto& selinger_plan = selinger_result.plan;
+    const auto& greedy_plan = greedy_search.plan;
+    const auto& selinger_plan = selinger_search.plan;
+    db.optimizer().printJoinOrderSearchComparison(
+        greedy_search,
+        selinger_search
+    );
+    db.optimizer().printJoinOrderSearchSteps(greedy_search);
+    db.optimizer().printJoinOrderSearchSteps(selinger_search);
     db.optimizer().printJoinOrderPlan(
         "MCV-greedy optimizer order",
         greedy_plan
     );
     std::cout << "\nSelinger left-deep DP search:"
-              << " kept " << selinger_result.states_kept
+              << " kept " << selinger_search.states_kept
               << " state(s), considered "
-              << selinger_result.candidates_considered
+              << selinger_search.candidates_considered
               << " candidate extension(s), estimated cost="
-              << formatEstimate(selinger_result.estimated_cost)
+              << formatEstimate(selinger_search.estimated_cost)
               << std::endl;
     db.optimizer().printJoinOrderPlan(
         "Selinger left-deep DP order",
