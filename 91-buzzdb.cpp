@@ -7318,8 +7318,7 @@ void runImdbJoinOrdering() {
         throw std::runtime_error("Join reordering changed the query result.");
     }
 
-    std::cout << "\nResult: With the same propagated estimated RelationStats"
-              << " and tuple-cost model, Selinger searches more left-deep"
+    std::cout << "\nResult: Selinger searches more left-deep"
               << " alternatives than greedy.\n";
 }
 
