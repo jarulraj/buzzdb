@@ -3994,7 +3994,6 @@ std::string physicalJoinKindName(PhysicalJoinKind kind) {
 struct JoinOrderStepEstimate {
     JoinClause join;
     double output_rows = 0.0;
-    double output_pages = 0.0;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
     double chosen_cost = 0.0;
 };
@@ -4047,16 +4046,6 @@ private:
         return copy;
     }
 
-    static TableRefId tableRefIdForAlias(const QueryComponents& components,
-                                         const std::string& alias) {
-        for (const auto& table_ref : components.table_refs) {
-            if (table_ref.alias == alias) {
-                return table_ref.id;
-            }
-        }
-        throw std::runtime_error("Unknown table alias in join order: " + alias);
-    }
-
     static std::vector<JoinClause> equalityEdgesForJoinOrdering(
             const QueryComponents& components) {
         std::vector<JoinClause> edges = components.joins;
@@ -4105,37 +4094,8 @@ private:
         throw std::runtime_error("Join edge is not connected to the current plan.");
     }
 
-    static double estimatePagesForRows(const TableStats& table_stats, double rows) {
-        if (rows <= 0.0 || table_stats.row_count == 0 ||
-            table_stats.page_count == 0) {
-            return 0.0;
-        }
-
-        double page_fraction = rows / static_cast<double>(table_stats.row_count);
-        return std::max(
-            1.0,
-            static_cast<double>(table_stats.page_count) * page_fraction
-        );
-    }
-
-    static double estimateJoinOutputPages(double output_rows,
-                                          double left_rows,
-                                          double left_pages,
-                                          double right_rows,
-                                          double right_pages) {
-        if (output_rows <= 0.0) {
-            return 0.0;
-        }
-
-        double left_rows_per_page =
-            left_rows / std::max(1.0, left_pages);
-        double right_rows_per_page =
-            right_rows / std::max(1.0, right_pages);
-        double output_rows_per_page = std::max(
-            1.0,
-            std::min(left_rows_per_page, right_rows_per_page)
-        );
-        return std::max(1.0, output_rows / output_rows_per_page);
+    static double tupleScanCost(double tuples) {
+        return std::max(0.0, tuples);
     }
 
     static double tupleComparisonCost(double comparisons) {
@@ -4148,6 +4108,24 @@ private:
 
     static double tupleMaterializationCost(double tuples) {
         return 0.10 * std::max(0.0, tuples);
+    }
+
+    static double nestedLoopJoinCost(double current_total_cost,
+                                     double left_rows,
+                                     double right_rows,
+                                     double output_rows) {
+        return current_total_cost +
+               tupleComparisonCost(left_rows * right_rows) +
+               tupleMaterializationCost(output_rows);
+    }
+
+    static double hashJoinCost(double current_total_cost,
+                               double left_rows,
+                               double right_rows,
+                               double output_rows) {
+        return current_total_cost +
+               tupleHashCost(left_rows + right_rows) +
+               tupleMaterializationCost(output_rows);
     }
 
     static bool betterJoinOrderStep(const JoinOrderStepEstimate& candidate,
@@ -4211,38 +4189,31 @@ private:
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
             const std::map<TableRefId, double>& base_estimates,
-            const std::map<TableRefId, double>& base_page_estimates,
             const std::set<TableRefId>& joined_table_refs,
             const JoinClause& join,
             double current_rows,
-            double current_pages,
             double current_total_cost) {
         auto columns = joinedAndInputColumns(join, joined_table_refs);
         double right_rows = base_estimates.at(join.input_table_ref_id);
-        double right_pages = base_page_estimates.at(join.input_table_ref_id);
         double output_rows = estimateJoinRows(
             current_rows,
             right_rows,
             columnStatsFor(components, stats, columns.first),
             columnStatsFor(components, stats, columns.second)
         );
-        double output_pages = estimateJoinOutputPages(
-            output_rows,
-            current_rows,
-            current_pages,
-            right_rows,
-            right_pages
-        );
 
-        double nested_loop_cost = current_total_cost +
-            current_rows * right_pages +
-            tupleComparisonCost(current_rows * right_rows) +
-            tupleMaterializationCost(output_rows);
-        double hash_join_cost = current_total_cost +
-            2.0 * current_pages +
-            3.0 * right_pages +
-            tupleHashCost(current_rows + right_rows) +
-            tupleMaterializationCost(output_rows);
+        double nested_loop_cost = nestedLoopJoinCost(
+            current_total_cost,
+            current_rows,
+            right_rows,
+            output_rows
+        );
+        double hash_join_cost = hashJoinCost(
+            current_total_cost,
+            current_rows,
+            right_rows,
+            output_rows
+        );
         PhysicalJoinKind chosen_join_kind =
             nested_loop_cost <= hash_join_cost
                 ? PhysicalJoinKind::NestedLoopJoin
@@ -4254,7 +4225,6 @@ private:
         return {
             join,
             output_rows,
-            output_pages,
             chosen_join_kind,
             chosen_cost
         };
@@ -4339,56 +4309,10 @@ public:
         return estimates;
     }
 
-    QueryComponents makeJoinPlanFromAliases(
-            const QueryComponents& source,
-            const std::vector<std::string>& aliases) {
-        if (aliases.empty()) {
-            throw std::runtime_error("Join order cannot be empty.");
-        }
-
-        TableRefId base_table_ref_id = tableRefIdForAlias(source, aliases.front());
-        std::set<TableRefId> joined_table_refs{base_table_ref_id};
-        auto edges = equalityEdgesForJoinOrdering(source);
-        std::vector<JoinClause> join_order;
-
-        for (size_t i = 1; i < aliases.size(); i++) {
-            TableRefId next_table_ref_id = tableRefIdForAlias(source, aliases[i]);
-            std::optional<JoinClause> selected;
-            for (const auto& edge : edges) {
-                auto oriented = orientJoinEdge(edge, joined_table_refs);
-                if (oriented && oriented->input_table_ref_id == next_table_ref_id) {
-                    selected = *oriented;
-                    break;
-                }
-            }
-            if (!selected) {
-                throw std::runtime_error(
-                    "Join order is not connected at alias " + aliases[i]
-                );
-            }
-
-            join_order.push_back(*selected);
-            joined_table_refs.insert(next_table_ref_id);
-        }
-
-        return makeJoinPlanComponents(
-            source,
-            base_table_ref_id,
-            std::move(join_order)
-        );
-    }
-
     JoinOrderPlan chooseGreedyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats) {
         auto base_estimates = estimateFilteredBaseRows(components, stats);
-        std::map<TableRefId, double> base_page_estimates;
-        for (const auto& table_ref : components.table_refs) {
-            base_page_estimates[table_ref.id] = estimatePagesForRows(
-                stats.at(table_ref.table_id),
-                base_estimates.at(table_ref.id)
-            );
-        }
         auto edges = equalityEdgesForJoinOrdering(components);
 
         std::optional<TableRefId> best_start_table_ref_id;
@@ -4406,12 +4330,10 @@ public:
                     components,
                     stats,
                     base_estimates,
-                    base_page_estimates,
                     joined_table_refs,
                     *oriented,
                     base_estimates.at(start_table_ref_id),
-                    base_page_estimates.at(start_table_ref_id),
-                    base_page_estimates.at(start_table_ref_id)
+                    tupleScanCost(base_estimates.at(start_table_ref_id))
                 );
                 if (!best_first_step ||
                     betterJoinOrderStep(step, *best_first_step)) {
@@ -4432,7 +4354,6 @@ public:
             best_first_step->join.input_table_ref_id
         };
         double current_rows = best_first_step->output_rows;
-        double current_pages = best_first_step->output_pages;
         double current_total_cost = best_first_step->chosen_cost;
 
         while (joined_table_refs.size() < components.table_refs.size()) {
@@ -4447,11 +4368,9 @@ public:
                     components,
                     stats,
                     base_estimates,
-                    base_page_estimates,
                     joined_table_refs,
                     *oriented,
                     current_rows,
-                    current_pages,
                     current_total_cost
                 );
                 if (!best_step || betterJoinOrderStep(step, *best_step)) {
@@ -4467,7 +4386,6 @@ public:
             steps.push_back(*best_step);
             joined_table_refs.insert(best_step->join.input_table_ref_id);
             current_rows = best_step->output_rows;
-            current_pages = best_step->output_pages;
             current_total_cost = best_step->chosen_cost;
         }
 
@@ -4535,36 +4453,25 @@ public:
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats) {
         auto base_estimates = estimateFilteredBaseRows(components, stats);
-        std::map<TableRefId, double> base_page_estimates;
-        for (const auto& table_ref : components.table_refs) {
-            base_page_estimates[table_ref.id] = estimatePagesForRows(
-                stats.at(table_ref.table_id),
-                base_estimates.at(table_ref.id)
-            );
-        }
 
         std::vector<PhysicalJoinKind> kinds;
         std::set<TableRefId> joined_table_refs{components.base_table_ref_id};
         double current_rows = base_estimates.at(components.base_table_ref_id);
-        double current_pages = base_page_estimates.at(components.base_table_ref_id);
-        double current_total_cost = current_pages;
+        double current_total_cost = tupleScanCost(current_rows);
 
         for (const auto& join : components.joins) {
             auto step = estimateJoinOrderStep(
                 components,
                 stats,
                 base_estimates,
-                base_page_estimates,
                 joined_table_refs,
                 join,
                 current_rows,
-                current_pages,
                 current_total_cost
             );
             kinds.push_back(step.chosen_join_kind);
             joined_table_refs.insert(join.input_table_ref_id);
             current_rows = step.output_rows;
-            current_pages = step.output_pages;
             current_total_cost = step.chosen_cost;
         }
         return kinds;
@@ -6215,15 +6122,15 @@ public:
 const std::string imdb_data_filename = "imdb_large.txt";
 const std::string imdb_join_query =
     "PROJECT {cn.name}, {miidx.info}, {t.title} "
-    "FROM title AS t "
-    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-    "JOIN movie_companies AS mc ON {t.id} = {mc.movie_id} "
+    "FROM info_type AS it "
+    "JOIN movie_info_idx AS miidx ON {it.id} = {miidx.info_type_id} "
+    "JOIN movie_companies AS mc ON {miidx.movie_id} = {mc.movie_id} "
     "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
+    "JOIN movie_info AS mi ON {mc.movie_id} = {mi.movie_id} "
+    "JOIN title AS t ON {mi.movie_id} = {t.id} "
+    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
     "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
-    "JOIN movie_info AS mi ON {t.id} = {mi.movie_id} "
     "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
-    "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
-    "JOIN info_type AS it ON {miidx.info_type_id} = {it.id} "
     "WHERE {cn.country_code} = [us] "
     "AND {ct.kind} = production_companies "
     "AND {it.info} = rating "
@@ -6232,10 +6139,6 @@ const std::string imdb_join_query =
     "AND {mi.movie_id} = {miidx.movie_id} "
     "AND {mi.movie_id} = {mc.movie_id} "
     "AND {miidx.movie_id} = {mc.movie_id}";
-
-const std::vector<std::string> random_join_order_aliases = {
-    "it", "miidx", "mc", "cn", "mi", "t", "kt", "ct", "it2"
-};
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
     if (db.isDatabaseEmpty()) {
@@ -6320,24 +6223,20 @@ void runImdbJoinOrdering() {
     auto components = db.parseSelectStatement(imdb_join_query);
     auto stats = db.optimizer().analyzeQueryTables(components);
 
-    auto random_components = db.optimizer().makeJoinPlanFromAliases(
-        components,
-        random_join_order_aliases
-    );
     auto greedy_plan =
         db.optimizer().chooseGreedyJoinOrder(components, stats);
-    std::cout << "\nBad legal join order:" << std::endl;
+    std::cout << "\nWritten query join order:" << std::endl;
     std::cout << "  "
-              << db.optimizer().joinOrderString(random_components)
+              << db.optimizer().joinOrderString(components)
               << std::endl;
     db.optimizer().printJoinOrderPlan(
         "Optimizer chosen join order",
         greedy_plan
     );
 
-    auto random_join_kinds =
+    auto written_join_kinds =
         db.optimizer().choosePhysicalJoinKindsForOrder(
-        random_components,
+        components,
         stats
     );
     auto physical_join_kinds =
@@ -6345,10 +6244,10 @@ void runImdbJoinOrdering() {
     std::cout << "\nQuery time comparison "
               << "(buffer pool cleared before each run):" << std::endl;
     db.clearBufferPool();
-    auto random_result = executeJoinQueryInTransaction(
+    auto written_result = executeJoinQueryInTransaction(
         db,
-        random_components,
-        &random_join_kinds
+        components,
+        &written_join_kinds
     );
     db.clearBufferPool();
     auto greedy_physical_result = executeJoinQueryInTransaction(
@@ -6356,12 +6255,12 @@ void runImdbJoinOrdering() {
         greedy_plan.components,
         &physical_join_kinds
     );
-    printTimedQueryResult("Random legal order", random_result);
+    printTimedQueryResult("Written query order", written_result);
     printTimedQueryResult(
         "Optimizer chosen order",
         greedy_physical_result
     );
-    if (random_result.result.row_count != greedy_physical_result.result.row_count) {
+    if (written_result.result.row_count != greedy_physical_result.result.row_count) {
         throw std::runtime_error("Join reordering changed the query result.");
     }
 

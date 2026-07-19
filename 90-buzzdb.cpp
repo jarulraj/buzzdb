@@ -25,7 +25,6 @@
 #include <set>
 #include <functional>
 #include <utility>
-#include <cstdint>
 #include <limits>
 #include <unordered_map>
 #include <unistd.h>
@@ -3906,6 +3905,30 @@ struct TableStats {
     std::map<size_t, ColumnStats> columns;
 };
 
+struct ColumnRelationStats {
+    FieldType type = INT;
+    double distinct_count = 0.0;
+    bool unique = false;
+    std::map<std::string, double> mcv_counts;
+};
+
+struct RelationStats {
+    double rows = 0.0;
+    std::map<TableRefId, std::map<size_t, ColumnRelationStats>> columns;
+};
+
+std::string fieldTypeName(FieldType type) {
+    switch (type) {
+        case INT:
+            return "INT";
+        case FLOAT:
+            return "FLOAT";
+        case STRING:
+            return "STRING";
+    }
+    throw std::runtime_error("Unknown field type.");
+}
+
 size_t physicalOffset(const ColumnRef& column,
                       const std::map<TableRefId, size_t>& table_offsets) {
     auto offset = table_offsets.find(column.table_ref_id);
@@ -3953,115 +3976,6 @@ std::unique_ptr<IPredicate> makeTableFilterPredicate(
     return predicate;
 }
 
-void replaceOptionalField(std::optional<Field>& target, const Field& value) {
-    target.reset();
-    target.emplace(value);
-}
-
-constexpr size_t MCV_LIMIT = 5;
-
-std::map<std::string, size_t> topKValueCounts(
-        const std::map<std::string, size_t>& value_counts,
-        size_t limit) {
-    std::vector<std::pair<std::string, size_t>> counts(
-        value_counts.begin(),
-        value_counts.end()
-    );
-    std::sort(
-        counts.begin(),
-        counts.end(),
-        [](const auto& left, const auto& right) {
-            if (left.second != right.second) {
-                return left.second > right.second;
-            }
-            return left.first < right.first;
-        }
-    );
-
-    std::map<std::string, size_t> top_counts;
-    for (size_t i = 0; i < std::min(limit, counts.size()); i++) {
-        top_counts[counts[i].first] = counts[i].second;
-    }
-    return top_counts;
-}
-
-TableStats analyzeTable(TableMetadata& metadata, PageManager& page_manager) {
-    TableStats stats;
-    stats.table_id = metadata.table_id;
-    stats.table_name = metadata.name;
-
-    std::vector<std::set<std::string>> distinct_values(
-        metadata.schema.columns.size());
-    std::vector<std::map<std::string, size_t>> value_counts(
-        metadata.schema.columns.size());
-    for (size_t column = 0; column < metadata.schema.columns.size(); column++) {
-        stats.columns[column].type = metadata.schema.columns[column].type;
-    }
-
-    TableHeap table_heap(metadata, page_manager);
-    for (PageID page_id = table_heap.firstPage();
-         page_id != INVALID_PAGE_ID;
-         page_id = table_heap.nextPage(page_id)) {
-        stats.page_count++;
-        for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-            auto tuple = table_heap.getTuple(page_id, slot);
-            if (!tuple) {
-                continue;
-            }
-
-            stats.row_count++;
-            for (size_t column = 0; column < tuple->fields.size(); column++) {
-                const auto& value = *tuple->fields[column];
-                auto& column_stats = stats.columns[column];
-                auto value_string = fieldToString(value);
-                distinct_values[column].insert(value_string);
-                value_counts[column][value_string]++;
-
-                if (!column_stats.min_value ||
-                    compareFields(value, *column_stats.min_value) < 0) {
-                    replaceOptionalField(column_stats.min_value, value);
-                }
-                if (!column_stats.max_value ||
-                    compareFields(value, *column_stats.max_value) > 0) {
-                    replaceOptionalField(column_stats.max_value, value);
-                }
-            }
-        }
-    }
-
-    for (size_t column = 0; column < distinct_values.size(); column++) {
-        stats.columns[column].distinct_count = distinct_values[column].size();
-        stats.columns[column].mcv_counts = topKValueCounts(
-            value_counts[column],
-            MCV_LIMIT
-        );
-    }
-    return stats;
-}
-
-std::map<TableId, TableStats> analyzeQueryTables(
-        const QueryComponents& components,
-        Catalog& catalog,
-        PageManager& page_manager) {
-    std::map<TableId, TableStats> stats;
-    for (const auto& table_ref : components.table_refs) {
-        if (stats.find(table_ref.table_id) != stats.end()) {
-            continue;
-        }
-        auto& metadata = catalog.getTable(table_ref.table_id);
-        stats[table_ref.table_id] = analyzeTable(metadata, page_manager);
-    }
-    return stats;
-}
-
-const ColumnStats& columnStatsFor(
-        const QueryComponents& components,
-        const std::map<TableId, TableStats>& stats,
-        const ColumnRef& column) {
-    const auto& table_ref = tableRefForId(components, column.table_ref_id);
-    return stats.at(table_ref.table_id).columns.at(column.column_index);
-}
-
 std::string columnRefLabel(const QueryComponents& components,
                            Catalog& catalog,
                            const ColumnRef& column) {
@@ -4069,80 +3983,6 @@ std::string columnRefLabel(const QueryComponents& components,
     const auto& metadata = catalog.getTable(table_ref.table_id);
     return table_ref.alias + "." +
            metadata.schema.columns[column.column_index].name;
-}
-
-double clampEstimate(double estimate, double input_rows) {
-    if (input_rows <= 0.0) {
-        return 0.0;
-    }
-    return std::max(1.0, estimate);
-}
-
-double estimateEqualityFilterRows(double input_rows,
-                                  const ColumnStats& column_stats) {
-    if (input_rows <= 0.0 || column_stats.distinct_count == 0) {
-        return 0.0;
-    }
-    return clampEstimate(
-        input_rows / static_cast<double>(column_stats.distinct_count),
-        input_rows
-    );
-}
-
-double estimateEqualityFilterRowsWithMcv(double input_rows,
-                                         const ColumnStats& column_stats,
-                                         const Field& value) {
-    if (input_rows <= 0.0 || column_stats.distinct_count == 0) {
-        return 0.0;
-    }
-
-    auto value_it = column_stats.mcv_counts.find(fieldToString(value));
-    if (value_it != column_stats.mcv_counts.end()) {
-        return static_cast<double>(value_it->second);
-    }
-
-    size_t mcv_rows = 0;
-    for (const auto& mcv : column_stats.mcv_counts) {
-        mcv_rows += mcv.second;
-    }
-    size_t remaining_distinct =
-        column_stats.distinct_count > column_stats.mcv_counts.size()
-            ? column_stats.distinct_count - column_stats.mcv_counts.size()
-            : 0;
-    if (remaining_distinct == 0) {
-        return 1.0;
-    }
-
-    double remaining_rows = std::max(
-        0.0,
-        input_rows - static_cast<double>(mcv_rows)
-    );
-    return clampEstimate(
-        remaining_rows / static_cast<double>(remaining_distinct),
-        input_rows
-    );
-}
-
-double estimateJoinRows(double left_rows,
-                        double right_rows,
-                        const ColumnStats& left_stats,
-                        const ColumnStats& right_stats) {
-    if (left_rows <= 0.0 || right_rows <= 0.0) {
-        return 0.0;
-    }
-
-    size_t denominator = std::max(
-        left_stats.distinct_count,
-        right_stats.distinct_count
-    );
-    if (denominator == 0) {
-        return 0.0;
-    }
-
-    return clampEstimate(
-        left_rows * right_rows / static_cast<double>(denominator),
-        left_rows * right_rows
-    );
 }
 
 std::string formatEstimate(double value) {
@@ -4174,32 +4014,6 @@ enum class SelectivityModel {
     MostCommonValues
 };
 
-std::map<TableRefId, double> estimateFilteredBaseRows(
-        const QueryComponents& components,
-        const std::map<TableId, TableStats>& stats,
-        SelectivityModel model = SelectivityModel::Uniform) {
-    std::map<TableRefId, double> estimates;
-    for (const auto& table_ref : components.table_refs) {
-        double rows = static_cast<double>(
-            stats.at(table_ref.table_id).row_count);
-        for (const auto& filter : components.filters) {
-            if (filter.column.table_ref_id != table_ref.id) {
-                continue;
-            }
-            const auto& column_stats = columnStatsFor(components, stats, filter.column);
-            rows = model == SelectivityModel::MostCommonValues
-                ? estimateEqualityFilterRowsWithMcv(
-                    rows,
-                    column_stats,
-                    *filter.value
-                )
-                : estimateEqualityFilterRows(rows, column_stats);
-        }
-        estimates[table_ref.id] = rows;
-    }
-    return estimates;
-}
-
 enum class PhysicalJoinKind {
     NestedLoopJoin,
     HashJoin
@@ -4218,7 +4032,7 @@ std::string physicalJoinKindName(PhysicalJoinKind kind) {
 struct JoinOrderStepEstimate {
     JoinClause join;
     double output_rows = 0.0;
-    double output_pages = 0.0;
+    RelationStats output_relation;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
     double chosen_cost = 0.0;
 };
@@ -4229,926 +4043,166 @@ struct JoinOrderPlan {
     double final_estimate = 0.0;
 };
 
-enum class JoinOrderSearchPolicy {
-    Greedy,
-    SelingerLeftDeepDP
-};
+using MaterializedRow = std::vector<std::unique_ptr<Field>>;
+using MaterializedRows = std::vector<MaterializedRow>;
 
-std::string joinOrderSearchPolicyName(JoinOrderSearchPolicy policy) {
-    switch (policy) {
-        case JoinOrderSearchPolicy::Greedy:
-            return "Greedy";
-        case JoinOrderSearchPolicy::SelingerLeftDeepDP:
-            return "Selinger left-deep DP";
-    }
-    throw std::runtime_error("Unknown join-order search policy.");
-}
-
-struct JoinOrderSearchResult {
-    JoinOrderSearchPolicy policy;
-    JoinOrderPlan plan;
-    double estimated_cost = 0.0;
-    size_t states_kept = 0;
-    size_t candidates_considered = 0;
-    std::vector<std::string> search_steps;
-};
-
-QueryComponents makeJoinPlanComponents(
-        const QueryComponents& source,
-        TableRefId base_table_ref_id,
-        std::vector<JoinClause> join_order) {
-    QueryComponents copy;
-    copy.base_table_ref_id = base_table_ref_id;
-    copy.table_refs = source.table_refs;
-    copy.select_columns = source.select_columns;
-    copy.joins = std::move(join_order);
-    copy.column_filters = source.column_filters;
-    copy.output_names = source.output_names;
-
-    for (const auto& filter : source.filters) {
-        copy.filters.push_back({filter.column, filter.value->clone()});
-    }
-
-    // Treat every original ON predicate as a final equality predicate too, so
-    // changing the physical join order does not change query semantics.
-    for (const auto& join : source.joins) {
-        copy.column_filters.push_back({join.left, join.right});
-    }
-    return copy;
-}
-
-std::vector<JoinClause> equalityEdgesForJoinOrdering(
-        const QueryComponents& components) {
-    std::vector<JoinClause> edges = components.joins;
-    for (const auto& equality : components.column_filters) {
-        edges.push_back({
-            INVALID_TABLE_REF_ID,
-            equality.left,
-            equality.right
-        });
-    }
-    return edges;
-}
-
-std::optional<JoinClause> orientJoinEdge(
-        const JoinClause& edge,
-        const std::set<TableRefId>& joined_table_refs) {
-    bool left_joined =
-        joined_table_refs.find(edge.left.table_ref_id) != joined_table_refs.end();
-    bool right_joined =
-        joined_table_refs.find(edge.right.table_ref_id) != joined_table_refs.end();
-    if (left_joined == right_joined) {
-        return std::nullopt;
-    }
-
-    JoinClause oriented = edge;
-    oriented.input_table_ref_id =
-        left_joined ? edge.right.table_ref_id : edge.left.table_ref_id;
-    return oriented;
-}
-
-std::pair<ColumnRef, ColumnRef> joinedAndInputColumns(
-        const JoinClause& join,
-        const std::set<TableRefId>& joined_table_refs) {
-    bool left_joined =
-        joined_table_refs.find(join.left.table_ref_id) != joined_table_refs.end();
-    bool right_joined =
-        joined_table_refs.find(join.right.table_ref_id) != joined_table_refs.end();
-
-    if (left_joined && join.right.table_ref_id == join.input_table_ref_id) {
-        return {join.left, join.right};
-    }
-    if (right_joined && join.left.table_ref_id == join.input_table_ref_id) {
-        return {join.right, join.left};
-    }
-
-    throw std::runtime_error("Join edge is not connected to the current plan.");
-}
-
-double estimatePagesForRows(const TableStats& table_stats, double rows) {
-    if (rows <= 0.0 || table_stats.row_count == 0 || table_stats.page_count == 0) {
-        return 0.0;
-    }
-
-    double page_fraction = rows / static_cast<double>(table_stats.row_count);
-    return std::max(1.0, static_cast<double>(table_stats.page_count) * page_fraction);
-}
-
-double estimateJoinOutputPages(double output_rows,
-                               double left_rows,
-                               double left_pages,
-                               double right_rows,
-                               double right_pages) {
-    if (output_rows <= 0.0) {
-        return 0.0;
-    }
-
-    double left_rows_per_page =
-        left_rows / std::max(1.0, left_pages);
-    double right_rows_per_page =
-        right_rows / std::max(1.0, right_pages);
-    double output_rows_per_page = std::max(
-        1.0,
-        std::min(left_rows_per_page, right_rows_per_page)
-    );
-    return std::max(1.0, output_rows / output_rows_per_page);
-}
-
-double tupleComparisonCost(double comparisons) {
-    return 0.01 * std::max(0.0, comparisons);
-}
-
-double tupleHashCost(double tuples) {
-    return 0.05 * std::max(0.0, tuples);
-}
-
-double tupleMaterializationCost(double tuples) {
-    return 0.10 * std::max(0.0, tuples);
-}
-
-JoinOrderStepEstimate estimateJoinOrderStep(
-        const QueryComponents& components,
-        const std::map<TableId, TableStats>& stats,
-        const std::map<TableRefId, double>& base_estimates,
-        const std::map<TableRefId, double>& base_page_estimates,
-        const std::set<TableRefId>& joined_table_refs,
-        const JoinClause& join,
-        double current_rows,
-        double current_pages,
-        double current_total_cost) {
-    auto columns = joinedAndInputColumns(join, joined_table_refs);
-    double right_rows = base_estimates.at(join.input_table_ref_id);
-    double right_pages = base_page_estimates.at(join.input_table_ref_id);
-    double output_rows = estimateJoinRows(
-        current_rows,
-        right_rows,
-        columnStatsFor(components, stats, columns.first),
-        columnStatsFor(components, stats, columns.second)
-    );
-    double output_pages = estimateJoinOutputPages(
-        output_rows,
-        current_rows,
-        current_pages,
-        right_rows,
-        right_pages
-    );
-
-    double nested_loop_cost = current_total_cost +
-        current_rows * right_pages +
-        tupleComparisonCost(current_rows * right_rows) +
-        tupleMaterializationCost(output_rows);
-    double hash_join_cost = current_total_cost +
-        2.0 * current_pages +
-        3.0 * right_pages +
-        tupleHashCost(current_rows + right_rows) +
-        tupleMaterializationCost(output_rows);
-    PhysicalJoinKind chosen_join_kind =
-        nested_loop_cost <= hash_join_cost
-            ? PhysicalJoinKind::NestedLoopJoin
-            : PhysicalJoinKind::HashJoin;
-    double chosen_cost = chosen_join_kind == PhysicalJoinKind::NestedLoopJoin
-        ? nested_loop_cost
-        : hash_join_cost;
-
-    return {
-        join,
-        output_rows,
-        output_pages,
-        chosen_join_kind,
-        chosen_cost
-    };
-}
-
-bool betterJoinOrderStep(const JoinOrderStepEstimate& candidate,
-                         const JoinOrderStepEstimate& incumbent) {
-    if (candidate.output_rows != incumbent.output_rows) {
-        return candidate.output_rows < incumbent.output_rows;
-    }
-    if (candidate.chosen_cost != incumbent.chosen_cost) {
-        return candidate.chosen_cost < incumbent.chosen_cost;
-    }
-    return candidate.join.input_table_ref_id < incumbent.join.input_table_ref_id;
-}
-
-std::string tableRefAlias(const QueryComponents& components,
-                          TableRefId table_ref_id) {
-    return tableRefForId(components, table_ref_id).alias;
-}
-
-std::string tableRefSetLabel(const QueryComponents& components,
-                             const std::set<TableRefId>& table_ref_ids) {
-    std::ostringstream output;
-    output << "{";
-    bool first = true;
-    for (const auto& table_ref : components.table_refs) {
-        if (table_ref_ids.find(table_ref.id) == table_ref_ids.end()) {
+bool rowMatchesTableFilters(const QueryComponents& components,
+                            TableRefId table_ref_id,
+                            const MaterializedRow& row) {
+    for (const auto& filter : components.filters) {
+        if (filter.column.table_ref_id != table_ref_id) {
             continue;
         }
-        if (!first) {
-            output << ",";
-        }
-        output << table_ref.alias;
-        first = false;
-    }
-    output << "}";
-    return output.str();
-}
-
-std::string joinOrderStringFor(const QueryComponents& components,
-                               TableRefId base_table_ref_id,
-                               const std::vector<JoinClause>& join_order) {
-    std::ostringstream output;
-    output << tableRefAlias(components, base_table_ref_id);
-    for (const auto& join : join_order) {
-        output << " -> "
-               << tableRefAlias(components, join.input_table_ref_id);
-    }
-    return output.str();
-}
-
-std::string joinCandidateTraceLine(const QueryComponents& components,
-                                   Catalog& catalog,
-                                   const std::set<TableRefId>& joined_table_refs,
-                                   const JoinOrderStepEstimate& step) {
-    auto columns = joinedAndInputColumns(step.join, joined_table_refs);
-    std::ostringstream output;
-    output << "add "
-           << tableRefAlias(components, step.join.input_table_ref_id)
-           << " via "
-           << columnRefLabel(components, catalog, columns.first)
-           << " = "
-           << columnRefLabel(components, catalog, columns.second)
-           << " -> "
-           << physicalJoinKindName(step.chosen_join_kind)
-           << ", rows=" << formatEstimate(step.output_rows)
-           << ", cost=" << formatEstimate(step.chosen_cost);
-    return output.str();
-}
-
-std::string startCandidateTraceLine(const QueryComponents& components,
-                                    Catalog& catalog,
-                                    TableRefId start_table_ref_id,
-                                    const JoinOrderStepEstimate& step) {
-    std::set<TableRefId> joined_table_refs{start_table_ref_id};
-    std::ostringstream output;
-    output << "base="
-           << tableRefAlias(components, start_table_ref_id)
-           << ", "
-           << joinCandidateTraceLine(
-               components,
-               catalog,
-               joined_table_refs,
-               step
-           );
-    return output.str();
-}
-
-JoinOrderPlan chooseGreedyJoinOrder(
-        const QueryComponents& components,
-        const std::map<TableId, TableStats>& stats,
-        SelectivityModel model = SelectivityModel::Uniform,
-        std::vector<std::string>* search_steps = nullptr,
-        Catalog* catalog = nullptr) {
-    auto base_estimates = estimateFilteredBaseRows(components, stats, model);
-    std::map<TableRefId, double> base_page_estimates;
-    for (const auto& table_ref : components.table_refs) {
-        base_page_estimates[table_ref.id] = estimatePagesForRows(
-            stats.at(table_ref.table_id),
-            base_estimates.at(table_ref.id)
-        );
-    }
-    auto edges = equalityEdgesForJoinOrdering(components);
-
-    std::optional<TableRefId> best_start_table_ref_id;
-    std::optional<JoinOrderStepEstimate> best_first_step;
-    std::vector<std::pair<TableRefId, JoinOrderStepEstimate>> first_candidates;
-    for (const auto& edge : edges) {
-        for (TableRefId start_table_ref_id :
-             {edge.left.table_ref_id, edge.right.table_ref_id}) {
-            std::set<TableRefId> joined_table_refs{start_table_ref_id};
-            auto oriented = orientJoinEdge(edge, joined_table_refs);
-            if (!oriented) {
-                continue;
-            }
-
-            auto step = estimateJoinOrderStep(
-                components,
-                stats,
-                base_estimates,
-                base_page_estimates,
-                joined_table_refs,
-                *oriented,
-                base_estimates.at(start_table_ref_id),
-                base_page_estimates.at(start_table_ref_id),
-                base_page_estimates.at(start_table_ref_id)
-            );
-            first_candidates.push_back({start_table_ref_id, step});
-            if (!best_first_step ||
-                betterJoinOrderStep(step, *best_first_step)) {
-                best_start_table_ref_id = start_table_ref_id;
-                best_first_step = step;
-            }
+        if (filter.column.column_index >= row.size() ||
+            !(*row[filter.column.column_index] == *filter.value)) {
+            return false;
         }
     }
-
-    if (!best_start_table_ref_id || !best_first_step) {
-        throw std::runtime_error("Unable to choose a join order.");
-    }
-
-    if (search_steps && catalog) {
-        search_steps->push_back(
-            "Greedy round 1: evaluate every connected two-table start "
-            "(rank by lowest rows, then lowest cost)"
-        );
-        for (const auto& candidate : first_candidates) {
-            search_steps->push_back(
-                "  candidate " +
-                startCandidateTraceLine(
-                    components,
-                    *catalog,
-                    candidate.first,
-                    candidate.second
-                )
-            );
-        }
-        search_steps->push_back(
-            "  choose " +
-            startCandidateTraceLine(
-                components,
-                *catalog,
-                *best_start_table_ref_id,
-                *best_first_step
-            )
-        );
-    }
-
-    std::vector<JoinClause> join_order{best_first_step->join};
-    std::vector<JoinOrderStepEstimate> steps{*best_first_step};
-    std::set<TableRefId> joined_table_refs{
-        *best_start_table_ref_id,
-        best_first_step->join.input_table_ref_id
-    };
-    double current_rows = best_first_step->output_rows;
-    double current_pages = best_first_step->output_pages;
-    double current_total_cost = best_first_step->chosen_cost;
-
-    while (joined_table_refs.size() < components.table_refs.size()) {
-        std::optional<JoinOrderStepEstimate> best_step;
-        std::vector<JoinOrderStepEstimate> round_candidates;
-        for (const auto& edge : edges) {
-            auto oriented = orientJoinEdge(edge, joined_table_refs);
-            if (!oriented) {
-                continue;
-            }
-
-            auto step = estimateJoinOrderStep(
-                components,
-                stats,
-                base_estimates,
-                base_page_estimates,
-                joined_table_refs,
-                *oriented,
-                current_rows,
-                current_pages,
-                current_total_cost
-            );
-            round_candidates.push_back(step);
-            if (!best_step || betterJoinOrderStep(step, *best_step)) {
-                best_step = step;
-            }
-        }
-
-        if (!best_step) {
-            throw std::runtime_error("Join graph is disconnected.");
-        }
-
-        if (search_steps && catalog) {
-            size_t round_number = steps.size() + 1;
-            search_steps->push_back(
-                "Greedy round " + std::to_string(round_number) +
-                ": joined " + tableRefSetLabel(components, joined_table_refs) +
-                "; evaluate connected extensions "
-                "(rank by lowest rows, then lowest cost)"
-            );
-            for (const auto& candidate : round_candidates) {
-                search_steps->push_back(
-                    "  candidate " +
-                    joinCandidateTraceLine(
-                        components,
-                        *catalog,
-                        joined_table_refs,
-                        candidate
-                    )
-                );
-            }
-            search_steps->push_back(
-                "  choose " +
-                joinCandidateTraceLine(
-                    components,
-                    *catalog,
-                    joined_table_refs,
-                    *best_step
-                )
-            );
-        }
-
-        join_order.push_back(best_step->join);
-        steps.push_back(*best_step);
-        joined_table_refs.insert(best_step->join.input_table_ref_id);
-        current_rows = best_step->output_rows;
-        current_pages = best_step->output_pages;
-        current_total_cost = best_step->chosen_cost;
-    }
-
-    auto planned_components = makeJoinPlanComponents(
-        components,
-        *best_start_table_ref_id,
-        std::move(join_order)
-    );
-    return {std::move(planned_components), std::move(steps), current_rows};
+    return true;
 }
 
-JoinOrderPlan buildJoinPlanForOrder(
-        const QueryComponents& source,
-        TableRefId base_table_ref_id,
-        const std::vector<JoinClause>& join_order,
-        const std::map<TableId, TableStats>& stats,
-        SelectivityModel model = SelectivityModel::Uniform) {
-    auto planned_components = makeJoinPlanComponents(
-        source,
-        base_table_ref_id,
-        join_order
-    );
-    auto base_estimates = estimateFilteredBaseRows(
-        planned_components,
-        stats,
-        model
-    );
-
-    std::map<TableRefId, double> base_page_estimates;
-    for (const auto& table_ref : planned_components.table_refs) {
-        base_page_estimates[table_ref.id] = estimatePagesForRows(
-            stats.at(table_ref.table_id),
-            base_estimates.at(table_ref.id)
-        );
-    }
-
-    std::vector<JoinOrderStepEstimate> steps;
-    std::set<TableRefId> joined_table_refs{base_table_ref_id};
-    double current_rows = base_estimates.at(base_table_ref_id);
-    double current_pages = base_page_estimates.at(base_table_ref_id);
-    double current_total_cost = current_pages;
-
-    for (const auto& join : planned_components.joins) {
-        auto step = estimateJoinOrderStep(
-            planned_components,
-            stats,
-            base_estimates,
-            base_page_estimates,
-            joined_table_refs,
-            join,
-            current_rows,
-            current_pages,
-            current_total_cost
-        );
-        steps.push_back(step);
-        joined_table_refs.insert(join.input_table_ref_id);
-        current_rows = step.output_rows;
-        current_pages = step.output_pages;
-        current_total_cost = step.chosen_cost;
-    }
-
-    return {
-        std::move(planned_components),
-        std::move(steps),
-        current_rows
-    };
-}
-
-struct SelingerDpState {
-    TableRefId base_table_ref_id = INVALID_TABLE_REF_ID;
-    std::vector<JoinClause> join_order;
-    std::set<TableRefId> joined_table_refs;
-    double rows = 0.0;
-    double pages = 0.0;
-    double cost = 0.0;
-};
-
-struct SelingerJoinOrderResult {
-    JoinOrderPlan plan;
-    size_t states_kept = 0;
-    size_t candidates_considered = 0;
-    double estimated_cost = 0.0;
-};
-
-std::string selingerStateTraceLine(const QueryComponents& components,
-                                   const SelingerDpState& state) {
-    std::ostringstream output;
-    output << tableRefSetLabel(components, state.joined_table_refs)
-           << ": order="
-           << joinOrderStringFor(
-               components,
-               state.base_table_ref_id,
-               state.join_order
-           )
-           << ", rows=" << formatEstimate(state.rows)
-           << ", cost=" << formatEstimate(state.cost);
-    return output.str();
-}
-
-bool betterSelingerState(const SelingerDpState& candidate,
-                         const SelingerDpState& incumbent) {
-    if (candidate.cost != incumbent.cost) {
-        return candidate.cost < incumbent.cost;
-    }
-    if (candidate.rows != incumbent.rows) {
-        return candidate.rows < incumbent.rows;
-    }
-    return candidate.base_table_ref_id < incumbent.base_table_ref_id;
-}
-
-SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
-        const QueryComponents& components,
-        const std::map<TableId, TableStats>& stats,
-        SelectivityModel model = SelectivityModel::MostCommonValues,
-        std::vector<std::string>* search_steps = nullptr,
-        Catalog* catalog = nullptr) {
-    size_t table_count = components.table_refs.size();
-    if (table_count == 0 || table_count >= 63) {
-        throw std::runtime_error("Selinger DP supports 1..62 table refs.");
-    }
-
-    auto base_estimates = estimateFilteredBaseRows(components, stats, model);
-    std::map<TableRefId, double> base_page_estimates;
-    std::map<TableRefId, uint64_t> bit_for_table_ref;
-    for (size_t i = 0; i < table_count; i++) {
-        const auto& table_ref = components.table_refs[i];
-        base_page_estimates[table_ref.id] = estimatePagesForRows(
-            stats.at(table_ref.table_id),
-            base_estimates.at(table_ref.id)
-        );
-        bit_for_table_ref[table_ref.id] = 1ULL << i;
-    }
-
-    auto edges = equalityEdgesForJoinOrdering(components);
-    uint64_t full_mask = (1ULL << table_count) - 1ULL;
-    std::vector<std::optional<SelingerDpState>> best(full_mask + 1);
-    SelingerJoinOrderResult result;
-    std::vector<size_t> candidates_by_level(table_count + 1, 0);
-    std::vector<size_t> discarded_by_level(table_count + 1, 0);
-    std::vector<std::vector<std::string>> kept_by_level(table_count + 1);
-
-    for (const auto& table_ref : components.table_refs) {
-        uint64_t mask = bit_for_table_ref.at(table_ref.id);
-        SelingerDpState state;
-        state.base_table_ref_id = table_ref.id;
-        state.joined_table_refs.insert(table_ref.id);
-        state.rows = base_estimates.at(table_ref.id);
-        state.pages = base_page_estimates.at(table_ref.id);
-        state.cost = state.pages;
-        best[mask] = std::move(state);
-        result.states_kept++;
-        if (search_steps) {
-            kept_by_level[1].push_back(
-                "seed " + selingerStateTraceLine(
-                    components,
-                    *best[mask]
-                )
-            );
-        }
-    }
-
-    for (uint64_t mask = 1; mask <= full_mask; mask++) {
-        if (!best[mask] || mask == full_mask) {
-            continue;
-        }
-
-        const auto& current = *best[mask];
-        for (const auto& edge : edges) {
-            auto oriented = orientJoinEdge(edge, current.joined_table_refs);
-            if (!oriented) {
-                continue;
-            }
-
-            uint64_t input_bit = bit_for_table_ref.at(
-                oriented->input_table_ref_id
-            );
-            if ((mask & input_bit) != 0) {
-                continue;
-            }
-
-            auto step = estimateJoinOrderStep(
-                components,
-                stats,
-                base_estimates,
-                base_page_estimates,
-                current.joined_table_refs,
-                *oriented,
-                current.rows,
-                current.pages,
-                current.cost
-            );
-
-            SelingerDpState candidate = current;
-            candidate.join_order.push_back(step.join);
-            candidate.joined_table_refs.insert(step.join.input_table_ref_id);
-            candidate.rows = step.output_rows;
-            candidate.pages = step.output_pages;
-            candidate.cost = step.chosen_cost;
-
-            uint64_t next_mask = mask | input_bit;
-            size_t next_level = candidate.joined_table_refs.size();
-            result.candidates_considered++;
-            candidates_by_level[next_level]++;
-            if (!best[next_mask]) {
-                if (search_steps && catalog) {
-                    kept_by_level[next_level].push_back(
-                        "keep " +
-                        selingerStateTraceLine(components, candidate) +
-                        " by " +
-                        joinCandidateTraceLine(
-                            components,
-                            *catalog,
-                            current.joined_table_refs,
-                            step
-                        )
-                    );
-                }
-                best[next_mask] = std::move(candidate);
-                result.states_kept++;
-            } else if (betterSelingerState(candidate, *best[next_mask])) {
-                if (search_steps && catalog) {
-                    kept_by_level[next_level].push_back(
-                        "replace " +
-                        selingerStateTraceLine(components, candidate) +
-                        " by " +
-                        joinCandidateTraceLine(
-                            components,
-                            *catalog,
-                            current.joined_table_refs,
-                            step
-                        )
-                    );
-                }
-                best[next_mask] = std::move(candidate);
-            } else {
-                discarded_by_level[next_level]++;
-            }
-        }
-    }
-
-    if (!best[full_mask]) {
-        throw std::runtime_error("Selinger DP could not build a connected plan.");
-    }
-
-    result.estimated_cost = best[full_mask]->cost;
-    result.plan = buildJoinPlanForOrder(
-        components,
-        best[full_mask]->base_table_ref_id,
-        best[full_mask]->join_order,
-        stats,
-        model
-    );
-
-    if (search_steps) {
-        search_steps->clear();
-        search_steps->push_back(
-            "Selinger DP level 1: seed one state for each possible base table "
-            "(rank subset winners by lowest cumulative cost, then rows)"
-        );
-        for (const auto& line : kept_by_level[1]) {
-            search_steps->push_back("  " + line);
-        }
-
-        for (size_t level = 2; level <= table_count; level++) {
-            search_steps->push_back(
-                "Selinger DP level " + std::to_string(level) +
-                ": considered " +
-                std::to_string(candidates_by_level[level]) +
-                " extension(s), kept/replaced " +
-                std::to_string(kept_by_level[level].size()) +
-                " subset winner(s), discarded " +
-                std::to_string(discarded_by_level[level]) +
-                " higher-cost candidate(s)"
-            );
-            for (const auto& line : kept_by_level[level]) {
-                search_steps->push_back("  " + line);
-            }
-        }
-    }
-    return result;
-}
-
-std::string tableRefLabel(const QueryComponents& components,
-                          TableRefId table_ref_id) {
-    return tableRefForId(components, table_ref_id).alias;
-}
-
-std::string joinOrderString(const QueryComponents& components) {
-    std::vector<std::string> labels;
-    labels.push_back(tableRefLabel(components, components.base_table_ref_id));
-    for (const auto& join : components.joins) {
-        labels.push_back(tableRefLabel(components, join.input_table_ref_id));
-    }
-
-    std::ostringstream output;
-    for (size_t i = 0; i < labels.size(); i++) {
-        if (i != 0) {
-            output << " -> ";
-        }
-        output << labels[i];
-    }
-    return output.str();
-}
-
-std::vector<std::string> joinOrderLabels(const QueryComponents& components) {
-    std::vector<std::string> labels;
-    labels.push_back(tableRefLabel(components, components.base_table_ref_id));
-    for (const auto& join : components.joins) {
-        labels.push_back(tableRefLabel(components, join.input_table_ref_id));
-    }
-    return labels;
-}
-
-double estimatedPlanCost(const JoinOrderPlan& plan) {
-    if (plan.steps.empty()) {
-        return 0.0;
-    }
-    return plan.steps.back().chosen_cost;
-}
-
-std::string firstJoinOrderDifference(
-        const JoinOrderSearchResult& left,
-        const JoinOrderSearchResult& right) {
-    auto left_labels = joinOrderLabels(left.plan.components);
-    auto right_labels = joinOrderLabels(right.plan.components);
-    size_t limit = std::min(left_labels.size(), right_labels.size());
-    for (size_t i = 0; i < limit; i++) {
-        if (left_labels[i] == right_labels[i]) {
-            continue;
-        }
-
-        std::ostringstream output;
-        if (i == 0) {
-            output << "base table: "
-                   << joinOrderSearchPolicyName(left.policy)
-                   << " starts at " << left_labels[i]
-                   << "; "
-                   << joinOrderSearchPolicyName(right.policy)
-                   << " starts at " << right_labels[i];
-            return output.str();
-        }
-
-        output << "step " << i << ": "
-               << joinOrderSearchPolicyName(left.policy)
-               << " adds " << left_labels[i]
-               << "; "
-               << joinOrderSearchPolicyName(right.policy)
-               << " adds " << right_labels[i];
-        return output.str();
-    }
-
-    if (left_labels.size() != right_labels.size()) {
-        return "orders have different lengths";
-    }
-    return "none; both policies chose the same order";
-}
-
-void printJoinOrderSearchComparison(
-        const JoinOrderSearchResult& greedy,
-        const JoinOrderSearchResult& selinger) {
-    std::cout << "\nJoin-order search policies:" << std::endl;
-    std::cout << "  estimates: MCV selectivity + physical join cost"
-              << std::endl;
-    std::cout << "  Greedy ranking: lowest next-step rows, then lowest cost"
-              << std::endl;
-    std::cout << "  Selinger ranking: lowest cumulative subset cost, then rows"
-              << std::endl;
-    std::cout << "  " << joinOrderSearchPolicyName(greedy.policy)
-              << ": follows one locally-best path"
-              << ", cost=" << formatEstimate(greedy.estimated_cost)
-              << ", final_est=" << formatEstimate(greedy.plan.final_estimate)
-              << ", order=" << joinOrderString(greedy.plan.components)
-              << std::endl;
-    std::cout << "  " << joinOrderSearchPolicyName(selinger.policy)
-              << ": enumerates left-deep subsets"
-              << ", states=" << selinger.states_kept
-              << ", candidates=" << selinger.candidates_considered
-              << ", cost=" << formatEstimate(selinger.estimated_cost)
-              << ", final_est=" << formatEstimate(selinger.plan.final_estimate)
-              << ", order=" << joinOrderString(selinger.plan.components)
-              << std::endl;
-    std::cout << "  first divergence: "
-              << firstJoinOrderDifference(greedy, selinger)
-              << std::endl;
-}
-
-void printJoinOrderSearchSteps(const JoinOrderSearchResult& result) {
-    std::cout << "\n" << joinOrderSearchPolicyName(result.policy)
-              << " search steps:" << std::endl;
-    for (const auto& step : result.search_steps) {
-        std::cout << "  " << step << std::endl;
-    }
-}
-
-void printJoinOrderPlan(const std::string& title,
-                        const JoinOrderPlan& plan,
-                        Catalog& catalog) {
-    std::cout << "\n" << title << ":" << std::endl;
-    std::cout << "  " << joinOrderString(plan.components) << std::endl;
-    std::set<TableRefId> joined_table_refs{plan.components.base_table_ref_id};
-    for (const auto& step : plan.steps) {
-        auto columns = joinedAndInputColumns(step.join, joined_table_refs);
-        std::cout << "  join "
-                  << columnRefLabel(plan.components, catalog, columns.first)
-                  << " = "
-                  << columnRefLabel(plan.components, catalog, columns.second)
-                  << ": " << physicalJoinKindName(step.chosen_join_kind)
-                  << ", est rows=" << formatEstimate(step.output_rows)
-                  << std::endl;
-        joined_table_refs.insert(step.join.input_table_ref_id);
-    }
-    std::cout << "  final estimate=" << formatEstimate(plan.final_estimate)
-              << std::endl;
-}
-
-std::vector<PhysicalJoinKind> physicalJoinKindsForPlan(
-        const JoinOrderPlan& plan) {
-    std::vector<PhysicalJoinKind> kinds;
-    for (const auto& step : plan.steps) {
-        kinds.push_back(step.chosen_join_kind);
-    }
-    return kinds;
-}
-
-size_t countRowsMatchingFilter(const QueryComponents& components,
-                               const FilterClause& filter,
-                               Catalog& catalog,
-                               PageManager& page_manager) {
-    const auto& table_ref = tableRefForId(
-        components,
-        filter.column.table_ref_id
-    );
+MaterializedRows collectFilteredRows(const QueryComponents& components,
+                                     TableRefId table_ref_id,
+                                     Catalog& catalog,
+                                     PageManager& page_manager) {
+    const auto& table_ref = tableRefForId(components, table_ref_id);
     auto& metadata = catalog.getTable(table_ref.table_id);
     TableHeap table_heap(metadata, page_manager);
 
-    size_t count = 0;
+    MaterializedRows rows;
     for (PageID page_id = table_heap.firstPage();
          page_id != INVALID_PAGE_ID;
          page_id = table_heap.nextPage(page_id)) {
         for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
             auto tuple = table_heap.getTuple(page_id, slot);
-            if (!tuple ||
-                filter.column.column_index >= tuple->fields.size() ||
-                !(*tuple->fields[filter.column.column_index] == *filter.value)) {
+            if (!tuple || !rowMatchesTableFilters(
+                    components,
+                    table_ref_id,
+                    tuple->fields)) {
                 continue;
             }
-            count++;
+            rows.push_back(cloneFields(tuple->fields));
         }
     }
-    return count;
+    return rows;
 }
 
-void printEqualityFilterEstimateComparison(
-        const QueryComponents& components,
-        Catalog& catalog,
-        PageManager& page_manager,
-        const std::map<TableId, TableStats>& stats) {
-    std::cout << "\nEquality filter q-error:" << std::endl;
-    for (const auto& filter : components.filters) {
-        const auto& table_ref = tableRefForId(
-            components,
-            filter.column.table_ref_id
-        );
-        const auto& table_stats = stats.at(table_ref.table_id);
-        const auto& column_stats = columnStatsFor(components, stats, filter.column);
-        double input_rows = static_cast<double>(table_stats.row_count);
-        double uniform_estimate = estimateEqualityFilterRows(
-            input_rows,
-            column_stats
-        );
-        double mcv_estimate = estimateEqualityFilterRowsWithMcv(
-            input_rows,
-            column_stats,
-            *filter.value
-        );
-        size_t actual_rows = countRowsMatchingFilter(
-            components,
-            filter,
-            catalog,
-            page_manager
-        );
-        double actual = static_cast<double>(actual_rows);
-        std::cout << "  " << columnRefLabel(components, catalog, filter.column)
-                  << " = " << fieldToString(*filter.value)
-                  << ": actual=" << actual_rows
-                  << " uniform=" << formatEstimate(uniform_estimate)
-                  << " q-error=" << formatQError(uniform_estimate, actual)
-                  << " mcv=" << formatEstimate(mcv_estimate)
-                  << " q-error=" << formatQError(mcv_estimate, actual)
-                  << std::endl;
+struct MaterializedHashKey {
+    FieldType type;
+    int int_value = 0;
+    float float_value = 0.0f;
+    std::string string_value;
+
+    explicit MaterializedHashKey(const Field& field) : type(field.getType()) {
+        switch (type) {
+            case INT:
+                int_value = field.asInt();
+                break;
+            case FLOAT:
+                float_value = field.asFloat();
+                break;
+            case STRING:
+                string_value = field.asString();
+                break;
+        }
     }
+
+    bool operator==(const MaterializedHashKey& other) const {
+        if (type != other.type) {
+            return false;
+        }
+        switch (type) {
+            case INT:
+                return int_value == other.int_value;
+            case FLOAT:
+                return float_value == other.float_value;
+            case STRING:
+                return string_value == other.string_value;
+        }
+        return false;
+    }
+};
+
+struct MaterializedHashKeyHasher {
+    std::size_t operator()(const MaterializedHashKey& key) const {
+        switch (key.type) {
+            case INT:
+                return std::hash<int>{}(key.int_value);
+            case FLOAT:
+                return std::hash<float>{}(key.float_value);
+            case STRING:
+                return std::hash<std::string>{}(key.string_value);
+        }
+        return 0;
+    }
+};
+
+MaterializedRows hashJoinRows(const MaterializedRows& left_rows,
+                              const MaterializedRows& right_rows,
+                              size_t left_attr_index,
+                              size_t right_attr_index) {
+    std::unordered_map<
+        MaterializedHashKey,
+        std::vector<size_t>,
+        MaterializedHashKeyHasher
+    > right_index;
+    for (size_t i = 0; i < right_rows.size(); i++) {
+        if (right_attr_index >= right_rows[i].size()) {
+            throw std::runtime_error("Actual join right attribute index out of range.");
+        }
+        right_index[MaterializedHashKey(*right_rows[i][right_attr_index])]
+            .push_back(i);
+    }
+
+    MaterializedRows output;
+    for (const auto& left_row : left_rows) {
+        if (left_attr_index >= left_row.size()) {
+            throw std::runtime_error("Actual join left attribute index out of range.");
+        }
+        auto matches = right_index.find(
+            MaterializedHashKey(*left_row[left_attr_index])
+        );
+        if (matches == right_index.end()) {
+            continue;
+        }
+
+        for (size_t right_row_index : matches->second) {
+            auto joined = cloneFields(left_row);
+            for (const auto& field : right_rows[right_row_index]) {
+                joined.push_back(field->clone());
+            }
+            output.push_back(std::move(joined));
+        }
+    }
+    return output;
 }
+
+bool rowMatchesFinalPredicates(
+        const QueryComponents& components,
+        const MaterializedRow& row,
+        const std::map<TableRefId, size_t>& table_offsets) {
+    for (const auto& filter : components.filters) {
+        size_t attr_index = physicalOffset(filter.column, table_offsets);
+        if (attr_index >= row.size() ||
+            !(*row[attr_index] == *filter.value)) {
+            return false;
+        }
+    }
+    for (const auto& filter : components.column_filters) {
+        size_t left_index = physicalOffset(filter.left, table_offsets);
+        size_t right_index = physicalOffset(filter.right, table_offsets);
+        if (left_index >= row.size() || right_index >= row.size() ||
+            !(*row[left_index] == *row[right_index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct ActualJoinCounts {
+    std::vector<size_t> step_rows;
+    size_t final_rows = 0;
+};
 
 QueryResult executeJoinQuery(const QueryComponents& components,
                              Catalog& catalog,
@@ -5554,102 +4608,1073 @@ private:
     Catalog& catalog;
     PageManager& page_manager;
 
+    static constexpr size_t MCV_LIMIT = 5;
+
+    static void replaceOptionalField(std::optional<Field>& target,
+                                     const Field& value) {
+        target.reset();
+        target.emplace(value);
+    }
+
+    static double clampEstimate(double estimate, double input_rows) {
+        if (input_rows <= 0.0) {
+            return 0.0;
+        }
+        return std::max(1.0, estimate);
+    }
+
+    static std::map<std::string, size_t> topKValueCounts(
+            const std::map<std::string, size_t>& value_counts,
+            size_t limit) {
+        std::vector<std::pair<std::string, size_t>> counts(
+            value_counts.begin(),
+            value_counts.end()
+        );
+        std::sort(
+            counts.begin(),
+            counts.end(),
+            [](const auto& left, const auto& right) {
+                if (left.second != right.second) {
+                    return left.second > right.second;
+                }
+                return left.first < right.first;
+            }
+        );
+
+        std::map<std::string, size_t> top_counts;
+        for (size_t i = 0; i < std::min(limit, counts.size()); i++) {
+            top_counts[counts[i].first] = counts[i].second;
+        }
+        return top_counts;
+    }
+
+    static QueryComponents makeJoinPlanComponents(
+            const QueryComponents& source,
+            TableRefId base_table_ref_id,
+            std::vector<JoinClause> join_order) {
+        QueryComponents copy;
+        copy.base_table_ref_id = base_table_ref_id;
+        copy.table_refs = source.table_refs;
+        copy.select_columns = source.select_columns;
+        copy.joins = std::move(join_order);
+        copy.column_filters = source.column_filters;
+        copy.output_names = source.output_names;
+
+        for (const auto& filter : source.filters) {
+            copy.filters.push_back({filter.column, filter.value->clone()});
+        }
+
+        // Treat every original ON predicate as a final equality predicate too,
+        // so changing the physical join order does not change query semantics.
+        for (const auto& join : source.joins) {
+            copy.column_filters.push_back({join.left, join.right});
+        }
+        return copy;
+    }
+
+    static std::vector<JoinClause> equalityEdgesForJoinOrdering(
+            const QueryComponents& components) {
+        std::vector<JoinClause> edges = components.joins;
+        for (const auto& equality : components.column_filters) {
+            edges.push_back({
+                INVALID_TABLE_REF_ID,
+                equality.left,
+                equality.right
+            });
+        }
+        return edges;
+    }
+
+    static std::optional<JoinClause> orientJoinEdge(
+            const JoinClause& edge,
+            const std::set<TableRefId>& joined_table_refs) {
+        bool left_joined =
+            joined_table_refs.find(edge.left.table_ref_id) != joined_table_refs.end();
+        bool right_joined =
+            joined_table_refs.find(edge.right.table_ref_id) != joined_table_refs.end();
+        if (left_joined == right_joined) {
+            return std::nullopt;
+        }
+
+        JoinClause oriented = edge;
+        oriented.input_table_ref_id =
+            left_joined ? edge.right.table_ref_id : edge.left.table_ref_id;
+        return oriented;
+    }
+
+    static std::pair<ColumnRef, ColumnRef> joinedAndInputColumns(
+            const JoinClause& join,
+            const std::set<TableRefId>& joined_table_refs) {
+        bool left_joined =
+            joined_table_refs.find(join.left.table_ref_id) != joined_table_refs.end();
+        bool right_joined =
+            joined_table_refs.find(join.right.table_ref_id) != joined_table_refs.end();
+
+        if (left_joined && join.right.table_ref_id == join.input_table_ref_id) {
+            return {join.left, join.right};
+        }
+        if (right_joined && join.left.table_ref_id == join.input_table_ref_id) {
+            return {join.right, join.left};
+        }
+
+        throw std::runtime_error("Join edge is not connected to the current plan.");
+    }
+
+    static double tupleScanCost(double tuples) {
+        return std::max(0.0, tuples);
+    }
+
+    static double tupleComparisonCost(double comparisons) {
+        return 0.01 * std::max(0.0, comparisons);
+    }
+
+    static double tupleHashCost(double tuples) {
+        return 0.05 * std::max(0.0, tuples);
+    }
+
+    static double tupleMaterializationCost(double tuples) {
+        return 0.10 * std::max(0.0, tuples);
+    }
+
+    static double nestedLoopJoinCost(double current_total_cost,
+                                     double left_rows,
+                                     double right_rows,
+                                     double output_rows) {
+        return current_total_cost +
+               tupleComparisonCost(left_rows * right_rows) +
+               tupleMaterializationCost(output_rows);
+    }
+
+    static double hashJoinCost(double current_total_cost,
+                               double left_rows,
+                               double right_rows,
+                               double output_rows) {
+        return current_total_cost +
+               tupleHashCost(left_rows + right_rows) +
+               tupleMaterializationCost(output_rows);
+    }
+
+    static bool betterJoinOrderStep(const JoinOrderStepEstimate& candidate,
+                                    const JoinOrderStepEstimate& incumbent) {
+        if (candidate.output_rows != incumbent.output_rows) {
+            return candidate.output_rows < incumbent.output_rows;
+        }
+        if (candidate.chosen_cost != incumbent.chosen_cost) {
+            return candidate.chosen_cost < incumbent.chosen_cost;
+        }
+        return candidate.join.input_table_ref_id < incumbent.join.input_table_ref_id;
+    }
+
+    TableStats analyzeTable(TableMetadata& metadata) {
+        TableStats stats;
+        stats.table_id = metadata.table_id;
+        stats.table_name = metadata.name;
+
+        std::vector<std::set<std::string>> distinct_values(
+            metadata.schema.columns.size());
+        std::vector<std::map<std::string, size_t>> value_counts(
+            metadata.schema.columns.size());
+        for (size_t column = 0; column < metadata.schema.columns.size(); column++) {
+            stats.columns[column].type = metadata.schema.columns[column].type;
+        }
+
+        TableHeap table_heap(metadata, page_manager);
+        for (PageID page_id = table_heap.firstPage();
+             page_id != INVALID_PAGE_ID;
+             page_id = table_heap.nextPage(page_id)) {
+            stats.page_count++;
+            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
+                auto tuple = table_heap.getTuple(page_id, slot);
+                if (!tuple) {
+                    continue;
+                }
+
+                stats.row_count++;
+                for (size_t column = 0; column < tuple->fields.size(); column++) {
+                    const auto& value = *tuple->fields[column];
+                    auto& column_stats = stats.columns[column];
+                    auto value_string = fieldToString(value);
+                    distinct_values[column].insert(value_string);
+                    value_counts[column][value_string]++;
+
+                    if (!column_stats.min_value ||
+                        compareFields(value, *column_stats.min_value) < 0) {
+                        replaceOptionalField(column_stats.min_value, value);
+                    }
+                    if (!column_stats.max_value ||
+                        compareFields(value, *column_stats.max_value) > 0) {
+                        replaceOptionalField(column_stats.max_value, value);
+                    }
+                }
+            }
+        }
+
+        for (size_t column = 0; column < distinct_values.size(); column++) {
+            stats.columns[column].distinct_count = distinct_values[column].size();
+            stats.columns[column].mcv_counts = topKValueCounts(
+                value_counts[column],
+                MCV_LIMIT
+            );
+        }
+        return stats;
+    }
+
+    static std::map<std::string, double> scaledMcvCounts(
+            const std::map<std::string, double>& counts,
+            double scale,
+            double max_rows) {
+        std::map<std::string, double> scaled;
+        for (const auto& entry : counts) {
+            double count = std::min(max_rows, entry.second * scale);
+            if (count > 0.0) {
+                scaled[entry.first] = count;
+            }
+        }
+        return scaled;
+    }
+
+    static std::map<std::string, double> baseMcvCounts(
+            const ColumnStats& column_stats,
+            double old_rows,
+            double new_rows) {
+        std::map<std::string, double> base_counts;
+        double scale = old_rows > 0.0 ? new_rows / old_rows : 0.0;
+        for (const auto& entry : column_stats.mcv_counts) {
+            double count = std::min(new_rows, entry.second * scale);
+            if (count > 0.0) {
+                base_counts[entry.first] = count;
+            }
+        }
+        return base_counts;
+    }
+
+    static void clampRelationColumnsToRows(RelationStats& relation,
+                                           double old_rows,
+                                           double new_rows) {
+        double scale = old_rows > 0.0 ? new_rows / old_rows : 0.0;
+        relation.rows = new_rows;
+        for (auto& table_columns : relation.columns) {
+            for (auto& column_entry : table_columns.second) {
+                auto& column_stats = column_entry.second;
+                column_stats.distinct_count = std::min(
+                    column_stats.distinct_count,
+                    new_rows
+                );
+                if (new_rows <= 1.0) {
+                    column_stats.unique = true;
+                }
+                column_stats.mcv_counts = scaledMcvCounts(
+                    column_stats.mcv_counts,
+                    scale,
+                    new_rows
+                );
+            }
+        }
+    }
+
+    void applyEqualityFilterToRelation(RelationStats& relation,
+                                       const TableStats& table_stats,
+                                       const FilterClause& filter,
+                                       SelectivityModel model) {
+        const auto& base_column_stats =
+            table_stats.columns.at(filter.column.column_index);
+        double old_rows = relation.rows;
+        double new_rows = model == SelectivityModel::MostCommonValues
+            ? estimateEqualityFilterRowsWithMcv(
+                old_rows,
+                base_column_stats,
+                *filter.value
+            )
+            : estimateEqualityFilterRows(old_rows, base_column_stats);
+
+        auto& filtered_column =
+            relation.columns.at(filter.column.table_ref_id)
+                            .at(filter.column.column_index);
+        if (filtered_column.unique) {
+            new_rows = std::min(new_rows, 1.0);
+        }
+
+        clampRelationColumnsToRows(relation, old_rows, new_rows);
+
+        filtered_column.distinct_count = relation.rows > 0.0 ? 1.0 : 0.0;
+        filtered_column.unique = relation.rows <= 1.0;
+        filtered_column.mcv_counts.clear();
+        if (relation.rows > 0.0) {
+            filtered_column.mcv_counts[fieldToString(*filter.value)] =
+                relation.rows;
+        }
+    }
+
+    RelationStats makeBaseRelationStats(
+            const QueryComponents& components,
+            const TableRef& table_ref,
+            const std::map<TableId, TableStats>& stats,
+            SelectivityModel model) {
+        const auto& table_stats = stats.at(table_ref.table_id);
+        RelationStats relation;
+        relation.rows = static_cast<double>(table_stats.row_count);
+
+        for (const auto& column_entry : table_stats.columns) {
+            size_t column_index = column_entry.first;
+            const auto& base_column_stats = column_entry.second;
+            ColumnRelationStats column_stats;
+            column_stats.type = base_column_stats.type;
+            column_stats.distinct_count = std::min(
+                static_cast<double>(base_column_stats.distinct_count),
+                relation.rows
+            );
+            column_stats.unique =
+                relation.rows > 0.0 &&
+                static_cast<double>(base_column_stats.distinct_count) >=
+                    relation.rows;
+            column_stats.mcv_counts = baseMcvCounts(
+                base_column_stats,
+                relation.rows,
+                relation.rows
+            );
+            relation.columns[table_ref.id][column_index] = std::move(column_stats);
+        }
+
+        for (const auto& filter : components.filters) {
+            if (filter.column.table_ref_id != table_ref.id) {
+                continue;
+            }
+            applyEqualityFilterToRelation(
+                relation,
+                table_stats,
+                filter,
+                model
+            );
+        }
+        return relation;
+    }
+
+    std::map<TableRefId, RelationStats> estimateBaseRelations(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            SelectivityModel model) {
+        std::map<TableRefId, RelationStats> relations;
+        for (const auto& table_ref : components.table_refs) {
+            relations[table_ref.id] = makeBaseRelationStats(
+                components,
+                table_ref,
+                stats,
+                model
+            );
+        }
+        return relations;
+    }
+
+    static const ColumnRelationStats& relationColumnStatsFor(
+            const RelationStats& relation,
+            const ColumnRef& column) {
+        return relation.columns.at(column.table_ref_id).at(column.column_index);
+    }
+
+    static double estimateJoinRows(double left_rows,
+                                   double right_rows,
+                                   const ColumnRelationStats& left_stats,
+                                   const ColumnRelationStats& right_stats) {
+        if (left_rows <= 0.0 || right_rows <= 0.0) {
+            return 0.0;
+        }
+
+        double denominator = std::max(
+            left_stats.distinct_count,
+            right_stats.distinct_count
+        );
+        if (denominator <= 0.0) {
+            return 0.0;
+        }
+
+        return clampEstimate(left_rows * right_rows / denominator,
+                             left_rows * right_rows);
+    }
+
+    RelationStats estimateJoinedRelationStats(
+            const RelationStats& left,
+            const RelationStats& right,
+            const ColumnRef& left_column,
+            const ColumnRef& right_column,
+            double output_rows) {
+        RelationStats output;
+        output.rows = output_rows;
+
+        auto add_side = [&](const RelationStats& side) {
+            double scale = side.rows > 0.0 ? output_rows / side.rows : 0.0;
+            bool rows_preserved = output_rows <= side.rows;
+            for (const auto& table_columns : side.columns) {
+                for (const auto& column_entry : table_columns.second) {
+                    ColumnRelationStats column_stats = column_entry.second;
+                    column_stats.distinct_count = std::min(
+                        column_stats.distinct_count,
+                        output_rows
+                    );
+                    column_stats.unique = column_stats.unique &&
+                                          (rows_preserved || output_rows <= 1.0);
+                    column_stats.mcv_counts = scaledMcvCounts(
+                        column_stats.mcv_counts,
+                        scale,
+                        output_rows
+                    );
+                    output.columns[table_columns.first][column_entry.first] =
+                        std::move(column_stats);
+                }
+            }
+        };
+
+        add_side(left);
+        add_side(right);
+
+        const auto& left_stats = relationColumnStatsFor(left, left_column);
+        const auto& right_stats = relationColumnStatsFor(right, right_column);
+        double join_distinct = std::min({
+            left_stats.distinct_count,
+            right_stats.distinct_count,
+            output_rows
+        });
+        output.columns.at(left_column.table_ref_id)
+                      .at(left_column.column_index)
+                      .distinct_count = join_distinct;
+        output.columns.at(right_column.table_ref_id)
+                      .at(right_column.column_index)
+                      .distinct_count = join_distinct;
+        if (output_rows <= 1.0) {
+            output.columns.at(left_column.table_ref_id)
+                          .at(left_column.column_index)
+                          .unique = true;
+            output.columns.at(right_column.table_ref_id)
+                          .at(right_column.column_index)
+                          .unique = true;
+        }
+        return output;
+    }
+
+    JoinOrderStepEstimate estimateJoinOrderStep(
+            const std::map<TableRefId, RelationStats>& base_relations,
+            const std::set<TableRefId>& joined_table_refs,
+            const JoinClause& join,
+            const RelationStats& current_relation,
+            double current_total_cost) {
+        auto columns = joinedAndInputColumns(join, joined_table_refs);
+        const auto& right_relation = base_relations.at(join.input_table_ref_id);
+        double output_rows = estimateJoinRows(
+            current_relation.rows,
+            right_relation.rows,
+            relationColumnStatsFor(current_relation, columns.first),
+            relationColumnStatsFor(right_relation, columns.second)
+        );
+        RelationStats output_relation = estimateJoinedRelationStats(
+            current_relation,
+            right_relation,
+            columns.first,
+            columns.second,
+            output_rows
+        );
+
+        double nested_loop_cost = nestedLoopJoinCost(
+            current_total_cost,
+            current_relation.rows,
+            right_relation.rows,
+            output_rows
+        );
+        double hash_join_cost = hashJoinCost(
+            current_total_cost,
+            current_relation.rows,
+            right_relation.rows,
+            output_rows
+        );
+        PhysicalJoinKind chosen_join_kind =
+            nested_loop_cost <= hash_join_cost
+                ? PhysicalJoinKind::NestedLoopJoin
+                : PhysicalJoinKind::HashJoin;
+        double chosen_cost = chosen_join_kind == PhysicalJoinKind::NestedLoopJoin
+            ? nested_loop_cost
+            : hash_join_cost;
+
+        return {
+            join,
+            output_rows,
+            std::move(output_relation),
+            chosen_join_kind,
+            chosen_cost
+        };
+    }
+
+    std::string columnTraceLabel(const QueryComponents& components,
+                                 const ColumnRef& column) {
+        return columnRefLabel(components, catalog, column);
+    }
+
+    std::string greedyStartTraceLine(const QueryComponents& components,
+                                     TableRefId start_table_ref_id,
+                                     const JoinOrderStepEstimate& step) {
+        std::set<TableRefId> joined_table_refs{start_table_ref_id};
+        auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+        std::ostringstream output;
+        output << "    candidate base="
+               << tableRefForId(components, start_table_ref_id).alias
+               << ", add "
+               << tableRefForId(components, step.join.input_table_ref_id).alias
+               << " via "
+               << columnTraceLabel(components, columns.first)
+               << " = "
+               << columnTraceLabel(components, columns.second)
+               << " -> " << physicalJoinKindName(step.chosen_join_kind)
+               << ", rows=" << formatEstimate(step.output_rows)
+               << ", cost=" << formatEstimate(step.chosen_cost);
+        return output.str();
+    }
+
+    std::string greedyStartChoiceTraceLine(const QueryComponents& components,
+                                           TableRefId start_table_ref_id,
+                                           const JoinOrderStepEstimate& step) {
+        std::string line = greedyStartTraceLine(
+            components,
+            start_table_ref_id,
+            step
+        );
+        return "    choose" + line.substr(std::string("    candidate").size());
+    }
+
+    static std::string joinedTableRefsTraceLabel(
+            const QueryComponents& components,
+            const std::set<TableRefId>& table_refs) {
+        std::ostringstream output;
+        bool first = true;
+        for (TableRefId table_ref_id : table_refs) {
+            if (!first) {
+                output << ", ";
+            }
+            output << tableRefForId(components, table_ref_id).alias;
+            first = false;
+        }
+        return output.str();
+    }
+
+    std::string greedyCandidateTraceLine(
+            const QueryComponents& components,
+            const std::set<TableRefId>& joined_table_refs,
+            const JoinOrderStepEstimate& step) {
+        auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+        std::ostringstream output;
+        output << "    candidate add "
+               << tableRefForId(components, step.join.input_table_ref_id).alias
+               << " via "
+               << columnTraceLabel(components, columns.first)
+               << " = "
+               << columnTraceLabel(components, columns.second)
+               << " -> " << physicalJoinKindName(step.chosen_join_kind)
+               << ", rows=" << formatEstimate(step.output_rows)
+               << ", cost=" << formatEstimate(step.chosen_cost);
+        return output.str();
+    }
+
+    std::string greedyChoiceTraceLine(
+            const QueryComponents& components,
+            const std::set<TableRefId>& joined_table_refs,
+            const JoinOrderStepEstimate& step) {
+        std::string line = greedyCandidateTraceLine(
+            components,
+            joined_table_refs,
+            step
+        );
+        return "    choose" + line.substr(std::string("    candidate").size());
+    }
+
+    ActualJoinCounts actualRowsForJoinPlan(const JoinOrderPlan& plan) {
+        std::map<TableRefId, MaterializedRows> base_rows;
+        std::map<TableRefId, size_t> table_widths;
+        for (const auto& table_ref : plan.components.table_refs) {
+            auto& metadata = catalog.getTable(table_ref.table_id);
+            table_widths[table_ref.id] = metadata.schema.columns.size();
+            base_rows[table_ref.id] = collectFilteredRows(
+                plan.components,
+                table_ref.id,
+                catalog,
+                page_manager
+            );
+        }
+
+        std::map<TableRefId, size_t> table_offsets;
+        table_offsets[plan.components.base_table_ref_id] = 0;
+        std::set<TableRefId> joined_table_refs{plan.components.base_table_ref_id};
+        size_t output_width = table_widths.at(plan.components.base_table_ref_id);
+        MaterializedRows current_rows =
+            std::move(base_rows[plan.components.base_table_ref_id]);
+
+        ActualJoinCounts counts;
+        for (const auto& step : plan.steps) {
+            auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+            size_t left_attr_index = physicalOffset(columns.first, table_offsets);
+            size_t right_attr_index = columns.second.column_index;
+            current_rows = hashJoinRows(
+                current_rows,
+                base_rows.at(step.join.input_table_ref_id),
+                left_attr_index,
+                right_attr_index
+            );
+            counts.step_rows.push_back(current_rows.size());
+
+            table_offsets[step.join.input_table_ref_id] = output_width;
+            output_width += table_widths.at(step.join.input_table_ref_id);
+            joined_table_refs.insert(step.join.input_table_ref_id);
+        }
+
+        for (const auto& row : current_rows) {
+            if (rowMatchesFinalPredicates(plan.components, row, table_offsets)) {
+                counts.final_rows++;
+            }
+        }
+        return counts;
+    }
+
+    size_t countRowsMatchingFilter(const QueryComponents& components,
+                                   const FilterClause& filter) {
+        const auto& table_ref = tableRefForId(
+            components,
+            filter.column.table_ref_id
+        );
+        auto& metadata = catalog.getTable(table_ref.table_id);
+        TableHeap table_heap(metadata, page_manager);
+
+        size_t count = 0;
+        for (PageID page_id = table_heap.firstPage();
+             page_id != INVALID_PAGE_ID;
+             page_id = table_heap.nextPage(page_id)) {
+            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
+                auto tuple = table_heap.getTuple(page_id, slot);
+                if (!tuple ||
+                    filter.column.column_index >= tuple->fields.size() ||
+                    !(*tuple->fields[filter.column.column_index] == *filter.value)) {
+                    continue;
+                }
+                count++;
+            }
+        }
+        return count;
+    }
+
 public:
     QueryOptimizer(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
 
     std::map<TableId, TableStats> analyzeQueryTables(
             const QueryComponents& components) {
-        return ::analyzeQueryTables(components, catalog, page_manager);
+        std::map<TableId, TableStats> stats;
+        for (const auto& table_ref : components.table_refs) {
+            if (stats.find(table_ref.table_id) != stats.end()) {
+                continue;
+            }
+            auto& metadata = catalog.getTable(table_ref.table_id);
+            stats[table_ref.table_id] = analyzeTable(metadata);
+        }
+        return stats;
+    }
+
+    const ColumnStats& columnStatsFor(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            const ColumnRef& column) {
+        const auto& table_ref = tableRefForId(components, column.table_ref_id);
+        return stats.at(table_ref.table_id).columns.at(column.column_index);
+    }
+
+    double estimateEqualityFilterRows(double input_rows,
+                                      const ColumnStats& column_stats) {
+        if (input_rows <= 0.0 || column_stats.distinct_count == 0) {
+            return 0.0;
+        }
+        return clampEstimate(
+            input_rows / static_cast<double>(column_stats.distinct_count),
+            input_rows
+        );
+    }
+
+    double estimateEqualityFilterRowsWithMcv(double input_rows,
+                                             const ColumnStats& column_stats,
+                                             const Field& value) {
+        if (input_rows <= 0.0 || column_stats.distinct_count == 0) {
+            return 0.0;
+        }
+
+        auto value_it = column_stats.mcv_counts.find(fieldToString(value));
+        if (value_it != column_stats.mcv_counts.end()) {
+            return static_cast<double>(value_it->second);
+        }
+
+        size_t mcv_rows = 0;
+        for (const auto& mcv : column_stats.mcv_counts) {
+            mcv_rows += mcv.second;
+        }
+        size_t remaining_distinct =
+            column_stats.distinct_count > column_stats.mcv_counts.size()
+                ? column_stats.distinct_count - column_stats.mcv_counts.size()
+                : 0;
+        if (remaining_distinct == 0) {
+            return 1.0;
+        }
+
+        double remaining_rows = std::max(
+            0.0,
+            input_rows - static_cast<double>(mcv_rows)
+        );
+        return clampEstimate(
+            remaining_rows / static_cast<double>(remaining_distinct),
+            input_rows
+        );
+    }
+
+    double estimateJoinRows(double left_rows,
+                            double right_rows,
+                            const ColumnStats& left_stats,
+                            const ColumnStats& right_stats) {
+        if (left_rows <= 0.0 || right_rows <= 0.0) {
+            return 0.0;
+        }
+
+        size_t denominator = std::max(
+            left_stats.distinct_count,
+            right_stats.distinct_count
+        );
+        if (denominator == 0) {
+            return 0.0;
+        }
+
+        return clampEstimate(
+            left_rows * right_rows / static_cast<double>(denominator),
+            left_rows * right_rows
+        );
+    }
+
+    std::map<TableRefId, double> estimateFilteredBaseRows(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            SelectivityModel model = SelectivityModel::Uniform) {
+        std::map<TableRefId, double> estimates;
+        for (const auto& table_ref : components.table_refs) {
+            double rows = static_cast<double>(
+                stats.at(table_ref.table_id).row_count);
+            for (const auto& filter : components.filters) {
+                if (filter.column.table_ref_id != table_ref.id) {
+                    continue;
+                }
+                const auto& column_stats = columnStatsFor(
+                    components,
+                    stats,
+                    filter.column
+                );
+                rows = model == SelectivityModel::MostCommonValues
+                    ? estimateEqualityFilterRowsWithMcv(
+                        rows,
+                        column_stats,
+                        *filter.value
+                    )
+                    : estimateEqualityFilterRows(rows, column_stats);
+            }
+            estimates[table_ref.id] = rows;
+        }
+        return estimates;
     }
 
     JoinOrderPlan chooseGreedyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::Uniform) {
-        return ::chooseGreedyJoinOrder(components, stats, model);
-    }
+            SelectivityModel model = SelectivityModel::Uniform,
+            std::vector<std::string>* search_trace = nullptr) {
+        auto base_relations = estimateBaseRelations(components, stats, model);
+        auto edges = equalityEdgesForJoinOrdering(components);
 
-    JoinOrderSearchResult chooseJoinOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            JoinOrderSearchPolicy policy,
-        SelectivityModel model = SelectivityModel::MostCommonValues) {
-        if (policy == JoinOrderSearchPolicy::Greedy) {
-            std::vector<std::string> search_steps;
-            auto plan = ::chooseGreedyJoinOrder(
-                components,
-                stats,
-                model,
-                &search_steps,
-                &catalog
-            );
-            double cost = estimatedPlanCost(plan);
-            return {
-                policy,
-                std::move(plan),
-                cost,
-                0,
-                0,
-                std::move(search_steps)
-            };
+        std::optional<TableRefId> best_start_table_ref_id;
+        std::optional<JoinOrderStepEstimate> best_first_step;
+        std::vector<std::string> first_round_trace;
+        for (const auto& edge : edges) {
+            for (TableRefId start_table_ref_id :
+                 {edge.left.table_ref_id, edge.right.table_ref_id}) {
+                std::set<TableRefId> joined_table_refs{start_table_ref_id};
+                auto oriented = orientJoinEdge(edge, joined_table_refs);
+                if (!oriented) {
+                    continue;
+                }
+
+                auto step = estimateJoinOrderStep(
+                    base_relations,
+                    joined_table_refs,
+                    *oriented,
+                    base_relations.at(start_table_ref_id),
+                    tupleScanCost(base_relations.at(start_table_ref_id).rows)
+                );
+                if (search_trace) {
+                    first_round_trace.push_back(greedyStartTraceLine(
+                        components,
+                        start_table_ref_id,
+                        step
+                    ));
+                }
+                if (!best_first_step ||
+                    betterJoinOrderStep(step, *best_first_step)) {
+                    best_start_table_ref_id = start_table_ref_id;
+                    best_first_step = step;
+                }
+            }
         }
 
-        std::vector<std::string> search_steps;
-        auto result = ::chooseSelingerLeftDeepJoinOrder(
-            components,
-            stats,
-            model,
-            &search_steps,
-            &catalog
-        );
-        return {
-            policy,
-            std::move(result.plan),
-            result.estimated_cost,
-            result.states_kept,
-            result.candidates_considered,
-            std::move(search_steps)
+        if (!best_start_table_ref_id || !best_first_step) {
+            throw std::runtime_error("Unable to choose a join order.");
+        }
+        if (search_trace) {
+            search_trace->push_back(
+                "Greedy round 1: evaluate every connected two-table start "
+                "(rank by lowest rows, then lowest cost)"
+            );
+            search_trace->insert(
+                search_trace->end(),
+                first_round_trace.begin(),
+                first_round_trace.end()
+            );
+            search_trace->push_back(greedyStartChoiceTraceLine(
+                components,
+                *best_start_table_ref_id,
+                *best_first_step
+            ));
+        }
+
+        std::vector<JoinClause> join_order{best_first_step->join};
+        std::vector<JoinOrderStepEstimate> steps{*best_first_step};
+        std::set<TableRefId> joined_table_refs{
+            *best_start_table_ref_id,
+            best_first_step->join.input_table_ref_id
         };
+        RelationStats current_relation = best_first_step->output_relation;
+        double current_total_cost = best_first_step->chosen_cost;
+        size_t greedy_round = 2;
+
+        while (joined_table_refs.size() < components.table_refs.size()) {
+            std::optional<JoinOrderStepEstimate> best_step;
+            std::vector<std::string> round_trace;
+            for (const auto& edge : edges) {
+                auto oriented = orientJoinEdge(edge, joined_table_refs);
+                if (!oriented) {
+                    continue;
+                }
+
+                auto step = estimateJoinOrderStep(
+                    base_relations,
+                    joined_table_refs,
+                    *oriented,
+                    current_relation,
+                    current_total_cost
+                );
+                if (search_trace && greedy_round == 2) {
+                    round_trace.push_back(greedyCandidateTraceLine(
+                        components,
+                        joined_table_refs,
+                        step
+                    ));
+                }
+                if (!best_step || betterJoinOrderStep(step, *best_step)) {
+                    best_step = step;
+                }
+            }
+
+            if (!best_step) {
+                throw std::runtime_error("Join graph is disconnected.");
+            }
+            if (search_trace && greedy_round == 2) {
+                search_trace->push_back(
+                    "Greedy round 2: evaluate joins connected to {" +
+                    joinedTableRefsTraceLabel(components, joined_table_refs) + "}"
+                );
+                search_trace->insert(
+                    search_trace->end(),
+                    round_trace.begin(),
+                    round_trace.end()
+                );
+                search_trace->push_back(greedyChoiceTraceLine(
+                    components,
+                    joined_table_refs,
+                    *best_step
+                ));
+            }
+
+            join_order.push_back(best_step->join);
+            steps.push_back(*best_step);
+            joined_table_refs.insert(best_step->join.input_table_ref_id);
+            current_relation = best_step->output_relation;
+            current_total_cost = best_step->chosen_cost;
+            greedy_round++;
+        }
+
+        auto planned_components = makeJoinPlanComponents(
+            components,
+            *best_start_table_ref_id,
+            std::move(join_order)
+        );
+        return {std::move(planned_components), std::move(steps), current_relation.rows};
+    }
+
+    std::string joinOrderString(const QueryComponents& components) {
+        std::vector<std::string> labels;
+        labels.push_back(tableRefForId(
+            components,
+            components.base_table_ref_id
+        ).alias);
+        for (const auto& join : components.joins) {
+            labels.push_back(tableRefForId(
+                components,
+                join.input_table_ref_id
+            ).alias);
+        }
+
+        std::ostringstream output;
+        for (size_t i = 0; i < labels.size(); i++) {
+            if (i != 0) {
+                output << " -> ";
+            }
+            output << labels[i];
+        }
+        return output.str();
     }
 
     std::vector<PhysicalJoinKind> physicalJoinKindsForPlan(
             const JoinOrderPlan& plan) {
-        return ::physicalJoinKindsForPlan(plan);
+        std::vector<PhysicalJoinKind> kinds;
+        for (const auto& step : plan.steps) {
+            kinds.push_back(step.chosen_join_kind);
+        }
+        return kinds;
+    }
+
+    std::vector<PhysicalJoinKind> choosePhysicalJoinKindsForOrder(
+            const QueryComponents& components,
+            const std::map<TableId, TableStats>& stats,
+            SelectivityModel model = SelectivityModel::Uniform) {
+        auto base_relations = estimateBaseRelations(components, stats, model);
+
+        std::vector<PhysicalJoinKind> kinds;
+        std::set<TableRefId> joined_table_refs{components.base_table_ref_id};
+        RelationStats current_relation =
+            base_relations.at(components.base_table_ref_id);
+        double current_total_cost = tupleScanCost(current_relation.rows);
+
+        for (const auto& join : components.joins) {
+            auto step = estimateJoinOrderStep(
+                base_relations,
+                joined_table_refs,
+                join,
+                current_relation,
+                current_total_cost
+            );
+            kinds.push_back(step.chosen_join_kind);
+            joined_table_refs.insert(join.input_table_ref_id);
+            current_relation = step.output_relation;
+            current_total_cost = step.chosen_cost;
+        }
+        return kinds;
     }
 
     void printJoinOrderPlan(const std::string& title,
                             const JoinOrderPlan& plan) {
-        ::printJoinOrderPlan(title, plan, catalog);
+        std::cout << "\n" << title << ":" << std::endl;
+        std::cout << "  " << joinOrderString(plan.components) << std::endl;
+        std::set<TableRefId> joined_table_refs{plan.components.base_table_ref_id};
+        for (const auto& step : plan.steps) {
+            auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+            std::cout << "  join "
+                      << columnRefLabel(plan.components, catalog, columns.first)
+                      << " = "
+                      << columnRefLabel(plan.components, catalog, columns.second)
+                      << ": " << physicalJoinKindName(step.chosen_join_kind)
+                      << ", est rows=" << formatEstimate(step.output_rows)
+                      << std::endl;
+            joined_table_refs.insert(step.join.input_table_ref_id);
+        }
+        std::cout << "  final estimate=" << formatEstimate(plan.final_estimate)
+                  << std::endl;
     }
 
-    void printJoinOrderSearchComparison(
-            const JoinOrderSearchResult& greedy,
-            const JoinOrderSearchResult& selinger) {
-        ::printJoinOrderSearchComparison(greedy, selinger);
+    void printJoinQErrorReport(const std::string& title,
+                               const JoinOrderPlan& plan) {
+        auto actual = actualRowsForJoinPlan(plan);
+        std::cout << "\n" << title << ":" << std::endl;
+
+        std::set<TableRefId> joined_table_refs{plan.components.base_table_ref_id};
+        for (size_t i = 0; i < plan.steps.size(); i++) {
+            const auto& step = plan.steps[i];
+            auto columns = joinedAndInputColumns(step.join, joined_table_refs);
+            double actual_rows = static_cast<double>(actual.step_rows.at(i));
+            std::cout << "  join "
+                      << columnRefLabel(plan.components, catalog, columns.first)
+                      << " = "
+                      << columnRefLabel(plan.components, catalog, columns.second)
+                      << ": estimate=" << formatEstimate(step.output_rows)
+                      << " actual=" << actual.step_rows.at(i)
+                      << " q-error=" << formatQError(step.output_rows, actual_rows)
+                      << std::endl;
+            joined_table_refs.insert(step.join.input_table_ref_id);
+        }
+
+        double actual_final = static_cast<double>(actual.final_rows);
+        std::cout << "  final rows: estimate="
+                  << formatEstimate(plan.final_estimate)
+                  << " actual=" << actual.final_rows
+                  << " q-error=" << formatQError(
+                        plan.final_estimate,
+                        actual_final
+                     )
+                  << std::endl;
     }
 
-    void printJoinOrderSearchSteps(
-            const JoinOrderSearchResult& result) {
-        ::printJoinOrderSearchSteps(result);
-    }
-
-    SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            SelectivityModel model = SelectivityModel::MostCommonValues) {
-        return ::chooseSelingerLeftDeepJoinOrder(components, stats, model);
+    void printFinalJoinQError(const std::string& title,
+                              const JoinOrderPlan& plan) {
+        auto actual = actualRowsForJoinPlan(plan);
+        double actual_final = static_cast<double>(actual.final_rows);
+        std::cout << "\n" << title << ": estimate="
+                  << formatEstimate(plan.final_estimate)
+                  << " actual=" << actual.final_rows
+                  << " q-error=" << formatQError(
+                        plan.final_estimate,
+                        actual_final
+                     )
+                  << std::endl;
     }
 
     void printEqualityFilterEstimateComparison(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats) {
-        ::printEqualityFilterEstimateComparison(
-            components,
-            catalog,
-            page_manager,
-            stats
-        );
+        std::cout << "\nEquality filter q-error:" << std::endl;
+        for (const auto& filter : components.filters) {
+            const auto& table_ref = tableRefForId(
+                components,
+                filter.column.table_ref_id
+            );
+            const auto& table_stats = stats.at(table_ref.table_id);
+            const auto& column_stats = columnStatsFor(
+                components,
+                stats,
+                filter.column
+            );
+            double input_rows = static_cast<double>(table_stats.row_count);
+            double uniform_estimate = estimateEqualityFilterRows(
+                input_rows,
+                column_stats
+            );
+            double mcv_estimate = estimateEqualityFilterRowsWithMcv(
+                input_rows,
+                column_stats,
+                *filter.value
+            );
+            size_t actual_rows = countRowsMatchingFilter(components, filter);
+            double actual = static_cast<double>(actual_rows);
+            std::cout << "  " << columnRefLabel(components, catalog, filter.column)
+                      << " = " << fieldToString(*filter.value)
+                      << ": actual=" << actual_rows
+                      << " uniform=" << formatEstimate(uniform_estimate)
+                      << " q-error=" << formatQError(uniform_estimate, actual)
+                      << " mcv=" << formatEstimate(mcv_estimate)
+                      << " q-error=" << formatQError(mcv_estimate, actual)
+                      << std::endl;
+        }
     }
 };
 
@@ -6846,13 +6871,6 @@ private:
         return schema;
     }
 
-    static void appendRow(BuzzDB& db,
-                          const std::string& tableName,
-                          const std::vector<std::string>& values,
-                          std::unordered_map<TableId, PageID>& append_pages) {
-        db.loadTuple(tableName, values, append_pages);
-    }
-
 public:
     static ImportResult importFile(BuzzDB& db, const std::string& filename) {
         ImportResult result;
@@ -6898,7 +6916,7 @@ public:
             }
 
             std::vector<std::string> values(tokens.begin() + 1, tokens.end());
-            appendRow(db, tableName, values, append_pages);
+            db.loadTuple(tableName, values, append_pages);
             result.rows_inserted++;
         }
 
@@ -6910,15 +6928,15 @@ public:
 const std::string imdb_data_filename = "imdb_large.txt";
 const std::string imdb_join_query =
     "PROJECT {cn.name}, {miidx.info}, {t.title} "
-    "FROM title AS t "
-    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-    "JOIN movie_companies AS mc ON {t.id} = {mc.movie_id} "
+    "FROM info_type AS it "
+    "JOIN movie_info_idx AS miidx ON {it.id} = {miidx.info_type_id} "
+    "JOIN movie_companies AS mc ON {miidx.movie_id} = {mc.movie_id} "
     "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
+    "JOIN movie_info AS mi ON {mc.movie_id} = {mi.movie_id} "
+    "JOIN title AS t ON {mi.movie_id} = {t.id} "
+    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
     "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
-    "JOIN movie_info AS mi ON {t.id} = {mi.movie_id} "
     "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
-    "JOIN movie_info_idx AS miidx ON {t.id} = {miidx.movie_id} "
-    "JOIN info_type AS it ON {miidx.info_type_id} = {it.id} "
     "WHERE {cn.country_code} = [us] "
     "AND {ct.kind} = production_companies "
     "AND {it.info} = rating "
@@ -6995,17 +7013,6 @@ void printTimedQueryResult(const std::string& label,
               << " seconds" << std::endl;
 }
 
-void printFinalEstimateQError(const std::string& label,
-                              const JoinOrderPlan& plan,
-                              const QueryResult& result) {
-    double actual_rows = static_cast<double>(result.row_count);
-    std::cout << "  " << label
-              << ": estimate=" << formatEstimate(plan.final_estimate)
-              << " actual=" << result.row_count
-              << " q-error=" << formatQError(plan.final_estimate, actual_rows)
-              << std::endl;
-}
-
 void runImdbJoinOrdering() {
     BuzzDB db;
     auto import_start = std::chrono::high_resolution_clock::now();
@@ -7027,86 +7034,47 @@ void runImdbJoinOrdering() {
         stats
     );
 
-    auto greedy_search = db.optimizer().chooseJoinOrder(
+    std::vector<std::string> greedy_trace;
+    auto propagated_plan = db.optimizer().chooseGreedyJoinOrder(
         components,
         stats,
-        JoinOrderSearchPolicy::Greedy,
-        SelectivityModel::MostCommonValues
+        SelectivityModel::MostCommonValues,
+        &greedy_trace
     );
-    auto selinger_search = db.optimizer().chooseJoinOrder(
-        components,
-        stats,
-        JoinOrderSearchPolicy::SelingerLeftDeepDP,
-        SelectivityModel::MostCommonValues
-    );
-    const auto& greedy_plan = greedy_search.plan;
-    const auto& selinger_plan = selinger_search.plan;
-    db.optimizer().printJoinOrderSearchComparison(
-        greedy_search,
-        selinger_search
-    );
-    db.optimizer().printJoinOrderSearchSteps(greedy_search);
-    db.optimizer().printJoinOrderSearchSteps(selinger_search);
-    db.optimizer().printJoinOrderPlan(
-        "MCV-greedy optimizer order",
-        greedy_plan
-    );
-    std::cout << "\nSelinger left-deep DP search:"
-              << " kept " << selinger_search.states_kept
-              << " state(s), considered "
-              << selinger_search.candidates_considered
-              << " candidate extension(s), estimated cost="
-              << formatEstimate(selinger_search.estimated_cost)
+    std::cout << "\nGreedy decisions with propagated estimated RelationStats:"
               << std::endl;
-    db.optimizer().printJoinOrderPlan(
-        "Selinger left-deep DP order",
-        selinger_plan
-    );
-
-    auto greedy_join_kinds =
-        db.optimizer().physicalJoinKindsForPlan(greedy_plan);
-    auto selinger_join_kinds =
-        db.optimizer().physicalJoinKindsForPlan(selinger_plan);
-    std::cout << "\nQuery time comparison "
-              << "(buffer pool cleared before each run):" << std::endl;
-    db.clearBufferPool();
-    auto greedy_result = executeJoinQueryInTransaction(
-        db,
-        greedy_plan.components,
-        &greedy_join_kinds
-    );
-    db.clearBufferPool();
-    auto selinger_timed_result = executeJoinQueryInTransaction(
-        db,
-        selinger_plan.components,
-        &selinger_join_kinds
-    );
-    printTimedQueryResult("MCV-greedy optimizer", greedy_result);
-    printTimedQueryResult("Selinger left-deep DP", selinger_timed_result);
-    std::cout << "\nFinal estimate q-error:" << std::endl;
-    printFinalEstimateQError(
-        "MCV-greedy optimizer",
-        greedy_plan,
-        greedy_result.result
-    );
-    printFinalEstimateQError(
-        "Selinger left-deep DP",
-        selinger_plan,
-        selinger_timed_result.result
-    );
-    if (greedy_result.result.row_count != selinger_timed_result.result.row_count) {
-        throw std::runtime_error("Join reordering changed the query result.");
+    for (const auto& line : greedy_trace) {
+        std::cout << line << std::endl;
     }
+    db.optimizer().printJoinOrderPlan(
+        "Propagated-stats optimizer order",
+        propagated_plan
+    );
+    db.optimizer().printFinalJoinQError(
+        "Propagated-stats final join q-error",
+        propagated_plan
+    );
 
-    std::cout << "\nResult: With the same MCV statistics, Selinger DP searches"
-              << " more left-deep alternatives than greedy and can choose a"
-              << " better plan.\n";
+    auto join_kinds =
+        db.optimizer().physicalJoinKindsForPlan(propagated_plan);
+    std::cout << "\nQuery time "
+              << "(buffer pool cleared before run):" << std::endl;
+    db.clearBufferPool();
+    auto result = executeJoinQueryInTransaction(
+        db,
+        propagated_plan.components,
+        &join_kinds
+    );
+    printTimedQueryResult("Propagated-stats optimizer", result);
+
+    std::cout << "\nResult: Greedy planning now propagates estimated row,"
+              << " NDV, uniqueness, and MCV stats through each join.\n";
 }
 
 int main() {
     try {
 
-    std::cout << "IMDB Selinger left-deep DP with most-common-value stats\n";
+    std::cout << "IMDB greedy optimizer with propagated estimated RelationStats\n";
 
     runImdbJoinOrdering();
 
