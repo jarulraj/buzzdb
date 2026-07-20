@@ -7704,7 +7704,7 @@ void runImdbJoinOrdering() {
 
     std::cout << "\nResult: the bushy search space stays unchanged"
               << " and uses a simple probe-plus-fetch cost model so IMDB"
-              << " indexes compete without a hard-coded whitelist.\n";
+              << " indexes are used.\n";
 }
 
 int main() {
