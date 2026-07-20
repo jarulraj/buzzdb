@@ -2701,64 +2701,21 @@ private:
 };
 
 struct IndexSpec {
-    std::string index_name;
     std::string table_name;
     std::string column_name;
-    bool unique = false;
-    bool primary_key = false;
-};
-
-struct IndexBuildResult {
-    std::string index_name;
-    std::string table_name;
-    std::string column_name;
-    bool unique = false;
-    bool primary_key = false;
-    size_t entries = 0;
-    size_t distinct_keys = 0;
-};
-
-struct IndexBuildSummary {
-    std::vector<IndexBuildResult> built;
-    std::vector<std::string> skipped;
-
-    size_t primaryBuilt() const {
-        size_t count = 0;
-        for (const auto& result : built) {
-            if (result.primary_key) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    size_t foreignKeyBuilt() const {
-        size_t count = 0;
-        for (const auto& result : built) {
-            if (!result.primary_key) {
-                count++;
-            }
-        }
-        return count;
-    }
 };
 
 class HashIndex {
 private:
     std::unordered_map<IndexKey, std::vector<RecordId>, IndexKeyHasher> entries;
-    bool unique_index = false;
 
 public:
-    void clear(bool unique) {
+    void clear() {
         entries.clear();
-        unique_index = unique;
     }
 
     void insert(const Field& key, const RecordId& record_id) {
         auto& records = entries[IndexKey(key)];
-        if (unique_index && !records.empty()) {
-            throw std::runtime_error("Duplicate key in unique hash index.");
-        }
         records.push_back(record_id);
     }
 
@@ -2770,27 +2727,11 @@ public:
         return &it->second;
     }
 
-    size_t entryCount() const {
-        size_t count = 0;
-        for (const auto& entry : entries) {
-            count += entry.second.size();
-        }
-        return count;
-    }
-
-    size_t distinctKeyCount() const {
-        return entries.size();
-    }
-
-    bool unique() const {
-        return unique_index;
-    }
 };
 
 class IndexManager {
 private:
     struct BuildTarget {
-        IndexSpec spec;
         IndexDescriptor descriptor;
     };
 
@@ -2802,31 +2743,26 @@ public:
     IndexManager(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
 
-    IndexBuildSummary buildIndexes(const std::vector<IndexSpec>& specs) {
-        IndexBuildSummary summary;
+    void buildIndexes(const std::vector<IndexSpec>& specs) {
         std::map<std::string, std::vector<BuildTarget>> targets_by_table;
 
         for (const auto& spec : specs) {
             if (!catalog.hasTable(spec.table_name)) {
-                summary.skipped.push_back(
-                    spec.index_name + " on " + spec.table_name + "." +
-                    spec.column_name + " (missing table)"
+                throw std::runtime_error(
+                    "Cannot build index on missing table: " + spec.table_name
                 );
-                continue;
             }
 
             auto& metadata = catalog.getTable(spec.table_name);
             auto column_index = metadata.schema.findColumnIndex(spec.column_name);
             if (!column_index) {
-                summary.skipped.push_back(
-                    spec.index_name + " on " + spec.table_name + "." +
-                    spec.column_name + " (missing column)"
+                throw std::runtime_error(
+                    "Cannot build index on missing column: " +
+                    spec.table_name + "." + spec.column_name
                 );
-                continue;
             }
 
             targets_by_table[spec.table_name].push_back({
-                spec,
                 {metadata.table_id, *column_index}
             });
         }
@@ -2834,7 +2770,7 @@ public:
         for (auto& entry : targets_by_table) {
             auto& metadata = catalog.getTable(entry.first);
             for (const auto& target : entry.second) {
-                indexes[target.descriptor].clear(target.spec.unique);
+                indexes[target.descriptor].clear();
             }
 
             TableHeap table_heap(metadata, page_manager);
@@ -2860,21 +2796,7 @@ public:
                 }
             }
 
-            for (const auto& target : entry.second) {
-                const auto& index = indexes.at(target.descriptor);
-                summary.built.push_back({
-                    target.spec.index_name,
-                    target.spec.table_name,
-                    target.spec.column_name,
-                    target.spec.unique,
-                    target.spec.primary_key,
-                    index.entryCount(),
-                    index.distinctKeyCount()
-                });
-            }
         }
-
-        return summary;
     }
 
     bool hasIndex(const IndexDescriptor& descriptor) const {
@@ -4381,41 +4303,11 @@ std::string formatEstimate(double value) {
     return output.str();
 }
 
-double qError(double estimate, double actual) {
-    if (estimate == 0.0 && actual == 0.0) {
-        return 1.0;
-    }
-    if (estimate <= 0.0 || actual <= 0.0) {
-        return std::numeric_limits<double>::infinity();
-    }
-    return std::max(estimate / actual, actual / estimate);
-}
-
-std::string formatQError(double estimate, double actual) {
-    double value = qError(estimate, actual);
-    if (std::isinf(value)) {
-        return "inf";
-    }
-    return formatEstimate(value);
-}
-
 enum class PhysicalJoinKind {
     NestedLoopJoin,
     HashJoin,
     IndexNestedLoopJoin
 };
-
-std::string physicalJoinKindName(PhysicalJoinKind kind) {
-    switch (kind) {
-        case PhysicalJoinKind::NestedLoopJoin:
-            return "NestedLoopJoin";
-        case PhysicalJoinKind::HashJoin:
-            return "HashJoin";
-        case PhysicalJoinKind::IndexNestedLoopJoin:
-            return "IndexNestedLoopJoin";
-    }
-    throw std::runtime_error("Unknown physical join kind.");
-}
 
 enum class PhysicalOpKind {
     TableScan,
@@ -5785,20 +5677,6 @@ private:
         };
     }
 
-    std::string physicalPlanTreeString(
-            const QueryComponents& components,
-            const std::shared_ptr<PhysicalPlanNode>& node) {
-        if (!node) {
-            return "";
-        }
-        if (node->isTableScan()) {
-            return tableRefForId(components, node->table_ref_id).alias;
-        }
-        return physicalOpKindName(node->op) + "(" +
-               physicalPlanTreeString(components, node->left) + ", " +
-               physicalPlanTreeString(components, node->right) + ")";
-    }
-
     void appendPhysicalPlanTree(
             const QueryComponents& components,
             const std::shared_ptr<PhysicalPlanNode>& node,
@@ -6939,16 +6817,8 @@ public:
                           transactional_storage_manager.page_manager),
           query_executor(transactional_storage_manager) {}
 
-    QueryOptimizer& optimizer() {
-        return query_optimizer;
-    }
-
     ParsedStatement parseStatement(const std::string& statement) {
         return query_parser.parseStatement(statement);
-    }
-
-    QueryComponents parseSelectStatement(const std::string& statement) {
-        return parseStatement(statement).query;
     }
 
     void execute(const ParsedStatement& statement,
@@ -7012,40 +6882,6 @@ public:
         execute(query_parser.parseStatement(statement));
     }
 
-    QueryResult executeJoinPlan(
-            const QueryComponents& components,
-            const TxnPtr& txn,
-            const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
-            size_t sample_limit = 5,
-            const std::shared_ptr<PhysicalPlanNode>& plan_root = nullptr) {
-        return query_executor.executeJoinPlan(
-            components,
-            txn,
-            physical_join_kinds,
-            sample_limit,
-            plan_root
-        );
-    }
-
-    QueryResult executeJoinPlan(
-            const QueryComponents& components,
-            const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
-            size_t sample_limit = 5,
-            const std::shared_ptr<PhysicalPlanNode>& plan_root = nullptr) {
-        return query_executor.executeJoinPlan(
-            components,
-            physical_join_kinds,
-            sample_limit,
-            plan_root
-        );
-    }
-
-    void insertRow(const std::string& tableName,
-                   const std::vector<std::string>& values,
-                   bool printResult = false) {
-        query_executor.insertRow(tableName, values, printResult);
-    }
-
 private:
     void explain(const QueryComponents& components) {
         if (!components.isJoinQuery()) {
@@ -7084,6 +6920,10 @@ public:
     void execute(const TxnPtr& txn, const std::string& statement) {
         requireRunningTransaction(txn);
         query_processor.execute(statement, txn);
+    }
+
+    void execute(const std::string& statement) {
+        query_processor.execute(statement);
     }
 
     void commit(const TxnPtr& txn) {
@@ -7127,10 +6967,6 @@ public:
         transactional_storage_manager.checkpoint();
     }
 
-    void clearBufferPool() {
-        transactional_storage_manager.buffer_manager.clearBufferPool();
-    }
-
     bool createTable(const std::string& name, TableSchema schema) {
         return transactional_storage_manager.catalog.createTable(
             name,
@@ -7156,31 +6992,9 @@ public:
         );
     }
 
-    QueryOptimizer& optimizer() {
-        return query_processor.optimizer();
-    }
-
-    QueryProcessor& queryProcessor() {
-        return query_processor;
-    }
-
-    IndexManager& indexManager() {
-        return transactional_storage_manager.index_manager;
-    }
-
-    IndexBuildSummary buildIndexes(
+    void buildIndexes(
             const std::vector<IndexSpec>& specs) {
-        return transactional_storage_manager.index_manager.buildIndexes(specs);
-    }
-
-    QueryComponents parseSelectStatement(const std::string& statement) {
-        return query_processor.parseSelectStatement(statement);
-    }
-
-    void insertRow(const std::string& tableName,
-                   const std::vector<std::string>& values,
-                   bool printResult = false) {
-        query_processor.insertRow(tableName, values, printResult);
+        transactional_storage_manager.index_manager.buildIndexes(specs);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -7241,14 +7055,6 @@ private:
     }
 };
 
-struct ImportResult {
-    bool loaded = false;
-    bool skipped = false;
-    size_t tables_created = 0;
-    size_t rows_inserted = 0;
-    std::string reason;
-};
-
 class DatabaseImporter {
 private:
     static FieldType parseFieldType(const std::string& typeName) {
@@ -7284,12 +7090,9 @@ private:
     }
 
 public:
-    static ImportResult importFile(BuzzDB& db, const std::string& filename) {
-        ImportResult result;
+    static void importFile(BuzzDB& db, const std::string& filename) {
         if (!db.isDatabaseEmpty()) {
-            result.skipped = true;
-            result.reason = "database already has user tables";
-            return result;
+            return;
         }
 
         std::ifstream inputFile(filename);
@@ -7318,7 +7121,6 @@ public:
                 if (!db.createTable(tableName, parseTableSchema(tokens))) {
                     throw std::runtime_error("Duplicate TABLE declaration: " + tableName);
                 }
-                result.tables_created++;
                 continue;
             }
 
@@ -7329,11 +7131,7 @@ public:
 
             std::vector<std::string> values(tokens.begin() + 1, tokens.end());
             db.loadTuple(tableName, values, append_pages);
-            result.rows_inserted++;
         }
-
-        result.loaded = true;
-        return result;
     }
 };
 
@@ -7358,118 +7156,31 @@ const std::string imdb_join_query =
     "AND {mi.movie_id} = {mc.movie_id} "
     "AND {miidx.movie_id} = {mc.movie_id}";
 
-ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
+void ensureImdbDatasetLoaded(BuzzDB& db) {
     if (db.isDatabaseEmpty()) {
-        return DatabaseImporter::importFile(db, imdb_data_filename);
+        DatabaseImporter::importFile(db, imdb_data_filename);
     }
-
-    ImportResult result;
-    result.skipped = true;
-    result.reason = "database already has user tables";
-    return result;
-}
-
-void printImportResult(const ImportResult& result) {
-    if (result.loaded) {
-        std::cout << "Loaded " << imdb_data_filename << ": "
-                  << result.tables_created << " table(s), "
-                  << result.rows_inserted << " row(s)." << std::endl;
-        return;
-    }
-
-    if (result.skipped) {
-        std::cout << "Skipped " << imdb_data_filename << ": "
-                  << result.reason << "." << std::endl;
-        return;
-    }
-
-    throw std::runtime_error("Importer finished without loading or skipping.");
 }
 
 std::vector<IndexSpec> imdbIndexSpecs() {
-    std::vector<IndexSpec> specs;
-
-    auto addPrimaryKey = [&](const std::string& table_name) {
-        specs.push_back({
-            "pk_" + table_name,
-            table_name,
-            "id",
-            true,
-            true
-        });
+    return {
+        {"movie_companies", "company_type_id"},
+        {"title", "kind_id"},
+        {"movie_info_idx", "info_type_id"},
+        {"movie_info", "info_type_id"},
+        {"company_name", "country_code"},
+        {"title", "production_year"},
+        {"movie_companies", "note"}
     };
-
-    auto addForeignKey = [&](const std::string& index_name,
-                             const std::string& table_name,
-                             const std::string& column_name) {
-        specs.push_back({
-            index_name,
-            table_name,
-            column_name,
-            false,
-            false
-        });
-    };
-
-    for (const std::string& table_name : {
-             "aka_name",
-             "aka_title",
-             "cast_info",
-             "char_name",
-             "comp_cast_type",
-             "company_name",
-             "company_type",
-             "complete_cast",
-             "info_type",
-             "keyword",
-             "kind_type",
-             "link_type",
-             "movie_companies",
-             "movie_info",
-             "movie_info_idx",
-             "movie_keyword",
-             "movie_link",
-             "name",
-             "person_info",
-             "role_type",
-             "title"
-         }) {
-        addPrimaryKey(table_name);
-    }
-
-    addForeignKey("company_id_movie_companies", "movie_companies", "company_id");
-    addForeignKey("company_type_id_movie_companies", "movie_companies", "company_type_id");
-    addForeignKey("info_type_id_movie_info_idx", "movie_info_idx", "info_type_id");
-    addForeignKey("info_type_id_movie_info", "movie_info", "info_type_id");
-    addForeignKey("info_type_id_person_info", "person_info", "info_type_id");
-    addForeignKey("keyword_id_movie_keyword", "movie_keyword", "keyword_id");
-    addForeignKey("kind_id_aka_title", "aka_title", "kind_id");
-    addForeignKey("kind_id_title", "title", "kind_id");
-    addForeignKey("linked_movie_id_movie_link", "movie_link", "linked_movie_id");
-    addForeignKey("link_type_id_movie_link", "movie_link", "link_type_id");
-    addForeignKey("movie_id_aka_title", "aka_title", "movie_id");
-    addForeignKey("movie_id_cast_info", "cast_info", "movie_id");
-    addForeignKey("movie_id_complete_cast", "complete_cast", "movie_id");
-    addForeignKey("movie_id_movie_companies", "movie_companies", "movie_id");
-    addForeignKey("movie_id_movie_info_idx", "movie_info_idx", "movie_id");
-    addForeignKey("movie_id_movie_keyword", "movie_keyword", "movie_id");
-    addForeignKey("movie_id_movie_link", "movie_link", "movie_id");
-    addForeignKey("movie_id_movie_info", "movie_info", "movie_id");
-    addForeignKey("person_id_aka_name", "aka_name", "person_id");
-    addForeignKey("person_id_cast_info", "cast_info", "person_id");
-    addForeignKey("person_id_person_info", "person_info", "person_id");
-    addForeignKey("person_role_id_cast_info", "cast_info", "person_role_id");
-    addForeignKey("role_id_cast_info", "cast_info", "role_id");
-
-    return specs;
 }
 
 void runImdbExplainPhysicalPlan() {
     BuzzDB db;
     ensureImdbDatasetLoaded(db);
-    db.buildIndexes(imdbIndexSpecs());
+    auto demo_indexes = imdbIndexSpecs();
+    db.buildIndexes(demo_indexes);
 
-    db.queryProcessor().execute("EXPLAIN " + imdb_join_query);
+    db.execute("EXPLAIN " + imdb_join_query);
 
     std::cout << "\nTakeaway: The optimizer emits an explicit"
               << " PhysicalPlanNode tree.\n";
