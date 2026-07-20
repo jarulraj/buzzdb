@@ -4027,6 +4027,7 @@ std::string physicalJoinKindName(PhysicalJoinKind kind) {
 
 struct JoinOrderStepEstimate {
     JoinClause join;
+    std::vector<JoinClause> join_predicates;
     double output_rows = 0.0;
     RelationStats output_relation;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
@@ -4045,6 +4046,7 @@ struct JoinPlanNode {
     std::shared_ptr<JoinPlanNode> left;
     std::shared_ptr<JoinPlanNode> right;
     JoinClause join;
+    std::vector<JoinClause> join_predicates;
     std::set<TableRefId> table_refs;
     RelationStats relation;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
@@ -4266,7 +4268,35 @@ QueryResult executeJoinQuery(const QueryComponents& components,
             right.table_ref_ids.begin(),
             right.table_ref_ids.end()
         );
-        return {&join_op, left.table_ref_ids, left.width + right.width};
+        Operator* output_op = &join_op;
+        if (node->join_predicates.size() > 1) {
+            auto predicate = std::make_unique<ComplexPredicate>(
+                ComplexPredicate::LogicOperator::AND
+            );
+            for (const auto& join_predicate : node->join_predicates) {
+                predicate->addPredicate(std::make_unique<SimplePredicate>(
+                    SimplePredicate::Operand(
+                        tableOffsetIn(
+                            left.table_ref_ids,
+                            join_predicate.left.table_ref_id
+                        ) + join_predicate.left.column_index
+                    ),
+                    SimplePredicate::Operand(
+                        tableOffsetIn(
+                            left.table_ref_ids,
+                            join_predicate.right.table_ref_id
+                        ) + join_predicate.right.column_index
+                    ),
+                    SimplePredicate::ComparisonOperator::EQ
+                ));
+            }
+            pushed_selects.push_back(std::make_unique<SelectOperator>(
+                *output_op,
+                std::move(predicate)
+            ));
+            output_op = pushed_selects.back().get();
+        }
+        return {output_op, left.table_ref_ids, left.width + right.width};
     };
 
     Operator* rootOp = nullptr;
@@ -5006,6 +5036,31 @@ private:
                              left_rows * right_rows);
     }
 
+    double estimateJoinRowsForPredicates(
+            const RelationStats& left_relation,
+            const RelationStats& right_relation,
+            const std::set<TableRefId>& left_table_refs,
+            const std::vector<JoinClause>& join_predicates) {
+        if (join_predicates.empty()) {
+            throw std::runtime_error("Join step has no join predicate.");
+        }
+
+        double output_rows = left_relation.rows * right_relation.rows;
+        for (const auto& join : join_predicates) {
+            auto columns = joinedAndInputColumns(join, left_table_refs);
+            output_rows = std::min(
+                output_rows,
+                estimateJoinRows(
+                    left_relation.rows,
+                    right_relation.rows,
+                    relationColumnStatsFor(left_relation, columns.first),
+                    relationColumnStatsFor(right_relation, columns.second)
+                )
+            );
+        }
+        return clampEstimate(output_rows, left_relation.rows * right_relation.rows);
+    }
+
     RelationStats estimateJoinedRelationStats(
             const RelationStats& left,
             const RelationStats& right,
@@ -5065,25 +5120,91 @@ private:
         return output;
     }
 
+    RelationStats estimateJoinedRelationStats(
+            const RelationStats& left,
+            const RelationStats& right,
+            const std::set<TableRefId>& left_table_refs,
+            const std::vector<JoinClause>& join_predicates,
+            double output_rows) {
+        if (join_predicates.empty()) {
+            throw std::runtime_error("Join step has no join predicate.");
+        }
+
+        RelationStats output;
+        output.rows = output_rows;
+
+        auto add_side = [&](const RelationStats& side) {
+            double scale = side.rows > 0.0 ? output_rows / side.rows : 0.0;
+            bool rows_preserved = output_rows <= side.rows;
+            for (const auto& table_columns : side.columns) {
+                for (const auto& column_entry : table_columns.second) {
+                    ColumnRelationStats column_stats = column_entry.second;
+                    column_stats.distinct_count = std::min(
+                        column_stats.distinct_count,
+                        output_rows
+                    );
+                    column_stats.unique = column_stats.unique &&
+                                          (rows_preserved || output_rows <= 1.0);
+                    column_stats.mcv_counts = scaledMcvCounts(
+                        column_stats.mcv_counts,
+                        scale,
+                        output_rows
+                    );
+                    output.columns[table_columns.first][column_entry.first] =
+                        std::move(column_stats);
+                }
+            }
+        };
+
+        add_side(left);
+        add_side(right);
+
+        for (const auto& join : join_predicates) {
+            auto columns = joinedAndInputColumns(join, left_table_refs);
+            const auto& left_stats = relationColumnStatsFor(left, columns.first);
+            const auto& right_stats = relationColumnStatsFor(right, columns.second);
+            double join_distinct = std::min({
+                left_stats.distinct_count,
+                right_stats.distinct_count,
+                output_rows
+            });
+            output.columns.at(columns.first.table_ref_id)
+                          .at(columns.first.column_index)
+                          .distinct_count = join_distinct;
+            output.columns.at(columns.second.table_ref_id)
+                          .at(columns.second.column_index)
+                          .distinct_count = join_distinct;
+            if (output_rows <= 1.0) {
+                output.columns.at(columns.first.table_ref_id)
+                              .at(columns.first.column_index)
+                              .unique = true;
+                output.columns.at(columns.second.table_ref_id)
+                              .at(columns.second.column_index)
+                              .unique = true;
+            }
+        }
+        return output;
+    }
+
     JoinOrderStepEstimate estimateJoinOrderStep(
             const std::map<TableRefId, RelationStats>& base_relations,
             const std::set<TableRefId>& joined_table_refs,
             const JoinClause& join,
+            const std::vector<JoinClause>& join_predicates,
             const RelationStats& current_relation,
             double current_total_cost) {
-        auto columns = joinedAndInputColumns(join, joined_table_refs);
         const auto& right_relation = base_relations.at(join.input_table_ref_id);
-        double output_rows = estimateJoinRows(
-            current_relation.rows,
-            right_relation.rows,
-            relationColumnStatsFor(current_relation, columns.first),
-            relationColumnStatsFor(right_relation, columns.second)
+        double output_rows = estimateJoinRowsForPredicates(
+            current_relation,
+            right_relation,
+            joined_table_refs,
+            join_predicates
         );
         RelationStats output_relation = estimateJoinedRelationStats(
             current_relation,
             right_relation,
-            columns.first,
-            columns.second,
+            joined_table_refs,
+            join_predicates,
             output_rows
         );
 
@@ -5112,6 +5233,7 @@ private:
 
         return {
             join,
+            join_predicates,
             output_rows,
             std::move(output_relation),
             chosen_join_kind,
@@ -5161,6 +5283,7 @@ private:
         node->left = left;
         node->right = right;
         node->join = join;
+        node->join_predicates = step.join_predicates;
         node->table_refs = left->table_refs;
         node->table_refs.insert(right->table_refs.begin(), right->table_refs.end());
         node->relation = step.output_relation;
@@ -5174,49 +5297,66 @@ private:
         return node.table_refs.find(table_ref_id) != node.table_refs.end();
     }
 
-    std::optional<JoinClause> joinEdgeBetweenPlans(
-            const JoinPlanNode& left,
-            const JoinPlanNode& right,
+    static bool setContainsTableRef(const std::set<TableRefId>& table_refs,
+                                    TableRefId table_ref_id) {
+        return table_refs.find(table_ref_id) != table_refs.end();
+    }
+
+    std::vector<JoinClause> joinEdgesBetweenSets(
+            const std::set<TableRefId>& left_table_refs,
+            const std::set<TableRefId>& right_table_refs,
             const std::vector<JoinClause>& edges) {
+        std::vector<JoinClause> join_predicates;
         for (const auto& edge : edges) {
-            bool left_has_left = planContainsTableRef(left, edge.left.table_ref_id);
-            bool left_has_right = planContainsTableRef(left, edge.right.table_ref_id);
-            bool right_has_left = planContainsTableRef(right, edge.left.table_ref_id);
-            bool right_has_right = planContainsTableRef(right, edge.right.table_ref_id);
+            bool left_has_left =
+                setContainsTableRef(left_table_refs, edge.left.table_ref_id);
+            bool left_has_right =
+                setContainsTableRef(left_table_refs, edge.right.table_ref_id);
+            bool right_has_left =
+                setContainsTableRef(right_table_refs, edge.left.table_ref_id);
+            bool right_has_right =
+                setContainsTableRef(right_table_refs, edge.right.table_ref_id);
 
             if (left_has_left && right_has_right) {
                 JoinClause oriented = edge;
                 oriented.input_table_ref_id = edge.right.table_ref_id;
-                return oriented;
+                join_predicates.push_back(oriented);
             }
             if (left_has_right && right_has_left) {
                 JoinClause oriented = edge;
                 oriented.input_table_ref_id = edge.left.table_ref_id;
-                return oriented;
+                join_predicates.push_back(oriented);
             }
         }
-        return std::nullopt;
+        return join_predicates;
+    }
+
+    std::vector<JoinClause> joinEdgesBetweenPlans(
+            const JoinPlanNode& left,
+            const JoinPlanNode& right,
+            const std::vector<JoinClause>& edges) {
+        return joinEdgesBetweenSets(left.table_refs, right.table_refs, edges);
     }
 
     JoinOrderStepEstimate estimateJoinTreeStep(
             const std::set<TableRefId>& left_table_refs,
             const JoinClause& join,
+            const std::vector<JoinClause>& join_predicates,
             const RelationStats& left_relation,
             double left_cost,
             const RelationStats& right_relation,
             double right_cost) {
-        auto columns = joinedAndInputColumns(join, left_table_refs);
-        double output_rows = estimateJoinRows(
-            left_relation.rows,
-            right_relation.rows,
-            relationColumnStatsFor(left_relation, columns.first),
-            relationColumnStatsFor(right_relation, columns.second)
+        double output_rows = estimateJoinRowsForPredicates(
+            left_relation,
+            right_relation,
+            left_table_refs,
+            join_predicates
         );
         RelationStats output_relation = estimateJoinedRelationStats(
             left_relation,
             right_relation,
-            columns.first,
-            columns.second,
+            left_table_refs,
+            join_predicates,
             output_rows
         );
 
@@ -5244,6 +5384,7 @@ private:
 
         return {
             join,
+            join_predicates,
             output_rows,
             std::move(output_relation),
             chosen_join_kind,
@@ -5459,6 +5600,7 @@ public:
                 }
 
                 const auto& current = *best[mask];
+                std::set<TableRefId> inputs_considered;
                 for (const auto& edge : edges) {
                     auto oriented = orientJoinEdge(edge, current.joined_table_refs);
                     if (!oriented) {
@@ -5470,11 +5612,25 @@ public:
                     if ((mask & next_bit) != 0) {
                         continue;
                     }
+                    if (!inputs_considered.insert(input_table_ref_id).second) {
+                        continue;
+                    }
+
+                    std::set<TableRefId> input_table_refs{input_table_ref_id};
+                    auto join_predicates = joinEdgesBetweenSets(
+                        current.joined_table_refs,
+                        input_table_refs,
+                        edges
+                    );
+                    if (join_predicates.empty()) {
+                        continue;
+                    }
 
                     auto step = estimateJoinOrderStep(
                         base_relations,
                         current.joined_table_refs,
-                        *oriented,
+                        join_predicates.front(),
+                        join_predicates,
                         current.relation,
                         current.cost
                     );
@@ -5661,12 +5817,12 @@ public:
                         continue;
                     }
 
-                    auto edge = joinEdgeBetweenPlans(
+                    auto join_predicates = joinEdgesBetweenPlans(
                         *best[left_mask]->plan_root,
                         *best[right_mask]->plan_root,
                         edges
                     );
-                    if (!edge) {
+                    if (join_predicates.empty()) {
                         cross_products_pruned++;
                         level_pruned++;
                         continue;
@@ -5674,7 +5830,8 @@ public:
 
                     auto step = estimateJoinTreeStep(
                         best[left_mask]->table_refs,
-                        *edge,
+                        join_predicates.front(),
+                        join_predicates,
                         best[left_mask]->relation,
                         best[left_mask]->cost,
                         best[right_mask]->relation,

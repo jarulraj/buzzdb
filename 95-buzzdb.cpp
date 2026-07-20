@@ -6274,6 +6274,51 @@ public:
         std::vector<BushyAnnealingCheckpoint> checkpoints;
         std::uniform_real_distribution<double> probability(0.0, 1.0);
 
+        struct TemperatureLevelTrace {
+            size_t level = 0;
+            size_t start_move = 0;
+            size_t end_move = 0;
+            double temperature = 0.0;
+            double start_best_cost = 0.0;
+            double end_best_cost = 0.0;
+            size_t valid_moves = 0;
+            size_t accepted_moves = 0;
+            size_t improving_moves = 0;
+            size_t worse_moves = 0;
+            size_t rejected_moves = 0;
+        };
+        std::vector<TemperatureLevelTrace> temperature_levels;
+
+        const double target_initial_acceptance = 0.80;
+        std::mt19937 temperature_rng(9204);
+        double uphill_delta_sum = 0.0;
+        size_t uphill_delta_count = 0;
+        size_t temperature_samples = 30;
+        for (size_t sample = 0; sample < temperature_samples; sample++) {
+            auto neighbor = randomNeighborBushyTree(
+                *current_root,
+                base_relations,
+                edges,
+                temperature_rng
+            );
+            if (!neighbor) {
+                continue;
+            }
+            double delta = neighbor->root->cost - current_cost;
+            if (delta > 0.0) {
+                uphill_delta_sum += delta;
+                uphill_delta_count++;
+            }
+        }
+        if (uphill_delta_count > 0) {
+            double average_uphill_delta =
+                uphill_delta_sum / static_cast<double>(uphill_delta_count);
+            temperature = std::max(
+                1.0,
+                -average_uphill_delta / std::log(target_initial_acceptance)
+            );
+        }
+
         auto countProposedMove = [&](BushyAnnealingMoveKind kind) {
             switch (kind) {
                 case BushyAnnealingMoveKind::SwapChildren:
@@ -6309,6 +6354,12 @@ public:
         };
 
         for (size_t outer = 0; outer < 4; outer++) {
+            TemperatureLevelTrace level_trace;
+            level_trace.level = outer + 1;
+            level_trace.start_move = attempted_moves + 1;
+            level_trace.temperature = temperature;
+            level_trace.start_best_cost = best_cost;
+
             for (size_t inner = 0; inner < 50; inner++) {
                 attempted_moves++;
                 auto neighbor = randomNeighborBushyTree(
@@ -6324,6 +6375,7 @@ public:
                 }
 
                 valid_moves++;
+                level_trace.valid_moves++;
                 countProposedMove(neighbor->kind);
                 double neighbor_cost = neighbor->root->cost;
                 double delta = neighbor_cost - current_cost;
@@ -6331,17 +6383,21 @@ public:
                     probability(rng) < std::exp(-delta / temperature);
                 if (!accept) {
                     rejected_moves++;
+                    level_trace.rejected_moves++;
                     recordCheckpoint();
                     continue;
                 }
 
                 if (delta < 0.0) {
                     improving_moves++;
+                    level_trace.improving_moves++;
                 } else if (delta > 0.0) {
                     worse_moves++;
+                    level_trace.worse_moves++;
                 } else {
                     neutral_moves++;
                 }
+                level_trace.accepted_moves++;
                 countAcceptedMove(neighbor->kind);
                 current_root = neighbor->root;
                 current_cost = neighbor_cost;
@@ -6351,14 +6407,29 @@ public:
                 }
                 recordCheckpoint();
             }
+            level_trace.end_move = attempted_moves;
+            level_trace.end_best_cost = best_cost;
+            temperature_levels.push_back(level_trace);
             temperature *= 0.55;
         }
 
         if (search_trace) {
             search_trace->push_back(
                 "Simulated Annealing bushy: deterministic seed=9203, "
+                "initial tree=random connected sampling (not uniform); "
                 "neighbors=swap children, rotate an associative subtree, or "
                 "locally resample one connected bushy subtree"
+            );
+            search_trace->push_back(
+                "    adaptive initial temperature: target uphill acceptance=" +
+                formatEstimate(target_initial_acceptance * 100.0) +
+                "%, uphill samples=" + std::to_string(uphill_delta_count) +
+                "/" + std::to_string(temperature_samples) +
+                ", T0=" + formatEstimate(
+                    temperature_levels.empty()
+                        ? temperature
+                        : temperature_levels.front().temperature
+                )
             );
             search_trace->push_back(
                 "    initial cost=" + formatEstimate(initial_cost) +
@@ -6384,6 +6455,26 @@ public:
                     formatEstimate(checkpoint.best_cost) +
                     ", improvement=" + formatEstimate(improvement) +
                     " (" + formatEstimate(improvement_percent) + "%)"
+                );
+            }
+            for (const auto& level : temperature_levels) {
+                double level_improvement =
+                    level.start_best_cost - level.end_best_cost;
+                search_trace->push_back(
+                    "    temperature level " + std::to_string(level.level) +
+                    " (moves " + std::to_string(level.start_move) +
+                    "-" + std::to_string(level.end_move) +
+                    ", T=" + formatEstimate(level.temperature) +
+                    "): best cost=" + formatEstimate(level.end_best_cost) +
+                    ", level improvement=" +
+                    formatEstimate(level_improvement) +
+                    ", accepted=" +
+                    std::to_string(level.accepted_moves) +
+                    "/" + std::to_string(level.valid_moves) +
+                    ", worse accepted=" +
+                    std::to_string(level.worse_moves) +
+                    ", rejected=" +
+                    std::to_string(level.rejected_moves)
                 );
             }
             search_trace->push_back(

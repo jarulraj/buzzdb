@@ -27,6 +27,7 @@
 #include <functional>
 #include <utility>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 #include <unistd.h>
 
@@ -4083,13 +4084,20 @@ struct SelingerJoinOrderResult {
     std::vector<std::string> search_steps;
 };
 
+enum class IKKBZSequenceKind {
+    Relation,
+    Chain,
+    Compound
+};
+
 struct IKKBZSequence {
+    IKKBZSequenceKind kind = IKKBZSequenceKind::Relation;
     std::vector<TableRefId> table_ref_ids;
-    std::vector<std::pair<TableRefId, double>> ranks;
+    std::vector<std::shared_ptr<IKKBZSequence>> parts;
     double transfer = 1.0;
     double cost = 0.0;
     double rank = 0.0;
-    size_t compounds = 0;
+    size_t rank_conflict_merges = 0;
 };
 
 struct IKKBZJoinOrderResult {
