@@ -4434,7 +4434,7 @@ std::string physicalJoinKindName(PhysicalJoinKind kind) {
     throw std::runtime_error("Unknown physical join kind.");
 }
 
-struct JoinOrderStepEstimate {
+struct JoinTreeStepEstimate {
     JoinClause join;
     double output_rows = 0.0;
     RelationStats output_relation;
@@ -4442,12 +4442,6 @@ struct JoinOrderStepEstimate {
     bool has_index_lookup = false;
     ColumnRef index_lookup_column;
     double chosen_cost = 0.0;
-};
-
-struct JoinOrderPlan {
-    QueryComponents components;
-    std::vector<JoinOrderStepEstimate> steps;
-    double final_estimate = 0.0;
 };
 
 struct JoinPlanNode {
@@ -4479,7 +4473,6 @@ struct BushyJoinOrderResult {
     size_t states_kept = 0;
     size_t candidates_considered = 0;
     size_t cross_products_pruned = 0;
-    std::vector<std::string> search_steps;
 };
 
 QueryResult executeJoinQuery(const QueryComponents& components,
@@ -5593,67 +5586,6 @@ private:
         return output;
     }
 
-    JoinOrderStepEstimate estimateJoinOrderStep(
-            const std::map<TableRefId, RelationStats>& base_relations,
-            const std::set<TableRefId>& joined_table_refs,
-            const JoinClause& join,
-            const RelationStats& current_relation,
-            double current_total_cost) {
-        auto columns = joinedAndInputColumns(join, joined_table_refs);
-        const auto& right_relation = base_relations.at(join.input_table_ref_id);
-        double output_rows = estimateJoinRows(
-            current_relation.rows,
-            right_relation.rows,
-            relationColumnStatsFor(current_relation, columns.first),
-            relationColumnStatsFor(right_relation, columns.second)
-        );
-        RelationStats output_relation = estimateJoinedRelationStats(
-            current_relation,
-            right_relation,
-            columns.first,
-            columns.second,
-            output_rows
-        );
-
-        double right_total_cost = tupleScanCost(right_relation.rows);
-        double nested_loop_cost = nestedLoopJoinCost(
-            current_total_cost,
-            right_total_cost,
-            current_relation.rows,
-            right_relation.rows,
-            output_rows
-        );
-        double hash_join_cost = hashJoinCost(
-            current_total_cost,
-            right_total_cost,
-            current_relation.rows,
-            right_relation.rows,
-            output_rows
-        );
-        PhysicalJoinKind chosen_join_kind =
-            nested_loop_cost <= hash_join_cost
-                ? PhysicalJoinKind::NestedLoopJoin
-                : PhysicalJoinKind::HashJoin;
-        double chosen_cost = chosen_join_kind == PhysicalJoinKind::NestedLoopJoin
-            ? nested_loop_cost
-            : hash_join_cost;
-
-        return {
-            join,
-            output_rows,
-            std::move(output_relation),
-            chosen_join_kind,
-            false,
-            {},
-            chosen_cost
-        };
-    }
-
-    std::string columnTraceLabel(const QueryComponents& components,
-                                 const ColumnRef& column) {
-        return columnRefLabel(components, catalog, column);
-    }
-
     static std::string joinedTableRefsTraceLabel(
             const QueryComponents& components,
             const std::set<TableRefId>& table_refs) {
@@ -5685,7 +5617,7 @@ private:
             const std::shared_ptr<JoinPlanNode>& left,
             const std::shared_ptr<JoinPlanNode>& right,
             const JoinClause& join,
-            const JoinOrderStepEstimate& step) {
+            const JoinTreeStepEstimate& step) {
         auto node = std::make_shared<JoinPlanNode>();
         node->is_leaf = false;
         node->left = left;
@@ -5730,7 +5662,7 @@ private:
         return std::nullopt;
     }
 
-    JoinOrderStepEstimate estimateJoinTreeStep(
+    JoinTreeStepEstimate estimateJoinTreeStep(
             const std::set<TableRefId>& left_table_refs,
             const JoinClause& join,
             const RelationStats& left_relation,
@@ -5952,24 +5884,9 @@ public:
         return candidate.table_refs < incumbent.table_refs;
     }
 
-    std::string bushyKeptStateTraceLine(
-            const QueryComponents& components,
-            const BushyDpState& state) {
-        std::ostringstream output;
-        output << "    keep {" << joinedTableRefsTraceLabel(
-                    components,
-                    state.table_refs
-                )
-               << "}: tree=" << joinPlanTreeString(components, state.plan_root)
-               << ", rows=" << formatEstimate(state.relation.rows)
-               << ", cost=" << formatEstimate(state.cost);
-        return output.str();
-    }
-
     BushyJoinOrderResult chooseBushyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            std::vector<std::string>* search_trace = nullptr,
             const IndexManager* index_manager = nullptr) {
         if (components.table_refs.empty() || components.table_refs.size() > 62) {
             throw std::runtime_error("Bushy DP supports 1..62 table refs.");
@@ -6004,8 +5921,6 @@ public:
         size_t candidates_considered = 0;
         size_t cross_products_pruned = 0;
         for (size_t level = 2; level <= components.table_refs.size(); level++) {
-            size_t level_candidates = 0;
-            size_t level_pruned = 0;
             for (std::uint64_t mask = 1; mask <= full_mask; mask++) {
                 if (__builtin_popcountll(mask) != static_cast<int>(level)) {
                     continue;
@@ -6027,7 +5942,6 @@ public:
                     );
                     if (!edge) {
                         cross_products_pruned++;
-                        level_pruned++;
                         continue;
                     }
 
@@ -6064,29 +5978,6 @@ public:
                         best[mask] = std::move(candidate);
                     }
                     candidates_considered++;
-                    level_candidates++;
-                }
-            }
-
-            if (search_trace) {
-                search_trace->push_back(
-                    "Bushy DP level " + std::to_string(level) +
-                    ": considered " + std::to_string(level_candidates) +
-                    " connected partition(s), pruned " +
-                    std::to_string(level_pruned) + " cross product(s)"
-                );
-                if (level <= 3) {
-                    for (std::uint64_t mask = 1; mask <= full_mask; mask++) {
-                        if (!best[mask] ||
-                            __builtin_popcountll(mask) !=
-                                static_cast<int>(level)) {
-                            continue;
-                        }
-                        search_trace->push_back(bushyKeptStateTraceLine(
-                            components,
-                            *best[mask]
-                        ));
-                    }
                 }
             }
         }
@@ -6114,8 +6005,7 @@ public:
             best[full_mask]->cost,
             states_kept,
             candidates_considered,
-            cross_products_pruned,
-            search_trace ? *search_trace : std::vector<std::string>{}
+            cross_products_pruned
         };
     }
 
@@ -7038,7 +6928,6 @@ public:
             auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
                 stats,
-                nullptr,
                 &transactional_storage_manager.index_manager
             );
             auto result = query_executor.executeJoinPlan(
@@ -7066,7 +6955,6 @@ public:
             auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
                 stats,
-                nullptr,
                 &transactional_storage_manager.index_manager
             );
             auto result = query_executor.executeJoinPlan(
@@ -7611,17 +7499,13 @@ void runImdbJoinOrdering() {
     auto components = db.parseSelectStatement(imdb_join_query);
     auto stats = db.optimizer().analyzeQueryTables(components);
 
-    std::vector<std::string> baseline_trace;
     auto baseline_search = db.optimizer().chooseBushyJoinOrder(
         components,
-        stats,
-        &baseline_trace
+        stats
     );
-    std::vector<std::string> all_index_trace;
     auto all_index_search = db.optimizer().chooseBushyJoinOrder(
         components,
         stats,
-        &all_index_trace,
         &db.indexes()
     );
 

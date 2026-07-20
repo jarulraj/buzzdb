@@ -7325,14 +7325,15 @@ void runImdbJoinOrdering() {
         throw std::runtime_error("Join reordering changed the query result.");
     }
 
-    std::cout << "\nResult: Selinger searches more left-deep"
-              << " alternatives than greedy.\n";
+    std::cout << "\nResult: Greedy keeps one locally cheapest extension,"
+              << " while Selinger DP keeps the best left-deep state per"
+              << " table subset.\n";
 }
 
 int main() {
     try {
 
-    std::cout << "IMDB Selinger left-deep DP over propagated estimated RelationStats\n";
+    std::cout << "IMDB join ordering: Greedy vs Selinger left-deep DP\n";
 
     runImdbJoinOrdering();
 

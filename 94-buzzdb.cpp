@@ -4053,15 +4053,12 @@ struct JoinPlanNode {
 };
 
 enum class JoinOrderSearchPolicy {
-    SelingerLeftDeepDP,
     BushyDP,
     SimulatedAnnealingBushy
 };
 
 std::string joinOrderSearchPolicyName(JoinOrderSearchPolicy policy) {
     switch (policy) {
-        case JoinOrderSearchPolicy::SelingerLeftDeepDP:
-            return "Selinger left-deep DP";
         case JoinOrderSearchPolicy::BushyDP:
             return "Bushy DP";
         case JoinOrderSearchPolicy::SimulatedAnnealingBushy:
@@ -4084,25 +4081,6 @@ struct JoinOrderSearchResult {
     size_t annealing_improving_moves = 0;
     size_t annealing_worse_moves = 0;
     size_t annealing_rejected_moves = 0;
-    std::vector<std::string> search_steps;
-};
-
-struct SelingerDpState {
-    TableRefId base_table_ref_id = INVALID_TABLE_REF_ID;
-    std::vector<JoinClause> join_order;
-    std::vector<JoinOrderStepEstimate> steps;
-    std::set<TableRefId> joined_table_refs;
-    RelationStats relation;
-    std::shared_ptr<JoinPlanNode> plan_root;
-    double cost = 0.0;
-};
-
-struct SelingerJoinOrderResult {
-    JoinOrderPlan plan;
-    std::shared_ptr<JoinPlanNode> plan_root;
-    double estimated_cost = 0.0;
-    size_t states_kept = 0;
-    size_t candidates_considered = 0;
     std::vector<std::string> search_steps;
 };
 
@@ -5349,49 +5327,6 @@ private:
         return output.str();
     }
 
-    std::string selingerCandidateTraceLine(
-            const QueryComponents& components,
-            const SelingerDpState& current,
-            const JoinOrderStepEstimate& step) {
-        auto columns = joinedAndInputColumns(step.join, current.joined_table_refs);
-        std::ostringstream output;
-        output << "    candidate {" << joinedTableRefsTraceLabel(
-                    components,
-                    current.joined_table_refs
-                )
-               << "} + "
-               << tableRefForId(components, step.join.input_table_ref_id).alias
-               << " via "
-               << columnTraceLabel(components, columns.first)
-               << " = "
-               << columnTraceLabel(components, columns.second)
-               << " -> " << physicalJoinKindName(step.chosen_join_kind)
-               << ", rows=" << formatEstimate(step.output_rows)
-               << ", cost=" << formatEstimate(step.chosen_cost);
-        return output.str();
-    }
-
-    std::string selingerKeptStateTraceLine(
-            const QueryComponents& components,
-            const SelingerDpState& state) {
-        std::ostringstream order;
-        order << tableRefForId(components, state.base_table_ref_id).alias;
-        for (const auto& join : state.join_order) {
-            order << " -> "
-                  << tableRefForId(components, join.input_table_ref_id).alias;
-        }
-
-        std::ostringstream output;
-        output << "    keep {" << joinedTableRefsTraceLabel(
-                    components,
-                    state.joined_table_refs
-                )
-               << "}: order=" << order.str()
-               << ", rows=" << formatEstimate(state.relation.rows)
-               << ", cost=" << formatEstimate(state.cost);
-        return output.str();
-    }
-
 public:
     QueryOptimizer(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
@@ -5449,187 +5384,6 @@ public:
             remaining_rows / static_cast<double>(remaining_distinct),
             input_rows
         );
-    }
-
-    static bool betterSelingerState(const SelingerDpState& candidate,
-                                    const SelingerDpState& incumbent) {
-        if (candidate.cost != incumbent.cost) {
-            return candidate.cost < incumbent.cost;
-        }
-        if (candidate.relation.rows != incumbent.relation.rows) {
-            return candidate.relation.rows < incumbent.relation.rows;
-        }
-        return candidate.base_table_ref_id < incumbent.base_table_ref_id;
-    }
-
-    SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            std::vector<std::string>* search_trace = nullptr) {
-        if (components.table_refs.empty() || components.table_refs.size() > 62) {
-            throw std::runtime_error("Selinger DP supports 1..62 table refs.");
-        }
-
-        std::vector<TableRefId> table_ref_ids;
-        std::map<TableRefId, size_t> bit_index;
-        for (size_t i = 0; i < components.table_refs.size(); i++) {
-            table_ref_ids.push_back(components.table_refs[i].id);
-            bit_index[components.table_refs[i].id] = i;
-        }
-
-        auto bitFor = [&](TableRefId table_ref_id) -> std::uint64_t {
-            return 1ULL << bit_index.at(table_ref_id);
-        };
-
-        std::uint64_t full_mask =
-            (1ULL << components.table_refs.size()) - 1ULL;
-        auto base_relations = estimateBaseRelations(components, stats);
-        auto edges = equalityEdgesForJoinOrdering(components);
-
-        std::vector<std::optional<SelingerDpState>> best(full_mask + 1);
-        for (TableRefId table_ref_id : table_ref_ids) {
-            SelingerDpState state;
-            state.base_table_ref_id = table_ref_id;
-            state.joined_table_refs.insert(table_ref_id);
-            state.relation = base_relations.at(table_ref_id);
-            state.cost = tupleScanCost(state.relation.rows);
-            state.plan_root = makeLeafJoinPlanNode(table_ref_id, state.relation);
-            best[bitFor(table_ref_id)] = state;
-        }
-
-        size_t candidates_considered = 0;
-        for (size_t level = 1; level < components.table_refs.size(); level++) {
-            size_t level_candidates = 0;
-            bool trace_this_level = search_trace && level <= 2;
-            std::vector<std::string> candidate_trace;
-            for (std::uint64_t mask = 1; mask <= full_mask; mask++) {
-                if (!best[mask] || __builtin_popcountll(mask) != static_cast<int>(level)) {
-                    continue;
-                }
-
-                const auto& current = *best[mask];
-                for (const auto& edge : edges) {
-                    auto oriented = orientJoinEdge(edge, current.joined_table_refs);
-                    if (!oriented) {
-                        continue;
-                    }
-
-                    TableRefId input_table_ref_id = oriented->input_table_ref_id;
-                    std::uint64_t next_bit = bitFor(input_table_ref_id);
-                    if ((mask & next_bit) != 0) {
-                        continue;
-                    }
-
-                    auto step = estimateJoinOrderStep(
-                        base_relations,
-                        current.joined_table_refs,
-                        *oriented,
-                        current.relation,
-                        current.cost
-                    );
-
-                    if (trace_this_level) {
-                        candidate_trace.push_back(selingerCandidateTraceLine(
-                            components,
-                            current,
-                            step
-                        ));
-                    }
-
-                    SelingerDpState candidate = current;
-                    candidate.join_order.push_back(step.join);
-                    candidate.steps.push_back(step);
-                    candidate.joined_table_refs.insert(input_table_ref_id);
-                    candidate.relation = step.output_relation;
-                    candidate.cost = step.chosen_cost;
-                    candidate.plan_root = makeJoinPlanNode(
-                        current.plan_root,
-                        makeLeafJoinPlanNode(
-                            input_table_ref_id,
-                            base_relations.at(input_table_ref_id)
-                        ),
-                        *oriented,
-                        step
-                    );
-
-                    std::uint64_t next_mask = mask | next_bit;
-                    if (!best[next_mask] ||
-                        betterSelingerState(candidate, *best[next_mask])) {
-                        best[next_mask] = std::move(candidate);
-                    }
-
-                    candidates_considered++;
-                    level_candidates++;
-                }
-            }
-
-            if (search_trace) {
-                if (trace_this_level) {
-                    search_trace->push_back(
-                        "Selinger DP level " + std::to_string(level + 1) +
-                        ": evaluate every retained " +
-                        std::to_string(level) + "-table subset"
-                    );
-                    search_trace->insert(
-                        search_trace->end(),
-                        candidate_trace.begin(),
-                        candidate_trace.end()
-                    );
-                    search_trace->push_back(
-                        "    keep best state per " +
-                        std::to_string(level + 1) + "-table subset"
-                    );
-                    for (std::uint64_t mask = 1; mask <= full_mask; mask++) {
-                        if (!best[mask] ||
-                            __builtin_popcountll(mask) !=
-                                static_cast<int>(level + 1)) {
-                            continue;
-                        }
-                        search_trace->push_back(selingerKeptStateTraceLine(
-                            components,
-                            *best[mask]
-                        ));
-                    }
-                } else {
-                    search_trace->push_back(
-                        "Selinger DP level " + std::to_string(level + 1) +
-                        ": considered " + std::to_string(level_candidates) +
-                        " candidate extension(s)"
-                    );
-                }
-            }
-        }
-
-        if (!best[full_mask]) {
-            throw std::runtime_error("Selinger DP could not build a connected plan.");
-        }
-
-        size_t states_kept = 0;
-        for (const auto& state : best) {
-            if (state) {
-                states_kept++;
-            }
-        }
-
-        auto planned_components = makeJoinPlanComponents(
-            components,
-            best[full_mask]->base_table_ref_id,
-            best[full_mask]->join_order
-        );
-        JoinOrderPlan plan{
-            std::move(planned_components),
-            best[full_mask]->steps,
-            best[full_mask]->relation.rows
-        };
-
-        return {
-            std::move(plan),
-            best[full_mask]->plan_root,
-            best[full_mask]->cost,
-            states_kept,
-            candidates_considered,
-            search_trace ? *search_trace : std::vector<std::string>{}
-        };
     }
 
     static bool betterBushyState(const BushyDpState& candidate,
@@ -6534,30 +6288,6 @@ public:
             const std::map<TableId, TableStats>& stats,
             JoinOrderSearchPolicy policy) {
         std::vector<std::string> search_steps;
-        if (policy == JoinOrderSearchPolicy::SelingerLeftDeepDP) {
-            auto result = chooseSelingerLeftDeepJoinOrder(
-                components,
-                stats,
-                &search_steps
-            );
-            return {
-                policy,
-                std::move(result.plan),
-                result.plan_root,
-                result.estimated_cost,
-                result.states_kept,
-                result.candidates_considered,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                std::move(search_steps)
-            };
-        }
-
         if (policy == JoinOrderSearchPolicy::SimulatedAnnealingBushy) {
             auto result = chooseSimulatedAnnealingBushyJoinOrder(
                 components,
@@ -7654,15 +7384,14 @@ public:
             auto search = query_optimizer.chooseJoinOrder(
                 statement.query,
                 stats,
-                JoinOrderSearchPolicy::SelingerLeftDeepDP
-            );
-            auto join_kinds = query_optimizer.physicalJoinKindsForPlan(
-                search.plan
+                JoinOrderSearchPolicy::BushyDP
             );
             auto result = query_executor.executeJoinPlan(
                 search.plan.components,
                 txn,
-                &join_kinds
+                nullptr,
+                5,
+                search.plan_root
             );
             query_executor.printJoinPlanResult(search.plan.components, result);
             return;
@@ -7682,14 +7411,13 @@ public:
             auto search = query_optimizer.chooseJoinOrder(
                 statement.query,
                 stats,
-                JoinOrderSearchPolicy::SelingerLeftDeepDP
-            );
-            auto join_kinds = query_optimizer.physicalJoinKindsForPlan(
-                search.plan
+                JoinOrderSearchPolicy::BushyDP
             );
             auto result = query_executor.executeJoinPlan(
                 search.plan.components,
-                &join_kinds
+                nullptr,
+                5,
+                search.plan_root
             );
             query_executor.printJoinPlanResult(search.plan.components, result);
             return;

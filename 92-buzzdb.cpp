@@ -4041,15 +4041,12 @@ struct JoinOrderPlan {
 };
 
 enum class JoinOrderSearchPolicy {
-    Greedy,
     SelingerLeftDeepDP,
     IKKBZ
 };
 
 std::string joinOrderSearchPolicyName(JoinOrderSearchPolicy policy) {
     switch (policy) {
-        case JoinOrderSearchPolicy::Greedy:
-            return "Greedy";
         case JoinOrderSearchPolicy::SelingerLeftDeepDP:
             return "Selinger left-deep DP";
         case JoinOrderSearchPolicy::IKKBZ:
@@ -4823,17 +4820,6 @@ private:
                tupleMaterializationCost(output_rows);
     }
 
-    static bool betterJoinOrderStep(const JoinOrderStepEstimate& candidate,
-                                    const JoinOrderStepEstimate& incumbent) {
-        if (candidate.output_rows != incumbent.output_rows) {
-            return candidate.output_rows < incumbent.output_rows;
-        }
-        if (candidate.chosen_cost != incumbent.chosen_cost) {
-            return candidate.chosen_cost < incumbent.chosen_cost;
-        }
-        return candidate.join.input_table_ref_id < incumbent.join.input_table_ref_id;
-    }
-
     TableStats analyzeTable(TableMetadata& metadata) {
         TableStats stats;
         stats.table_id = metadata.table_id;
@@ -5171,37 +5157,6 @@ private:
         return columnRefLabel(components, catalog, column);
     }
 
-    std::string greedyStartTraceLine(const QueryComponents& components,
-                                     TableRefId start_table_ref_id,
-                                     const JoinOrderStepEstimate& step) {
-        std::set<TableRefId> joined_table_refs{start_table_ref_id};
-        auto columns = joinedAndInputColumns(step.join, joined_table_refs);
-        std::ostringstream output;
-        output << "    candidate base="
-               << tableRefForId(components, start_table_ref_id).alias
-               << ", add "
-               << tableRefForId(components, step.join.input_table_ref_id).alias
-               << " via "
-               << columnTraceLabel(components, columns.first)
-               << " = "
-               << columnTraceLabel(components, columns.second)
-               << " -> " << physicalJoinKindName(step.chosen_join_kind)
-               << ", rows=" << formatEstimate(step.output_rows)
-               << ", cost=" << formatEstimate(step.chosen_cost);
-        return output.str();
-    }
-
-    std::string greedyStartChoiceTraceLine(const QueryComponents& components,
-                                           TableRefId start_table_ref_id,
-                                           const JoinOrderStepEstimate& step) {
-        std::string line = greedyStartTraceLine(
-            components,
-            start_table_ref_id,
-            step
-        );
-        return "    choose" + line.substr(std::string("    candidate").size());
-    }
-
     static std::string joinedTableRefsTraceLabel(
             const QueryComponents& components,
             const std::set<TableRefId>& table_refs) {
@@ -5215,36 +5170,6 @@ private:
             first = false;
         }
         return output.str();
-    }
-
-    std::string greedyCandidateTraceLine(
-            const QueryComponents& components,
-            const std::set<TableRefId>& joined_table_refs,
-            const JoinOrderStepEstimate& step) {
-        auto columns = joinedAndInputColumns(step.join, joined_table_refs);
-        std::ostringstream output;
-        output << "    candidate add "
-               << tableRefForId(components, step.join.input_table_ref_id).alias
-               << " via "
-               << columnTraceLabel(components, columns.first)
-               << " = "
-               << columnTraceLabel(components, columns.second)
-               << " -> " << physicalJoinKindName(step.chosen_join_kind)
-               << ", rows=" << formatEstimate(step.output_rows)
-               << ", cost=" << formatEstimate(step.chosen_cost);
-        return output.str();
-    }
-
-    std::string greedyChoiceTraceLine(
-            const QueryComponents& components,
-            const std::set<TableRefId>& joined_table_refs,
-            const JoinOrderStepEstimate& step) {
-        std::string line = greedyCandidateTraceLine(
-            components,
-            joined_table_refs,
-            step
-        );
-        return "    choose" + line.substr(std::string("    candidate").size());
     }
 
     std::string selingerCandidateTraceLine(
@@ -5416,141 +5341,6 @@ public:
             left_rows * right_rows / static_cast<double>(denominator),
             left_rows * right_rows
         );
-    }
-
-    JoinOrderPlan chooseGreedyJoinOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            std::vector<std::string>* search_trace = nullptr) {
-        auto base_relations = estimateBaseRelations(components, stats);
-        auto edges = equalityEdgesForJoinOrdering(components);
-
-        std::optional<TableRefId> best_start_table_ref_id;
-        std::optional<JoinOrderStepEstimate> best_first_step;
-        std::vector<std::string> first_round_trace;
-        for (const auto& edge : edges) {
-            for (TableRefId start_table_ref_id :
-                 {edge.left.table_ref_id, edge.right.table_ref_id}) {
-                std::set<TableRefId> joined_table_refs{start_table_ref_id};
-                auto oriented = orientJoinEdge(edge, joined_table_refs);
-                if (!oriented) {
-                    continue;
-                }
-
-                auto step = estimateJoinOrderStep(
-                    base_relations,
-                    joined_table_refs,
-                    *oriented,
-                    base_relations.at(start_table_ref_id),
-                    tupleScanCost(base_relations.at(start_table_ref_id).rows)
-                );
-                if (search_trace) {
-                    first_round_trace.push_back(greedyStartTraceLine(
-                        components,
-                        start_table_ref_id,
-                        step
-                    ));
-                }
-                if (!best_first_step ||
-                    betterJoinOrderStep(step, *best_first_step)) {
-                    best_start_table_ref_id = start_table_ref_id;
-                    best_first_step = step;
-                }
-            }
-        }
-
-        if (!best_start_table_ref_id || !best_first_step) {
-            throw std::runtime_error("Unable to choose a join order.");
-        }
-        if (search_trace) {
-            search_trace->push_back(
-                "Greedy round 1: evaluate every connected two-table start "
-                "(rank by lowest rows, then lowest cost)"
-            );
-            search_trace->insert(
-                search_trace->end(),
-                first_round_trace.begin(),
-                first_round_trace.end()
-            );
-            search_trace->push_back(greedyStartChoiceTraceLine(
-                components,
-                *best_start_table_ref_id,
-                *best_first_step
-            ));
-        }
-
-        std::vector<JoinClause> join_order{best_first_step->join};
-        std::vector<JoinOrderStepEstimate> steps{*best_first_step};
-        std::set<TableRefId> joined_table_refs{
-            *best_start_table_ref_id,
-            best_first_step->join.input_table_ref_id
-        };
-        RelationStats current_relation = best_first_step->output_relation;
-        double current_total_cost = best_first_step->chosen_cost;
-        size_t greedy_round = 2;
-
-        while (joined_table_refs.size() < components.table_refs.size()) {
-            std::optional<JoinOrderStepEstimate> best_step;
-            std::vector<std::string> round_trace;
-            for (const auto& edge : edges) {
-                auto oriented = orientJoinEdge(edge, joined_table_refs);
-                if (!oriented) {
-                    continue;
-                }
-
-                auto step = estimateJoinOrderStep(
-                    base_relations,
-                    joined_table_refs,
-                    *oriented,
-                    current_relation,
-                    current_total_cost
-                );
-                if (search_trace && greedy_round == 2) {
-                    round_trace.push_back(greedyCandidateTraceLine(
-                        components,
-                        joined_table_refs,
-                        step
-                    ));
-                }
-                if (!best_step || betterJoinOrderStep(step, *best_step)) {
-                    best_step = step;
-                }
-            }
-
-            if (!best_step) {
-                throw std::runtime_error("Join graph is disconnected.");
-            }
-            if (search_trace && greedy_round == 2) {
-                search_trace->push_back(
-                    "Greedy round 2: evaluate joins connected to {" +
-                    joinedTableRefsTraceLabel(components, joined_table_refs) + "}"
-                );
-                search_trace->insert(
-                    search_trace->end(),
-                    round_trace.begin(),
-                    round_trace.end()
-                );
-                search_trace->push_back(greedyChoiceTraceLine(
-                    components,
-                    joined_table_refs,
-                    *best_step
-                ));
-            }
-
-            join_order.push_back(best_step->join);
-            steps.push_back(*best_step);
-            joined_table_refs.insert(best_step->join.input_table_ref_id);
-            current_relation = best_step->output_relation;
-            current_total_cost = best_step->chosen_cost;
-            greedy_round++;
-        }
-
-        auto planned_components = makeJoinPlanComponents(
-            components,
-            *best_start_table_ref_id,
-            std::move(join_order)
-        );
-        return {std::move(planned_components), std::move(steps), current_relation.rows};
     }
 
     static double estimatedPlanCost(const JoinOrderPlan& plan) {
@@ -6199,24 +5989,6 @@ public:
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
             JoinOrderSearchPolicy policy) {
-        if (policy == JoinOrderSearchPolicy::Greedy) {
-            std::vector<std::string> search_steps;
-            auto plan = chooseGreedyJoinOrder(
-                components,
-                stats,
-                &search_steps
-            );
-            double cost = estimatedPlanCost(plan);
-            return {
-                policy,
-                std::move(plan),
-                cost,
-                0,
-                0,
-                std::move(search_steps)
-            };
-        }
-
         if (policy == JoinOrderSearchPolicy::IKKBZ) {
             std::vector<std::string> search_steps;
             auto result = chooseIKKBZJoinOrder(

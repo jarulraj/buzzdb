@@ -6089,7 +6089,7 @@ public:
                   << std::endl;
 
         if (bushy.estimated_cost < left_deep.estimated_cost) {
-            std::cout << "  search result: bushy DP found a lower-cost tree."
+            std::cout << "  search result: Bushy DP found a lower-cost tree."
                       << std::endl;
         } else if (bushy.estimated_cost > left_deep.estimated_cost) {
             std::cout << "  search result: left-deep DP is cheaper under this"
@@ -7557,8 +7557,8 @@ void runImdbJoinOrdering() {
                  )
               << std::endl;
 
-    std::cout << "\nResult: bushy DP expands the search space"
-              << " beyond left-deep plans while preserving the SQL result.\n";
+    std::cout << "\nResult: Bushy DP compares both left-deep and bushy"
+              << " trees while preserving the SQL result.\n";
 }
 
 int main() {
