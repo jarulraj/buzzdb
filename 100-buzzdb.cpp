@@ -7476,14 +7476,10 @@ std::vector<IndexSpec> imdbIndexSpecs() {
 void runImdbLogicalMemo() {
     BuzzDB db;
     ensureImdbDatasetLoaded(db);
-    auto indexes = imdbIndexSpecs();
-    db.buildIndexes(indexes);
 
     auto components = db.parseSelectStatement(imdb_join_query);
     auto memo = db.optimizer().buildInitialMemo(components);
     db.optimizer().printMemo(components, memo);
-
-    db.execute("EXPLAIN " + imdb_join_query);
 
     std::cout << "\nTakeaway: the memo is a compact logical expression graph."
               << " This version records one written-order expression per"
