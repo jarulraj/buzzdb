@@ -4733,9 +4733,32 @@ private:
 
     static std::vector<JoinClause> equalityEdgesForJoinOrdering(
             const QueryComponents& components) {
-        std::vector<JoinClause> edges = components.joins;
+        std::vector<JoinClause> edges;
+        std::set<std::string> seen_edges;
+
+        auto column_key = [](const ColumnRef& column) {
+            return std::to_string(column.table_ref_id) + "." +
+                   std::to_string(column.column_index);
+        };
+        auto edge_key = [&](const JoinClause& edge) {
+            auto left = column_key(edge.left);
+            auto right = column_key(edge.right);
+            if (right < left) {
+                std::swap(left, right);
+            }
+            return left + "=" + right;
+        };
+        auto add_edge = [&](const JoinClause& edge) {
+            if (seen_edges.insert(edge_key(edge)).second) {
+                edges.push_back(edge);
+            }
+        };
+
+        for (const auto& join : components.joins) {
+            add_edge(join);
+        }
         for (const auto& equality : components.column_filters) {
-            edges.push_back({
+            add_edge({
                 INVALID_TABLE_REF_ID,
                 equality.left,
                 equality.right
@@ -5246,6 +5269,26 @@ private:
         return columnRefLabel(components, catalog, column);
     }
 
+    std::string joinPredicateSetTraceLabel(
+            const QueryComponents& components,
+            const std::set<TableRefId>& left_table_refs,
+            const std::vector<JoinClause>& join_predicates) {
+        std::ostringstream output;
+        for (size_t i = 0; i < join_predicates.size(); i++) {
+            if (i != 0) {
+                output << " AND ";
+            }
+            auto columns = joinedAndInputColumns(
+                join_predicates[i],
+                left_table_refs
+            );
+            output << columnTraceLabel(components, columns.first)
+                   << " = "
+                   << columnTraceLabel(components, columns.second);
+        }
+        return output.str();
+    }
+
     static std::string joinedTableRefsTraceLabel(
             const QueryComponents& components,
             const std::set<TableRefId>& table_refs) {
@@ -5426,7 +5469,13 @@ private:
                << " {" << joinedTableRefsTraceLabel(components, node->left->table_refs)
                << "} x {"
                << joinedTableRefsTraceLabel(components, node->right->table_refs)
-               << "}, est rows=" << formatEstimate(node->relation.rows)
+               << "}, predicates="
+               << joinPredicateSetTraceLabel(
+                    components,
+                    node->left->table_refs,
+                    node->join_predicates
+                  )
+               << ", est rows=" << formatEstimate(node->relation.rows)
                << ", cost=" << formatEstimate(node->cost)
                << "\n";
         appendJoinPlanTree(components, node->left, depth + 1, output);
@@ -5445,7 +5494,6 @@ private:
             const QueryComponents& components,
             const SelingerDpState& current,
             const JoinOrderStepEstimate& step) {
-        auto columns = joinedAndInputColumns(step.join, current.joined_table_refs);
         std::ostringstream output;
         output << "    candidate {" << joinedTableRefsTraceLabel(
                     components,
@@ -5454,9 +5502,11 @@ private:
                << "} + "
                << tableRefForId(components, step.join.input_table_ref_id).alias
                << " via "
-               << columnTraceLabel(components, columns.first)
-               << " = "
-               << columnTraceLabel(components, columns.second)
+               << joinPredicateSetTraceLabel(
+                    components,
+                    current.joined_table_refs,
+                    step.join_predicates
+                  )
                << " -> " << physicalJoinKindName(step.chosen_join_kind)
                << ", rows=" << formatEstimate(step.output_rows)
                << ", cost=" << formatEstimate(step.chosen_cost);
@@ -5849,7 +5899,7 @@ public:
                     candidate.plan_root = makeJoinPlanNode(
                         best[left_mask]->plan_root,
                         best[right_mask]->plan_root,
-                        *edge,
+                        join_predicates.front(),
                         step
                     );
 
@@ -6000,11 +6050,12 @@ public:
         std::cout << "  " << joinOrderString(plan.components) << std::endl;
         std::set<TableRefId> joined_table_refs{plan.components.base_table_ref_id};
         for (const auto& step : plan.steps) {
-            auto columns = joinedAndInputColumns(step.join, joined_table_refs);
             std::cout << "  join "
-                      << columnRefLabel(plan.components, catalog, columns.first)
-                      << " = "
-                      << columnRefLabel(plan.components, catalog, columns.second)
+                      << joinPredicateSetTraceLabel(
+                            plan.components,
+                            joined_table_refs,
+                            step.join_predicates
+                         )
                       << ": " << physicalJoinKindName(step.chosen_join_kind)
                       << ", est rows=" << formatEstimate(step.output_rows)
                       << std::endl;
