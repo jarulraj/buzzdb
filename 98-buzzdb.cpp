@@ -2700,7 +2700,7 @@ private:
     }
 };
 
-struct ImdbIndexSpec {
+struct HashIndexSpec {
     std::string index_name;
     std::string table_name;
     std::string column_name;
@@ -2708,7 +2708,7 @@ struct ImdbIndexSpec {
     bool primary_key = false;
 };
 
-struct IndexBuildResult {
+struct HashIndexBuildResult {
     std::string index_name;
     std::string table_name;
     std::string column_name;
@@ -2718,8 +2718,8 @@ struct IndexBuildResult {
     size_t distinct_keys = 0;
 };
 
-struct ImdbIndexBuildSummary {
-    std::vector<IndexBuildResult> built;
+struct HashIndexBuildSummary {
+    std::vector<HashIndexBuildResult> built;
     std::vector<std::string> skipped;
 
     size_t primaryBuilt() const {
@@ -2787,10 +2787,10 @@ public:
     }
 };
 
-class IndexManager {
+class HashIndexManager {
 private:
     struct BuildTarget {
-        ImdbIndexSpec spec;
+        HashIndexSpec spec;
         IndexDescriptor descriptor;
     };
 
@@ -2799,11 +2799,11 @@ private:
     std::map<IndexDescriptor, HashIndex> hash_indexes;
 
 public:
-    IndexManager(Catalog& catalog, PageManager& page_manager)
+    HashIndexManager(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
 
-    ImdbIndexBuildSummary buildIndexes(const std::vector<ImdbIndexSpec>& specs) {
-        ImdbIndexBuildSummary summary;
+    HashIndexBuildSummary buildHashIndexes(const std::vector<HashIndexSpec>& specs) {
+        HashIndexBuildSummary summary;
         std::map<std::string, std::vector<BuildTarget>> targets_by_table;
 
         for (const auto& spec : specs) {
@@ -4455,7 +4455,7 @@ QueryResult executeJoinQuery(const QueryComponents& components,
                              size_t sample_limit = 5,
                              const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
                              const std::shared_ptr<JoinPlanNode>& plan_root = nullptr,
-                             const IndexManager* index_manager = nullptr) {
+                             const HashIndexManager* hash_index_manager = nullptr) {
     if (components.base_table_ref_id == INVALID_TABLE_REF_ID) {
         throw std::runtime_error("Join query is missing a base table.");
     }
@@ -4557,7 +4557,7 @@ QueryResult executeJoinQuery(const QueryComponents& components,
                 const ColumnRef& outer_column,
                 const ColumnRef& indexed_column,
                 bool indexed_output_first) -> Operator& {
-        if (!index_manager) {
+        if (!hash_index_manager) {
             throw std::runtime_error("Index join requires an index manager.");
         }
         const auto& indexed_table_ref = tableRefForId(
@@ -4578,7 +4578,7 @@ QueryResult executeJoinQuery(const QueryComponents& components,
             std::make_unique<IndexNestedLoopJoinOperator>(
                 outer_op,
                 indexed_heap,
-                index_manager->hashIndex(descriptor),
+                hash_index_manager->hashIndex(descriptor),
                 outer_attr_index,
                 indexed_column.column_index,
                 indexed_output_first,
@@ -5257,8 +5257,8 @@ private:
     std::optional<IndexDescriptor> indexDescriptorForColumn(
             const QueryComponents& components,
             const ColumnRef& column,
-            const IndexManager* index_manager) {
-        if (!index_manager) {
+            const HashIndexManager* hash_index_manager) {
+        if (!hash_index_manager) {
             return std::nullopt;
         }
 
@@ -5270,7 +5270,7 @@ private:
             table_ref.table_id,
             column.column_index
         };
-        if (!index_manager->hasHashIndex(descriptor)) {
+        if (!hash_index_manager->hasHashIndex(descriptor)) {
             return std::nullopt;
         }
         return descriptor;
@@ -5630,7 +5630,7 @@ private:
             const QueryComponents* components = nullptr,
             const JoinPlanNode* left_plan = nullptr,
             const JoinPlanNode* right_plan = nullptr,
-            const IndexManager* index_manager = nullptr) {
+            const HashIndexManager* hash_index_manager = nullptr) {
         auto columns = joinedAndInputColumns(join, left_table_refs);
         double output_rows = estimateJoinRows(
             left_relation.rows,
@@ -5681,7 +5681,7 @@ private:
             if (!indexDescriptorForColumn(
                     *components,
                     indexed_column,
-                    index_manager
+                    hash_index_manager
                 )) {
                 return;
             }
@@ -5845,7 +5845,7 @@ public:
     BushyJoinOrderResult chooseBushyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            const IndexManager* index_manager = nullptr) {
+            const HashIndexManager* hash_index_manager = nullptr) {
         if (components.table_refs.empty() || components.table_refs.size() > 62) {
             throw std::runtime_error("Bushy DP supports 1..62 table refs.");
         }
@@ -5913,7 +5913,7 @@ public:
                         &components,
                         best[left_mask]->plan_root.get(),
                         best[right_mask]->plan_root.get(),
-                        index_manager
+                        hash_index_manager
                     );
 
                     BushyDpState candidate;
@@ -6414,7 +6414,7 @@ public:
     RecoveryManager recovery_manager;
     PageManager page_manager;
     Catalog catalog;
-    IndexManager index_manager;
+    HashIndexManager hash_index_manager;
     TransactionManager txn_manager;
 
     TransactionalStorageManager()
@@ -6423,7 +6423,7 @@ public:
           recovery_manager(buffer_manager, log_manager),
           page_manager(buffer_manager, recovery_manager),
           catalog(buffer_manager, page_manager),
-          index_manager(catalog, page_manager),
+          hash_index_manager(catalog, page_manager),
           txn_manager() {
         recovery_manager.recover();
         catalog.load();
@@ -6636,7 +6636,7 @@ public:
             sample_limit,
             physical_join_kinds,
             plan_root,
-            &transactional_storage_manager.index_manager
+            &transactional_storage_manager.hash_index_manager
         );
     }
 
@@ -6886,7 +6886,7 @@ public:
             auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
                 stats,
-                &transactional_storage_manager.index_manager
+                &transactional_storage_manager.hash_index_manager
             );
             auto result = query_executor.executeJoinPlan(
                 search.components,
@@ -6913,7 +6913,7 @@ public:
             auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
                 stats,
-                &transactional_storage_manager.index_manager
+                &transactional_storage_manager.hash_index_manager
             );
             auto result = query_executor.executeJoinPlan(
                 search.components,
@@ -7064,13 +7064,13 @@ public:
         return query_processor;
     }
 
-    IndexManager& indexes() {
-        return transactional_storage_manager.index_manager;
+    HashIndexManager& hashIndexes() {
+        return transactional_storage_manager.hash_index_manager;
     }
 
-    ImdbIndexBuildSummary buildIndexes(
-            const std::vector<ImdbIndexSpec>& specs) {
-        return transactional_storage_manager.index_manager.buildIndexes(specs);
+    HashIndexBuildSummary buildHashIndexes(
+            const std::vector<HashIndexSpec>& specs) {
+        return transactional_storage_manager.hash_index_manager.buildHashIndexes(specs);
     }
 
     QueryComponents parseSelectStatement(const std::string& statement) {
@@ -7286,8 +7286,8 @@ void printImportResult(const ImportResult& result) {
     throw std::runtime_error("Importer finished without loading or skipping.");
 }
 
-std::vector<ImdbIndexSpec> imdbIndexSpecs() {
-    std::vector<ImdbIndexSpec> specs;
+std::vector<HashIndexSpec> imdbHashIndexSpecs() {
+    std::vector<HashIndexSpec> specs;
 
     auto addPrimaryKey = [&](const std::string& table_name) {
         specs.push_back({
@@ -7364,7 +7364,7 @@ std::vector<ImdbIndexSpec> imdbIndexSpecs() {
     return specs;
 }
 
-void printImdbIndexBuildSummary(const ImdbIndexBuildSummary& summary) {
+void printHashIndexBuildSummary(const HashIndexBuildSummary& summary) {
     std::cout << "\nHash index build:" << std::endl;
     std::cout << "  primary-key indexes built: " << summary.primaryBuilt()
               << std::endl;
@@ -7438,8 +7438,8 @@ void runImdbJoinAccessPathSelection() {
                   << import_elapsed.count() << " seconds" << std::endl;
     }
 
-    auto index_build = db.buildIndexes(imdbIndexSpecs());
-    printImdbIndexBuildSummary(index_build);
+    auto index_build = db.buildHashIndexes(imdbHashIndexSpecs());
+    printHashIndexBuildSummary(index_build);
 
     auto components = db.parseSelectStatement(imdb_join_query);
     auto stats = db.optimizer().analyzeQueryTables(components);
@@ -7451,7 +7451,7 @@ void runImdbJoinAccessPathSelection() {
     auto indexed_search = db.optimizer().chooseBushyJoinOrder(
         components,
         stats,
-        &db.indexes()
+        &db.hashIndexes()
     );
 
     std::cout << "\nBushy DP physical access-path search:" << std::endl;

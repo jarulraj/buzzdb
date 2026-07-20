@@ -270,79 +270,6 @@ constexpr TableId SYS_TABLES_ID = 1;
 constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
 
-struct RecordId {
-    TableId table_id = INVALID_TABLE_ID;
-    PageID page_id = INVALID_PAGE_ID;
-    size_t slot_id = 0;
-};
-
-struct IndexDescriptor {
-    TableId table_id = INVALID_TABLE_ID;
-    size_t column_index = 0;
-
-    bool operator<(const IndexDescriptor& other) const {
-        if (table_id != other.table_id) {
-            return table_id < other.table_id;
-        }
-        return column_index < other.column_index;
-    }
-
-    bool operator==(const IndexDescriptor& other) const {
-        return table_id == other.table_id &&
-               column_index == other.column_index;
-    }
-};
-
-struct IndexKey {
-    FieldType type = INT;
-    int int_value = 0;
-    float float_value = 0.0f;
-    std::string string_value;
-
-    explicit IndexKey(const Field& field) : type(field.getType()) {
-        switch (type) {
-            case INT:
-                int_value = field.asInt();
-                break;
-            case FLOAT:
-                float_value = field.asFloat();
-                break;
-            case STRING:
-                string_value = field.asString();
-                break;
-        }
-    }
-
-    bool operator==(const IndexKey& other) const {
-        if (type != other.type) {
-            return false;
-        }
-
-        switch (type) {
-            case INT:
-                return int_value == other.int_value;
-            case FLOAT:
-                return float_value == other.float_value;
-            case STRING:
-                return string_value == other.string_value;
-        }
-        return false;
-    }
-};
-
-struct IndexKeyHasher {
-    std::size_t operator()(const IndexKey& key) const {
-        switch (key.type) {
-            case INT:
-                return std::hash<int>{}(key.int_value);
-            case FLOAT:
-                return std::hash<float>{}(key.float_value);
-            case STRING:
-                return std::hash<std::string>{}(key.string_value);
-        }
-        return 0;
-    }
-};
 const std::string BOOTSTRAP_MAGIC = "BUZZDB_BOOTSTRAP";
 
 enum class CrashPoint {
@@ -2724,201 +2651,6 @@ private:
     }
 };
 
-struct ImdbIndexSpec {
-    std::string index_name;
-    std::string table_name;
-    std::string column_name;
-    bool unique = false;
-    bool primary_key = false;
-};
-
-struct IndexBuildResult {
-    std::string index_name;
-    std::string table_name;
-    std::string column_name;
-    bool unique = false;
-    bool primary_key = false;
-    size_t entries = 0;
-    size_t distinct_keys = 0;
-};
-
-struct ImdbIndexBuildSummary {
-    std::vector<IndexBuildResult> built;
-    std::vector<std::string> skipped;
-
-    size_t primaryBuilt() const {
-        size_t count = 0;
-        for (const auto& result : built) {
-            if (result.primary_key) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    size_t foreignKeyBuilt() const {
-        size_t count = 0;
-        for (const auto& result : built) {
-            if (!result.primary_key) {
-                count++;
-            }
-        }
-        return count;
-    }
-};
-
-class HashIndex {
-private:
-    std::unordered_map<IndexKey, std::vector<RecordId>, IndexKeyHasher> entries;
-    bool unique_index = false;
-
-public:
-    void clear(bool unique) {
-        entries.clear();
-        unique_index = unique;
-    }
-
-    void insert(const Field& key, const RecordId& record_id) {
-        auto& records = entries[IndexKey(key)];
-        if (unique_index && !records.empty()) {
-            throw std::runtime_error("Duplicate key in unique hash index.");
-        }
-        records.push_back(record_id);
-    }
-
-    const std::vector<RecordId>* lookup(const Field& key) const {
-        auto it = entries.find(IndexKey(key));
-        if (it == entries.end()) {
-            return nullptr;
-        }
-        return &it->second;
-    }
-
-    size_t entryCount() const {
-        size_t count = 0;
-        for (const auto& entry : entries) {
-            count += entry.second.size();
-        }
-        return count;
-    }
-
-    size_t distinctKeyCount() const {
-        return entries.size();
-    }
-
-    bool unique() const {
-        return unique_index;
-    }
-};
-
-class IndexManager {
-private:
-    struct BuildTarget {
-        ImdbIndexSpec spec;
-        IndexDescriptor descriptor;
-    };
-
-    Catalog& catalog;
-    PageManager& page_manager;
-    std::map<IndexDescriptor, HashIndex> hash_indexes;
-
-public:
-    IndexManager(Catalog& catalog, PageManager& page_manager)
-        : catalog(catalog), page_manager(page_manager) {}
-
-    ImdbIndexBuildSummary buildIndexes(const std::vector<ImdbIndexSpec>& specs) {
-        ImdbIndexBuildSummary summary;
-        std::map<std::string, std::vector<BuildTarget>> targets_by_table;
-
-        for (const auto& spec : specs) {
-            if (!catalog.hasTable(spec.table_name)) {
-                summary.skipped.push_back(
-                    spec.index_name + " on " + spec.table_name + "." +
-                    spec.column_name + " (missing table)"
-                );
-                continue;
-            }
-
-            auto& metadata = catalog.getTable(spec.table_name);
-            auto column_index = metadata.schema.findColumnIndex(spec.column_name);
-            if (!column_index) {
-                summary.skipped.push_back(
-                    spec.index_name + " on " + spec.table_name + "." +
-                    spec.column_name + " (missing column)"
-                );
-                continue;
-            }
-
-            targets_by_table[spec.table_name].push_back({
-                spec,
-                {metadata.table_id, *column_index}
-            });
-        }
-
-        for (auto& entry : targets_by_table) {
-            auto& metadata = catalog.getTable(entry.first);
-            for (const auto& target : entry.second) {
-                hash_indexes[target.descriptor].clear(target.spec.unique);
-            }
-
-            TableHeap table_heap(metadata, page_manager);
-            for (PageID page_id = table_heap.firstPage();
-                 page_id != INVALID_PAGE_ID;
-                 page_id = table_heap.nextPage(page_id)) {
-                for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                    auto tuple = table_heap.getTuple(page_id, slot);
-                    if (!tuple) {
-                        continue;
-                    }
-
-                    for (const auto& target : entry.second) {
-                        size_t column_index = target.descriptor.column_index;
-                        if (column_index >= tuple->fields.size()) {
-                            continue;
-                        }
-                        hash_indexes[target.descriptor].insert(
-                            *tuple->fields[column_index],
-                            {metadata.table_id, page_id, slot}
-                        );
-                    }
-                }
-            }
-
-            for (const auto& target : entry.second) {
-                const auto& index = hash_indexes.at(target.descriptor);
-                summary.built.push_back({
-                    target.spec.index_name,
-                    target.spec.table_name,
-                    target.spec.column_name,
-                    target.spec.unique,
-                    target.spec.primary_key,
-                    index.entryCount(),
-                    index.distinctKeyCount()
-                });
-            }
-        }
-
-        return summary;
-    }
-
-    bool hasHashIndex(const IndexDescriptor& descriptor) const {
-        return hash_indexes.find(descriptor) != hash_indexes.end();
-    }
-
-    const HashIndex& hashIndex(const IndexDescriptor& descriptor) const {
-        auto it = hash_indexes.find(descriptor);
-        if (it == hash_indexes.end()) {
-            throw std::runtime_error("Hash index is not built.");
-        }
-        return it->second;
-    }
-
-    const std::vector<RecordId>* lookup(const IndexDescriptor& descriptor,
-                                        const Field& value) const {
-        return hashIndex(descriptor).lookup(value);
-    }
-};
-
 class Operator {
     public:
     virtual ~Operator() = default;
@@ -3352,135 +3084,6 @@ public:
             return {};
         }
         return cloneFields(currentOutput);
-    }
-};
-
-class IndexNestedLoopJoinOperator : public Operator {
-private:
-    Operator& outer;
-    TableHeap& inner_heap;
-    const HashIndex& index;
-    size_t outer_attr_index;
-    size_t inner_attr_index;
-    bool inner_output_first;
-    std::unique_ptr<IPredicate> inner_predicate;
-    std::vector<std::unique_ptr<Field>> current_outer_tuple;
-    std::vector<std::unique_ptr<Field>> current_output;
-    const std::vector<RecordId>* matching_records = nullptr;
-    size_t matching_record_index = 0;
-    bool has_outer_tuple = false;
-    bool has_next = false;
-
-public:
-    IndexNestedLoopJoinOperator(
-            Operator& outer,
-            TableHeap& inner_heap,
-            const HashIndex& index,
-            size_t outer_attr_index,
-            size_t inner_attr_index,
-            bool inner_output_first,
-            std::unique_ptr<IPredicate> inner_predicate)
-        : outer(outer),
-          inner_heap(inner_heap),
-          index(index),
-          outer_attr_index(outer_attr_index),
-          inner_attr_index(inner_attr_index),
-          inner_output_first(inner_output_first),
-          inner_predicate(std::move(inner_predicate)) {}
-
-    void open() override {
-        outer.open();
-        current_outer_tuple.clear();
-        current_output.clear();
-        matching_records = nullptr;
-        matching_record_index = 0;
-        has_outer_tuple = false;
-        has_next = false;
-    }
-
-    bool next() override {
-        current_output.clear();
-        has_next = false;
-
-        while (true) {
-            if (!has_outer_tuple) {
-                if (!outer.next()) {
-                    return false;
-                }
-                current_outer_tuple = outer.getOutput();
-                if (outer_attr_index >= current_outer_tuple.size()) {
-                    throw std::runtime_error(
-                        "Index nested-loop outer attribute index out of range."
-                    );
-                }
-                matching_records = index.lookup(
-                    *current_outer_tuple[outer_attr_index]
-                );
-                matching_record_index = 0;
-                has_outer_tuple = true;
-            }
-
-            while (matching_records &&
-                   matching_record_index < matching_records->size()) {
-                const auto& record_id =
-                    (*matching_records)[matching_record_index++];
-                auto inner_tuple = inner_heap.getTuple(
-                    record_id.page_id,
-                    record_id.slot_id
-                );
-                if (!inner_tuple) {
-                    continue;
-                }
-                if (inner_attr_index >= inner_tuple->fields.size()) {
-                    throw std::runtime_error(
-                        "Index nested-loop inner attribute index out of range."
-                    );
-                }
-                if (!(*current_outer_tuple[outer_attr_index] ==
-                      *inner_tuple->fields[inner_attr_index])) {
-                    continue;
-                }
-                if (inner_predicate &&
-                    !inner_predicate->check(inner_tuple->fields)) {
-                    continue;
-                }
-
-                if (inner_output_first) {
-                    current_output = cloneFields(inner_tuple->fields);
-                    for (const auto& field : current_outer_tuple) {
-                        current_output.push_back(field->clone());
-                    }
-                } else {
-                    current_output = cloneFields(current_outer_tuple);
-                    for (const auto& field : inner_tuple->fields) {
-                        current_output.push_back(field->clone());
-                    }
-                }
-                has_next = true;
-                return true;
-            }
-
-            has_outer_tuple = false;
-            matching_records = nullptr;
-            matching_record_index = 0;
-        }
-    }
-
-    void close() override {
-        outer.close();
-        current_outer_tuple.clear();
-        current_output.clear();
-        matching_records = nullptr;
-        matching_record_index = 0;
-        has_outer_tuple = false;
-        has_next = false;
-    }
-
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        if (!has_next) {
-            return {};
-        }
-        return cloneFields(current_output);
     }
 };
 
@@ -4418,8 +4021,7 @@ std::string formatQError(double estimate, double actual) {
 
 enum class PhysicalJoinKind {
     NestedLoopJoin,
-    HashJoin,
-    IndexNestedLoopJoin
+    HashJoin
 };
 
 std::string physicalJoinKindName(PhysicalJoinKind kind) {
@@ -4428,8 +4030,6 @@ std::string physicalJoinKindName(PhysicalJoinKind kind) {
             return "NestedLoopJoin";
         case PhysicalJoinKind::HashJoin:
             return "HashJoin";
-        case PhysicalJoinKind::IndexNestedLoopJoin:
-            return "IndexNestedLoopJoin";
     }
     throw std::runtime_error("Unknown physical join kind.");
 }
@@ -4439,8 +4039,6 @@ struct JoinTreeStepEstimate {
     double output_rows = 0.0;
     RelationStats output_relation;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
-    bool has_index_lookup = false;
-    ColumnRef index_lookup_column;
     double chosen_cost = 0.0;
 };
 
@@ -4453,8 +4051,6 @@ struct JoinPlanNode {
     std::set<TableRefId> table_refs;
     RelationStats relation;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
-    bool has_index_lookup = false;
-    ColumnRef index_lookup_column;
     double cost = 0.0;
 };
 
@@ -4480,8 +4076,7 @@ QueryResult executeJoinQuery(const QueryComponents& components,
                              PageManager& page_manager,
                              size_t sample_limit = 5,
                              const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
-                             const std::shared_ptr<JoinPlanNode>& plan_root = nullptr,
-                             const IndexManager* index_manager = nullptr) {
+                             const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
     if (components.base_table_ref_id == INVALID_TABLE_REF_ID) {
         throw std::runtime_error("Join query is missing a base table.");
     }
@@ -4497,7 +4092,6 @@ QueryResult executeJoinQuery(const QueryComponents& components,
     std::vector<std::unique_ptr<SelectOperator>> pushed_selects;
     std::vector<std::unique_ptr<NestedLoopJoinOperator>> nested_loop_join_buffers;
     std::vector<std::unique_ptr<HashJoinOperator>> hash_join_buffers;
-    std::vector<std::unique_ptr<IndexNestedLoopJoinOperator>> index_join_buffers;
 
     auto addTableHeap = [&](TableRefId table_ref_id) -> TableHeap& {
         const auto& table_ref = tableRefForId(components, table_ref_id);
@@ -4534,22 +4128,6 @@ QueryResult executeJoinQuery(const QueryComponents& components,
         throw std::runtime_error("JOIN table is not in this subtree.");
     };
 
-    auto sameColumnRef = [](const ColumnRef& left, const ColumnRef& right) {
-        return left.table_ref_id == right.table_ref_id &&
-               left.column_index == right.column_index;
-    };
-
-    auto otherJoinColumn = [&](const JoinClause& join,
-                               const ColumnRef& column) {
-        if (sameColumnRef(join.left, column)) {
-            return join.right;
-        }
-        if (sameColumnRef(join.right, column)) {
-            return join.left;
-        }
-        throw std::runtime_error("Index lookup column is not part of join.");
-    };
-
     auto addJoinOperator = [&](Operator& left_op,
                                Operator& right_op,
                                size_t left_attr_index,
@@ -4576,44 +4154,6 @@ QueryResult executeJoinQuery(const QueryComponents& components,
         return *hash_join_buffers.back();
     };
 
-    auto addIndexJoinOperator =
-            [&](Operator& outer_op,
-                const std::vector<TableRefId>& outer_table_ref_ids,
-                TableRefId indexed_table_ref_id,
-                const ColumnRef& outer_column,
-                const ColumnRef& indexed_column,
-                bool indexed_output_first) -> Operator& {
-        if (!index_manager) {
-            throw std::runtime_error("Index join requires an index manager.");
-        }
-        const auto& indexed_table_ref = tableRefForId(
-            components,
-            indexed_table_ref_id
-        );
-        IndexDescriptor descriptor{
-            indexed_table_ref.table_id,
-            indexed_column.column_index
-        };
-        TableHeap& indexed_heap = addTableHeap(indexed_table_ref_id);
-        auto inner_predicate =
-            makeTableFilterPredicate(components, indexed_table_ref_id);
-        size_t outer_attr_index =
-            tableOffsetIn(outer_table_ref_ids, outer_column.table_ref_id) +
-            outer_column.column_index;
-        index_join_buffers.push_back(
-            std::make_unique<IndexNestedLoopJoinOperator>(
-                outer_op,
-                indexed_heap,
-                index_manager->hashIndex(descriptor),
-                outer_attr_index,
-                indexed_column.column_index,
-                indexed_output_first,
-                std::move(inner_predicate)
-            )
-        );
-        return *index_join_buffers.back();
-    };
-
     struct BuiltPlanOperator {
         Operator* op = nullptr;
         std::vector<TableRefId> table_ref_ids;
@@ -4633,66 +4173,6 @@ QueryResult executeJoinQuery(const QueryComponents& components,
                 {node->table_ref_id},
                 table_widths.at(node->table_ref_id)
             };
-        }
-
-        if (node->chosen_join_kind == PhysicalJoinKind::IndexNestedLoopJoin) {
-            if (!node->has_index_lookup) {
-                throw std::runtime_error("Index join is missing lookup column.");
-            }
-
-            ColumnRef outer_column =
-                otherJoinColumn(node->join, node->index_lookup_column);
-            bool index_on_left =
-                node->left &&
-                node->left->is_leaf &&
-                node->left->table_ref_id ==
-                    node->index_lookup_column.table_ref_id;
-            bool index_on_right =
-                node->right &&
-                node->right->is_leaf &&
-                node->right->table_ref_id ==
-                    node->index_lookup_column.table_ref_id;
-
-            if (index_on_left) {
-                auto right = buildPlanNode(node->right);
-                Operator& join_op = addIndexJoinOperator(
-                    *right.op,
-                    right.table_ref_ids,
-                    node->left->table_ref_id,
-                    outer_column,
-                    node->index_lookup_column,
-                    true
-                );
-                std::vector<TableRefId> table_ref_ids{node->left->table_ref_id};
-                table_ref_ids.insert(
-                    table_ref_ids.end(),
-                    right.table_ref_ids.begin(),
-                    right.table_ref_ids.end()
-                );
-                size_t width =
-                    table_widths.at(node->left->table_ref_id) + right.width;
-                return {&join_op, table_ref_ids, width};
-            }
-
-            if (index_on_right) {
-                auto left = buildPlanNode(node->left);
-                Operator& join_op = addIndexJoinOperator(
-                    *left.op,
-                    left.table_ref_ids,
-                    node->right->table_ref_id,
-                    outer_column,
-                    node->index_lookup_column,
-                    false
-                );
-                left.table_ref_ids.push_back(node->right->table_ref_id);
-                size_t width =
-                    left.width + table_widths.at(node->right->table_ref_id);
-                return {&join_op, left.table_ref_ids, width};
-            }
-
-            throw std::runtime_error(
-                "Index nested-loop join can only probe a base-table child."
-            );
         }
 
         auto left = buildPlanNode(node->left);
@@ -5247,14 +4727,6 @@ private:
         return 0.10 * std::max(0.0, tuples);
     }
 
-    static double tupleIndexProbeCost(double probes) {
-        return 10.0 * std::max(0.0, probes);
-    }
-
-    static double tupleFetchByRecordIdCost(double tuples) {
-        return 0.50 * std::max(0.0, tuples);
-    }
-
     static double nestedLoopJoinCost(double left_total_cost,
                                      double right_total_cost,
                                      double left_rows,
@@ -5275,37 +4747,6 @@ private:
                right_total_cost +
                tupleHashCost(left_rows + right_rows) +
                tupleMaterializationCost(output_rows);
-    }
-
-    static double indexNestedLoopJoinCost(double outer_total_cost,
-                                          double outer_rows,
-                                          double output_rows) {
-        return outer_total_cost +
-               tupleIndexProbeCost(outer_rows) +
-               tupleFetchByRecordIdCost(output_rows) +
-               tupleMaterializationCost(output_rows);
-    }
-
-    std::optional<IndexDescriptor> indexDescriptorForColumn(
-            const QueryComponents& components,
-            const ColumnRef& column,
-            const IndexManager* index_manager) {
-        if (!index_manager) {
-            return std::nullopt;
-        }
-
-        const auto& table_ref = tableRefForId(
-            components,
-            column.table_ref_id
-        );
-        IndexDescriptor descriptor{
-            table_ref.table_id,
-            column.column_index
-        };
-        if (!index_manager->hasHashIndex(descriptor)) {
-            return std::nullopt;
-        }
-        return descriptor;
     }
 
     TableStats analyzeTable(TableMetadata& metadata) {
@@ -5627,8 +5068,6 @@ private:
         node->table_refs.insert(right->table_refs.begin(), right->table_refs.end());
         node->relation = step.output_relation;
         node->chosen_join_kind = step.chosen_join_kind;
-        node->has_index_lookup = step.has_index_lookup;
-        node->index_lookup_column = step.index_lookup_column;
         node->cost = step.chosen_cost;
         return node;
     }
@@ -5668,11 +5107,7 @@ private:
             const RelationStats& left_relation,
             double left_cost,
             const RelationStats& right_relation,
-            double right_cost,
-            const QueryComponents* components = nullptr,
-            const JoinPlanNode* left_plan = nullptr,
-            const JoinPlanNode* right_plan = nullptr,
-            const IndexManager* index_manager = nullptr) {
+            double right_cost) {
         auto columns = joinedAndInputColumns(join, left_table_refs);
         double output_rows = estimateJoinRows(
             left_relation.rows,
@@ -5709,58 +5144,12 @@ private:
         double chosen_cost = chosen_join_kind == PhysicalJoinKind::NestedLoopJoin
             ? nested_loop_cost
             : hash_join_cost;
-        bool has_index_lookup = false;
-        ColumnRef index_lookup_column;
-
-        auto considerIndexJoin =
-                [&](const JoinPlanNode* indexed_plan,
-                    const ColumnRef& indexed_column,
-                    double outer_rows,
-                    double outer_cost) {
-            if (!components || !indexed_plan || !indexed_plan->is_leaf) {
-                return;
-            }
-            if (!indexDescriptorForColumn(
-                    *components,
-                    indexed_column,
-                    index_manager
-                )) {
-                return;
-            }
-
-            double index_cost = indexNestedLoopJoinCost(
-                outer_cost,
-                outer_rows,
-                output_rows
-            );
-            if (index_cost < chosen_cost) {
-                chosen_join_kind = PhysicalJoinKind::IndexNestedLoopJoin;
-                chosen_cost = index_cost;
-                has_index_lookup = true;
-                index_lookup_column = indexed_column;
-            }
-        };
-
-        considerIndexJoin(
-            right_plan,
-            columns.second,
-            left_relation.rows,
-            left_cost
-        );
-        considerIndexJoin(
-            left_plan,
-            columns.first,
-            right_relation.rows,
-            right_cost
-        );
 
         return {
             join,
             output_rows,
             std::move(output_relation),
             chosen_join_kind,
-            has_index_lookup,
-            index_lookup_column,
             chosen_cost
         };
     }
@@ -5921,8 +5310,7 @@ public:
 
     BushyJoinOrderResult chooseBushyJoinOrder(
             const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            const IndexManager* index_manager = nullptr) {
+            const std::map<TableId, TableStats>& stats) {
         if (components.table_refs.empty() || components.table_refs.size() > 62) {
             throw std::runtime_error("Bushy DP supports 1..62 table refs.");
         }
@@ -5986,11 +5374,7 @@ public:
                         best[left_mask]->relation,
                         best[left_mask]->cost,
                         best[right_mask]->relation,
-                        best[right_mask]->cost,
-                        &components,
-                        best[left_mask]->plan_root.get(),
-                        best[right_mask]->plan_root.get(),
-                        index_manager
+                        best[right_mask]->cost
                     );
 
                     BushyDpState candidate;
@@ -6491,7 +5875,6 @@ public:
     RecoveryManager recovery_manager;
     PageManager page_manager;
     Catalog catalog;
-    IndexManager index_manager;
     TransactionManager txn_manager;
 
     TransactionalStorageManager()
@@ -6500,7 +5883,6 @@ public:
           recovery_manager(buffer_manager, log_manager),
           page_manager(buffer_manager, recovery_manager),
           catalog(buffer_manager, page_manager),
-          index_manager(catalog, page_manager),
           txn_manager() {
         recovery_manager.recover();
         catalog.load();
@@ -6712,8 +6094,7 @@ public:
             transactional_storage_manager.page_manager,
             sample_limit,
             physical_join_kinds,
-            plan_root,
-            &transactional_storage_manager.index_manager
+            plan_root
         );
     }
 
@@ -6997,8 +6378,7 @@ public:
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
             auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
-                stats,
-                &transactional_storage_manager.index_manager
+                stats
             );
             auto result = query_executor.executeJoinPlan(
                 search.components,
@@ -7024,8 +6404,7 @@ public:
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
             auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
-                stats,
-                &transactional_storage_manager.index_manager
+                stats
             );
             auto result = query_executor.executeJoinPlan(
                 search.components,
@@ -7174,15 +6553,6 @@ public:
 
     QueryProcessor& queryProcessor() {
         return query_processor;
-    }
-
-    IndexManager& indexes() {
-        return transactional_storage_manager.index_manager;
-    }
-
-    ImdbIndexBuildSummary buildIndexes(
-            const std::vector<ImdbIndexSpec>& specs) {
-        return transactional_storage_manager.index_manager.buildIndexes(specs);
     }
 
     QueryComponents parseSelectStatement(const std::string& statement) {
