@@ -5818,6 +5818,41 @@ public:
     QueryOptimizer(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
 
+    TableStats analyzeTableByName(const std::string& table_name) {
+        auto& metadata = catalog.getTable(table_name);
+        return analyzeTable(metadata);
+    }
+
+    double estimateRangeFilterRowsUniform(double input_rows,
+                                          const ColumnStats& column_stats,
+                                          int lower_bound,
+                                          int upper_bound) const {
+        if (input_rows <= 0.0 ||
+            column_stats.type != INT ||
+            !column_stats.min_value ||
+            !column_stats.max_value) {
+            return 0.0;
+        }
+
+        int min_value = column_stats.min_value->asInt();
+        int max_value = column_stats.max_value->asInt();
+        if (min_value > max_value) {
+            return 0.0;
+        }
+
+        int overlap_lower = std::max(min_value, lower_bound + 1);
+        int overlap_upper = std::min(max_value, upper_bound - 1);
+        if (overlap_lower > overlap_upper) {
+            return 0.0;
+        }
+
+        double domain_width =
+            static_cast<double>(max_value - min_value + 1);
+        double overlap_width =
+            static_cast<double>(overlap_upper - overlap_lower + 1);
+        return input_rows * overlap_width / domain_width;
+    }
+
     std::map<TableId, TableStats> analyzeQueryTables(
             const QueryComponents& components) {
         std::map<TableId, TableStats> stats;
@@ -6920,6 +6955,41 @@ public:
         return parseStatement(statement).query;
     }
 
+    size_t countRowsInIntRange(const std::string& table_name,
+                               const std::string& column_name,
+                               int lower_bound,
+                               int upper_bound) {
+        auto& metadata = transactional_storage_manager.catalog.getTable(
+            table_name
+        );
+        size_t column = static_cast<size_t>(
+            metadata.schema.getColumnIndex(column_name)
+        );
+
+        TableHeap table_heap(
+            metadata,
+            transactional_storage_manager.page_manager
+        );
+        size_t count = 0;
+        for (PageID page_id = table_heap.firstPage();
+             page_id != INVALID_PAGE_ID;
+             page_id = table_heap.nextPage(page_id)) {
+            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
+                auto tuple = table_heap.getTuple(page_id, slot);
+                if (!tuple || column >= tuple->fields.size()) {
+                    continue;
+                }
+                const auto& field = *tuple->fields[column];
+                if (field.getType() == INT &&
+                    field.asInt() > lower_bound &&
+                    field.asInt() < upper_bound) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
     void execute(const ParsedStatement& statement,
                  const TxnPtr& txn) {
         if (statement.kind == ParsedStatement::Kind::Select &&
@@ -7008,17 +7078,8 @@ public:
     }
 };
 
-struct TimedQueryResult;
-
 class BuzzDB {
 private:
-    friend TimedQueryResult executeJoinQueryInTransaction(
-        BuzzDB& db,
-        const QueryComponents& components,
-        const std::vector<PhysicalJoinKind>* physical_join_kinds,
-        const std::shared_ptr<JoinPlanNode>& plan_root
-    );
-
     TransactionalStorageManager transactional_storage_manager;
     QueryProcessor query_processor;
     TxnPtr active_txn;
@@ -7109,6 +7170,10 @@ public:
 
     QueryOptimizer& optimizer() {
         return query_processor.optimizer();
+    }
+
+    QueryProcessor& queryProcessor() {
+        return query_processor;
     }
 
     IndexManager& indexes() {
@@ -7285,25 +7350,11 @@ public:
 };
 
 const std::string imdb_data_filename = "imdb_large.txt";
-const std::string imdb_join_query =
-    "PROJECT {cn.name}, {miidx.info}, {t.title} "
-    "FROM info_type AS it "
-    "JOIN movie_info_idx AS miidx ON {it.id} = {miidx.info_type_id} "
-    "JOIN movie_companies AS mc ON {miidx.movie_id} = {mc.movie_id} "
-    "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
-    "JOIN movie_info AS mi ON {mc.movie_id} = {mi.movie_id} "
-    "JOIN title AS t ON {mi.movie_id} = {t.id} "
-    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
-    "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
-    "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
-    "WHERE {cn.country_code} = [us] "
-    "AND {ct.kind} = production_companies "
-    "AND {it.info} = rating "
-    "AND {it2.info} = release_dates "
-    "AND {kt.kind} = movie "
-    "AND {mi.movie_id} = {miidx.movie_id} "
-    "AND {mi.movie_id} = {mc.movie_id} "
-    "AND {miidx.movie_id} = {mc.movie_id}";
+const std::string imdb_range_query =
+    "SELECT COUNT(id) FROM title GROUP BY kind_id "
+    "WHERE production_year > 1990 and production_year < 2010";
+const std::string imdb_range_table = "title";
+const std::string imdb_range_column = "production_year";
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
     if (db.isDatabaseEmpty()) {
@@ -7333,148 +7384,40 @@ void printImportResult(const ImportResult& result) {
     throw std::runtime_error("Importer finished without loading or skipping.");
 }
 
-std::vector<ImdbIndexSpec> imdbIndexSpecs() {
-    std::vector<ImdbIndexSpec> specs;
-
-    auto addPrimaryKey = [&](const std::string& table_name) {
-        specs.push_back({
-            "pk_" + table_name,
-            table_name,
-            "id",
-            true,
-            true
-        });
-    };
-
-    auto addForeignKey = [&](const std::string& index_name,
-                             const std::string& table_name,
-                             const std::string& column_name) {
-        specs.push_back({
-            index_name,
-            table_name,
-            column_name,
-            false,
-            false
-        });
-    };
-
-    for (const std::string& table_name : {
-             "aka_name",
-             "aka_title",
-             "cast_info",
-             "char_name",
-             "comp_cast_type",
-             "company_name",
-             "company_type",
-             "complete_cast",
-             "info_type",
-             "keyword",
-             "kind_type",
-             "link_type",
-             "movie_companies",
-             "movie_info",
-             "movie_info_idx",
-             "movie_keyword",
-             "movie_link",
-             "name",
-             "person_info",
-             "role_type",
-             "title"
-         }) {
-        addPrimaryKey(table_name);
+std::string fieldValueOrMissing(const std::optional<Field>& value) {
+    if (!value) {
+        return "n/a";
     }
-
-    addForeignKey("company_id_movie_companies", "movie_companies", "company_id");
-    addForeignKey("company_type_id_movie_companies", "movie_companies", "company_type_id");
-    addForeignKey("info_type_id_movie_info_idx", "movie_info_idx", "info_type_id");
-    addForeignKey("info_type_id_movie_info", "movie_info", "info_type_id");
-    addForeignKey("info_type_id_person_info", "person_info", "info_type_id");
-    addForeignKey("keyword_id_movie_keyword", "movie_keyword", "keyword_id");
-    addForeignKey("kind_id_aka_title", "aka_title", "kind_id");
-    addForeignKey("kind_id_title", "title", "kind_id");
-    addForeignKey("linked_movie_id_movie_link", "movie_link", "linked_movie_id");
-    addForeignKey("link_type_id_movie_link", "movie_link", "link_type_id");
-    addForeignKey("movie_id_aka_title", "aka_title", "movie_id");
-    addForeignKey("movie_id_cast_info", "cast_info", "movie_id");
-    addForeignKey("movie_id_complete_cast", "complete_cast", "movie_id");
-    addForeignKey("movie_id_movie_companies", "movie_companies", "movie_id");
-    addForeignKey("movie_id_movie_info_idx", "movie_info_idx", "movie_id");
-    addForeignKey("movie_id_movie_keyword", "movie_keyword", "movie_id");
-    addForeignKey("movie_id_movie_link", "movie_link", "movie_id");
-    addForeignKey("movie_id_movie_info", "movie_info", "movie_id");
-    addForeignKey("person_id_aka_name", "aka_name", "person_id");
-    addForeignKey("person_id_cast_info", "cast_info", "person_id");
-    addForeignKey("person_id_person_info", "person_info", "person_id");
-    addForeignKey("person_role_id_cast_info", "cast_info", "person_role_id");
-    addForeignKey("role_id_cast_info", "cast_info", "role_id");
-
-    return specs;
+    return fieldToString(*value);
 }
 
-void printImdbIndexBuildSummary(const ImdbIndexBuildSummary& summary) {
-    std::cout << "\nIndex build:" << std::endl;
-    std::cout << "  primary-key indexes built: " << summary.primaryBuilt()
-              << std::endl;
-    std::cout << "  foreign-key indexes built: " << summary.foreignKeyBuilt()
-              << std::endl;
-    std::cout << "  skipped IMDB index specs: " << summary.skipped.size()
-              << std::endl;
-}
-
-size_t countJoinKind(const std::shared_ptr<JoinPlanNode>& node,
-                     PhysicalJoinKind kind) {
-    if (!node || node->is_leaf) {
-        return 0;
-    }
-    size_t count = node->chosen_join_kind == kind ? 1 : 0;
-    return count +
-           countJoinKind(node->left, kind) +
-           countJoinKind(node->right, kind);
-}
-
-struct TimedQueryResult {
-    QueryResult result;
-    double elapsed_seconds = 0.0;
-};
-
-TimedQueryResult executeJoinQueryInTransaction(
-        BuzzDB& db,
-        const QueryComponents& components,
-        const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
-        const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
-    auto txn = db.beginTransaction();
-    try {
-        auto query_start = std::chrono::high_resolution_clock::now();
-        BuzzDB::requireRunningTransaction(txn);
-        auto result = db.query_processor.executeJoinPlan(
-            components,
-            txn,
-            physical_join_kinds,
-            0,
-            plan_root
-        );
-        auto query_end = std::chrono::high_resolution_clock::now();
-        db.commit(txn);
-
-        std::chrono::duration<double> elapsed = query_end - query_start;
-        return {std::move(result), elapsed.count()};
-    } catch (...) {
-        if (txn && txn->state == TxnContext::RUNNING) {
-            db.abort(txn);
+std::string topMcvSummary(const ColumnStats& column_stats, size_t limit = 5) {
+    std::vector<std::pair<std::string, size_t>> counts(
+        column_stats.mcv_counts.begin(),
+        column_stats.mcv_counts.end()
+    );
+    std::sort(counts.begin(), counts.end(), [](const auto& left,
+                                               const auto& right) {
+        if (left.second != right.second) {
+            return left.second > right.second;
         }
-        throw;
+        return left.first < right.first;
+    });
+
+    std::ostringstream out;
+    for (size_t i = 0; i < counts.size() && i < limit; i++) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << counts[i].first << "=" << counts[i].second;
     }
+    if (counts.empty()) {
+        out << "none";
+    }
+    return out.str();
 }
 
-void printTimedQueryResult(const std::string& label,
-                           const TimedQueryResult& timed_result) {
-    std::cout << "  " << label
-              << ": rows=" << timed_result.result.row_count
-              << " elapsed=" << timed_result.elapsed_seconds
-              << " seconds" << std::endl;
-}
-
-void runImdbJoinOrdering() {
+void runImdbRangeEstimation() {
     BuzzDB db;
     auto import_start = std::chrono::high_resolution_clock::now();
     auto import_result = ensureImdbDatasetLoaded(db);
@@ -7487,110 +7430,62 @@ void runImdbJoinOrdering() {
                   << import_elapsed.count() << " seconds" << std::endl;
     }
 
-    auto index_build = db.buildIndexes(imdbIndexSpecs());
-    printImdbIndexBuildSummary(index_build);
-
-    auto components = db.parseSelectStatement(imdb_join_query);
-    auto stats = db.optimizer().analyzeQueryTables(components);
-
-    auto baseline_search = db.optimizer().chooseBushyJoinOrder(
-        components,
-        stats
-    );
-    auto all_index_search = db.optimizer().chooseBushyJoinOrder(
-        components,
-        stats,
-        &db.indexes()
+    auto components = db.parseSelectStatement(imdb_range_query);
+    auto table_stats = db.optimizer().analyzeTableByName(imdb_range_table);
+    const auto& column_stats = table_stats.columns.at(
+        static_cast<size_t>(components.whereAttributeIndex)
     );
 
-    std::cout << "\nBushy DP physical search:" << std::endl;
-    std::cout << "  baseline: table-scan leaves, no index joins, states="
-              << baseline_search.states_kept
-              << ", candidates=" << baseline_search.candidates_considered
-              << ", pruned_cross_products="
-              << baseline_search.cross_products_pruned
-              << ", cost=" << formatEstimate(baseline_search.estimated_cost)
-              << ", final_est="
-              << formatEstimate(baseline_search.final_estimate)
+    double estimated_rows = db.optimizer().estimateRangeFilterRowsUniform(
+        static_cast<double>(table_stats.row_count),
+        column_stats,
+        components.lowerBound,
+        components.upperBound
+    );
+    size_t actual_rows = db.queryProcessor().countRowsInIntRange(
+        imdb_range_table,
+        imdb_range_column,
+        components.lowerBound,
+        components.upperBound
+    );
+
+    std::cout << "\nQuery:" << std::endl;
+    std::cout << "  " << imdb_range_query << std::endl;
+    std::cout << "\nANALYZE stats already available:" << std::endl;
+    std::cout << "  table: " << imdb_range_table
+              << ", rows=" << table_stats.row_count
+              << ", pages=" << table_stats.page_count << std::endl;
+    std::cout << "  column: " << imdb_range_column
+              << ", ndv=" << column_stats.distinct_count
+              << ", min=" << fieldValueOrMissing(column_stats.min_value)
+              << ", max=" << fieldValueOrMissing(column_stats.max_value)
               << std::endl;
-    std::cout << "  all IMDB primary-key/foreign-key indexes: states="
-              << all_index_search.states_kept
-              << ", candidates=" << all_index_search.candidates_considered
-              << ", pruned_cross_products="
-              << all_index_search.cross_products_pruned
-              << ", cost=" << formatEstimate(all_index_search.estimated_cost)
-              << ", final_est="
-              << formatEstimate(all_index_search.final_estimate)
-              << ", index_joins="
-              << countJoinKind(
-                    all_index_search.plan_root,
-                    PhysicalJoinKind::IndexNestedLoopJoin
-                 )
+    std::cout << "  MCV sample: " << topMcvSummary(column_stats) << std::endl;
+
+    std::cout << "\nUniform min/max range estimate:" << std::endl;
+    std::cout << "  predicate: " << imdb_range_column
+              << " > " << components.lowerBound
+              << " AND " << imdb_range_column
+              << " < " << components.upperBound << std::endl;
+    std::cout << "  estimated rows=" << formatEstimate(estimated_rows)
               << std::endl;
-
-    db.optimizer().printJoinPlanTree(
-        "Bushy DP baseline tree",
-        baseline_search.components,
-        baseline_search.plan_root
-    );
-    db.optimizer().printJoinPlanTree(
-        "Bushy DP all-index tree",
-        all_index_search.components,
-        all_index_search.plan_root
-    );
-
-    std::cout << "\nQuery time comparison "
-              << "(buffer pool cleared before each run):" << std::endl;
-    db.clearBufferPool();
-    auto baseline_result = executeJoinQueryInTransaction(
-        db,
-        baseline_search.components,
-        nullptr,
-        baseline_search.plan_root
-    );
-    db.clearBufferPool();
-    auto all_index_result = executeJoinQueryInTransaction(
-        db,
-        all_index_search.components,
-        nullptr,
-        all_index_search.plan_root
-    );
-    printTimedQueryResult("Bushy DP table-scan baseline", baseline_result);
-    printTimedQueryResult("Bushy DP with IMDB indexes", all_index_result);
-    if (baseline_result.result.row_count != all_index_result.result.row_count) {
-        throw std::runtime_error("Index planning changed the query result.");
-    }
-
-    double actual_rows = static_cast<double>(baseline_result.result.row_count);
-    std::cout << "\nFinal join q-error:" << std::endl;
-    std::cout << "  bushy table-scan baseline: estimate="
-              << formatEstimate(baseline_search.final_estimate)
-              << " actual=" << baseline_result.result.row_count
-              << " q-error=" << formatQError(
-                    baseline_search.final_estimate,
-                    actual_rows
-                 )
-              << std::endl;
-    std::cout << "  bushy with IMDB indexes: estimate="
-              << formatEstimate(all_index_search.final_estimate)
-              << " actual=" << all_index_result.result.row_count
-              << " q-error=" << formatQError(
-                    all_index_search.final_estimate,
-                    actual_rows
-                 )
+    std::cout << "  actual rows=" << actual_rows << std::endl;
+    std::cout << "  q-error="
+              << formatQError(estimated_rows, static_cast<double>(actual_rows))
               << std::endl;
 
-    std::cout << "\nResult: the bushy search space stays unchanged"
-              << " and uses a simple probe-plus-fetch cost model so IMDB"
-              << " indexes are used.\n";
+    std::cout << "\nTakeaway: MCV stats help equality predicates, but this"
+              << " range estimate only knows min/max and assumes the years"
+              << " are uniformly distributed. Histograms refine this by"
+              << " modeling the distribution inside the range.\n";
 }
 
 int main() {
     try {
 
-    std::cout << "IMDB bushy DP with primary-key and foreign-key indexes\n";
+    std::cout << "IMDB range predicate estimation\n";
 
-    runImdbJoinOrdering();
+    runImdbRangeEstimation();
 
     return 0;
     } catch (const std::exception& error) {

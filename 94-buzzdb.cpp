@@ -7464,8 +7464,17 @@ public:
     }
 };
 
+struct TimedQueryResult;
+
 class BuzzDB {
 private:
+    friend TimedQueryResult executeJoinQueryInTransaction(
+        BuzzDB& db,
+        const QueryComponents& components,
+        const std::vector<PhysicalJoinKind>* physical_join_kinds,
+        const std::shared_ptr<JoinPlanNode>& plan_root
+    );
+
     TransactionalStorageManager transactional_storage_manager;
     QueryProcessor query_processor;
     TxnPtr active_txn;
@@ -7560,22 +7569,6 @@ public:
 
     QueryComponents parseSelectStatement(const std::string& statement) {
         return query_processor.parseSelectStatement(statement);
-    }
-
-    QueryResult executeJoinPlan(
-            const TxnPtr& txn,
-            const QueryComponents& components,
-            const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
-            size_t sample_limit = 5,
-            const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
-        requireRunningTransaction(txn);
-        return query_processor.executeJoinPlan(
-            components,
-            txn,
-            physical_join_kinds,
-            sample_limit,
-            plan_root
-        );
     }
 
     void insertRow(const std::string& tableName,
@@ -7800,9 +7793,10 @@ TimedQueryResult executeJoinQueryInTransaction(
     auto txn = db.beginTransaction();
     try {
         auto query_start = std::chrono::high_resolution_clock::now();
-        auto result = db.executeJoinPlan(
-            txn,
+        BuzzDB::requireRunningTransaction(txn);
+        auto result = db.query_processor.executeJoinPlan(
             components,
+            txn,
             physical_join_kinds,
             0,
             plan_root
