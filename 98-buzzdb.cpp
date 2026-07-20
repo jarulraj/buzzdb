@@ -7817,6 +7817,25 @@ public:
 };
 
 const std::string imdb_data_filename = "imdb_large.txt";
+const std::string imdb_join_query =
+    "PROJECT {cn.name}, {miidx.info}, {t.title} "
+    "FROM info_type AS it "
+    "JOIN movie_info_idx AS miidx ON {it.id} = {miidx.info_type_id} "
+    "JOIN movie_companies AS mc ON {miidx.movie_id} = {mc.movie_id} "
+    "JOIN company_name AS cn ON {mc.company_id} = {cn.id} "
+    "JOIN movie_info AS mi ON {mc.movie_id} = {mi.movie_id} "
+    "JOIN title AS t ON {mi.movie_id} = {t.id} "
+    "JOIN kind_type AS kt ON {t.kind_id} = {kt.id} "
+    "JOIN company_type AS ct ON {mc.company_type_id} = {ct.id} "
+    "JOIN info_type AS it2 ON {mi.info_type_id} = {it2.id} "
+    "WHERE {cn.country_code} = [us] "
+    "AND {ct.kind} = production_companies "
+    "AND {it.info} = rating "
+    "AND {it2.info} = release_dates "
+    "AND {kt.kind} = movie "
+    "AND {mi.movie_id} = {miidx.movie_id} "
+    "AND {mi.movie_id} = {mc.movie_id} "
+    "AND {miidx.movie_id} = {mc.movie_id}";
 const std::string imdb_range_table = "title";
 const std::string imdb_range_column = "production_year";
 
@@ -7858,6 +7877,145 @@ void printImportResult(const ImportResult& result) {
     }
 
     throw std::runtime_error("Importer finished without loading or skipping.");
+}
+
+std::vector<ImdbIndexSpec> imdbIndexSpecs() {
+    std::vector<ImdbIndexSpec> specs;
+
+    auto addPrimaryKey = [&](const std::string& table_name) {
+        specs.push_back({
+            "pk_" + table_name,
+            table_name,
+            "id",
+            true,
+            true
+        });
+    };
+
+    auto addForeignKey = [&](const std::string& index_name,
+                             const std::string& table_name,
+                             const std::string& column_name) {
+        specs.push_back({
+            index_name,
+            table_name,
+            column_name,
+            false,
+            false
+        });
+    };
+
+    for (const std::string& table_name : {
+             "aka_name",
+             "aka_title",
+             "cast_info",
+             "char_name",
+             "comp_cast_type",
+             "company_name",
+             "company_type",
+             "complete_cast",
+             "info_type",
+             "keyword",
+             "kind_type",
+             "link_type",
+             "movie_companies",
+             "movie_info",
+             "movie_info_idx",
+             "movie_keyword",
+             "movie_link",
+             "name",
+             "person_info",
+             "role_type",
+             "title"
+         }) {
+        addPrimaryKey(table_name);
+    }
+
+    addForeignKey("company_id_movie_companies", "movie_companies", "company_id");
+    addForeignKey("company_type_id_movie_companies", "movie_companies", "company_type_id");
+    addForeignKey("info_type_id_movie_info_idx", "movie_info_idx", "info_type_id");
+    addForeignKey("info_type_id_movie_info", "movie_info", "info_type_id");
+    addForeignKey("info_type_id_person_info", "person_info", "info_type_id");
+    addForeignKey("keyword_id_movie_keyword", "movie_keyword", "keyword_id");
+    addForeignKey("kind_id_aka_title", "aka_title", "kind_id");
+    addForeignKey("kind_id_title", "title", "kind_id");
+    addForeignKey("linked_movie_id_movie_link", "movie_link", "linked_movie_id");
+    addForeignKey("link_type_id_movie_link", "movie_link", "link_type_id");
+    addForeignKey("movie_id_aka_title", "aka_title", "movie_id");
+    addForeignKey("movie_id_cast_info", "cast_info", "movie_id");
+    addForeignKey("movie_id_complete_cast", "complete_cast", "movie_id");
+    addForeignKey("movie_id_movie_companies", "movie_companies", "movie_id");
+    addForeignKey("movie_id_movie_info_idx", "movie_info_idx", "movie_id");
+    addForeignKey("movie_id_movie_keyword", "movie_keyword", "movie_id");
+    addForeignKey("movie_id_movie_link", "movie_link", "movie_id");
+    addForeignKey("movie_id_movie_info", "movie_info", "movie_id");
+    addForeignKey("person_id_aka_name", "aka_name", "person_id");
+    addForeignKey("person_id_cast_info", "cast_info", "person_id");
+    addForeignKey("person_id_person_info", "person_info", "person_id");
+    addForeignKey("person_role_id_cast_info", "cast_info", "person_role_id");
+    addForeignKey("role_id_cast_info", "cast_info", "role_id");
+
+    return specs;
+}
+
+void printImdbIndexBuildSummary(const ImdbIndexBuildSummary& summary) {
+    std::cout << "\nHash index build:" << std::endl;
+    std::cout << "  primary-key indexes built: " << summary.primaryBuilt()
+              << std::endl;
+    std::cout << "  foreign-key indexes built: " << summary.foreignKeyBuilt()
+              << std::endl;
+    std::cout << "  skipped IMDB index specs: " << summary.skipped.size()
+              << std::endl;
+}
+
+size_t countJoinKind(const std::shared_ptr<JoinPlanNode>& node,
+                     PhysicalJoinKind kind) {
+    if (!node || node->is_leaf) {
+        return 0;
+    }
+    size_t count = node->chosen_join_kind == kind ? 1 : 0;
+    return count +
+           countJoinKind(node->left, kind) +
+           countJoinKind(node->right, kind);
+}
+
+struct TimedQueryResult {
+    QueryResult result;
+    double elapsed_seconds = 0.0;
+};
+
+TimedQueryResult executeJoinQueryInTransaction(
+        BuzzDB& db,
+        const QueryComponents& components,
+        const std::shared_ptr<JoinPlanNode>& plan_root) {
+    auto txn = db.beginTransaction();
+    try {
+        auto query_start = std::chrono::high_resolution_clock::now();
+        auto result = db.queryProcessor().executeJoinPlan(
+            components,
+            txn,
+            nullptr,
+            0,
+            plan_root
+        );
+        auto query_end = std::chrono::high_resolution_clock::now();
+        db.commit(txn);
+
+        std::chrono::duration<double> elapsed = query_end - query_start;
+        return {std::move(result), elapsed.count()};
+    } catch (...) {
+        if (txn && txn->state == TxnContext::RUNNING) {
+            db.abort(txn);
+        }
+        throw;
+    }
+}
+
+void printTimedQueryResult(const std::string& label,
+                           const TimedQueryResult& timed_result) {
+    std::cout << "  " << label
+              << ": rows=" << timed_result.result.row_count
+              << " elapsed=" << timed_result.elapsed_seconds
+              << " seconds" << std::endl;
 }
 
 std::string fieldValueOrMissing(const std::optional<Field>& value) {
@@ -7945,6 +8103,117 @@ void printAccessPathExecution(const AccessPathExecutionResult& result) {
                   << ", tuples fetched=" << result.tuples_fetched;
     }
     std::cout << std::endl;
+}
+
+void runImdbJoinAccessPathSelection() {
+    BuzzDB db;
+    auto import_start = std::chrono::high_resolution_clock::now();
+    auto import_result = ensureImdbDatasetLoaded(db);
+    auto import_end = std::chrono::high_resolution_clock::now();
+    printImportResult(import_result);
+    if (import_result.loaded) {
+        std::chrono::duration<double> import_elapsed =
+            import_end - import_start;
+        std::cout << "Elapsed database importing time: "
+                  << import_elapsed.count() << " seconds" << std::endl;
+    }
+
+    auto index_build = db.buildIndexes(imdbIndexSpecs());
+    printImdbIndexBuildSummary(index_build);
+
+    auto components = db.parseSelectStatement(imdb_join_query);
+    auto stats = db.optimizer().analyzeQueryTables(components);
+
+    auto baseline_search = db.optimizer().chooseBushyJoinOrder(
+        components,
+        stats
+    );
+    auto indexed_search = db.optimizer().chooseBushyJoinOrder(
+        components,
+        stats,
+        &db.indexes()
+    );
+
+    std::cout << "\nBushy DP physical access-path search:" << std::endl;
+    std::cout << "  baseline: table-scan leaves and no index joins"
+              << ", states=" << baseline_search.states_kept
+              << ", candidates=" << baseline_search.candidates_considered
+              << ", pruned_cross_products="
+              << baseline_search.cross_products_pruned
+              << ", cost=" << formatEstimate(baseline_search.estimated_cost)
+              << ", final_est="
+              << formatEstimate(baseline_search.final_estimate)
+              << std::endl;
+    std::cout << "  with hash indexes: IndexNestedLoopJoin allowed"
+              << ", states=" << indexed_search.states_kept
+              << ", candidates=" << indexed_search.candidates_considered
+              << ", pruned_cross_products="
+              << indexed_search.cross_products_pruned
+              << ", cost=" << formatEstimate(indexed_search.estimated_cost)
+              << ", final_est="
+              << formatEstimate(indexed_search.final_estimate)
+              << ", index_joins="
+              << countJoinKind(
+                    indexed_search.plan_root,
+                    PhysicalJoinKind::IndexNestedLoopJoin
+                 )
+              << std::endl;
+
+    db.optimizer().printJoinPlanTree(
+        "Bushy DP baseline physical tree",
+        baseline_search.components,
+        baseline_search.plan_root
+    );
+    db.optimizer().printJoinPlanTree(
+        "Bushy DP indexed physical tree",
+        indexed_search.components,
+        indexed_search.plan_root
+    );
+
+    std::cout << "\nQuery time comparison "
+              << "(buffer pool cleared before each run):" << std::endl;
+    db.clearBufferPool();
+    auto baseline_result = executeJoinQueryInTransaction(
+        db,
+        baseline_search.components,
+        baseline_search.plan_root
+    );
+    db.clearBufferPool();
+    auto indexed_result = executeJoinQueryInTransaction(
+        db,
+        indexed_search.components,
+        indexed_search.plan_root
+    );
+    printTimedQueryResult("Bushy DP table-scan baseline", baseline_result);
+    printTimedQueryResult("Bushy DP with join indexes", indexed_result);
+    if (baseline_result.result.row_count != indexed_result.result.row_count) {
+        throw std::runtime_error("Index planning changed the query result.");
+    }
+
+    double actual_rows = static_cast<double>(baseline_result.result.row_count);
+    std::cout << "\nFinal join q-error:" << std::endl;
+    std::cout << "  table-scan baseline: estimate="
+              << formatEstimate(baseline_search.final_estimate)
+              << " actual=" << baseline_result.result.row_count
+              << " q-error=" << formatQError(
+                    baseline_search.final_estimate,
+                    actual_rows
+                 )
+              << std::endl;
+    std::cout << "  indexed plan: estimate="
+              << formatEstimate(indexed_search.final_estimate)
+              << " actual=" << indexed_result.result.row_count
+              << " q-error=" << formatQError(
+                    indexed_search.final_estimate,
+                    actual_rows
+                 )
+              << std::endl;
+
+    std::cout << "\nTakeaway: v98 chooses TableScan vs IndexScan for one"
+              << " filtered table. v99 applies the same access-path idea"
+              << " inside a join tree: when the inner side is an indexed"
+              << " base table, the optimizer can choose IndexNestedLoopJoin"
+              << " instead of a hash join.\n";
 }
 
 void runImdbAccessPathSelection() {
@@ -8083,9 +8352,9 @@ void runImdbAccessPathSelection() {
 int main() {
     try {
 
-    std::cout << "IMDB cost-based access path selection\n";
+    std::cout << "IMDB join access path selection with indexes\n";
 
-    runImdbAccessPathSelection();
+    runImdbJoinAccessPathSelection();
 
     return 0;
     } catch (const std::exception& error) {

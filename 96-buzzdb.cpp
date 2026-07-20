@@ -4296,12 +4296,20 @@ struct QueryResult {
     std::vector<std::vector<std::unique_ptr<Field>>> sample_rows;
 };
 
+struct HistogramBucket {
+    int lower = 0;
+    int upper = 0;
+    size_t count = 0;
+};
+
 struct ColumnStats {
     FieldType type = INT;
     size_t distinct_count = 0;
     std::map<std::string, size_t> mcv_counts;
     std::optional<Field> min_value;
     std::optional<Field> max_value;
+    std::vector<HistogramBucket> equi_width_histogram;
+    std::vector<HistogramBucket> equi_depth_histogram;
 };
 
 struct TableStats {
@@ -5120,6 +5128,7 @@ private:
     PageManager& page_manager;
 
     static constexpr size_t MCV_LIMIT = 5;
+    static constexpr size_t HISTOGRAM_BUCKET_COUNT = 10;
 
     static void replaceOptionalField(std::optional<Field>& target,
                                      const Field& value) {
@@ -5157,6 +5166,66 @@ private:
             top_counts[counts[i].first] = counts[i].second;
         }
         return top_counts;
+    }
+
+    static std::vector<HistogramBucket> buildEquiWidthHistogram(
+            const std::vector<int>& values,
+            size_t bucket_count) {
+        std::vector<HistogramBucket> buckets;
+        if (values.empty() || bucket_count == 0) {
+            return buckets;
+        }
+
+        auto minmax = std::minmax_element(values.begin(), values.end());
+        int min_value = *minmax.first;
+        int max_value = *minmax.second;
+        size_t domain_width =
+            static_cast<size_t>(max_value - min_value) + 1;
+        size_t bucket_width =
+            std::max<size_t>(1, (domain_width + bucket_count - 1) / bucket_count);
+
+        for (size_t bucket = 0; bucket < bucket_count; bucket++) {
+            int lower = min_value + static_cast<int>(bucket * bucket_width);
+            if (lower > max_value) {
+                break;
+            }
+            int upper = std::min(
+                max_value,
+                lower + static_cast<int>(bucket_width) - 1
+            );
+            buckets.push_back({lower, upper, 0});
+        }
+
+        for (int value : values) {
+            size_t bucket = std::min(
+                buckets.size() - 1,
+                static_cast<size_t>(value - min_value) / bucket_width
+            );
+            buckets[bucket].count++;
+        }
+        return buckets;
+    }
+
+    static std::vector<HistogramBucket> buildEquiDepthHistogram(
+            std::vector<int> values,
+            size_t bucket_count) {
+        std::vector<HistogramBucket> buckets;
+        if (values.empty() || bucket_count == 0) {
+            return buckets;
+        }
+
+        std::sort(values.begin(), values.end());
+        bucket_count = std::min(bucket_count, values.size());
+        for (size_t bucket = 0; bucket < bucket_count; bucket++) {
+            size_t begin = bucket * values.size() / bucket_count;
+            size_t end = ((bucket + 1) * values.size() / bucket_count) - 1;
+            buckets.push_back({
+                values[begin],
+                values[end],
+                end - begin + 1
+            });
+        }
+        return buckets;
     }
 
     static QueryComponents makeJoinPlanComponents(
@@ -5317,6 +5386,8 @@ private:
             metadata.schema.columns.size());
         std::vector<std::map<std::string, size_t>> value_counts(
             metadata.schema.columns.size());
+        std::vector<std::vector<int>> int_values(
+            metadata.schema.columns.size());
         for (size_t column = 0; column < metadata.schema.columns.size(); column++) {
             stats.columns[column].type = metadata.schema.columns[column].type;
         }
@@ -5339,6 +5410,9 @@ private:
                     auto value_string = fieldToString(value);
                     distinct_values[column].insert(value_string);
                     value_counts[column][value_string]++;
+                    if (value.getType() == INT) {
+                        int_values[column].push_back(value.asInt());
+                    }
 
                     if (!column_stats.min_value ||
                         compareFields(value, *column_stats.min_value) < 0) {
@@ -5358,6 +5432,18 @@ private:
                 value_counts[column],
                 MCV_LIMIT
             );
+            if (stats.columns[column].type == INT) {
+                stats.columns[column].equi_width_histogram =
+                    buildEquiWidthHistogram(
+                        int_values[column],
+                        HISTOGRAM_BUCKET_COUNT
+                    );
+                stats.columns[column].equi_depth_histogram =
+                    buildEquiDepthHistogram(
+                        int_values[column],
+                        HISTOGRAM_BUCKET_COUNT
+                    );
+            }
         }
         return stats;
     }
@@ -5851,6 +5937,43 @@ public:
         double overlap_width =
             static_cast<double>(overlap_upper - overlap_lower + 1);
         return input_rows * overlap_width / domain_width;
+    }
+
+    double estimateRangeFilterRowsFromHistogram(
+            const std::vector<HistogramBucket>& buckets,
+            int lower_bound,
+            int upper_bound) const {
+        if (buckets.empty()) {
+            return 0.0;
+        }
+
+        int range_lower = lower_bound + 1;
+        int range_upper = upper_bound - 1;
+        if (range_lower > range_upper) {
+            return 0.0;
+        }
+
+        double estimate = 0.0;
+        for (const auto& bucket : buckets) {
+            if (range_upper < bucket.lower || range_lower > bucket.upper) {
+                continue;
+            }
+
+            if (bucket.lower == bucket.upper) {
+                estimate += static_cast<double>(bucket.count);
+                continue;
+            }
+
+            int overlap_lower = std::max(range_lower, bucket.lower);
+            int overlap_upper = std::min(range_upper, bucket.upper);
+            double bucket_width =
+                static_cast<double>(bucket.upper - bucket.lower + 1);
+            double overlap_width =
+                static_cast<double>(overlap_upper - overlap_lower + 1);
+            estimate += static_cast<double>(bucket.count) *
+                        overlap_width / bucket_width;
+        }
+        return estimate;
     }
 
     std::map<TableId, TableStats> analyzeQueryTables(
@@ -7350,11 +7473,20 @@ public:
 };
 
 const std::string imdb_data_filename = "imdb_large.txt";
-const std::string imdb_range_query =
-    "SELECT COUNT(id) FROM title GROUP BY kind_id "
-    "WHERE production_year > 1990 and production_year < 2010";
 const std::string imdb_range_table = "title";
 const std::string imdb_range_column = "production_year";
+
+struct RangePredicateCase {
+    std::string label;
+    int lower_bound = 0;
+    int upper_bound = 0;
+};
+
+std::string imdbRangeQueryText(const RangePredicateCase& range_case) {
+    return "SELECT COUNT(id) FROM title GROUP BY kind_id "
+           "WHERE production_year > " + std::to_string(range_case.lower_bound) +
+           " and production_year < " + std::to_string(range_case.upper_bound);
+}
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
     if (db.isDatabaseEmpty()) {
@@ -7417,6 +7549,40 @@ std::string topMcvSummary(const ColumnStats& column_stats, size_t limit = 5) {
     return out.str();
 }
 
+void printHistogram(const std::string& label,
+                    const std::vector<HistogramBucket>& buckets,
+                    size_t bar_width = 40) {
+    std::cout << "  " << label << ":" << std::endl;
+    if (buckets.empty()) {
+        std::cout << "    none" << std::endl;
+        return;
+    }
+
+    size_t max_count = 0;
+    for (const auto& bucket : buckets) {
+        max_count = std::max(max_count, bucket.count);
+    }
+
+    for (size_t i = 0; i < buckets.size(); i++) {
+        const auto& bucket = buckets[i];
+        size_t bar_length = 0;
+        if (max_count > 0 && bucket.count > 0) {
+            bar_length = std::max<size_t>(
+                1,
+                bucket.count * bar_width / max_count
+            );
+        }
+
+        std::cout << "    "
+                  << std::setw(2) << (i + 1)
+                  << " [" << std::setw(4) << bucket.lower
+                  << "-" << std::setw(4) << bucket.upper
+                  << "] rows=" << std::setw(4) << bucket.count
+                  << " | " << std::string(bar_length, '#')
+                  << std::endl;
+    }
+}
+
 void runImdbRangeEstimation() {
     BuzzDB db;
     auto import_start = std::chrono::high_resolution_clock::now();
@@ -7430,27 +7596,32 @@ void runImdbRangeEstimation() {
                   << import_elapsed.count() << " seconds" << std::endl;
     }
 
-    auto components = db.parseSelectStatement(imdb_range_query);
+    const std::vector<RangePredicateCase> range_cases = {
+        {
+            "recent dense years, where equi-depth captures the skew",
+            1990,
+            2010
+        },
+        {
+            "recent tail years, where equi-depth is much sharper",
+            2011,
+            2014
+        },
+        {
+            "early sparse years, where equi-width is better",
+            1889,
+            1940
+        }
+    };
+
+    auto components = db.parseSelectStatement(
+        imdbRangeQueryText(range_cases.front())
+    );
     auto table_stats = db.optimizer().analyzeTableByName(imdb_range_table);
     const auto& column_stats = table_stats.columns.at(
         static_cast<size_t>(components.whereAttributeIndex)
     );
 
-    double estimated_rows = db.optimizer().estimateRangeFilterRowsUniform(
-        static_cast<double>(table_stats.row_count),
-        column_stats,
-        components.lowerBound,
-        components.upperBound
-    );
-    size_t actual_rows = db.queryProcessor().countRowsInIntRange(
-        imdb_range_table,
-        imdb_range_column,
-        components.lowerBound,
-        components.upperBound
-    );
-
-    std::cout << "\nQuery:" << std::endl;
-    std::cout << "  " << imdb_range_query << std::endl;
     std::cout << "\nANALYZE stats already available:" << std::endl;
     std::cout << "  table: " << imdb_range_table
               << ", rows=" << table_stats.row_count
@@ -7461,29 +7632,78 @@ void runImdbRangeEstimation() {
               << ", max=" << fieldValueOrMissing(column_stats.max_value)
               << std::endl;
     std::cout << "  MCV sample: " << topMcvSummary(column_stats) << std::endl;
+    printHistogram("equi-width histogram", column_stats.equi_width_histogram);
+    printHistogram("equi-depth histogram", column_stats.equi_depth_histogram);
 
-    std::cout << "\nUniform min/max range estimate:" << std::endl;
-    std::cout << "  predicate: " << imdb_range_column
-              << " > " << components.lowerBound
-              << " AND " << imdb_range_column
-              << " < " << components.upperBound << std::endl;
-    std::cout << "  estimated rows=" << formatEstimate(estimated_rows)
-              << std::endl;
-    std::cout << "  actual rows=" << actual_rows << std::endl;
-    std::cout << "  q-error="
-              << formatQError(estimated_rows, static_cast<double>(actual_rows))
-              << std::endl;
+    std::cout << "\nRange estimate comparison:" << std::endl;
+    for (const auto& range_case : range_cases) {
+        auto query = imdbRangeQueryText(range_case);
+        auto query_components = db.parseSelectStatement(query);
+        double uniform_estimated_rows =
+            db.optimizer().estimateRangeFilterRowsUniform(
+                static_cast<double>(table_stats.row_count),
+                column_stats,
+                query_components.lowerBound,
+                query_components.upperBound
+            );
+        double equi_width_estimated_rows =
+            db.optimizer().estimateRangeFilterRowsFromHistogram(
+                column_stats.equi_width_histogram,
+                query_components.lowerBound,
+                query_components.upperBound
+            );
+        double equi_depth_estimated_rows =
+            db.optimizer().estimateRangeFilterRowsFromHistogram(
+                column_stats.equi_depth_histogram,
+                query_components.lowerBound,
+                query_components.upperBound
+            );
+        size_t actual_rows = db.queryProcessor().countRowsInIntRange(
+            imdb_range_table,
+            imdb_range_column,
+            query_components.lowerBound,
+            query_components.upperBound
+        );
 
-    std::cout << "\nTakeaway: MCV stats help equality predicates, but this"
-              << " range estimate only knows min/max and assumes the years"
-              << " are uniformly distributed. Histograms refine this by"
-              << " modeling the distribution inside the range.\n";
+        std::cout << "\n  " << range_case.label << std::endl;
+        std::cout << "  query: " << query << std::endl;
+        std::cout << "  actual rows=" << actual_rows << std::endl;
+        std::cout << "  uniform min/max estimate="
+                  << formatEstimate(uniform_estimated_rows)
+                  << ", q-error="
+                  << formatQError(
+                         uniform_estimated_rows,
+                         static_cast<double>(actual_rows)
+                     )
+                  << std::endl;
+        std::cout << "  equi-width histogram estimate="
+                  << formatEstimate(equi_width_estimated_rows)
+                  << ", q-error="
+                  << formatQError(
+                         equi_width_estimated_rows,
+                         static_cast<double>(actual_rows)
+                     )
+                  << std::endl;
+        std::cout << "  equi-depth histogram estimate="
+                  << formatEstimate(equi_depth_estimated_rows)
+                  << ", q-error="
+                  << formatQError(
+                         equi_depth_estimated_rows,
+                         static_cast<double>(actual_rows)
+                     )
+                  << std::endl;
+    }
+
+    std::cout << "\nTakeaway: MCV stats help equality predicates and min/max"
+              << " gives a crude range estimate. Equi-depth is often better"
+              << " for dense skewed ranges, while equi-width can be better"
+              << " for sparse ranges that occupy a narrow part of the domain.\n";
 }
 
 int main() {
     try {
 
-    std::cout << "IMDB range predicate estimation\n";
+    std::cout << "IMDB histogram range predicate estimation\n";
 
     runImdbRangeEstimation();
 
