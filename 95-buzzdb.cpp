@@ -28,7 +28,6 @@
 #include <utility>
 #include <limits>
 #include <unordered_map>
-#include <random>
 #include <unistd.h>
 
 enum FieldType { INT, FLOAT, STRING };
@@ -270,6 +269,80 @@ constexpr TableId INVALID_TABLE_ID = 0;
 constexpr TableId SYS_TABLES_ID = 1;
 constexpr TableId SYS_COLUMNS_ID = 2;
 constexpr TableId FIRST_USER_TABLE_ID = 100;
+
+struct RecordId {
+    TableId table_id = INVALID_TABLE_ID;
+    PageID page_id = INVALID_PAGE_ID;
+    size_t slot_id = 0;
+};
+
+struct IndexDescriptor {
+    TableId table_id = INVALID_TABLE_ID;
+    size_t column_index = 0;
+
+    bool operator<(const IndexDescriptor& other) const {
+        if (table_id != other.table_id) {
+            return table_id < other.table_id;
+        }
+        return column_index < other.column_index;
+    }
+
+    bool operator==(const IndexDescriptor& other) const {
+        return table_id == other.table_id &&
+               column_index == other.column_index;
+    }
+};
+
+struct IndexKey {
+    FieldType type = INT;
+    int int_value = 0;
+    float float_value = 0.0f;
+    std::string string_value;
+
+    explicit IndexKey(const Field& field) : type(field.getType()) {
+        switch (type) {
+            case INT:
+                int_value = field.asInt();
+                break;
+            case FLOAT:
+                float_value = field.asFloat();
+                break;
+            case STRING:
+                string_value = field.asString();
+                break;
+        }
+    }
+
+    bool operator==(const IndexKey& other) const {
+        if (type != other.type) {
+            return false;
+        }
+
+        switch (type) {
+            case INT:
+                return int_value == other.int_value;
+            case FLOAT:
+                return float_value == other.float_value;
+            case STRING:
+                return string_value == other.string_value;
+        }
+        return false;
+    }
+};
+
+struct IndexKeyHasher {
+    std::size_t operator()(const IndexKey& key) const {
+        switch (key.type) {
+            case INT:
+                return std::hash<int>{}(key.int_value);
+            case FLOAT:
+                return std::hash<float>{}(key.float_value);
+            case STRING:
+                return std::hash<std::string>{}(key.string_value);
+        }
+        return 0;
+    }
+};
 const std::string BOOTSTRAP_MAGIC = "BUZZDB_BOOTSTRAP";
 
 enum class CrashPoint {
@@ -2170,11 +2243,19 @@ struct ColumnSchema {
 struct TableSchema {
     std::vector<ColumnSchema> columns;
 
-    int getColumnIndex(const std::string& name) const {
+    std::optional<size_t> findColumnIndex(const std::string& name) const {
         for (size_t i = 0; i < columns.size(); i++) {
             if (columns[i].name == name) {
-                return static_cast<int>(i);
+                return i;
             }
+        }
+        return std::nullopt;
+    }
+
+    int getColumnIndex(const std::string& name) const {
+        auto index = findColumnIndex(name);
+        if (index) {
+            return static_cast<int>(*index);
         }
         throw std::runtime_error("Unknown column: " + name);
     }
@@ -2643,6 +2724,201 @@ private:
     }
 };
 
+struct ImdbIndexSpec {
+    std::string index_name;
+    std::string table_name;
+    std::string column_name;
+    bool unique = false;
+    bool primary_key = false;
+};
+
+struct IndexBuildResult {
+    std::string index_name;
+    std::string table_name;
+    std::string column_name;
+    bool unique = false;
+    bool primary_key = false;
+    size_t entries = 0;
+    size_t distinct_keys = 0;
+};
+
+struct ImdbIndexBuildSummary {
+    std::vector<IndexBuildResult> built;
+    std::vector<std::string> skipped;
+
+    size_t primaryBuilt() const {
+        size_t count = 0;
+        for (const auto& result : built) {
+            if (result.primary_key) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    size_t foreignKeyBuilt() const {
+        size_t count = 0;
+        for (const auto& result : built) {
+            if (!result.primary_key) {
+                count++;
+            }
+        }
+        return count;
+    }
+};
+
+class HashIndex {
+private:
+    std::unordered_map<IndexKey, std::vector<RecordId>, IndexKeyHasher> entries;
+    bool unique_index = false;
+
+public:
+    void clear(bool unique) {
+        entries.clear();
+        unique_index = unique;
+    }
+
+    void insert(const Field& key, const RecordId& record_id) {
+        auto& records = entries[IndexKey(key)];
+        if (unique_index && !records.empty()) {
+            throw std::runtime_error("Duplicate key in unique hash index.");
+        }
+        records.push_back(record_id);
+    }
+
+    const std::vector<RecordId>* lookup(const Field& key) const {
+        auto it = entries.find(IndexKey(key));
+        if (it == entries.end()) {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    size_t entryCount() const {
+        size_t count = 0;
+        for (const auto& entry : entries) {
+            count += entry.second.size();
+        }
+        return count;
+    }
+
+    size_t distinctKeyCount() const {
+        return entries.size();
+    }
+
+    bool unique() const {
+        return unique_index;
+    }
+};
+
+class IndexManager {
+private:
+    struct BuildTarget {
+        ImdbIndexSpec spec;
+        IndexDescriptor descriptor;
+    };
+
+    Catalog& catalog;
+    PageManager& page_manager;
+    std::map<IndexDescriptor, HashIndex> hash_indexes;
+
+public:
+    IndexManager(Catalog& catalog, PageManager& page_manager)
+        : catalog(catalog), page_manager(page_manager) {}
+
+    ImdbIndexBuildSummary buildIndexes(const std::vector<ImdbIndexSpec>& specs) {
+        ImdbIndexBuildSummary summary;
+        std::map<std::string, std::vector<BuildTarget>> targets_by_table;
+
+        for (const auto& spec : specs) {
+            if (!catalog.hasTable(spec.table_name)) {
+                summary.skipped.push_back(
+                    spec.index_name + " on " + spec.table_name + "." +
+                    spec.column_name + " (missing table)"
+                );
+                continue;
+            }
+
+            auto& metadata = catalog.getTable(spec.table_name);
+            auto column_index = metadata.schema.findColumnIndex(spec.column_name);
+            if (!column_index) {
+                summary.skipped.push_back(
+                    spec.index_name + " on " + spec.table_name + "." +
+                    spec.column_name + " (missing column)"
+                );
+                continue;
+            }
+
+            targets_by_table[spec.table_name].push_back({
+                spec,
+                {metadata.table_id, *column_index}
+            });
+        }
+
+        for (auto& entry : targets_by_table) {
+            auto& metadata = catalog.getTable(entry.first);
+            for (const auto& target : entry.second) {
+                hash_indexes[target.descriptor].clear(target.spec.unique);
+            }
+
+            TableHeap table_heap(metadata, page_manager);
+            for (PageID page_id = table_heap.firstPage();
+                 page_id != INVALID_PAGE_ID;
+                 page_id = table_heap.nextPage(page_id)) {
+                for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
+                    auto tuple = table_heap.getTuple(page_id, slot);
+                    if (!tuple) {
+                        continue;
+                    }
+
+                    for (const auto& target : entry.second) {
+                        size_t column_index = target.descriptor.column_index;
+                        if (column_index >= tuple->fields.size()) {
+                            continue;
+                        }
+                        hash_indexes[target.descriptor].insert(
+                            *tuple->fields[column_index],
+                            {metadata.table_id, page_id, slot}
+                        );
+                    }
+                }
+            }
+
+            for (const auto& target : entry.second) {
+                const auto& index = hash_indexes.at(target.descriptor);
+                summary.built.push_back({
+                    target.spec.index_name,
+                    target.spec.table_name,
+                    target.spec.column_name,
+                    target.spec.unique,
+                    target.spec.primary_key,
+                    index.entryCount(),
+                    index.distinctKeyCount()
+                });
+            }
+        }
+
+        return summary;
+    }
+
+    bool hasHashIndex(const IndexDescriptor& descriptor) const {
+        return hash_indexes.find(descriptor) != hash_indexes.end();
+    }
+
+    const HashIndex& hashIndex(const IndexDescriptor& descriptor) const {
+        auto it = hash_indexes.find(descriptor);
+        if (it == hash_indexes.end()) {
+            throw std::runtime_error("Hash index is not built.");
+        }
+        return it->second;
+    }
+
+    const std::vector<RecordId>* lookup(const IndexDescriptor& descriptor,
+                                        const Field& value) const {
+        return hashIndex(descriptor).lookup(value);
+    }
+};
+
 class Operator {
     public:
     virtual ~Operator() = default;
@@ -3076,6 +3352,135 @@ public:
             return {};
         }
         return cloneFields(currentOutput);
+    }
+};
+
+class IndexNestedLoopJoinOperator : public Operator {
+private:
+    Operator& outer;
+    TableHeap& inner_heap;
+    const HashIndex& index;
+    size_t outer_attr_index;
+    size_t inner_attr_index;
+    bool inner_output_first;
+    std::unique_ptr<IPredicate> inner_predicate;
+    std::vector<std::unique_ptr<Field>> current_outer_tuple;
+    std::vector<std::unique_ptr<Field>> current_output;
+    const std::vector<RecordId>* matching_records = nullptr;
+    size_t matching_record_index = 0;
+    bool has_outer_tuple = false;
+    bool has_next = false;
+
+public:
+    IndexNestedLoopJoinOperator(
+            Operator& outer,
+            TableHeap& inner_heap,
+            const HashIndex& index,
+            size_t outer_attr_index,
+            size_t inner_attr_index,
+            bool inner_output_first,
+            std::unique_ptr<IPredicate> inner_predicate)
+        : outer(outer),
+          inner_heap(inner_heap),
+          index(index),
+          outer_attr_index(outer_attr_index),
+          inner_attr_index(inner_attr_index),
+          inner_output_first(inner_output_first),
+          inner_predicate(std::move(inner_predicate)) {}
+
+    void open() override {
+        outer.open();
+        current_outer_tuple.clear();
+        current_output.clear();
+        matching_records = nullptr;
+        matching_record_index = 0;
+        has_outer_tuple = false;
+        has_next = false;
+    }
+
+    bool next() override {
+        current_output.clear();
+        has_next = false;
+
+        while (true) {
+            if (!has_outer_tuple) {
+                if (!outer.next()) {
+                    return false;
+                }
+                current_outer_tuple = outer.getOutput();
+                if (outer_attr_index >= current_outer_tuple.size()) {
+                    throw std::runtime_error(
+                        "Index nested-loop outer attribute index out of range."
+                    );
+                }
+                matching_records = index.lookup(
+                    *current_outer_tuple[outer_attr_index]
+                );
+                matching_record_index = 0;
+                has_outer_tuple = true;
+            }
+
+            while (matching_records &&
+                   matching_record_index < matching_records->size()) {
+                const auto& record_id =
+                    (*matching_records)[matching_record_index++];
+                auto inner_tuple = inner_heap.getTuple(
+                    record_id.page_id,
+                    record_id.slot_id
+                );
+                if (!inner_tuple) {
+                    continue;
+                }
+                if (inner_attr_index >= inner_tuple->fields.size()) {
+                    throw std::runtime_error(
+                        "Index nested-loop inner attribute index out of range."
+                    );
+                }
+                if (!(*current_outer_tuple[outer_attr_index] ==
+                      *inner_tuple->fields[inner_attr_index])) {
+                    continue;
+                }
+                if (inner_predicate &&
+                    !inner_predicate->check(inner_tuple->fields)) {
+                    continue;
+                }
+
+                if (inner_output_first) {
+                    current_output = cloneFields(inner_tuple->fields);
+                    for (const auto& field : current_outer_tuple) {
+                        current_output.push_back(field->clone());
+                    }
+                } else {
+                    current_output = cloneFields(current_outer_tuple);
+                    for (const auto& field : inner_tuple->fields) {
+                        current_output.push_back(field->clone());
+                    }
+                }
+                has_next = true;
+                return true;
+            }
+
+            has_outer_tuple = false;
+            matching_records = nullptr;
+            matching_record_index = 0;
+        }
+    }
+
+    void close() override {
+        outer.close();
+        current_outer_tuple.clear();
+        current_output.clear();
+        matching_records = nullptr;
+        matching_record_index = 0;
+        has_outer_tuple = false;
+        has_next = false;
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        if (!has_next) {
+            return {};
+        }
+        return cloneFields(current_output);
     }
 };
 
@@ -4013,7 +4418,8 @@ std::string formatQError(double estimate, double actual) {
 
 enum class PhysicalJoinKind {
     NestedLoopJoin,
-    HashJoin
+    HashJoin,
+    IndexNestedLoopJoin
 };
 
 std::string physicalJoinKindName(PhysicalJoinKind kind) {
@@ -4022,6 +4428,8 @@ std::string physicalJoinKindName(PhysicalJoinKind kind) {
             return "NestedLoopJoin";
         case PhysicalJoinKind::HashJoin:
             return "HashJoin";
+        case PhysicalJoinKind::IndexNestedLoopJoin:
+            return "IndexNestedLoopJoin";
     }
     throw std::runtime_error("Unknown physical join kind.");
 }
@@ -4031,6 +4439,8 @@ struct JoinOrderStepEstimate {
     double output_rows = 0.0;
     RelationStats output_relation;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
+    bool has_index_lookup = false;
+    ColumnRef index_lookup_column;
     double chosen_cost = 0.0;
 };
 
@@ -4049,61 +4459,9 @@ struct JoinPlanNode {
     std::set<TableRefId> table_refs;
     RelationStats relation;
     PhysicalJoinKind chosen_join_kind = PhysicalJoinKind::HashJoin;
+    bool has_index_lookup = false;
+    ColumnRef index_lookup_column;
     double cost = 0.0;
-};
-
-enum class JoinOrderSearchPolicy {
-    SelingerLeftDeepDP,
-    BushyDP,
-    SimulatedAnnealingBushy
-};
-
-std::string joinOrderSearchPolicyName(JoinOrderSearchPolicy policy) {
-    switch (policy) {
-        case JoinOrderSearchPolicy::SelingerLeftDeepDP:
-            return "Selinger left-deep DP";
-        case JoinOrderSearchPolicy::BushyDP:
-            return "Bushy DP";
-        case JoinOrderSearchPolicy::SimulatedAnnealingBushy:
-            return "Simulated Annealing bushy";
-    }
-    throw std::runtime_error("Unknown join-order search policy.");
-}
-
-struct JoinOrderSearchResult {
-    JoinOrderSearchPolicy policy;
-    JoinOrderPlan plan;
-    std::shared_ptr<JoinPlanNode> plan_root;
-    double estimated_cost = 0.0;
-    size_t states_kept = 0;
-    size_t candidates_considered = 0;
-    size_t cross_products_pruned = 0;
-    size_t annealing_attempted_moves = 0;
-    size_t annealing_valid_moves = 0;
-    size_t annealing_invalid_moves = 0;
-    size_t annealing_improving_moves = 0;
-    size_t annealing_worse_moves = 0;
-    size_t annealing_rejected_moves = 0;
-    std::vector<std::string> search_steps;
-};
-
-struct SelingerDpState {
-    TableRefId base_table_ref_id = INVALID_TABLE_REF_ID;
-    std::vector<JoinClause> join_order;
-    std::vector<JoinOrderStepEstimate> steps;
-    std::set<TableRefId> joined_table_refs;
-    RelationStats relation;
-    std::shared_ptr<JoinPlanNode> plan_root;
-    double cost = 0.0;
-};
-
-struct SelingerJoinOrderResult {
-    JoinOrderPlan plan;
-    std::shared_ptr<JoinPlanNode> plan_root;
-    double estimated_cost = 0.0;
-    size_t states_kept = 0;
-    size_t candidates_considered = 0;
-    std::vector<std::string> search_steps;
 };
 
 struct BushyDpState {
@@ -4124,51 +4482,13 @@ struct BushyJoinOrderResult {
     std::vector<std::string> search_steps;
 };
 
-struct BushyAnnealingCheckpoint {
-    size_t attempted_moves = 0;
-    double best_cost = 0.0;
-};
-
-enum class BushyAnnealingMoveKind {
-    SwapChildren,
-    Rotate,
-    ResampleSubtree
-};
-
-struct BushyAnnealingNeighbor {
-    std::shared_ptr<JoinPlanNode> root;
-    BushyAnnealingMoveKind kind = BushyAnnealingMoveKind::ResampleSubtree;
-};
-
-struct BushyAnnealingResult {
-    QueryComponents components;
-    std::shared_ptr<JoinPlanNode> plan_root;
-    double final_estimate = 0.0;
-    double estimated_cost = 0.0;
-    double initial_cost = 0.0;
-    size_t attempted_moves = 0;
-    size_t valid_moves = 0;
-    size_t invalid_moves = 0;
-    size_t improving_moves = 0;
-    size_t worse_moves = 0;
-    size_t rejected_moves = 0;
-    size_t neutral_moves = 0;
-    size_t proposed_swaps = 0;
-    size_t proposed_rotations = 0;
-    size_t proposed_resamples = 0;
-    size_t accepted_swaps = 0;
-    size_t accepted_rotations = 0;
-    size_t accepted_resamples = 0;
-    std::vector<BushyAnnealingCheckpoint> checkpoints;
-    std::vector<std::string> search_steps;
-};
-
 QueryResult executeJoinQuery(const QueryComponents& components,
                              Catalog& catalog,
                              PageManager& page_manager,
                              size_t sample_limit = 5,
                              const std::vector<PhysicalJoinKind>* physical_join_kinds = nullptr,
-                             const std::shared_ptr<JoinPlanNode>& plan_root = nullptr) {
+                             const std::shared_ptr<JoinPlanNode>& plan_root = nullptr,
+                             const IndexManager* index_manager = nullptr) {
     if (components.base_table_ref_id == INVALID_TABLE_REF_ID) {
         throw std::runtime_error("Join query is missing a base table.");
     }
@@ -4184,13 +4504,19 @@ QueryResult executeJoinQuery(const QueryComponents& components,
     std::vector<std::unique_ptr<SelectOperator>> pushed_selects;
     std::vector<std::unique_ptr<NestedLoopJoinOperator>> nested_loop_join_buffers;
     std::vector<std::unique_ptr<HashJoinOperator>> hash_join_buffers;
+    std::vector<std::unique_ptr<IndexNestedLoopJoinOperator>> index_join_buffers;
 
-    auto addScan = [&](TableRefId table_ref_id) -> Operator& {
+    auto addTableHeap = [&](TableRefId table_ref_id) -> TableHeap& {
         const auto& table_ref = tableRefForId(components, table_ref_id);
         auto& metadata = catalog.getTable(table_ref.table_id);
         table_widths[table_ref_id] = metadata.schema.columns.size();
         heaps.push_back(std::make_unique<TableHeap>(metadata, page_manager));
-        scans.push_back(std::make_unique<ScanOperator>(*heaps.back()));
+        return *heaps.back();
+    };
+
+    auto addScan = [&](TableRefId table_ref_id) -> Operator& {
+        TableHeap& table_heap = addTableHeap(table_ref_id);
+        scans.push_back(std::make_unique<ScanOperator>(table_heap));
 
         auto predicate = makeTableFilterPredicate(components, table_ref_id);
         if (predicate) {
@@ -4213,6 +4539,22 @@ QueryResult executeJoinQuery(const QueryComponents& components,
             offset += table_widths.at(current_table_ref_id);
         }
         throw std::runtime_error("JOIN table is not in this subtree.");
+    };
+
+    auto sameColumnRef = [](const ColumnRef& left, const ColumnRef& right) {
+        return left.table_ref_id == right.table_ref_id &&
+               left.column_index == right.column_index;
+    };
+
+    auto otherJoinColumn = [&](const JoinClause& join,
+                               const ColumnRef& column) {
+        if (sameColumnRef(join.left, column)) {
+            return join.right;
+        }
+        if (sameColumnRef(join.right, column)) {
+            return join.left;
+        }
+        throw std::runtime_error("Index lookup column is not part of join.");
     };
 
     auto addJoinOperator = [&](Operator& left_op,
@@ -4241,6 +4583,44 @@ QueryResult executeJoinQuery(const QueryComponents& components,
         return *hash_join_buffers.back();
     };
 
+    auto addIndexJoinOperator =
+            [&](Operator& outer_op,
+                const std::vector<TableRefId>& outer_table_ref_ids,
+                TableRefId indexed_table_ref_id,
+                const ColumnRef& outer_column,
+                const ColumnRef& indexed_column,
+                bool indexed_output_first) -> Operator& {
+        if (!index_manager) {
+            throw std::runtime_error("Index join requires an index manager.");
+        }
+        const auto& indexed_table_ref = tableRefForId(
+            components,
+            indexed_table_ref_id
+        );
+        IndexDescriptor descriptor{
+            indexed_table_ref.table_id,
+            indexed_column.column_index
+        };
+        TableHeap& indexed_heap = addTableHeap(indexed_table_ref_id);
+        auto inner_predicate =
+            makeTableFilterPredicate(components, indexed_table_ref_id);
+        size_t outer_attr_index =
+            tableOffsetIn(outer_table_ref_ids, outer_column.table_ref_id) +
+            outer_column.column_index;
+        index_join_buffers.push_back(
+            std::make_unique<IndexNestedLoopJoinOperator>(
+                outer_op,
+                indexed_heap,
+                index_manager->hashIndex(descriptor),
+                outer_attr_index,
+                indexed_column.column_index,
+                indexed_output_first,
+                std::move(inner_predicate)
+            )
+        );
+        return *index_join_buffers.back();
+    };
+
     struct BuiltPlanOperator {
         Operator* op = nullptr;
         std::vector<TableRefId> table_ref_ids;
@@ -4260,6 +4640,66 @@ QueryResult executeJoinQuery(const QueryComponents& components,
                 {node->table_ref_id},
                 table_widths.at(node->table_ref_id)
             };
+        }
+
+        if (node->chosen_join_kind == PhysicalJoinKind::IndexNestedLoopJoin) {
+            if (!node->has_index_lookup) {
+                throw std::runtime_error("Index join is missing lookup column.");
+            }
+
+            ColumnRef outer_column =
+                otherJoinColumn(node->join, node->index_lookup_column);
+            bool index_on_left =
+                node->left &&
+                node->left->is_leaf &&
+                node->left->table_ref_id ==
+                    node->index_lookup_column.table_ref_id;
+            bool index_on_right =
+                node->right &&
+                node->right->is_leaf &&
+                node->right->table_ref_id ==
+                    node->index_lookup_column.table_ref_id;
+
+            if (index_on_left) {
+                auto right = buildPlanNode(node->right);
+                Operator& join_op = addIndexJoinOperator(
+                    *right.op,
+                    right.table_ref_ids,
+                    node->left->table_ref_id,
+                    outer_column,
+                    node->index_lookup_column,
+                    true
+                );
+                std::vector<TableRefId> table_ref_ids{node->left->table_ref_id};
+                table_ref_ids.insert(
+                    table_ref_ids.end(),
+                    right.table_ref_ids.begin(),
+                    right.table_ref_ids.end()
+                );
+                size_t width =
+                    table_widths.at(node->left->table_ref_id) + right.width;
+                return {&join_op, table_ref_ids, width};
+            }
+
+            if (index_on_right) {
+                auto left = buildPlanNode(node->left);
+                Operator& join_op = addIndexJoinOperator(
+                    *left.op,
+                    left.table_ref_ids,
+                    node->right->table_ref_id,
+                    outer_column,
+                    node->index_lookup_column,
+                    false
+                );
+                left.table_ref_ids.push_back(node->right->table_ref_id);
+                size_t width =
+                    left.width + table_widths.at(node->right->table_ref_id);
+                return {&join_op, left.table_ref_ids, width};
+            }
+
+            throw std::runtime_error(
+                "Index nested-loop join can only probe a base-table child."
+            );
         }
 
         auto left = buildPlanNode(node->left);
@@ -4814,6 +5254,14 @@ private:
         return 0.10 * std::max(0.0, tuples);
     }
 
+    static double tupleIndexProbeCost(double probes) {
+        return 10.0 * std::max(0.0, probes);
+    }
+
+    static double tupleFetchByRecordIdCost(double tuples) {
+        return 0.50 * std::max(0.0, tuples);
+    }
+
     static double nestedLoopJoinCost(double left_total_cost,
                                      double right_total_cost,
                                      double left_rows,
@@ -4834,6 +5282,37 @@ private:
                right_total_cost +
                tupleHashCost(left_rows + right_rows) +
                tupleMaterializationCost(output_rows);
+    }
+
+    static double indexNestedLoopJoinCost(double outer_total_cost,
+                                          double outer_rows,
+                                          double output_rows) {
+        return outer_total_cost +
+               tupleIndexProbeCost(outer_rows) +
+               tupleFetchByRecordIdCost(output_rows) +
+               tupleMaterializationCost(output_rows);
+    }
+
+    std::optional<IndexDescriptor> indexDescriptorForColumn(
+            const QueryComponents& components,
+            const ColumnRef& column,
+            const IndexManager* index_manager) {
+        if (!index_manager) {
+            return std::nullopt;
+        }
+
+        const auto& table_ref = tableRefForId(
+            components,
+            column.table_ref_id
+        );
+        IndexDescriptor descriptor{
+            table_ref.table_id,
+            column.column_index
+        };
+        if (!index_manager->hasHashIndex(descriptor)) {
+            return std::nullopt;
+        }
+        return descriptor;
     }
 
     TableStats analyzeTable(TableMetadata& metadata) {
@@ -5164,6 +5643,8 @@ private:
             output_rows,
             std::move(output_relation),
             chosen_join_kind,
+            false,
+            {},
             chosen_cost
         };
     }
@@ -5214,6 +5695,8 @@ private:
         node->table_refs.insert(right->table_refs.begin(), right->table_refs.end());
         node->relation = step.output_relation;
         node->chosen_join_kind = step.chosen_join_kind;
+        node->has_index_lookup = step.has_index_lookup;
+        node->index_lookup_column = step.index_lookup_column;
         node->cost = step.chosen_cost;
         return node;
     }
@@ -5253,7 +5736,11 @@ private:
             const RelationStats& left_relation,
             double left_cost,
             const RelationStats& right_relation,
-            double right_cost) {
+            double right_cost,
+            const QueryComponents* components = nullptr,
+            const JoinPlanNode* left_plan = nullptr,
+            const JoinPlanNode* right_plan = nullptr,
+            const IndexManager* index_manager = nullptr) {
         auto columns = joinedAndInputColumns(join, left_table_refs);
         double output_rows = estimateJoinRows(
             left_relation.rows,
@@ -5290,12 +5777,58 @@ private:
         double chosen_cost = chosen_join_kind == PhysicalJoinKind::NestedLoopJoin
             ? nested_loop_cost
             : hash_join_cost;
+        bool has_index_lookup = false;
+        ColumnRef index_lookup_column;
+
+        auto considerIndexJoin =
+                [&](const JoinPlanNode* indexed_plan,
+                    const ColumnRef& indexed_column,
+                    double outer_rows,
+                    double outer_cost) {
+            if (!components || !indexed_plan || !indexed_plan->is_leaf) {
+                return;
+            }
+            if (!indexDescriptorForColumn(
+                    *components,
+                    indexed_column,
+                    index_manager
+                )) {
+                return;
+            }
+
+            double index_cost = indexNestedLoopJoinCost(
+                outer_cost,
+                outer_rows,
+                output_rows
+            );
+            if (index_cost < chosen_cost) {
+                chosen_join_kind = PhysicalJoinKind::IndexNestedLoopJoin;
+                chosen_cost = index_cost;
+                has_index_lookup = true;
+                index_lookup_column = indexed_column;
+            }
+        };
+
+        considerIndexJoin(
+            right_plan,
+            columns.second,
+            left_relation.rows,
+            left_cost
+        );
+        considerIndexJoin(
+            left_plan,
+            columns.first,
+            right_relation.rows,
+            right_cost
+        );
 
         return {
             join,
             output_rows,
             std::move(output_relation),
             chosen_join_kind,
+            has_index_lookup,
+            index_lookup_column,
             chosen_cost
         };
     }
@@ -5346,49 +5879,6 @@ private:
             const std::shared_ptr<JoinPlanNode>& node) {
         std::ostringstream output;
         appendJoinPlanTree(components, node, 0, output);
-        return output.str();
-    }
-
-    std::string selingerCandidateTraceLine(
-            const QueryComponents& components,
-            const SelingerDpState& current,
-            const JoinOrderStepEstimate& step) {
-        auto columns = joinedAndInputColumns(step.join, current.joined_table_refs);
-        std::ostringstream output;
-        output << "    candidate {" << joinedTableRefsTraceLabel(
-                    components,
-                    current.joined_table_refs
-                )
-               << "} + "
-               << tableRefForId(components, step.join.input_table_ref_id).alias
-               << " via "
-               << columnTraceLabel(components, columns.first)
-               << " = "
-               << columnTraceLabel(components, columns.second)
-               << " -> " << physicalJoinKindName(step.chosen_join_kind)
-               << ", rows=" << formatEstimate(step.output_rows)
-               << ", cost=" << formatEstimate(step.chosen_cost);
-        return output.str();
-    }
-
-    std::string selingerKeptStateTraceLine(
-            const QueryComponents& components,
-            const SelingerDpState& state) {
-        std::ostringstream order;
-        order << tableRefForId(components, state.base_table_ref_id).alias;
-        for (const auto& join : state.join_order) {
-            order << " -> "
-                  << tableRefForId(components, join.input_table_ref_id).alias;
-        }
-
-        std::ostringstream output;
-        output << "    keep {" << joinedTableRefsTraceLabel(
-                    components,
-                    state.joined_table_refs
-                )
-               << "}: order=" << order.str()
-               << ", rows=" << formatEstimate(state.relation.rows)
-               << ", cost=" << formatEstimate(state.cost);
         return output.str();
     }
 
@@ -5451,187 +5941,6 @@ public:
         );
     }
 
-    static bool betterSelingerState(const SelingerDpState& candidate,
-                                    const SelingerDpState& incumbent) {
-        if (candidate.cost != incumbent.cost) {
-            return candidate.cost < incumbent.cost;
-        }
-        if (candidate.relation.rows != incumbent.relation.rows) {
-            return candidate.relation.rows < incumbent.relation.rows;
-        }
-        return candidate.base_table_ref_id < incumbent.base_table_ref_id;
-    }
-
-    SelingerJoinOrderResult chooseSelingerLeftDeepJoinOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            std::vector<std::string>* search_trace = nullptr) {
-        if (components.table_refs.empty() || components.table_refs.size() > 62) {
-            throw std::runtime_error("Selinger DP supports 1..62 table refs.");
-        }
-
-        std::vector<TableRefId> table_ref_ids;
-        std::map<TableRefId, size_t> bit_index;
-        for (size_t i = 0; i < components.table_refs.size(); i++) {
-            table_ref_ids.push_back(components.table_refs[i].id);
-            bit_index[components.table_refs[i].id] = i;
-        }
-
-        auto bitFor = [&](TableRefId table_ref_id) -> std::uint64_t {
-            return 1ULL << bit_index.at(table_ref_id);
-        };
-
-        std::uint64_t full_mask =
-            (1ULL << components.table_refs.size()) - 1ULL;
-        auto base_relations = estimateBaseRelations(components, stats);
-        auto edges = equalityEdgesForJoinOrdering(components);
-
-        std::vector<std::optional<SelingerDpState>> best(full_mask + 1);
-        for (TableRefId table_ref_id : table_ref_ids) {
-            SelingerDpState state;
-            state.base_table_ref_id = table_ref_id;
-            state.joined_table_refs.insert(table_ref_id);
-            state.relation = base_relations.at(table_ref_id);
-            state.cost = tupleScanCost(state.relation.rows);
-            state.plan_root = makeLeafJoinPlanNode(table_ref_id, state.relation);
-            best[bitFor(table_ref_id)] = state;
-        }
-
-        size_t candidates_considered = 0;
-        for (size_t level = 1; level < components.table_refs.size(); level++) {
-            size_t level_candidates = 0;
-            bool trace_this_level = search_trace && level <= 2;
-            std::vector<std::string> candidate_trace;
-            for (std::uint64_t mask = 1; mask <= full_mask; mask++) {
-                if (!best[mask] || __builtin_popcountll(mask) != static_cast<int>(level)) {
-                    continue;
-                }
-
-                const auto& current = *best[mask];
-                for (const auto& edge : edges) {
-                    auto oriented = orientJoinEdge(edge, current.joined_table_refs);
-                    if (!oriented) {
-                        continue;
-                    }
-
-                    TableRefId input_table_ref_id = oriented->input_table_ref_id;
-                    std::uint64_t next_bit = bitFor(input_table_ref_id);
-                    if ((mask & next_bit) != 0) {
-                        continue;
-                    }
-
-                    auto step = estimateJoinOrderStep(
-                        base_relations,
-                        current.joined_table_refs,
-                        *oriented,
-                        current.relation,
-                        current.cost
-                    );
-
-                    if (trace_this_level) {
-                        candidate_trace.push_back(selingerCandidateTraceLine(
-                            components,
-                            current,
-                            step
-                        ));
-                    }
-
-                    SelingerDpState candidate = current;
-                    candidate.join_order.push_back(step.join);
-                    candidate.steps.push_back(step);
-                    candidate.joined_table_refs.insert(input_table_ref_id);
-                    candidate.relation = step.output_relation;
-                    candidate.cost = step.chosen_cost;
-                    candidate.plan_root = makeJoinPlanNode(
-                        current.plan_root,
-                        makeLeafJoinPlanNode(
-                            input_table_ref_id,
-                            base_relations.at(input_table_ref_id)
-                        ),
-                        *oriented,
-                        step
-                    );
-
-                    std::uint64_t next_mask = mask | next_bit;
-                    if (!best[next_mask] ||
-                        betterSelingerState(candidate, *best[next_mask])) {
-                        best[next_mask] = std::move(candidate);
-                    }
-
-                    candidates_considered++;
-                    level_candidates++;
-                }
-            }
-
-            if (search_trace) {
-                if (trace_this_level) {
-                    search_trace->push_back(
-                        "Selinger DP level " + std::to_string(level + 1) +
-                        ": evaluate every retained " +
-                        std::to_string(level) + "-table subset"
-                    );
-                    search_trace->insert(
-                        search_trace->end(),
-                        candidate_trace.begin(),
-                        candidate_trace.end()
-                    );
-                    search_trace->push_back(
-                        "    keep best state per " +
-                        std::to_string(level + 1) + "-table subset"
-                    );
-                    for (std::uint64_t mask = 1; mask <= full_mask; mask++) {
-                        if (!best[mask] ||
-                            __builtin_popcountll(mask) !=
-                                static_cast<int>(level + 1)) {
-                            continue;
-                        }
-                        search_trace->push_back(selingerKeptStateTraceLine(
-                            components,
-                            *best[mask]
-                        ));
-                    }
-                } else {
-                    search_trace->push_back(
-                        "Selinger DP level " + std::to_string(level + 1) +
-                        ": considered " + std::to_string(level_candidates) +
-                        " candidate extension(s)"
-                    );
-                }
-            }
-        }
-
-        if (!best[full_mask]) {
-            throw std::runtime_error("Selinger DP could not build a connected plan.");
-        }
-
-        size_t states_kept = 0;
-        for (const auto& state : best) {
-            if (state) {
-                states_kept++;
-            }
-        }
-
-        auto planned_components = makeJoinPlanComponents(
-            components,
-            best[full_mask]->base_table_ref_id,
-            best[full_mask]->join_order
-        );
-        JoinOrderPlan plan{
-            std::move(planned_components),
-            best[full_mask]->steps,
-            best[full_mask]->relation.rows
-        };
-
-        return {
-            std::move(plan),
-            best[full_mask]->plan_root,
-            best[full_mask]->cost,
-            states_kept,
-            candidates_considered,
-            search_trace ? *search_trace : std::vector<std::string>{}
-        };
-    }
-
     static bool betterBushyState(const BushyDpState& candidate,
                                  const BushyDpState& incumbent) {
         if (candidate.cost != incumbent.cost) {
@@ -5660,7 +5969,8 @@ public:
     BushyJoinOrderResult chooseBushyJoinOrder(
             const QueryComponents& components,
             const std::map<TableId, TableStats>& stats,
-            std::vector<std::string>* search_trace = nullptr) {
+            std::vector<std::string>* search_trace = nullptr,
+            const IndexManager* index_manager = nullptr) {
         if (components.table_refs.empty() || components.table_refs.size() > 62) {
             throw std::runtime_error("Bushy DP supports 1..62 table refs.");
         }
@@ -5727,7 +6037,11 @@ public:
                         best[left_mask]->relation,
                         best[left_mask]->cost,
                         best[right_mask]->relation,
-                        best[right_mask]->cost
+                        best[right_mask]->cost,
+                        &components,
+                        best[left_mask]->plan_root.get(),
+                        best[right_mask]->plan_root.get(),
+                        index_manager
                     );
 
                     BushyDpState candidate;
@@ -5805,946 +6119,11 @@ public:
         };
     }
 
-    std::vector<TableRefId> tableRefIdsFor(
-            const QueryComponents& components) {
-        std::vector<TableRefId> table_ref_ids;
-        for (const auto& table_ref : components.table_refs) {
-            table_ref_ids.push_back(table_ref.id);
-        }
-        return table_ref_ids;
-    }
-
-    std::optional<std::shared_ptr<JoinPlanNode>> makeConnectedBushyJoin(
-            const std::shared_ptr<JoinPlanNode>& left,
-            const std::shared_ptr<JoinPlanNode>& right,
-            const std::vector<JoinClause>& edges) {
-        auto edge = joinEdgeBetweenPlans(*left, *right, edges);
-        if (!edge) {
-            return std::nullopt;
-        }
-
-        auto step = estimateJoinTreeStep(
-            left->table_refs,
-            *edge,
-            left->relation,
-            left->cost,
-            right->relation,
-            right->cost
-        );
-        return makeJoinPlanNode(left, right, *edge, step);
-    }
-
-    std::optional<std::shared_ptr<JoinPlanNode>> randomBushyTreeForTableRefs(
-            const std::map<TableRefId, RelationStats>& base_relations,
-            const std::vector<JoinClause>& edges,
-            const std::vector<TableRefId>& table_ref_ids,
-            std::mt19937& rng) {
-        if (table_ref_ids.empty()) {
-            return std::nullopt;
-        }
-
-        std::vector<std::shared_ptr<JoinPlanNode>> components;
-        for (TableRefId table_ref_id : table_ref_ids) {
-            components.push_back(makeLeafJoinPlanNode(
-                table_ref_id,
-                base_relations.at(table_ref_id)
-            ));
-        }
-        std::shuffle(components.begin(), components.end(), rng);
-
-        while (components.size() > 1) {
-            std::vector<std::pair<size_t, size_t>> connected_pairs;
-            for (size_t i = 0; i < components.size(); i++) {
-                for (size_t j = i + 1; j < components.size(); j++) {
-                    if (joinEdgeBetweenPlans(
-                            *components[i],
-                            *components[j],
-                            edges)) {
-                        connected_pairs.push_back({i, j});
-                    }
-                    if (joinEdgeBetweenPlans(
-                            *components[j],
-                            *components[i],
-                            edges)) {
-                        connected_pairs.push_back({j, i});
-                    }
-                }
-            }
-            if (connected_pairs.empty()) {
-                return std::nullopt;
-            }
-
-            std::uniform_int_distribution<size_t> pair_dist(
-                0,
-                connected_pairs.size() - 1
-            );
-            auto [left_index, right_index] = connected_pairs[pair_dist(rng)];
-            auto joined = makeConnectedBushyJoin(
-                components[left_index],
-                components[right_index],
-                edges
-            );
-            if (!joined) {
-                return std::nullopt;
-            }
-
-            size_t first = std::max(left_index, right_index);
-            size_t second = std::min(left_index, right_index);
-            components.erase(components.begin() + static_cast<long>(first));
-            components.erase(components.begin() + static_cast<long>(second));
-            components.push_back(*joined);
-        }
-
-        return components.front();
-    }
-
-    void collectLeafTableRefs(const std::shared_ptr<JoinPlanNode>& node,
-                              std::vector<TableRefId>& table_ref_ids) {
-        if (!node) {
-            return;
-        }
-        if (node->is_leaf) {
-            table_ref_ids.push_back(node->table_ref_id);
-            return;
-        }
-        collectLeafTableRefs(node->left, table_ref_ids);
-        collectLeafTableRefs(node->right, table_ref_ids);
-    }
-
-    void collectInternalNodePaths(const std::shared_ptr<JoinPlanNode>& node,
-                                  std::vector<int>& current_path,
-                                  std::vector<std::vector<int>>& paths) {
-        if (!node || node->is_leaf) {
-            return;
-        }
-
-        paths.push_back(current_path);
-        current_path.push_back(0);
-        collectInternalNodePaths(node->left, current_path, paths);
-        current_path.back() = 1;
-        collectInternalNodePaths(node->right, current_path, paths);
-        current_path.pop_back();
-    }
-
-    std::shared_ptr<JoinPlanNode> nodeAtPath(
-            const std::shared_ptr<JoinPlanNode>& node,
-            const std::vector<int>& path) {
-        auto current = node;
-        for (int direction : path) {
-            if (!current || current->is_leaf) {
-                return nullptr;
-            }
-            current = direction == 0 ? current->left : current->right;
-        }
-        return current;
-    }
-
-    std::optional<std::shared_ptr<JoinPlanNode>> replaceSubtreeAndRecost(
-            const std::shared_ptr<JoinPlanNode>& node,
-            const std::vector<int>& path,
-            size_t path_index,
-            const std::shared_ptr<JoinPlanNode>& replacement,
-            const std::vector<JoinClause>& edges) {
-        if (path_index == path.size()) {
-            return replacement;
-        }
-        if (!node || node->is_leaf) {
-            return std::nullopt;
-        }
-
-        auto rebuilt_left = node->left;
-        auto rebuilt_right = node->right;
-        if (path[path_index] == 0) {
-            auto child = replaceSubtreeAndRecost(
-                node->left,
-                path,
-                path_index + 1,
-                replacement,
-                edges
-            );
-            if (!child) {
-                return std::nullopt;
-            }
-            rebuilt_left = *child;
-        } else {
-            auto child = replaceSubtreeAndRecost(
-                node->right,
-                path,
-                path_index + 1,
-                replacement,
-                edges
-            );
-            if (!child) {
-                return std::nullopt;
-            }
-            rebuilt_right = *child;
-        }
-
-        return makeConnectedBushyJoin(rebuilt_left, rebuilt_right, edges);
-    }
-
-    std::vector<std::vector<int>> internalNodePaths(
-            const std::shared_ptr<JoinPlanNode>& root) {
-        std::vector<std::vector<int>> paths;
-        std::vector<int> current_path;
-        collectInternalNodePaths(root, current_path, paths);
-        return paths;
-    }
-
-    std::optional<BushyAnnealingNeighbor> randomSwapNeighborBushyTree(
-            const std::shared_ptr<JoinPlanNode>& current_root,
-            const std::vector<JoinClause>& edges,
-            std::mt19937& rng) {
-        auto paths = internalNodePaths(current_root);
-        if (paths.empty()) {
-            return std::nullopt;
-        }
-
-        std::uniform_int_distribution<size_t> path_dist(0, paths.size() - 1);
-        for (size_t attempt = 0; attempt < 40; attempt++) {
-            auto path = paths[path_dist(rng)];
-            auto target = nodeAtPath(current_root, path);
-            if (!target || target->is_leaf) {
-                continue;
-            }
-
-            auto swapped = makeConnectedBushyJoin(
-                target->right,
-                target->left,
-                edges
-            );
-            if (!swapped) {
-                continue;
-            }
-
-            auto rebuilt = replaceSubtreeAndRecost(
-                current_root,
-                path,
-                0,
-                *swapped,
-                edges
-            );
-            if (rebuilt) {
-                return BushyAnnealingNeighbor{
-                    *rebuilt,
-                    BushyAnnealingMoveKind::SwapChildren
-                };
-            }
-        }
-
-        return std::nullopt;
-    }
-
-    std::optional<std::shared_ptr<JoinPlanNode>> rotatedReplacement(
-            const std::shared_ptr<JoinPlanNode>& target,
-            const std::vector<JoinClause>& edges,
-            std::mt19937& rng) {
-        std::vector<std::shared_ptr<JoinPlanNode>> candidates;
-        if (target->left && !target->left->is_leaf) {
-            auto a = target->left->left;
-            auto b = target->left->right;
-            auto c = target->right;
-
-            auto right_inner = makeConnectedBushyJoin(b, c, edges);
-            if (right_inner) {
-                auto rotated = makeConnectedBushyJoin(a, *right_inner, edges);
-                if (rotated) {
-                    candidates.push_back(*rotated);
-                }
-            }
-
-            auto alternate_inner = makeConnectedBushyJoin(a, c, edges);
-            if (alternate_inner) {
-                auto rotated = makeConnectedBushyJoin(b, *alternate_inner, edges);
-                if (rotated) {
-                    candidates.push_back(*rotated);
-                }
-            }
-        }
-
-        if (target->right && !target->right->is_leaf) {
-            auto a = target->left;
-            auto b = target->right->left;
-            auto c = target->right->right;
-
-            auto left_inner = makeConnectedBushyJoin(a, b, edges);
-            if (left_inner) {
-                auto rotated = makeConnectedBushyJoin(*left_inner, c, edges);
-                if (rotated) {
-                    candidates.push_back(*rotated);
-                }
-            }
-
-            auto alternate_inner = makeConnectedBushyJoin(a, c, edges);
-            if (alternate_inner) {
-                auto rotated = makeConnectedBushyJoin(*alternate_inner, b, edges);
-                if (rotated) {
-                    candidates.push_back(*rotated);
-                }
-            }
-        }
-
-        if (candidates.empty()) {
-            return std::nullopt;
-        }
-        std::uniform_int_distribution<size_t> candidate_dist(
-            0,
-            candidates.size() - 1
-        );
-        return candidates[candidate_dist(rng)];
-    }
-
-    std::optional<BushyAnnealingNeighbor> randomRotateNeighborBushyTree(
-            const std::shared_ptr<JoinPlanNode>& current_root,
-            const std::vector<JoinClause>& edges,
-            std::mt19937& rng) {
-        auto paths = internalNodePaths(current_root);
-        std::vector<std::vector<int>> rotatable_paths;
-        for (const auto& path : paths) {
-            auto target = nodeAtPath(current_root, path);
-            if (!target || target->is_leaf) {
-                continue;
-            }
-            if ((target->left && !target->left->is_leaf) ||
-                (target->right && !target->right->is_leaf)) {
-                rotatable_paths.push_back(path);
-            }
-        }
-        if (rotatable_paths.empty()) {
-            return std::nullopt;
-        }
-
-        std::uniform_int_distribution<size_t> path_dist(
-            0,
-            rotatable_paths.size() - 1
-        );
-        for (size_t attempt = 0; attempt < 40; attempt++) {
-            auto path = rotatable_paths[path_dist(rng)];
-            auto target = nodeAtPath(current_root, path);
-            auto replacement = rotatedReplacement(target, edges, rng);
-            if (!replacement) {
-                continue;
-            }
-
-            auto rebuilt = replaceSubtreeAndRecost(
-                current_root,
-                path,
-                0,
-                *replacement,
-                edges
-            );
-            if (rebuilt) {
-                return BushyAnnealingNeighbor{
-                    *rebuilt,
-                    BushyAnnealingMoveKind::Rotate
-                };
-            }
-        }
-
-        return std::nullopt;
-    }
-
-    std::optional<BushyAnnealingNeighbor> randomResampleNeighborBushyTree(
-            const std::shared_ptr<JoinPlanNode>& current_root,
-            const std::map<TableRefId, RelationStats>& base_relations,
-            const std::vector<JoinClause>& edges,
-            std::mt19937& rng) {
-        auto paths = internalNodePaths(current_root);
-        if (paths.empty()) {
-            return std::nullopt;
-        }
-
-        std::vector<std::vector<int>> local_paths;
-        for (const auto& path : paths) {
-            if (!path.empty()) {
-                local_paths.push_back(path);
-            }
-        }
-        const auto& candidate_paths = local_paths.empty() ? paths : local_paths;
-        std::uniform_int_distribution<size_t> path_dist(
-            0,
-            candidate_paths.size() - 1
-        );
-        for (size_t attempt = 0; attempt < 40; attempt++) {
-            auto path = candidate_paths[path_dist(rng)];
-            auto target = nodeAtPath(current_root, path);
-            if (!target || target->is_leaf) {
-                continue;
-            }
-
-            std::vector<TableRefId> target_table_ref_ids;
-            collectLeafTableRefs(target, target_table_ref_ids);
-            auto replacement = randomBushyTreeForTableRefs(
-                base_relations,
-                edges,
-                target_table_ref_ids,
-                rng
-            );
-            if (!replacement) {
-                continue;
-            }
-
-            auto rebuilt = replaceSubtreeAndRecost(
-                current_root,
-                path,
-                0,
-                *replacement,
-                edges
-            );
-            if (rebuilt) {
-                return BushyAnnealingNeighbor{
-                    *rebuilt,
-                    BushyAnnealingMoveKind::ResampleSubtree
-                };
-            }
-        }
-
-        return std::nullopt;
-    }
-
-    std::optional<BushyAnnealingNeighbor> randomNeighborBushyTree(
-            const std::shared_ptr<JoinPlanNode>& current_root,
-            const std::map<TableRefId, RelationStats>& base_relations,
-            const std::vector<JoinClause>& edges,
-            std::mt19937& rng) {
-        std::uniform_int_distribution<int> move_dist(0, 99);
-        for (size_t attempt = 0; attempt < 60; attempt++) {
-            int move = move_dist(rng);
-            std::optional<BushyAnnealingNeighbor> neighbor;
-            if (move < 35) {
-                neighbor = randomSwapNeighborBushyTree(current_root, edges, rng);
-            } else if (move < 70) {
-                neighbor = randomRotateNeighborBushyTree(current_root, edges, rng);
-            } else {
-                neighbor = randomResampleNeighborBushyTree(
-                    current_root,
-                    base_relations,
-                    edges,
-                    rng
-                );
-            }
-            if (neighbor) {
-                return neighbor;
-            }
-        }
-        return std::nullopt;
-    }
-
-    BushyAnnealingResult chooseSimulatedAnnealingBushyJoinOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            std::vector<std::string>* search_trace = nullptr) {
-        if (components.table_refs.empty()) {
-            throw std::runtime_error("Simulated annealing supports at least one table ref.");
-        }
-
-        auto table_ref_ids = tableRefIdsFor(components);
-        auto base_relations = estimateBaseRelations(components, stats);
-        auto edges = equalityEdgesForJoinOrdering(components);
-        std::mt19937 rng(9203);
-
-        auto current_root = randomBushyTreeForTableRefs(
-            base_relations,
-            edges,
-            table_ref_ids,
-            rng
-        );
-        if (!current_root) {
-            throw std::runtime_error("Simulated annealing could not build an initial bushy plan.");
-        }
-
-        auto best_root = *current_root;
-        double initial_cost = (*current_root)->cost;
-        double current_cost = initial_cost;
-        double best_cost = initial_cost;
-        double temperature = std::max(1.0, initial_cost * 0.25);
-        size_t attempted_moves = 0;
-        size_t valid_moves = 0;
-        size_t invalid_moves = 0;
-        size_t improving_moves = 0;
-        size_t worse_moves = 0;
-        size_t rejected_moves = 0;
-        size_t neutral_moves = 0;
-        size_t proposed_swaps = 0;
-        size_t proposed_rotations = 0;
-        size_t proposed_resamples = 0;
-        size_t accepted_swaps = 0;
-        size_t accepted_rotations = 0;
-        size_t accepted_resamples = 0;
-        std::vector<BushyAnnealingCheckpoint> checkpoints;
-        std::uniform_real_distribution<double> probability(0.0, 1.0);
-
-        struct TemperatureLevelTrace {
-            size_t level = 0;
-            size_t start_move = 0;
-            size_t end_move = 0;
-            double temperature = 0.0;
-            double start_best_cost = 0.0;
-            double end_best_cost = 0.0;
-            size_t valid_moves = 0;
-            size_t accepted_moves = 0;
-            size_t improving_moves = 0;
-            size_t worse_moves = 0;
-            size_t rejected_moves = 0;
-        };
-        std::vector<TemperatureLevelTrace> temperature_levels;
-
-        const double target_initial_acceptance = 0.80;
-        std::mt19937 temperature_rng(9204);
-        double uphill_delta_sum = 0.0;
-        size_t uphill_delta_count = 0;
-        size_t temperature_samples = 30;
-        for (size_t sample = 0; sample < temperature_samples; sample++) {
-            auto neighbor = randomNeighborBushyTree(
-                *current_root,
-                base_relations,
-                edges,
-                temperature_rng
-            );
-            if (!neighbor) {
-                continue;
-            }
-            double delta = neighbor->root->cost - current_cost;
-            if (delta > 0.0) {
-                uphill_delta_sum += delta;
-                uphill_delta_count++;
-            }
-        }
-        if (uphill_delta_count > 0) {
-            double average_uphill_delta =
-                uphill_delta_sum / static_cast<double>(uphill_delta_count);
-            temperature = std::max(
-                1.0,
-                -average_uphill_delta / std::log(target_initial_acceptance)
-            );
-        }
-
-        auto countProposedMove = [&](BushyAnnealingMoveKind kind) {
-            switch (kind) {
-                case BushyAnnealingMoveKind::SwapChildren:
-                    proposed_swaps++;
-                    break;
-                case BushyAnnealingMoveKind::Rotate:
-                    proposed_rotations++;
-                    break;
-                case BushyAnnealingMoveKind::ResampleSubtree:
-                    proposed_resamples++;
-                    break;
-            }
-        };
-
-        auto countAcceptedMove = [&](BushyAnnealingMoveKind kind) {
-            switch (kind) {
-                case BushyAnnealingMoveKind::SwapChildren:
-                    accepted_swaps++;
-                    break;
-                case BushyAnnealingMoveKind::Rotate:
-                    accepted_rotations++;
-                    break;
-                case BushyAnnealingMoveKind::ResampleSubtree:
-                    accepted_resamples++;
-                    break;
-            }
-        };
-
-        auto recordCheckpoint = [&]() {
-            if (attempted_moves == 100 || attempted_moves == 200) {
-                checkpoints.push_back({attempted_moves, best_cost});
-            }
-        };
-
-        for (size_t outer = 0; outer < 4; outer++) {
-            TemperatureLevelTrace level_trace;
-            level_trace.level = outer + 1;
-            level_trace.start_move = attempted_moves + 1;
-            level_trace.temperature = temperature;
-            level_trace.start_best_cost = best_cost;
-
-            for (size_t inner = 0; inner < 50; inner++) {
-                attempted_moves++;
-                auto neighbor = randomNeighborBushyTree(
-                    *current_root,
-                    base_relations,
-                    edges,
-                    rng
-                );
-                if (!neighbor) {
-                    invalid_moves++;
-                    recordCheckpoint();
-                    continue;
-                }
-
-                valid_moves++;
-                level_trace.valid_moves++;
-                countProposedMove(neighbor->kind);
-                double neighbor_cost = neighbor->root->cost;
-                double delta = neighbor_cost - current_cost;
-                bool accept = delta <= 0.0 ||
-                    probability(rng) < std::exp(-delta / temperature);
-                if (!accept) {
-                    rejected_moves++;
-                    level_trace.rejected_moves++;
-                    recordCheckpoint();
-                    continue;
-                }
-
-                if (delta < 0.0) {
-                    improving_moves++;
-                    level_trace.improving_moves++;
-                } else if (delta > 0.0) {
-                    worse_moves++;
-                    level_trace.worse_moves++;
-                } else {
-                    neutral_moves++;
-                }
-                level_trace.accepted_moves++;
-                countAcceptedMove(neighbor->kind);
-                current_root = neighbor->root;
-                current_cost = neighbor_cost;
-                if (current_cost < best_cost) {
-                    best_root = *current_root;
-                    best_cost = current_cost;
-                }
-                recordCheckpoint();
-            }
-            level_trace.end_move = attempted_moves;
-            level_trace.end_best_cost = best_cost;
-            temperature_levels.push_back(level_trace);
-            temperature *= 0.55;
-        }
-
-        if (search_trace) {
-            search_trace->push_back(
-                "Simulated Annealing bushy: deterministic seed=9203, "
-                "initial tree=random connected sampling (not uniform); "
-                "neighbors=swap children, rotate an associative subtree, or "
-                "locally resample one connected bushy subtree"
-            );
-            search_trace->push_back(
-                "    adaptive initial temperature: target uphill acceptance=" +
-                formatEstimate(target_initial_acceptance * 100.0) +
-                "%, uphill samples=" + std::to_string(uphill_delta_count) +
-                "/" + std::to_string(temperature_samples) +
-                ", T0=" + formatEstimate(
-                    temperature_levels.empty()
-                        ? temperature
-                        : temperature_levels.front().temperature
-                )
-            );
-            search_trace->push_back(
-                "    initial cost=" + formatEstimate(initial_cost) +
-                ", best cost=" + formatEstimate(best_cost) +
-                ", total improvement=" +
-                formatEstimate(initial_cost - best_cost) +
-                " (" +
-                formatEstimate(
-                    initial_cost > 0.0
-                        ? 100.0 * (initial_cost - best_cost) / initial_cost
-                        : 0.0
-                ) +
-                "%)"
-            );
-            for (const auto& checkpoint : checkpoints) {
-                double improvement = initial_cost - checkpoint.best_cost;
-                double improvement_percent = initial_cost > 0.0
-                    ? 100.0 * improvement / initial_cost
-                    : 0.0;
-                search_trace->push_back(
-                    "    after " + std::to_string(checkpoint.attempted_moves) +
-                    " move(s): best cost=" +
-                    formatEstimate(checkpoint.best_cost) +
-                    ", improvement=" + formatEstimate(improvement) +
-                    " (" + formatEstimate(improvement_percent) + "%)"
-                );
-            }
-            for (const auto& level : temperature_levels) {
-                double level_improvement =
-                    level.start_best_cost - level.end_best_cost;
-                search_trace->push_back(
-                    "    temperature level " + std::to_string(level.level) +
-                    " (moves " + std::to_string(level.start_move) +
-                    "-" + std::to_string(level.end_move) +
-                    ", T=" + formatEstimate(level.temperature) +
-                    "): best cost=" + formatEstimate(level.end_best_cost) +
-                    ", level improvement=" +
-                    formatEstimate(level_improvement) +
-                    ", accepted=" +
-                    std::to_string(level.accepted_moves) +
-                    "/" + std::to_string(level.valid_moves) +
-                    ", worse accepted=" +
-                    std::to_string(level.worse_moves) +
-                    ", rejected=" +
-                    std::to_string(level.rejected_moves)
-                );
-            }
-            search_trace->push_back(
-                "    moves: valid=" + std::to_string(valid_moves) +
-                "/" + std::to_string(attempted_moves) +
-                ", invalid=" + std::to_string(invalid_moves) +
-                ", improving=" + std::to_string(improving_moves) +
-                ", neutral accepted=" + std::to_string(neutral_moves) +
-                ", worse accepted=" + std::to_string(worse_moves) +
-                ", rejected=" + std::to_string(rejected_moves)
-            );
-            search_trace->push_back(
-                "    valid move types: swap=" +
-                std::to_string(proposed_swaps) +
-                ", rotate=" + std::to_string(proposed_rotations) +
-                ", resample=" + std::to_string(proposed_resamples)
-            );
-            search_trace->push_back(
-                "    accepted move types: swap=" +
-                std::to_string(accepted_swaps) +
-                ", rotate=" + std::to_string(accepted_rotations) +
-                ", resample=" + std::to_string(accepted_resamples)
-            );
-        }
-
-        auto planned_components = makeJoinPlanComponents(
-            components,
-            components.base_table_ref_id,
-            components.joins
-        );
-        return {
-            std::move(planned_components),
-            best_root,
-            best_root->relation.rows,
-            best_cost,
-            initial_cost,
-            attempted_moves,
-            valid_moves,
-            invalid_moves,
-            improving_moves,
-            worse_moves,
-            rejected_moves,
-            neutral_moves,
-            proposed_swaps,
-            proposed_rotations,
-            proposed_resamples,
-            accepted_swaps,
-            accepted_rotations,
-            accepted_resamples,
-            std::move(checkpoints),
-            search_trace ? *search_trace : std::vector<std::string>{}
-        };
-    }
-
-    JoinOrderSearchResult chooseJoinOrder(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            JoinOrderSearchPolicy policy) {
-        std::vector<std::string> search_steps;
-        if (policy == JoinOrderSearchPolicy::SelingerLeftDeepDP) {
-            auto result = chooseSelingerLeftDeepJoinOrder(
-                components,
-                stats,
-                &search_steps
-            );
-            return {
-                policy,
-                std::move(result.plan),
-                result.plan_root,
-                result.estimated_cost,
-                result.states_kept,
-                result.candidates_considered,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                std::move(search_steps)
-            };
-        }
-
-        if (policy == JoinOrderSearchPolicy::SimulatedAnnealingBushy) {
-            auto result = chooseSimulatedAnnealingBushyJoinOrder(
-                components,
-                stats,
-                &search_steps
-            );
-            JoinOrderPlan plan{
-                std::move(result.components),
-                {},
-                result.final_estimate
-            };
-            return {
-                policy,
-                std::move(plan),
-                result.plan_root,
-                result.estimated_cost,
-                0,
-                result.valid_moves,
-                0,
-                result.attempted_moves,
-                result.valid_moves,
-                result.invalid_moves,
-                result.improving_moves,
-                result.worse_moves,
-                result.rejected_moves,
-                std::move(search_steps)
-            };
-        }
-
-        auto result = chooseBushyJoinOrder(
-            components,
-            stats,
-            &search_steps
-        );
-        JoinOrderPlan plan{
-            std::move(result.components),
-            {},
-            result.final_estimate
-        };
-        return {
-            policy,
-            std::move(plan),
-            result.plan_root,
-            result.estimated_cost,
-            result.states_kept,
-            result.candidates_considered,
-            result.cross_products_pruned,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            std::move(search_steps)
-        };
-    }
-
-    std::vector<std::string> joinOrderAliases(const QueryComponents& components) {
-        std::vector<std::string> labels;
-        labels.push_back(tableRefForId(
-            components,
-            components.base_table_ref_id
-        ).alias);
-        for (const auto& join : components.joins) {
-            labels.push_back(tableRefForId(
-                components,
-                join.input_table_ref_id
-            ).alias);
-        }
-        return labels;
-    }
-
-    std::string joinOrderString(const QueryComponents& components) {
-        auto labels = joinOrderAliases(components);
-        std::ostringstream output;
-        for (size_t i = 0; i < labels.size(); i++) {
-            if (i != 0) {
-                output << " -> ";
-            }
-            output << labels[i];
-        }
-        return output.str();
-    }
-
-    std::vector<PhysicalJoinKind> physicalJoinKindsForPlan(
-            const JoinOrderPlan& plan) {
-        std::vector<PhysicalJoinKind> kinds;
-        for (const auto& step : plan.steps) {
-            kinds.push_back(step.chosen_join_kind);
-        }
-        return kinds;
-    }
-
-    void printJoinOrderPlan(const std::string& title,
-                            const JoinOrderPlan& plan) {
-        std::cout << "\n" << title << ":" << std::endl;
-        std::cout << "  " << joinOrderString(plan.components) << std::endl;
-        std::set<TableRefId> joined_table_refs{plan.components.base_table_ref_id};
-        for (const auto& step : plan.steps) {
-            auto columns = joinedAndInputColumns(step.join, joined_table_refs);
-            std::cout << "  join "
-                      << columnRefLabel(plan.components, catalog, columns.first)
-                      << " = "
-                      << columnRefLabel(plan.components, catalog, columns.second)
-                      << ": " << physicalJoinKindName(step.chosen_join_kind)
-                      << ", est rows=" << formatEstimate(step.output_rows)
-                      << std::endl;
-            joined_table_refs.insert(step.join.input_table_ref_id);
-        }
-        std::cout << "  final estimate=" << formatEstimate(plan.final_estimate)
-                  << std::endl;
-    }
-
-    void printJoinOrderSearchComparison(
-            const JoinOrderSearchResult& exact,
-            const JoinOrderSearchResult& heuristic) {
-        std::cout << "\nJoin-order search policies:" << std::endl;
-        std::cout << "  estimates: MCV filters + propagated estimated"
-                  << " RelationStats + tuple-cost model" << std::endl;
-
-        auto print_result = [&](const JoinOrderSearchResult& result) {
-            std::cout << "  " << joinOrderSearchPolicyName(result.policy);
-            if (result.policy == JoinOrderSearchPolicy::BushyDP) {
-                std::cout << ": states=" << result.states_kept
-                          << ", candidates=" << result.candidates_considered
-                          << ", pruned_cross_products="
-                          << result.cross_products_pruned;
-            } else if (result.policy ==
-                       JoinOrderSearchPolicy::SimulatedAnnealingBushy) {
-                std::cout << ": attempted_moves="
-                          << result.annealing_attempted_moves
-                          << ", valid_moves=" << result.annealing_valid_moves
-                          << ", invalid_moves="
-                          << result.annealing_invalid_moves
-                          << ", improving_moves="
-                          << result.annealing_improving_moves
-                          << ", worse_accepted="
-                          << result.annealing_worse_moves
-                          << ", rejected="
-                          << result.annealing_rejected_moves;
-            } else {
-                std::cout << ": states=" << result.states_kept
-                          << ", candidates=" << result.candidates_considered;
-            }
-            std::cout << ", cost=" << formatEstimate(result.estimated_cost)
-                      << ", final_est="
-                      << formatEstimate(result.plan.final_estimate)
-                      << ", tree="
-                      << joinPlanTreeString(
-                            result.plan.components,
-                            result.plan_root
-                         )
-                      << std::endl;
-        };
-
-        print_result(exact);
-        print_result(heuristic);
-
-        if (heuristic.estimated_cost < exact.estimated_cost) {
-            std::cout << "  search result: simulated annealing found a"
-                      << " lower-cost sampled tree." << std::endl;
-        } else if (heuristic.estimated_cost > exact.estimated_cost) {
-            std::cout << "  search result: exact bushy DP is cheaper under"
-                      << " this cost model." << std::endl;
-        } else {
-            std::cout << "  search result: both policies tie under this cost model."
-                      << std::endl;
-        }
-    }
-
     void printJoinPlanTree(const std::string& title,
                            const QueryComponents& components,
                            const std::shared_ptr<JoinPlanNode>& plan_root) {
         std::cout << "\n" << title << ":" << std::endl;
         std::cout << prettyJoinPlanTree(components, plan_root);
-    }
-
-    void printJoinOrderSearchSteps(const JoinOrderSearchResult& result) {
-        if (result.search_steps.empty()) {
-            return;
-        }
-
-        std::cout << "\n" << joinOrderSearchPolicyName(result.policy)
-                  << " search summary:" << std::endl;
-        for (const auto& line : result.search_steps) {
-            std::cout << line << std::endl;
-        }
     }
 
 };
@@ -7187,6 +6566,7 @@ public:
     RecoveryManager recovery_manager;
     PageManager page_manager;
     Catalog catalog;
+    IndexManager index_manager;
     TransactionManager txn_manager;
 
     TransactionalStorageManager()
@@ -7195,6 +6575,7 @@ public:
           recovery_manager(buffer_manager, log_manager),
           page_manager(buffer_manager, recovery_manager),
           catalog(buffer_manager, page_manager),
+          index_manager(catalog, page_manager),
           txn_manager() {
         recovery_manager.recover();
         catalog.load();
@@ -7406,7 +6787,8 @@ public:
             transactional_storage_manager.page_manager,
             sample_limit,
             physical_join_kinds,
-            plan_root
+            plan_root,
+            &transactional_storage_manager.index_manager
         );
     }
 
@@ -7622,6 +7004,7 @@ private:
 
 class QueryProcessor {
 private:
+    TransactionalStorageManager& transactional_storage_manager;
     QueryParser query_parser;
     QueryOptimizer query_optimizer;
     QueryExecutor query_executor;
@@ -7629,7 +7012,8 @@ private:
 public:
     explicit QueryProcessor(
             TransactionalStorageManager& transactional_storage_manager)
-        : query_parser(transactional_storage_manager.catalog),
+        : transactional_storage_manager(transactional_storage_manager),
+          query_parser(transactional_storage_manager.catalog),
           query_optimizer(transactional_storage_manager.catalog,
                           transactional_storage_manager.page_manager),
           query_executor(transactional_storage_manager) {}
@@ -7651,20 +7035,20 @@ public:
         if (statement.kind == ParsedStatement::Kind::Select &&
             statement.query.isJoinQuery()) {
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
-            auto search = query_optimizer.chooseJoinOrder(
+            auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
                 stats,
-                JoinOrderSearchPolicy::SelingerLeftDeepDP
-            );
-            auto join_kinds = query_optimizer.physicalJoinKindsForPlan(
-                search.plan
+                nullptr,
+                &transactional_storage_manager.index_manager
             );
             auto result = query_executor.executeJoinPlan(
-                search.plan.components,
+                search.components,
                 txn,
-                &join_kinds
+                nullptr,
+                5,
+                search.plan_root
             );
-            query_executor.printJoinPlanResult(search.plan.components, result);
+            query_executor.printJoinPlanResult(search.components, result);
             return;
         }
         query_executor.execute(statement, txn);
@@ -7679,19 +7063,19 @@ public:
         if (statement.kind == ParsedStatement::Kind::Select &&
             statement.query.isJoinQuery()) {
             auto stats = query_optimizer.analyzeQueryTables(statement.query);
-            auto search = query_optimizer.chooseJoinOrder(
+            auto search = query_optimizer.chooseBushyJoinOrder(
                 statement.query,
                 stats,
-                JoinOrderSearchPolicy::SelingerLeftDeepDP
-            );
-            auto join_kinds = query_optimizer.physicalJoinKindsForPlan(
-                search.plan
+                nullptr,
+                &transactional_storage_manager.index_manager
             );
             auto result = query_executor.executeJoinPlan(
-                search.plan.components,
-                &join_kinds
+                search.components,
+                nullptr,
+                5,
+                search.plan_root
             );
-            query_executor.printJoinPlanResult(search.plan.components, result);
+            query_executor.printJoinPlanResult(search.components, result);
             return;
         }
         query_executor.execute(statement);
@@ -7828,6 +7212,15 @@ public:
 
     QueryOptimizer& optimizer() {
         return query_processor.optimizer();
+    }
+
+    IndexManager& indexes() {
+        return transactional_storage_manager.index_manager;
+    }
+
+    ImdbIndexBuildSummary buildIndexes(
+            const std::vector<ImdbIndexSpec>& specs) {
+        return transactional_storage_manager.index_manager.buildIndexes(specs);
     }
 
     QueryComponents parseSelectStatement(const std::string& statement) {
@@ -8059,6 +7452,105 @@ void printImportResult(const ImportResult& result) {
     throw std::runtime_error("Importer finished without loading or skipping.");
 }
 
+std::vector<ImdbIndexSpec> imdbIndexSpecs() {
+    std::vector<ImdbIndexSpec> specs;
+
+    auto addPrimaryKey = [&](const std::string& table_name) {
+        specs.push_back({
+            "pk_" + table_name,
+            table_name,
+            "id",
+            true,
+            true
+        });
+    };
+
+    auto addForeignKey = [&](const std::string& index_name,
+                             const std::string& table_name,
+                             const std::string& column_name) {
+        specs.push_back({
+            index_name,
+            table_name,
+            column_name,
+            false,
+            false
+        });
+    };
+
+    for (const std::string& table_name : {
+             "aka_name",
+             "aka_title",
+             "cast_info",
+             "char_name",
+             "comp_cast_type",
+             "company_name",
+             "company_type",
+             "complete_cast",
+             "info_type",
+             "keyword",
+             "kind_type",
+             "link_type",
+             "movie_companies",
+             "movie_info",
+             "movie_info_idx",
+             "movie_keyword",
+             "movie_link",
+             "name",
+             "person_info",
+             "role_type",
+             "title"
+         }) {
+        addPrimaryKey(table_name);
+    }
+
+    addForeignKey("company_id_movie_companies", "movie_companies", "company_id");
+    addForeignKey("company_type_id_movie_companies", "movie_companies", "company_type_id");
+    addForeignKey("info_type_id_movie_info_idx", "movie_info_idx", "info_type_id");
+    addForeignKey("info_type_id_movie_info", "movie_info", "info_type_id");
+    addForeignKey("info_type_id_person_info", "person_info", "info_type_id");
+    addForeignKey("keyword_id_movie_keyword", "movie_keyword", "keyword_id");
+    addForeignKey("kind_id_aka_title", "aka_title", "kind_id");
+    addForeignKey("kind_id_title", "title", "kind_id");
+    addForeignKey("linked_movie_id_movie_link", "movie_link", "linked_movie_id");
+    addForeignKey("link_type_id_movie_link", "movie_link", "link_type_id");
+    addForeignKey("movie_id_aka_title", "aka_title", "movie_id");
+    addForeignKey("movie_id_cast_info", "cast_info", "movie_id");
+    addForeignKey("movie_id_complete_cast", "complete_cast", "movie_id");
+    addForeignKey("movie_id_movie_companies", "movie_companies", "movie_id");
+    addForeignKey("movie_id_movie_info_idx", "movie_info_idx", "movie_id");
+    addForeignKey("movie_id_movie_keyword", "movie_keyword", "movie_id");
+    addForeignKey("movie_id_movie_link", "movie_link", "movie_id");
+    addForeignKey("movie_id_movie_info", "movie_info", "movie_id");
+    addForeignKey("person_id_aka_name", "aka_name", "person_id");
+    addForeignKey("person_id_cast_info", "cast_info", "person_id");
+    addForeignKey("person_id_person_info", "person_info", "person_id");
+    addForeignKey("person_role_id_cast_info", "cast_info", "person_role_id");
+    addForeignKey("role_id_cast_info", "cast_info", "role_id");
+
+    return specs;
+}
+
+void printImdbIndexBuildSummary(const ImdbIndexBuildSummary& summary) {
+    std::cout << "\nIndex build:" << std::endl;
+    std::cout << "  primary-key indexes built: " << summary.primaryBuilt()
+              << std::endl;
+    std::cout << "  foreign-key indexes built: " << summary.foreignKeyBuilt()
+              << std::endl;
+    std::cout << "  skipped IMDB index specs: " << summary.skipped.size()
+              << std::endl;
+}
+
+size_t countJoinKind(const std::shared_ptr<JoinPlanNode>& node,
+                     PhysicalJoinKind kind) {
+    if (!node || node->is_leaf) {
+        return 0;
+    }
+    size_t count = node->chosen_join_kind == kind ? 1 : 0;
+    return count +
+           countJoinKind(node->left, kind) +
+           countJoinKind(node->right, kind);
+}
+
 struct TimedQueryResult {
     QueryResult result;
     double elapsed_seconds = 0.0;
@@ -8113,107 +7605,112 @@ void runImdbJoinOrdering() {
                   << import_elapsed.count() << " seconds" << std::endl;
     }
 
+    auto index_build = db.buildIndexes(imdbIndexSpecs());
+    printImdbIndexBuildSummary(index_build);
+
     auto components = db.parseSelectStatement(imdb_join_query);
     auto stats = db.optimizer().analyzeQueryTables(components);
 
-    auto bushy_planning_start = std::chrono::high_resolution_clock::now();
-    auto bushy_search = db.optimizer().chooseJoinOrder(
+    std::vector<std::string> baseline_trace;
+    auto baseline_search = db.optimizer().chooseBushyJoinOrder(
         components,
         stats,
-        JoinOrderSearchPolicy::BushyDP
+        &baseline_trace
     );
-    auto bushy_planning_end = std::chrono::high_resolution_clock::now();
-
-    auto annealing_planning_start = std::chrono::high_resolution_clock::now();
-    auto annealing_search = db.optimizer().chooseJoinOrder(
+    std::vector<std::string> all_index_trace;
+    auto all_index_search = db.optimizer().chooseBushyJoinOrder(
         components,
         stats,
-        JoinOrderSearchPolicy::SimulatedAnnealingBushy
+        &all_index_trace,
+        &db.indexes()
     );
-    auto annealing_planning_end = std::chrono::high_resolution_clock::now();
 
-    std::chrono::duration<double> bushy_planning_elapsed =
-        bushy_planning_end - bushy_planning_start;
-    std::chrono::duration<double> annealing_planning_elapsed =
-        annealing_planning_end - annealing_planning_start;
-
-    db.optimizer().printJoinOrderSearchComparison(
-        bushy_search,
-        annealing_search
-    );
-    db.optimizer().printJoinOrderSearchSteps(bushy_search);
-    db.optimizer().printJoinOrderSearchSteps(annealing_search);
-
-    std::cout << "\nPlanning time comparison "
-              << "(stats collection excluded):" << std::endl;
-    std::cout << "  Bushy DP: "
-              << bushy_planning_elapsed.count()
-              << " seconds" << std::endl;
-    std::cout << "  Simulated Annealing bushy: "
-              << annealing_planning_elapsed.count()
-              << " seconds" << std::endl;
+    std::cout << "\nBushy DP physical search:" << std::endl;
+    std::cout << "  baseline: table-scan leaves, no index joins, states="
+              << baseline_search.states_kept
+              << ", candidates=" << baseline_search.candidates_considered
+              << ", pruned_cross_products="
+              << baseline_search.cross_products_pruned
+              << ", cost=" << formatEstimate(baseline_search.estimated_cost)
+              << ", final_est="
+              << formatEstimate(baseline_search.final_estimate)
+              << std::endl;
+    std::cout << "  all IMDB primary-key/foreign-key indexes: states="
+              << all_index_search.states_kept
+              << ", candidates=" << all_index_search.candidates_considered
+              << ", pruned_cross_products="
+              << all_index_search.cross_products_pruned
+              << ", cost=" << formatEstimate(all_index_search.estimated_cost)
+              << ", final_est="
+              << formatEstimate(all_index_search.final_estimate)
+              << ", index_joins="
+              << countJoinKind(
+                    all_index_search.plan_root,
+                    PhysicalJoinKind::IndexNestedLoopJoin
+                 )
+              << std::endl;
 
     db.optimizer().printJoinPlanTree(
-        "Bushy DP tree",
-        bushy_search.plan.components,
-        bushy_search.plan_root
+        "Bushy DP baseline tree",
+        baseline_search.components,
+        baseline_search.plan_root
     );
     db.optimizer().printJoinPlanTree(
-        "Simulated Annealing bushy tree",
-        annealing_search.plan.components,
-        annealing_search.plan_root
+        "Bushy DP all-index tree",
+        all_index_search.components,
+        all_index_search.plan_root
     );
 
     std::cout << "\nQuery time comparison "
               << "(buffer pool cleared before each run):" << std::endl;
     db.clearBufferPool();
-    auto bushy_result = executeJoinQueryInTransaction(
+    auto baseline_result = executeJoinQueryInTransaction(
         db,
-        bushy_search.plan.components,
+        baseline_search.components,
         nullptr,
-        bushy_search.plan_root
+        baseline_search.plan_root
     );
     db.clearBufferPool();
-    auto annealing_result = executeJoinQueryInTransaction(
+    auto all_index_result = executeJoinQueryInTransaction(
         db,
-        annealing_search.plan.components,
+        all_index_search.components,
         nullptr,
-        annealing_search.plan_root
+        all_index_search.plan_root
     );
-    printTimedQueryResult("Bushy DP", bushy_result);
-    printTimedQueryResult("Simulated Annealing bushy", annealing_result);
-    if (bushy_result.result.row_count != annealing_result.result.row_count) {
-        throw std::runtime_error("Join reordering changed the query result.");
+    printTimedQueryResult("Bushy DP table-scan baseline", baseline_result);
+    printTimedQueryResult("Bushy DP with IMDB indexes", all_index_result);
+    if (baseline_result.result.row_count != all_index_result.result.row_count) {
+        throw std::runtime_error("Index planning changed the query result.");
     }
 
-    double actual_rows = static_cast<double>(bushy_result.result.row_count);
+    double actual_rows = static_cast<double>(baseline_result.result.row_count);
     std::cout << "\nFinal join q-error:" << std::endl;
-    std::cout << "  Bushy DP: estimate="
-              << formatEstimate(bushy_search.plan.final_estimate)
-              << " actual=" << bushy_result.result.row_count
+    std::cout << "  bushy table-scan baseline: estimate="
+              << formatEstimate(baseline_search.final_estimate)
+              << " actual=" << baseline_result.result.row_count
               << " q-error=" << formatQError(
-                    bushy_search.plan.final_estimate,
+                    baseline_search.final_estimate,
                     actual_rows
                  )
               << std::endl;
-    std::cout << "  Simulated Annealing bushy: estimate="
-              << formatEstimate(annealing_search.plan.final_estimate)
-              << " actual=" << annealing_result.result.row_count
+    std::cout << "  bushy with IMDB indexes: estimate="
+              << formatEstimate(all_index_search.final_estimate)
+              << " actual=" << all_index_result.result.row_count
               << " q-error=" << formatQError(
-                    annealing_search.plan.final_estimate,
+                    all_index_search.final_estimate,
                     actual_rows
                  )
               << std::endl;
 
-    std::cout << "\nResult: exact bushy DP enumerates the full bushy"
-              << " subset space; simulated annealing samples bushy trees"
-              << " through swaps, rotations, and local subtree resampling.\n";
+    std::cout << "\nResult: the bushy search space stays unchanged"
+              << " and uses a simple probe-plus-fetch cost model so IMDB"
+              << " indexes are used.\n";
 }
 
 int main() {
     try {
 
-    std::cout << "IMDB join ordering: Bushy DP vs Simulated Annealing bushy\n";
+    std::cout << "IMDB bushy DP with primary-key and foreign-key indexes\n";
 
     runImdbJoinOrdering();
 
