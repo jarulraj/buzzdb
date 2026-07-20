@@ -4428,11 +4428,86 @@ private:
     ExpressionId next_expression_id = 1;
     GroupId final_group_id = INVALID_GROUP_ID;
 
+    static bool isUnaryOp(MemoOpKind op) {
+        return op == MemoOpKind::LogicalSelect ||
+               op == MemoOpKind::LogicalProject;
+    }
+
+    static bool isJoinOp(MemoOpKind op) {
+        return op == MemoOpKind::LogicalEquiJoin ||
+               op == MemoOpKind::NestedLoopJoin ||
+               op == MemoOpKind::HashJoin ||
+               op == MemoOpKind::IndexNestedLoopJoin;
+    }
+
+    static bool labelIsSemantic(MemoOpKind op) {
+        return op == MemoOpKind::LogicalScan ||
+               op == MemoOpKind::LogicalSelect ||
+               op == MemoOpKind::LogicalProject;
+    }
+
+    static bool sameExpressionSignature(const MemoExpression& expression,
+                                        MemoOpKind op,
+                                        const std::vector<GroupId>& inputs,
+                                        const std::string& label) {
+        if (expression.op != op || expression.inputs != inputs) {
+            return false;
+        }
+        return !labelIsSemantic(op) || expression.label == label;
+    }
+
+    const MemoGroup& inputGroup(GroupId group_id) const {
+        if (group_id == INVALID_GROUP_ID || group_id > groups.size()) {
+            throw std::runtime_error("Memo expression input group id is out of range.");
+        }
+        return groups[group_id - 1];
+    }
+
+    void validateExpressionForGroup(const std::set<TableRefId>& table_refs,
+                                    MemoOpKind op,
+                                    const std::vector<GroupId>& inputs) const {
+        if (op == MemoOpKind::LogicalScan || op == MemoOpKind::TableScan) {
+            if (!inputs.empty() || table_refs.size() != 1) {
+                throw std::runtime_error("Scan expression must belong to one table group.");
+            }
+            return;
+        }
+
+        if (isUnaryOp(op)) {
+            if (inputs.size() != 1 ||
+                inputGroup(inputs[0]).table_refs != table_refs) {
+                throw std::runtime_error("Unary memo expression changes group semantics.");
+            }
+            return;
+        }
+
+        if (isJoinOp(op)) {
+            if (inputs.size() != 2) {
+                throw std::runtime_error("Join memo expression must have two inputs.");
+            }
+            const auto& left = inputGroup(inputs[0]).table_refs;
+            const auto& right = inputGroup(inputs[1]).table_refs;
+            std::set<TableRefId> joined = left;
+            for (TableRefId table_ref_id : right) {
+                if (!joined.insert(table_ref_id).second) {
+                    throw std::runtime_error("Join memo expression has overlapping inputs.");
+                }
+            }
+            if (joined != table_refs) {
+                throw std::runtime_error("Join memo expression does not match group tables.");
+            }
+            return;
+        }
+
+        throw std::runtime_error("Unknown memo expression kind.");
+    }
+
 public:
     GroupId addGroup(std::set<TableRefId> table_refs,
                      MemoOpKind op,
                      std::vector<GroupId> inputs,
                      std::string label) {
+        validateExpressionForGroup(table_refs, op, inputs);
         GroupId group_id = static_cast<GroupId>(groups.size() + 1);
         MemoExpression expression{
             next_expression_id++,
@@ -4467,10 +4542,9 @@ public:
                               std::vector<GroupId> inputs,
                               std::string label) {
         auto& group = groupFor(group_id);
+        validateExpressionForGroup(group.table_refs, op, inputs);
         for (const auto& expression : group.expressions) {
-            if (expression.op == op &&
-                expression.inputs == inputs &&
-                expression.label == label) {
+            if (sameExpressionSignature(expression, op, inputs, label)) {
                 return false;
             }
         }
@@ -5824,13 +5898,42 @@ private:
         return table_refs;
     }
 
+    static bool groupContainsOp(const MemoGroup& group, MemoOpKind op) {
+        for (const auto& expression : group.expressions) {
+            if (expression.op == op) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool isJoinEnumerationGroup(const MemoGroup& group) {
+        return groupContainsOp(group, MemoOpKind::LogicalEquiJoin);
+    }
+
+    static bool isFilteredBaseGroup(const MemoGroup& group) {
+        return group.table_refs.size() == 1 &&
+               groupContainsOp(group, MemoOpKind::LogicalSelect);
+    }
+
     static std::map<std::uint64_t, GroupId> buildGroupMaskIndex(
             const Memo& memo,
             const std::map<TableRefId, size_t>& bit_index) {
         std::map<std::uint64_t, GroupId> group_for_mask;
         for (const auto& group : memo.allGroups()) {
-            group_for_mask[maskForTableRefs(group.table_refs, bit_index)] =
-                group.id;
+            std::uint64_t mask = maskForTableRefs(group.table_refs, bit_index);
+            if (group.table_refs.size() == 1) {
+                if (group_for_mask.find(mask) == group_for_mask.end() ||
+                    isFilteredBaseGroup(group)) {
+                    group_for_mask[mask] = group.id;
+                }
+                continue;
+            }
+
+            if (isJoinEnumerationGroup(group) &&
+                group_for_mask.find(mask) == group_for_mask.end()) {
+                group_for_mask[mask] = group.id;
+            }
         }
         return group_for_mask;
     }

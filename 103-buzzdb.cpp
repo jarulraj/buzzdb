@@ -4720,11 +4720,87 @@ private:
     ExpressionId next_expression_id = 1;
     GroupId final_group_id = INVALID_GROUP_ID;
 
+    static bool isUnaryOp(MemoOpKind op) {
+        return op == MemoOpKind::LogicalSelect ||
+               op == MemoOpKind::LogicalProject;
+    }
+
+    static bool isJoinOp(MemoOpKind op) {
+        return op == MemoOpKind::LogicalEquiJoin ||
+               op == MemoOpKind::NestedLoopJoin ||
+               op == MemoOpKind::HashJoin ||
+               op == MemoOpKind::IndexNestedLoopJoin ||
+               op == MemoOpKind::SortMergeJoin;
+    }
+
+    static bool labelIsSemantic(MemoOpKind op) {
+        return op == MemoOpKind::LogicalScan ||
+               op == MemoOpKind::LogicalSelect ||
+               op == MemoOpKind::LogicalProject;
+    }
+
+    static bool sameExpressionSignature(const MemoExpression& expression,
+                                        MemoOpKind op,
+                                        const std::vector<GroupId>& inputs,
+                                        const std::string& label) {
+        if (expression.op != op || expression.inputs != inputs) {
+            return false;
+        }
+        return !labelIsSemantic(op) || expression.label == label;
+    }
+
+    const MemoGroup& inputGroup(GroupId group_id) const {
+        if (group_id == INVALID_GROUP_ID || group_id > groups.size()) {
+            throw std::runtime_error("Memo expression input group id is out of range.");
+        }
+        return groups[group_id - 1];
+    }
+
+    void validateExpressionForGroup(const std::set<TableRefId>& table_refs,
+                                    MemoOpKind op,
+                                    const std::vector<GroupId>& inputs) const {
+        if (op == MemoOpKind::LogicalScan || op == MemoOpKind::TableScan) {
+            if (!inputs.empty() || table_refs.size() != 1) {
+                throw std::runtime_error("Scan expression must belong to one table group.");
+            }
+            return;
+        }
+
+        if (isUnaryOp(op)) {
+            if (inputs.size() != 1 ||
+                inputGroup(inputs[0]).table_refs != table_refs) {
+                throw std::runtime_error("Unary memo expression changes group semantics.");
+            }
+            return;
+        }
+
+        if (isJoinOp(op)) {
+            if (inputs.size() != 2) {
+                throw std::runtime_error("Join memo expression must have two inputs.");
+            }
+            const auto& left = inputGroup(inputs[0]).table_refs;
+            const auto& right = inputGroup(inputs[1]).table_refs;
+            std::set<TableRefId> joined = left;
+            for (TableRefId table_ref_id : right) {
+                if (!joined.insert(table_ref_id).second) {
+                    throw std::runtime_error("Join memo expression has overlapping inputs.");
+                }
+            }
+            if (joined != table_refs) {
+                throw std::runtime_error("Join memo expression does not match group tables.");
+            }
+            return;
+        }
+
+        throw std::runtime_error("Unknown memo expression kind.");
+    }
+
 public:
     GroupId addGroup(std::set<TableRefId> table_refs,
                      MemoOpKind op,
                      std::vector<GroupId> inputs,
                      std::string label) {
+        validateExpressionForGroup(table_refs, op, inputs);
         GroupId group_id = static_cast<GroupId>(groups.size() + 1);
         MemoExpression expression{
             next_expression_id++,
@@ -4759,10 +4835,9 @@ public:
                               std::vector<GroupId> inputs,
                               std::string label) {
         auto& group = groupFor(group_id);
+        validateExpressionForGroup(group.table_refs, op, inputs);
         for (const auto& expression : group.expressions) {
-            if (expression.op == op &&
-                expression.inputs == inputs &&
-                expression.label == label) {
+            if (sameExpressionSignature(expression, op, inputs, label)) {
                 return false;
             }
         }
@@ -4837,6 +4912,24 @@ struct MemoOptimizationResult {
     size_t sort_enforcers = 0;
 };
 
+std::string orderPropertyKey(const std::optional<ColumnRef>& required_order) {
+    if (!required_order) {
+        return "";
+    }
+    return std::to_string(required_order->table_ref_id) + ":" +
+           std::to_string(required_order->column_index);
+}
+
+struct WinnerKey {
+    GroupId group_id = INVALID_GROUP_ID;
+    std::string required_order_key;
+
+    bool operator<(const WinnerKey& other) const {
+        return std::tie(group_id, required_order_key) <
+               std::tie(other.group_id, other.required_order_key);
+    }
+};
+
 enum class CascadesTaskKind {
     OptimizeGroup,
     ApplyRule,
@@ -4847,17 +4940,40 @@ struct CascadesTask {
     CascadesTaskKind kind = CascadesTaskKind::OptimizeGroup;
     GroupId group_id = INVALID_GROUP_ID;
     size_t expression_index = 0;
+    std::optional<ColumnRef> required_order;
 
-    static CascadesTask optimizeGroup(GroupId group_id) {
-        return {CascadesTaskKind::OptimizeGroup, group_id, 0};
+    static CascadesTask optimizeGroup(
+            GroupId group_id,
+            std::optional<ColumnRef> required_order = std::nullopt) {
+        return {
+            CascadesTaskKind::OptimizeGroup,
+            group_id,
+            0,
+            required_order
+        };
     }
 
-    static CascadesTask applyRule(GroupId group_id, size_t expression_index) {
-        return {CascadesTaskKind::ApplyRule, group_id, expression_index};
+    static CascadesTask applyRule(
+            GroupId group_id,
+            size_t expression_index,
+            std::optional<ColumnRef> required_order = std::nullopt) {
+        return {
+            CascadesTaskKind::ApplyRule,
+            group_id,
+            expression_index,
+            required_order
+        };
     }
 
-    static CascadesTask optimizeInput(GroupId group_id) {
-        return {CascadesTaskKind::OptimizeInput, group_id, 0};
+    static CascadesTask optimizeInput(
+            GroupId group_id,
+            std::optional<ColumnRef> required_order = std::nullopt) {
+        return {
+            CascadesTaskKind::OptimizeInput,
+            group_id,
+            0,
+            required_order
+        };
     }
 };
 
@@ -6225,13 +6341,42 @@ private:
         return table_refs;
     }
 
+    static bool groupContainsOp(const MemoGroup& group, MemoOpKind op) {
+        for (const auto& expression : group.expressions) {
+            if (expression.op == op) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool isJoinEnumerationGroup(const MemoGroup& group) {
+        return groupContainsOp(group, MemoOpKind::LogicalEquiJoin);
+    }
+
+    static bool isFilteredBaseGroup(const MemoGroup& group) {
+        return group.table_refs.size() == 1 &&
+               groupContainsOp(group, MemoOpKind::LogicalSelect);
+    }
+
     static std::map<std::uint64_t, GroupId> buildGroupMaskIndex(
             const Memo& memo,
             const std::map<TableRefId, size_t>& bit_index) {
         std::map<std::uint64_t, GroupId> group_for_mask;
         for (const auto& group : memo.allGroups()) {
-            group_for_mask[maskForTableRefs(group.table_refs, bit_index)] =
-                group.id;
+            std::uint64_t mask = maskForTableRefs(group.table_refs, bit_index);
+            if (group.table_refs.size() == 1) {
+                if (group_for_mask.find(mask) == group_for_mask.end() ||
+                    isFilteredBaseGroup(group)) {
+                    group_for_mask[mask] = group.id;
+                }
+                continue;
+            }
+
+            if (isJoinEnumerationGroup(group) &&
+                group_for_mask.find(mask) == group_for_mask.end()) {
+                group_for_mask[mask] = group.id;
+            }
         }
         return group_for_mask;
     }
@@ -6788,40 +6933,56 @@ private:
     bool recordCascadesCandidate(
             GroupId group_id,
             MemoPlanChoice candidate,
-            GroupId root_group_id,
             const std::optional<ColumnRef>& required_order,
-            std::map<GroupId, MemoPlanChoice>& winners,
+            std::map<WinnerKey, MemoPlanChoice>& winners,
             MemoRuleStats& stats) {
-        if (group_id == root_group_id) {
-            candidate = enforceRequiredOrder(
-                std::move(candidate),
-                required_order
-            );
-        }
+        candidate = enforceRequiredOrder(
+            std::move(candidate),
+            required_order
+        );
         stats.winner_candidates++;
-        auto winner = winners.find(group_id);
+        WinnerKey winner_key{group_id, orderPropertyKey(required_order)};
+        auto winner = winners.find(winner_key);
         bool improved =
             winner == winners.end() ||
             betterMemoPlanChoice(candidate, winner->second);
         if (!improved) {
             return false;
         }
-        winners[group_id] = candidate;
+        winners[winner_key] = candidate;
         return true;
     }
 
     void scheduleCascadesInput(
             std::deque<CascadesTask>& task_queue,
             const CascadesTask& retry_task,
-            GroupId input_group_id) {
+            GroupId input_group_id,
+            std::optional<ColumnRef> required_order = std::nullopt) {
         task_queue.push_front(retry_task);
-        task_queue.push_front(CascadesTask::optimizeInput(input_group_id));
+        task_queue.push_front(CascadesTask::optimizeInput(
+            input_group_id,
+            required_order
+        ));
     }
 
     bool cascadesInputReady(
             GroupId group_id,
-            const std::map<GroupId, MemoPlanChoice>& winners) {
-        return winners.find(group_id) != winners.end();
+            const std::optional<ColumnRef>& required_order,
+            const std::map<WinnerKey, MemoPlanChoice>& winners) {
+        return winners.find({
+            group_id,
+            orderPropertyKey(required_order)
+        }) != winners.end();
+    }
+
+    const MemoPlanChoice& cascadesWinner(
+            GroupId group_id,
+            const std::optional<ColumnRef>& required_order,
+            const std::map<WinnerKey, MemoPlanChoice>& winners) {
+        return winners.at({
+            group_id,
+            orderPropertyKey(required_order)
+        });
     }
 
     static GroupId physicalRootGroupId(const Memo& memo) {
@@ -6849,10 +7010,9 @@ private:
             const std::map<TableRefId, RelationStats>& base_relations,
             const std::vector<JoinClause>& edges,
             const IndexManager* index_manager,
-            std::map<GroupId, MemoPlanChoice>& winners,
+            std::map<WinnerKey, MemoPlanChoice>& winners,
             std::deque<CascadesTask>& task_queue,
             MemoRuleStats& stats,
-            GroupId root_group_id,
             const std::optional<ColumnRef>& required_order) {
         const auto& group = memo.groupFor(group_id);
         if (expression_index >= group.expressions.size()) {
@@ -6864,18 +7024,22 @@ private:
              expression.op == MemoOpKind::LogicalProject) &&
             expression.inputs.size() == 1) {
             GroupId input_group_id = expression.inputs[0];
-            if (!cascadesInputReady(input_group_id, winners)) {
+            if (!cascadesInputReady(input_group_id, required_order, winners)) {
                 scheduleCascadesInput(
                     task_queue,
-                    CascadesTask::applyRule(group_id, expression_index),
-                    input_group_id
+                    CascadesTask::applyRule(
+                        group_id,
+                        expression_index,
+                        required_order
+                    ),
+                    input_group_id,
+                    required_order
                 );
                 return;
             }
             recordCascadesCandidate(
                 group_id,
-                winners.at(input_group_id),
-                root_group_id,
+                cascadesWinner(input_group_id, required_order, winners),
                 required_order,
                 winners,
                 stats
@@ -6900,7 +7064,6 @@ private:
                     plan->table_refs,
                     plan->cost
                 },
-                root_group_id,
                 required_order,
                 winners,
                 stats
@@ -6915,33 +7078,62 @@ private:
 
         GroupId left_group_id = expression.inputs[0];
         GroupId right_group_id = expression.inputs[1];
-        if (!cascadesInputReady(left_group_id, winners)) {
-            scheduleCascadesInput(
-                task_queue,
-                CascadesTask::applyRule(group_id, expression_index),
-                left_group_id
-            );
-            return;
-        }
-        if (!cascadesInputReady(right_group_id, winners)) {
-            scheduleCascadesInput(
-                task_queue,
-                CascadesTask::applyRule(group_id, expression_index),
-                right_group_id
-            );
-            return;
-        }
-
-        const auto& left = winners.at(left_group_id);
-        const auto& right = winners.at(right_group_id);
-        auto edge = joinEdgeBetweenPlans(
-            *left.plan_root,
-            *right.plan_root,
+        const auto& left_group = memo.groupFor(left_group_id);
+        const auto& right_group = memo.groupFor(right_group_id);
+        auto edge = joinEdgeBetweenTableRefSets(
+            left_group.table_refs,
+            right_group.table_refs,
             edges
         );
         if (!edge) {
             return;
         }
+
+        std::optional<ColumnRef> left_required_order;
+        std::optional<ColumnRef> right_required_order;
+        if (*join_kind == PhysicalJoinKind::SortMergeJoin) {
+            auto columns = joinedAndInputColumns(*edge, left_group.table_refs);
+            left_required_order = columns.first;
+            right_required_order = columns.second;
+        }
+
+        if (!cascadesInputReady(left_group_id, left_required_order, winners)) {
+            scheduleCascadesInput(
+                task_queue,
+                CascadesTask::applyRule(
+                    group_id,
+                    expression_index,
+                    required_order
+                ),
+                left_group_id,
+                left_required_order
+            );
+            return;
+        }
+        if (!cascadesInputReady(right_group_id, right_required_order, winners)) {
+            scheduleCascadesInput(
+                task_queue,
+                CascadesTask::applyRule(
+                    group_id,
+                    expression_index,
+                    required_order
+                ),
+                right_group_id,
+                right_required_order
+            );
+            return;
+        }
+
+        const auto& left = cascadesWinner(
+            left_group_id,
+            left_required_order,
+            winners
+        );
+        const auto& right = cascadesWinner(
+            right_group_id,
+            right_required_order,
+            winners
+        );
 
         auto step = estimateJoinTreeStepForKind(
             left.table_refs,
@@ -6974,7 +7166,6 @@ private:
                 plan->table_refs,
                 plan->cost
             },
-            root_group_id,
             required_order,
             winners,
             stats
@@ -7078,11 +7269,15 @@ public:
         auto base_relations = estimateBaseRelations(components, stats);
         auto edges = equalityEdgesForJoinOrdering(components);
 
-        std::map<GroupId, MemoPlanChoice> winners;
-        std::set<GroupId> optimized_groups;
+        std::map<WinnerKey, MemoPlanChoice> winners;
+        std::set<WinnerKey> optimized_groups;
         std::deque<CascadesTask> task_queue;
         GroupId root_group_id = physicalRootGroupId(memo);
-        task_queue.push_back(CascadesTask::optimizeGroup(root_group_id));
+        auto root_required_order = components.order_by_column;
+        task_queue.push_back(CascadesTask::optimizeGroup(
+            root_group_id,
+            root_required_order
+        ));
 
         while (!task_queue.empty()) {
             auto task = task_queue.front();
@@ -7091,14 +7286,22 @@ public:
 
             if (task.kind == CascadesTaskKind::OptimizeGroup) {
                 rule_stats.optimize_group_tasks++;
-                if (!optimized_groups.insert(task.group_id).second) {
+                WinnerKey task_key{
+                    task.group_id,
+                    orderPropertyKey(task.required_order)
+                };
+                if (!optimized_groups.insert(task_key).second) {
                     continue;
                 }
 
                 const auto& group = memo.groupFor(task.group_id);
                 for (size_t i = group.expressions.size(); i > 0; i--) {
                     task_queue.push_front(
-                        CascadesTask::applyRule(task.group_id, i - 1)
+                        CascadesTask::applyRule(
+                            task.group_id,
+                            i - 1,
+                            task.required_order
+                        )
                     );
                 }
             } else if (task.kind == CascadesTaskKind::ApplyRule) {
@@ -7114,21 +7317,31 @@ public:
                     winners,
                     task_queue,
                     rule_stats,
-                    root_group_id,
-                    components.order_by_column
+                    task.required_order
                 );
             } else if (task.kind == CascadesTaskKind::OptimizeInput) {
                 rule_stats.optimize_input_tasks++;
-                if (winners.find(task.group_id) == winners.end() &&
-                    optimized_groups.find(task.group_id) == optimized_groups.end()) {
+                WinnerKey task_key{
+                    task.group_id,
+                    orderPropertyKey(task.required_order)
+                };
+                if (winners.find(task_key) == winners.end() &&
+                    optimized_groups.find(task_key) == optimized_groups.end()) {
                     task_queue.push_front(
-                        CascadesTask::optimizeGroup(task.group_id)
+                        CascadesTask::optimizeGroup(
+                            task.group_id,
+                            task.required_order
+                        )
                     );
                 }
             }
         }
 
-        auto final_choice = winners.find(root_group_id);
+        WinnerKey final_key{
+            root_group_id,
+            orderPropertyKey(root_required_order)
+        };
+        auto final_choice = winners.find(final_key);
         if (final_choice == winners.end()) {
             throw std::runtime_error("Cascades queue found no executable plan.");
         }
