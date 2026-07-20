@@ -8978,6 +8978,20 @@ public:
         );
     }
 
+    QueryResult executeJoinOrder(
+            const QueryComponents& components,
+            const std::vector<PhysicalJoinKind>& physical_join_kinds,
+            LookaheadInfoPassingManager* lip_manager = nullptr,
+            size_t sample_limit = 5) {
+        return query_executor.executeJoinPlan(
+            components,
+            &physical_join_kinds,
+            sample_limit,
+            nullptr,
+            lip_manager
+        );
+    }
+
     QueryOptimizer& optimizer() {
         return query_optimizer;
     }
@@ -9130,6 +9144,19 @@ public:
         return query_processor.executeJoinPlan(
             components,
             plan_root,
+            lip_manager,
+            sample_limit
+        );
+    }
+
+    QueryResult executeJoinOrder(
+            const QueryComponents& components,
+            const std::vector<PhysicalJoinKind>& physical_join_kinds,
+            LookaheadInfoPassingManager* lip_manager = nullptr,
+            size_t sample_limit = 5) {
+        return query_processor.executeJoinOrder(
+            components,
+            physical_join_kinds,
             lip_manager,
             sample_limit
         );
@@ -9301,6 +9328,18 @@ void ensureImdbDatasetLoaded(BuzzDB& db) {
     }
 }
 
+std::vector<IndexSpec> imdbIndexSpecs() {
+    return {
+        {"movie_companies", "company_type_id"},
+        {"title", "kind_id"},
+        {"movie_info_idx", "info_type_id"},
+        {"movie_info", "info_type_id"},
+        {"company_name", "country_code"},
+        {"title", "production_year"},
+        {"movie_companies", "note"}
+    };
+}
+
 void printMemoRuleStats(const std::string& label,
                         const MemoRuleStats& stats) {
     std::cout << "  " << label
@@ -9346,20 +9385,59 @@ TimedLipResult executeTimedPlan(
     return {std::move(result), elapsed.count()};
 }
 
+TimedLipResult executeTimedJoinOrder(
+        BuzzDB& db,
+        const QueryComponents& components,
+        const std::vector<PhysicalJoinKind>& physical_join_kinds,
+        LookaheadInfoPassingManager* lip_manager = nullptr) {
+    db.clearBufferPool();
+    auto start = std::chrono::steady_clock::now();
+    auto result = db.executeJoinOrder(
+        components,
+        physical_join_kinds,
+        lip_manager,
+        0
+    );
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    return {std::move(result), elapsed.count()};
+}
+
+std::string joinOrderLabel(const QueryComponents& components) {
+    std::ostringstream output;
+    output << tableRefForId(components, components.base_table_ref_id).alias;
+    for (const auto& join : components.joins) {
+        output << " -> "
+               << tableRefForId(components, join.input_table_ref_id).alias;
+    }
+    return output.str();
+}
+
 void runImdbLookaheadInfoPassing() {
     BuzzDB db;
     ensureImdbDatasetLoaded(db);
 
     auto components = db.parseSelectStatement(imdb_join_query);
+    std::vector<PhysicalJoinKind> written_join_kinds(
+        components.joins.size(),
+        PhysicalJoinKind::HashJoin
+    );
     auto stats = db.optimizer().analyzeQueryTables(components);
 
+    auto indexes = imdbIndexSpecs();
+    db.buildIndexes(indexes);
     auto search = db.optimizer().optimizeWithCascadesQueue(
         components,
-        stats
+        stats,
+        &db.indexes()
     );
 
+    std::cout << "\nWritten-order plan:" << std::endl;
+    std::cout << "  order=" << joinOrderLabel(components) << std::endl;
+    std::cout << "  operators=HashJoin for each JOIN clause" << std::endl;
+
     std::cout << "\nCascades queue work:" << std::endl;
-    printMemoRuleStats("without index implementations", search.rule_stats);
+    printMemoRuleStats("with index implementations", search.rule_stats);
 
     std::cout << "\nCascades winner:" << std::endl;
     std::cout << "  cost=" << formatEstimate(search.estimated_cost)
@@ -9375,40 +9453,79 @@ void runImdbLookaheadInfoPassing() {
         search.plan_root
     );
 
-    auto without_lip = executeTimedPlan(db, search.components, search.plan_root);
+    auto written_without_lip = executeTimedJoinOrder(
+        db,
+        components,
+        written_join_kinds
+    );
 
-    LookaheadInfoPassingManager lip_manager;
-    auto filter_start = std::chrono::steady_clock::now();
-    db.buildLookaheadFilters(lip_manager, search.components);
-    auto filter_end = std::chrono::steady_clock::now();
-    std::chrono::duration<double> filter_elapsed =
-        filter_end - filter_start;
+    LookaheadInfoPassingManager written_lip_manager;
+    auto written_filter_start = std::chrono::steady_clock::now();
+    db.buildLookaheadFilters(written_lip_manager, components);
+    auto written_filter_end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> written_filter_elapsed =
+        written_filter_end - written_filter_start;
 
-    auto with_lip = executeTimedPlan(
+    auto written_with_lip = executeTimedJoinOrder(
+        db,
+        components,
+        written_join_kinds,
+        &written_lip_manager
+    );
+
+    auto cascades_without_lip = executeTimedPlan(
+        db,
+        search.components,
+        search.plan_root
+    );
+
+    LookaheadInfoPassingManager cascades_lip_manager;
+    auto cascades_filter_start = std::chrono::steady_clock::now();
+    db.buildLookaheadFilters(cascades_lip_manager, search.components);
+    auto cascades_filter_end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> cascades_filter_elapsed =
+        cascades_filter_end - cascades_filter_start;
+
+    auto cascades_with_lip = executeTimedPlan(
         db,
         search.components,
         search.plan_root,
-        &lip_manager
+        &cascades_lip_manager
     );
 
-    std::cout << "\nExecuted Cascades plan:" << std::endl;
-    std::cout << "  without LIP: rows=" << without_lip.result.row_count
+    std::cout << "\nExecuted plans:" << std::endl;
+    std::cout << "  written order, without LIP: rows="
+              << written_without_lip.result.row_count
               << ", elapsed="
-              << formatEstimate(without_lip.elapsed_seconds)
+              << formatEstimate(written_without_lip.elapsed_seconds)
               << " seconds" << std::endl;
-    std::cout << "  with LIP:    rows=" << with_lip.result.row_count
+    std::cout << "  written order, with LIP:    rows="
+              << written_with_lip.result.row_count
               << ", filter_build="
-              << formatEstimate(filter_elapsed.count())
+              << formatEstimate(written_filter_elapsed.count())
               << " seconds, elapsed="
-              << formatEstimate(with_lip.elapsed_seconds)
+              << formatEstimate(written_with_lip.elapsed_seconds)
+              << " seconds, early_rejections="
+              << written_lip_manager.rejectedTuples() << std::endl;
+    std::cout << "  Cascades, without LIP:      rows="
+              << cascades_without_lip.result.row_count
+              << ", elapsed="
+              << formatEstimate(cascades_without_lip.elapsed_seconds)
               << " seconds" << std::endl;
-    std::cout << "  LIP early rejections="
-              << lip_manager.rejectedTuples() << std::endl;
+    std::cout << "  Cascades, with LIP:         rows="
+              << cascades_with_lip.result.row_count
+              << ", filter_build="
+              << formatEstimate(cascades_filter_elapsed.count())
+              << " seconds, elapsed="
+              << formatEstimate(cascades_with_lip.elapsed_seconds)
+              << " seconds, early_rejections="
+              << cascades_lip_manager.rejectedTuples() << std::endl;
 
     std::cout << "\nTakeaway: Lookahead Information Passing adds runtime"
-              << " Bloom filters to an optimizer-produced plan. The filters"
-              << " can reject tuples before later joins see them, without"
-              << " changing the query result.\n";
+              << " Bloom filters to an existing physical plan. It helps most"
+              << " when the chosen order would otherwise scan many tuples"
+              << " before reaching selective joins. An indexed Cascades plan"
+              << " may already avoid much of that work.\n";
 }
 
 int main() {
