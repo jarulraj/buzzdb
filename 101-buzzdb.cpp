@@ -4303,6 +4303,12 @@ std::string formatEstimate(double value) {
     return output.str();
 }
 
+std::string formatSeconds(double value) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(6) << value;
+    return output.str();
+}
+
 enum class PhysicalJoinKind {
     NestedLoopJoin,
     HashJoin,
@@ -7473,6 +7479,19 @@ public:
         execute(query_parser.parseStatement(statement));
     }
 
+    QueryResult executeJoinPlan(
+            const QueryComponents& components,
+            const TxnPtr& txn,
+            const std::shared_ptr<PhysicalPlanNode>& plan_root) {
+        return query_executor.executeJoinPlan(
+            components,
+            txn,
+            nullptr,
+            0,
+            plan_root
+        );
+    }
+
     QueryComponents parseSelectStatement(const std::string& statement) {
         auto parsed = query_parser.parseStatement(statement);
         if (parsed.kind != ParsedStatement::Kind::Select &&
@@ -7528,6 +7547,13 @@ public:
 
     void execute(const std::string& statement) {
         query_processor.execute(statement);
+    }
+
+    QueryResult executeJoinPlan(
+            const QueryComponents& components,
+            const TxnPtr& txn,
+            const std::shared_ptr<PhysicalPlanNode>& plan_root) {
+        return query_processor.executeJoinPlan(components, txn, plan_root);
     }
 
     void commit(const TxnPtr& txn) {
@@ -7790,6 +7816,32 @@ std::vector<IndexSpec> imdbIndexSpecs() {
     };
 }
 
+struct TimedPlanResult {
+    QueryResult result;
+    double elapsed_seconds = 0.0;
+};
+
+TimedPlanResult executeTimedPlan(
+        BuzzDB& db,
+        const QueryComponents& components,
+        const std::shared_ptr<PhysicalPlanNode>& plan_root) {
+    auto txn = db.beginTransaction();
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto result = db.executeJoinPlan(components, txn, plan_root);
+        auto end = std::chrono::high_resolution_clock::now();
+        db.commit(txn);
+
+        std::chrono::duration<double> elapsed = end - start;
+        return {std::move(result), elapsed.count()};
+    } catch (...) {
+        if (txn && txn->state == TxnContext::RUNNING) {
+            db.abort(txn);
+        }
+        throw;
+    }
+}
+
 void printMemoRuleStats(const std::string& label,
                         const MemoRuleStats& stats) {
     std::cout << "  " << label
@@ -7836,6 +7888,12 @@ void runImdbMemoRules() {
         search.components,
         search.plan_root
     );
+
+    auto executed = executeTimedPlan(db, search.components, search.plan_root);
+    std::cout << "\nExecuted generated plan:" << std::endl;
+    std::cout << "  rows=" << executed.result.row_count
+              << ", elapsed=" << formatSeconds(executed.elapsed_seconds)
+              << " seconds" << std::endl;
 
     std::cout << "\nTakeaway: memo rules add equivalent logical joins and"
               << " physical implementations to the same groups. The optimizer"
