@@ -8494,7 +8494,7 @@ public:
 
 const std::string imdb_data_filename = "imdb_large.txt";
 const std::string imdb_join_query =
-    "PROJECT {cn.id}, {cn.name}, {miidx.info}, {t.title} "
+    "PROJECT {cn.id}, {cn.name}, {miidx.info}, {mi.info}, {t.title} "
     "FROM info_type AS it "
     "JOIN movie_info_idx AS miidx ON {it.id} = {miidx.info_type_id} "
     "JOIN movie_companies AS mc ON {miidx.movie_id} = {mc.movie_id} "
