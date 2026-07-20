@@ -153,31 +153,6 @@ bool operator==(const Field& lhs, const Field& rhs) {
     }
 }
 
-int compareFields(const Field& lhs, const Field& rhs) {
-    if (lhs.type != rhs.type) {
-        throw std::runtime_error("Cannot compare fields with different types.");
-    }
-
-    switch (lhs.type) {
-        case INT: {
-            int left = lhs.asInt();
-            int right = rhs.asInt();
-            return (left > right) - (left < right);
-        }
-        case FLOAT: {
-            float left = lhs.asFloat();
-            float right = rhs.asFloat();
-            return (left > right) - (left < right);
-        }
-        case STRING: {
-            const auto left = lhs.asString();
-            const auto right = rhs.asString();
-            return (left > right) - (left < right);
-        }
-    }
-    throw std::runtime_error("Unsupported field type for comparison.");
-}
-
 class Tuple {
 public:
     std::vector<std::unique_ptr<Field>> fields;
@@ -343,21 +318,6 @@ struct IndexKeyHasher {
         return 0;
     }
 };
-
-enum class AccessPathKind {
-    TableScan,
-    IndexScan
-};
-
-std::string accessPathKindName(AccessPathKind kind) {
-    switch (kind) {
-        case AccessPathKind::TableScan:
-            return "TableScan";
-        case AccessPathKind::IndexScan:
-            return "IndexScan";
-    }
-    throw std::runtime_error("Unknown access path kind.");
-}
 
 const std::string BOOTSTRAP_MAGIC = "BUZZDB_BOOTSTRAP";
 
@@ -2827,207 +2787,6 @@ public:
     }
 };
 
-struct IndexRangeLookupResult {
-    std::vector<RecordId> record_ids;
-    size_t index_keys_visited = 0;
-};
-
-class BPlusTreeIndex {
-private:
-    struct Node {
-        bool is_leaf = false;
-        std::vector<int> keys;
-        std::vector<std::vector<RecordId>> values;
-        std::vector<std::shared_ptr<Node>> children;
-        std::shared_ptr<Node> next = nullptr;
-
-        explicit Node(bool leaf) : is_leaf(leaf) {}
-    };
-
-    static constexpr size_t DEFAULT_MAX_KEYS = 64;
-
-    size_t max_keys = DEFAULT_MAX_KEYS;
-    std::shared_ptr<Node> root = std::make_shared<Node>(true);
-    size_t entries = 0;
-    size_t distinct_keys = 0;
-
-public:
-    void clear() {
-        root = std::make_shared<Node>(true);
-        entries = 0;
-        distinct_keys = 0;
-    }
-
-    void insert(int key, const RecordId& record_id) {
-        auto node = root;
-        std::vector<std::shared_ptr<Node>> path;
-        while (!node->is_leaf) {
-            path.push_back(node);
-            auto child_it = std::upper_bound(
-                node->keys.begin(),
-                node->keys.end(),
-                key
-            );
-            node = node->children[static_cast<size_t>(
-                std::distance(node->keys.begin(), child_it)
-            )];
-        }
-
-        auto key_it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
-        size_t position = static_cast<size_t>(
-            std::distance(node->keys.begin(), key_it)
-        );
-        if (key_it != node->keys.end() && *key_it == key) {
-            node->values[position].push_back(record_id);
-            entries++;
-            return;
-        }
-
-        node->keys.insert(node->keys.begin() + static_cast<long>(position), key);
-        node->values.insert(
-            node->values.begin() + static_cast<long>(position),
-            std::vector<RecordId>{record_id}
-        );
-        entries++;
-        distinct_keys++;
-
-        if (node->keys.size() > max_keys) {
-            splitNode(path, node);
-        }
-    }
-
-    IndexRangeLookupResult rangeLookup(int lower_bound,
-                                       int upper_bound) const {
-        IndexRangeLookupResult result;
-        int lower = lower_bound + 1;
-        int upper = upper_bound - 1;
-        if (lower > upper) {
-            return result;
-        }
-
-        auto node = root;
-        while (node && !node->is_leaf) {
-            auto child_it = std::upper_bound(
-                node->keys.begin(),
-                node->keys.end(),
-                lower
-            );
-            node = node->children[static_cast<size_t>(
-                std::distance(node->keys.begin(), child_it)
-            )];
-        }
-
-        while (node) {
-            for (size_t i = 0; i < node->keys.size(); i++) {
-                int key = node->keys[i];
-                if (key > upper) {
-                    return result;
-                }
-                if (key >= lower) {
-                    result.index_keys_visited++;
-                    result.record_ids.insert(
-                        result.record_ids.end(),
-                        node->values[i].begin(),
-                        node->values[i].end()
-                    );
-                }
-            }
-            node = node->next;
-        }
-        return result;
-    }
-
-    size_t entryCount() const {
-        return entries;
-    }
-
-    size_t distinctKeyCount() const {
-        return distinct_keys;
-    }
-
-private:
-    void splitNode(std::vector<std::shared_ptr<Node>> path,
-                   std::shared_ptr<Node> node) {
-        if (node->is_leaf) {
-            splitLeaf(std::move(path), std::move(node));
-            return;
-        }
-        splitInternal(std::move(path), std::move(node));
-    }
-
-    void splitLeaf(std::vector<std::shared_ptr<Node>> path,
-                   std::shared_ptr<Node> node) {
-        auto sibling = std::make_shared<Node>(true);
-        size_t mid = node->keys.size() / 2;
-        sibling->keys.assign(node->keys.begin() + static_cast<long>(mid),
-                             node->keys.end());
-        sibling->values.assign(node->values.begin() + static_cast<long>(mid),
-                               node->values.end());
-        node->keys.resize(mid);
-        node->values.resize(mid);
-
-        sibling->next = node->next;
-        node->next = sibling;
-        insertIntoParent(std::move(path), node, sibling->keys.front(), sibling);
-    }
-
-    void splitInternal(std::vector<std::shared_ptr<Node>> path,
-                       std::shared_ptr<Node> node) {
-        auto sibling = std::make_shared<Node>(false);
-        size_t mid = node->keys.size() / 2;
-        int promoted_key = node->keys[mid];
-
-        sibling->keys.assign(node->keys.begin() + static_cast<long>(mid + 1),
-                             node->keys.end());
-        sibling->children.assign(
-            node->children.begin() + static_cast<long>(mid + 1),
-            node->children.end()
-        );
-        node->keys.resize(mid);
-        node->children.resize(mid + 1);
-
-        insertIntoParent(std::move(path), node, promoted_key, sibling);
-    }
-
-    void insertIntoParent(std::vector<std::shared_ptr<Node>> path,
-                          const std::shared_ptr<Node>& node,
-                          int promoted_key,
-                          const std::shared_ptr<Node>& sibling) {
-        if (path.empty()) {
-            auto new_root = std::make_shared<Node>(false);
-            new_root->keys.push_back(promoted_key);
-            new_root->children.push_back(node);
-            new_root->children.push_back(sibling);
-            root = new_root;
-            return;
-        }
-
-        auto parent = path.back();
-        path.pop_back();
-        auto child_it = std::find(parent->children.begin(),
-                                  parent->children.end(),
-                                  node);
-        if (child_it == parent->children.end()) {
-            throw std::runtime_error("B+tree parent lost child pointer.");
-        }
-        size_t child_index = static_cast<size_t>(
-            std::distance(parent->children.begin(), child_it)
-        );
-        parent->keys.insert(
-            parent->keys.begin() + static_cast<long>(child_index),
-            promoted_key
-        );
-        parent->children.insert(
-            parent->children.begin() + static_cast<long>(child_index + 1),
-            sibling
-        );
-
-        if (parent->keys.size() > max_keys) {
-            splitNode(std::move(path), parent);
-        }
-    }
-};
-
 class IndexManager {
 private:
     struct BuildTarget {
@@ -3038,7 +2797,6 @@ private:
     Catalog& catalog;
     PageManager& page_manager;
     std::map<IndexDescriptor, HashIndex> hash_indexes;
-    std::map<IndexDescriptor, BPlusTreeIndex> ordered_indexes;
 
 public:
     IndexManager(Catalog& catalog, PageManager& page_manager)
@@ -3119,62 +2877,8 @@ public:
         return summary;
     }
 
-    IndexBuildResult buildOrderedIndex(const ImdbIndexSpec& spec) {
-        if (!catalog.hasTable(spec.table_name)) {
-            throw std::runtime_error(
-                "Cannot build index on missing table: " + spec.table_name
-            );
-        }
-
-        auto& metadata = catalog.getTable(spec.table_name);
-        auto column_index = metadata.schema.findColumnIndex(spec.column_name);
-        if (!column_index) {
-            throw std::runtime_error(
-                "Cannot build index on missing column: " + spec.column_name
-            );
-        }
-        if (metadata.schema.columns[*column_index].type != INT) {
-            throw std::runtime_error("IndexScan range demo requires an INT key.");
-        }
-
-        IndexDescriptor descriptor{metadata.table_id, *column_index};
-        auto& index = ordered_indexes[descriptor];
-        index.clear();
-
-        TableHeap table_heap(metadata, page_manager);
-        for (PageID page_id = table_heap.firstPage();
-             page_id != INVALID_PAGE_ID;
-             page_id = table_heap.nextPage(page_id)) {
-            for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                auto tuple = table_heap.getTuple(page_id, slot);
-                if (!tuple || *column_index >= tuple->fields.size()) {
-                    continue;
-                }
-                const auto& field = *tuple->fields[*column_index];
-                if (field.getType() != INT) {
-                    continue;
-                }
-                index.insert(field.asInt(), {metadata.table_id, page_id, slot});
-            }
-        }
-
-        return {
-            spec.index_name,
-            spec.table_name,
-            spec.column_name,
-            spec.unique,
-            spec.primary_key,
-            index.entryCount(),
-            index.distinctKeyCount()
-        };
-    }
-
     bool hasHashIndex(const IndexDescriptor& descriptor) const {
         return hash_indexes.find(descriptor) != hash_indexes.end();
-    }
-
-    bool hasOrderedIndex(const IndexDescriptor& descriptor) const {
-        return ordered_indexes.find(descriptor) != ordered_indexes.end();
     }
 
     const HashIndex& hashIndex(const IndexDescriptor& descriptor) const {
@@ -3185,23 +2889,9 @@ public:
         return it->second;
     }
 
-    const BPlusTreeIndex& orderedIndex(const IndexDescriptor& descriptor) const {
-        auto it = ordered_indexes.find(descriptor);
-        if (it == ordered_indexes.end()) {
-            throw std::runtime_error("Ordered index is not built.");
-        }
-        return it->second;
-    }
-
     const std::vector<RecordId>* lookup(const IndexDescriptor& descriptor,
                                         const Field& value) const {
         return hashIndex(descriptor).lookup(value);
-    }
-
-    IndexRangeLookupResult rangeLookup(const IndexDescriptor& descriptor,
-                                       int lower_bound,
-                                       int upper_bound) const {
-        return orderedIndex(descriptor).rangeLookup(lower_bound, upper_bound);
     }
 };
 
@@ -4582,19 +4272,10 @@ struct QueryResult {
     std::vector<std::vector<std::unique_ptr<Field>>> sample_rows;
 };
 
-struct HistogramBucket {
-    int lower = 0;
-    int upper = 0;
-    size_t count = 0;
-};
-
 struct ColumnStats {
     FieldType type = INT;
     size_t distinct_count = 0;
     std::map<std::string, size_t> mcv_counts;
-    std::optional<Field> min_value;
-    std::optional<Field> max_value;
-    std::vector<HistogramBucket> range_histogram;
 };
 
 struct TableStats {
@@ -4603,25 +4284,6 @@ struct TableStats {
     size_t row_count = 0;
     size_t page_count = 0;
     std::map<size_t, ColumnStats> columns;
-};
-
-struct AccessPathChoice {
-    AccessPathKind kind = AccessPathKind::TableScan;
-    IndexDescriptor index_descriptor;
-    double estimated_rows = 0.0;
-    double table_scan_cost = 0.0;
-    double index_scan_cost = std::numeric_limits<double>::infinity();
-    bool index_available = false;
-};
-
-struct AccessPathExecutionResult {
-    AccessPathKind kind = AccessPathKind::TableScan;
-    size_t qualifying_rows = 0;
-    size_t rows_examined = 0;
-    size_t record_ids_produced = 0;
-    size_t tuples_fetched = 0;
-    size_t index_keys_visited = 0;
-    double elapsed_ms = 0.0;
 };
 
 struct ColumnRelationStats {
@@ -5432,13 +5094,6 @@ private:
     PageManager& page_manager;
 
     static constexpr size_t MCV_LIMIT = 5;
-    static constexpr size_t HISTOGRAM_BUCKET_COUNT = 10;
-
-    static void replaceOptionalField(std::optional<Field>& target,
-                                     const Field& value) {
-        target.reset();
-        target.emplace(value);
-    }
 
     static double clampEstimate(double estimate, double input_rows) {
         if (input_rows <= 0.0) {
@@ -5470,44 +5125,6 @@ private:
             top_counts[counts[i].first] = counts[i].second;
         }
         return top_counts;
-    }
-
-    static std::vector<HistogramBucket> buildRangeHistogram(
-            const std::vector<int>& values,
-            size_t bucket_count) {
-        std::vector<HistogramBucket> buckets;
-        if (values.empty() || bucket_count == 0) {
-            return buckets;
-        }
-
-        auto minmax = std::minmax_element(values.begin(), values.end());
-        int min_value = *minmax.first;
-        int max_value = *minmax.second;
-        size_t domain_width =
-            static_cast<size_t>(max_value - min_value) + 1;
-        size_t bucket_width =
-            std::max<size_t>(1, (domain_width + bucket_count - 1) / bucket_count);
-
-        for (size_t bucket = 0; bucket < bucket_count; bucket++) {
-            int lower = min_value + static_cast<int>(bucket * bucket_width);
-            if (lower > max_value) {
-                break;
-            }
-            int upper = std::min(
-                max_value,
-                lower + static_cast<int>(bucket_width) - 1
-            );
-            buckets.push_back({lower, upper, 0});
-        }
-
-        for (int value : values) {
-            size_t bucket = std::min(
-                buckets.size() - 1,
-                static_cast<size_t>(value - min_value) / bucket_width
-            );
-            buckets[bucket].count++;
-        }
-        return buckets;
     }
 
     static QueryComponents makeJoinPlanComponents(
@@ -5606,16 +5223,6 @@ private:
         return 0.50 * std::max(0.0, tuples);
     }
 
-    static double rangeTableScanCost(const TableStats& table_stats) {
-        return static_cast<double>(table_stats.page_count) * 5.0 +
-               static_cast<double>(table_stats.row_count) * 0.02;
-    }
-
-    static double rangeIndexScanCost(double estimated_rows) {
-        return 25.0 +
-               std::max(0.0, estimated_rows) * 0.75;
-    }
-
     static double nestedLoopJoinCost(double left_total_cost,
                                      double right_total_cost,
                                      double left_rows,
@@ -5678,8 +5285,6 @@ private:
             metadata.schema.columns.size());
         std::vector<std::map<std::string, size_t>> value_counts(
             metadata.schema.columns.size());
-        std::vector<std::vector<int>> int_values(
-            metadata.schema.columns.size());
         for (size_t column = 0; column < metadata.schema.columns.size(); column++) {
             stats.columns[column].type = metadata.schema.columns[column].type;
         }
@@ -5698,22 +5303,9 @@ private:
                 stats.row_count++;
                 for (size_t column = 0; column < tuple->fields.size(); column++) {
                     const auto& value = *tuple->fields[column];
-                    auto& column_stats = stats.columns[column];
                     auto value_string = fieldToString(value);
                     distinct_values[column].insert(value_string);
                     value_counts[column][value_string]++;
-                    if (value.getType() == INT) {
-                        int_values[column].push_back(value.asInt());
-                    }
-
-                    if (!column_stats.min_value ||
-                        compareFields(value, *column_stats.min_value) < 0) {
-                        replaceOptionalField(column_stats.min_value, value);
-                    }
-                    if (!column_stats.max_value ||
-                        compareFields(value, *column_stats.max_value) > 0) {
-                        replaceOptionalField(column_stats.max_value, value);
-                    }
                 }
             }
         }
@@ -5724,13 +5316,6 @@ private:
                 value_counts[column],
                 MCV_LIMIT
             );
-            if (stats.columns[column].type == INT) {
-                stats.columns[column].range_histogram =
-                    buildRangeHistogram(
-                        int_values[column],
-                        HISTOGRAM_BUCKET_COUNT
-                    );
-            }
         }
         return stats;
     }
@@ -6190,77 +5775,6 @@ private:
 public:
     QueryOptimizer(Catalog& catalog, PageManager& page_manager)
         : catalog(catalog), page_manager(page_manager) {}
-
-    TableStats analyzeTableByName(const std::string& table_name) {
-        auto& metadata = catalog.getTable(table_name);
-        return analyzeTable(metadata);
-    }
-
-    double estimateRangeFilterRows(
-            const ColumnStats& column_stats,
-            int lower_bound,
-            int upper_bound) const {
-        const auto& buckets = column_stats.range_histogram;
-        if (buckets.empty()) {
-            return 0.0;
-        }
-
-        int range_lower = lower_bound + 1;
-        int range_upper = upper_bound - 1;
-        if (range_lower > range_upper) {
-            return 0.0;
-        }
-
-        double estimate = 0.0;
-        for (const auto& bucket : buckets) {
-            if (range_upper < bucket.lower || range_lower > bucket.upper) {
-                continue;
-            }
-
-            if (bucket.lower == bucket.upper) {
-                estimate += static_cast<double>(bucket.count);
-                continue;
-            }
-
-            int overlap_lower = std::max(range_lower, bucket.lower);
-            int overlap_upper = std::min(range_upper, bucket.upper);
-            double bucket_width =
-                static_cast<double>(bucket.upper - bucket.lower + 1);
-            double overlap_width =
-                static_cast<double>(overlap_upper - overlap_lower + 1);
-            estimate += static_cast<double>(bucket.count) *
-                        overlap_width / bucket_width;
-        }
-        return estimate;
-    }
-
-    AccessPathChoice chooseRangeAccessPath(const TableStats& table_stats,
-                                           size_t column_index,
-                                           int lower_bound,
-                                           int upper_bound,
-                                           const IndexManager& index_manager) const {
-        const auto& column_stats = table_stats.columns.at(column_index);
-        double estimated_rows = estimateRangeFilterRows(
-            column_stats,
-            lower_bound,
-            upper_bound
-        );
-
-        AccessPathChoice choice;
-        choice.index_descriptor = {table_stats.table_id, column_index};
-        choice.estimated_rows = estimated_rows;
-        choice.table_scan_cost = rangeTableScanCost(table_stats);
-        choice.index_available =
-            index_manager.hasOrderedIndex(choice.index_descriptor);
-        if (choice.index_available) {
-            choice.index_scan_cost = rangeIndexScanCost(estimated_rows);
-        }
-        choice.kind = choice.index_available &&
-                      choice.index_scan_cost < choice.table_scan_cost
-            ? AccessPathKind::IndexScan
-            : AccessPathKind::TableScan;
-        return choice;
-    }
 
     std::map<TableId, TableStats> analyzeQueryTables(
             const QueryComponents& components) {
@@ -7150,84 +6664,6 @@ public:
         printJoinQueryResult(components, result);
     }
 
-    AccessPathExecutionResult executeRangeCount(
-            const std::string& table_name,
-            const std::string& column_name,
-            int lower_bound,
-            int upper_bound,
-            AccessPathKind access_path) {
-        auto& metadata = transactional_storage_manager.catalog.getTable(
-            table_name
-        );
-        size_t column = static_cast<size_t>(
-            metadata.schema.getColumnIndex(column_name)
-        );
-        TableHeap table_heap(
-            metadata,
-            transactional_storage_manager.page_manager
-        );
-
-        AccessPathExecutionResult result;
-        result.kind = access_path;
-        auto start = std::chrono::high_resolution_clock::now();
-
-        auto matches_range = [&](const Tuple& tuple) {
-            if (column >= tuple.fields.size()) {
-                return false;
-            }
-            const auto& field = *tuple.fields[column];
-            return field.getType() == INT &&
-                   field.asInt() > lower_bound &&
-                   field.asInt() < upper_bound;
-        };
-
-        if (access_path == AccessPathKind::TableScan) {
-            for (PageID page_id = table_heap.firstPage();
-                 page_id != INVALID_PAGE_ID;
-                 page_id = table_heap.nextPage(page_id)) {
-                for (size_t slot = 0; slot < MAX_SLOTS; slot++) {
-                    auto tuple = table_heap.getTuple(page_id, slot);
-                    if (!tuple) {
-                        continue;
-                    }
-                    result.rows_examined++;
-                    if (matches_range(*tuple)) {
-                        result.qualifying_rows++;
-                    }
-                }
-            }
-        } else {
-            IndexDescriptor descriptor{metadata.table_id, column};
-            auto lookup = transactional_storage_manager.index_manager
-                .rangeLookup(descriptor, lower_bound, upper_bound);
-            result.record_ids_produced = lookup.record_ids.size();
-            result.index_keys_visited = lookup.index_keys_visited;
-
-            for (const auto& record_id : lookup.record_ids) {
-                if (record_id.table_id != metadata.table_id) {
-                    continue;
-                }
-                result.tuples_fetched++;
-                auto tuple = table_heap.getTuple(
-                    record_id.page_id,
-                    record_id.slot_id
-                );
-                if (!tuple) {
-                    continue;
-                }
-                result.rows_examined++;
-                if (matches_range(*tuple)) {
-                    result.qualifying_rows++;
-                }
-            }
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        result.elapsed_ms =
-            std::chrono::duration<double, std::milli>(end - start).count();
-        return result;
-    }
-
 private:
     static void requireRunningTransaction(const TxnPtr& txn) {
         if (!txn || txn->state != TxnContext::RUNNING) {
@@ -7440,21 +6876,6 @@ public:
 
     QueryComponents parseSelectStatement(const std::string& statement) {
         return parseStatement(statement).query;
-    }
-
-    AccessPathExecutionResult executeRangeCount(
-            const std::string& table_name,
-            const std::string& column_name,
-            int lower_bound,
-            int upper_bound,
-            AccessPathKind access_path) {
-        return query_executor.executeRangeCount(
-            table_name,
-            column_name,
-            lower_bound,
-            upper_bound,
-            access_path
-        );
     }
 
     void execute(const ParsedStatement& statement,
@@ -7836,20 +7257,6 @@ const std::string imdb_join_query =
     "AND {mi.movie_id} = {miidx.movie_id} "
     "AND {mi.movie_id} = {mc.movie_id} "
     "AND {miidx.movie_id} = {mc.movie_id}";
-const std::string imdb_range_table = "title";
-const std::string imdb_range_column = "production_year";
-
-struct RangePredicateCase {
-    std::string label;
-    int lower_bound = 0;
-    int upper_bound = 0;
-};
-
-std::string imdbRangeQueryText(const RangePredicateCase& range_case) {
-    return "SELECT COUNT(id) FROM title GROUP BY kind_id "
-           "WHERE production_year > " + std::to_string(range_case.lower_bound) +
-           " and production_year < " + std::to_string(range_case.upper_bound);
-}
 
 ImportResult ensureImdbDatasetLoaded(BuzzDB& db) {
     if (db.isDatabaseEmpty()) {
@@ -8018,93 +7425,6 @@ void printTimedQueryResult(const std::string& label,
               << " seconds" << std::endl;
 }
 
-std::string fieldValueOrMissing(const std::optional<Field>& value) {
-    if (!value) {
-        return "n/a";
-    }
-    return fieldToString(*value);
-}
-
-std::string topMcvSummary(const ColumnStats& column_stats, size_t limit = 5) {
-    std::vector<std::pair<std::string, size_t>> counts(
-        column_stats.mcv_counts.begin(),
-        column_stats.mcv_counts.end()
-    );
-    std::sort(counts.begin(), counts.end(), [](const auto& left,
-                                               const auto& right) {
-        if (left.second != right.second) {
-            return left.second > right.second;
-        }
-        return left.first < right.first;
-    });
-
-    std::ostringstream out;
-    for (size_t i = 0; i < counts.size() && i < limit; i++) {
-        if (i > 0) {
-            out << ", ";
-        }
-        out << counts[i].first << "=" << counts[i].second;
-    }
-    if (counts.empty()) {
-        out << "none";
-    }
-    return out.str();
-}
-
-void printHistogram(const std::string& label,
-                    const std::vector<HistogramBucket>& buckets,
-                    size_t bar_width = 40) {
-    std::cout << "  " << label << ":" << std::endl;
-    if (buckets.empty()) {
-        std::cout << "    none" << std::endl;
-        return;
-    }
-
-    size_t max_count = 0;
-    for (const auto& bucket : buckets) {
-        max_count = std::max(max_count, bucket.count);
-    }
-
-    for (size_t i = 0; i < buckets.size(); i++) {
-        const auto& bucket = buckets[i];
-        size_t bar_length = 0;
-        if (max_count > 0 && bucket.count > 0) {
-            bar_length = std::max<size_t>(
-                1,
-                bucket.count * bar_width / max_count
-            );
-        }
-
-        std::cout << "    "
-                  << std::setw(2) << (i + 1)
-                  << " [" << std::setw(4) << bucket.lower
-                  << "-" << std::setw(4) << bucket.upper
-                  << "] rows=" << std::setw(4) << bucket.count
-                  << " | " << std::string(bar_length, '#')
-                  << std::endl;
-    }
-}
-
-std::string accessPathLabel(AccessPathKind kind) {
-    if (kind == AccessPathKind::IndexScan) {
-        return "IndexScan on " + imdb_range_table + "." + imdb_range_column;
-    }
-    return "TableScan";
-}
-
-void printAccessPathExecution(const AccessPathExecutionResult& result) {
-    std::cout << "  " << accessPathLabel(result.kind)
-              << ": elapsed=" << formatEstimate(result.elapsed_ms) << " ms"
-              << ", qualifying rows=" << result.qualifying_rows
-              << ", rows examined=" << result.rows_examined;
-    if (result.kind == AccessPathKind::IndexScan) {
-        std::cout << ", index keys visited=" << result.index_keys_visited
-                  << ", RIDs produced=" << result.record_ids_produced
-                  << ", tuples fetched=" << result.tuples_fetched;
-    }
-    std::cout << std::endl;
-}
-
 void runImdbJoinAccessPathSelection() {
     BuzzDB db;
     auto import_start = std::chrono::high_resolution_clock::now();
@@ -8209,144 +7529,10 @@ void runImdbJoinAccessPathSelection() {
                  )
               << std::endl;
 
-    std::cout << "\nTakeaway: v98 chooses TableScan vs IndexScan for one"
-              << " filtered table. v99 applies the same access-path idea"
-              << " inside a join tree: when the inner side is an indexed"
-              << " base table, the optimizer can choose IndexNestedLoopJoin"
+    std::cout << "\nTakeaway: v98 applies access-path selection inside"
+              << " a join tree. When the inner side is an indexed base"
+              << " table, the optimizer can choose IndexNestedLoopJoin"
               << " instead of a hash join.\n";
-}
-
-void runImdbAccessPathSelection() {
-    BuzzDB db;
-    auto import_start = std::chrono::high_resolution_clock::now();
-    auto import_result = ensureImdbDatasetLoaded(db);
-    auto import_end = std::chrono::high_resolution_clock::now();
-    printImportResult(import_result);
-    if (import_result.loaded) {
-        std::chrono::duration<double> import_elapsed =
-            import_end - import_start;
-        std::cout << "Elapsed database importing time: "
-                  << import_elapsed.count() << " seconds" << std::endl;
-    }
-
-    const std::vector<RangePredicateCase> range_cases = {
-        {
-            "high-selectivity range: few rows, IndexScan should win",
-            1889,
-            1940
-        },
-        {
-            "low-selectivity range: many rows, TableScan should win",
-            1980,
-            2014
-        }
-    };
-
-    auto components = db.parseSelectStatement(
-        imdbRangeQueryText(range_cases.front())
-    );
-    auto table_stats = db.optimizer().analyzeTableByName(imdb_range_table);
-    const auto& column_stats = table_stats.columns.at(
-        static_cast<size_t>(components.whereAttributeIndex)
-    );
-
-    std::cout << "\nANALYZE stats already available:" << std::endl;
-    std::cout << "  table: " << imdb_range_table
-              << ", rows=" << table_stats.row_count
-              << ", pages=" << table_stats.page_count << std::endl;
-    std::cout << "  column: " << imdb_range_column
-              << ", ndv=" << column_stats.distinct_count
-              << ", min=" << fieldValueOrMissing(column_stats.min_value)
-              << ", max=" << fieldValueOrMissing(column_stats.max_value)
-              << std::endl;
-    std::cout << "  MCV sample: " << topMcvSummary(column_stats) << std::endl;
-    printHistogram(
-        "range histogram used by the access-path cost model",
-        column_stats.range_histogram
-    );
-
-    auto index_build = db.indexes().buildOrderedIndex({
-        "title_production_year_idx",
-        imdb_range_table,
-        imdb_range_column,
-        false,
-        false
-    });
-    std::cout << "\nIndex build:" << std::endl;
-    std::cout << "  " << index_build.index_name
-              << " on " << index_build.table_name
-              << "." << index_build.column_name
-              << ": entries=" << index_build.entries
-              << ", distinct keys=" << index_build.distinct_keys
-              << std::endl;
-
-    std::cout << "\nAccess path choices and execution comparisons:" << std::endl;
-    for (const auto& range_case : range_cases) {
-        auto query = imdbRangeQueryText(range_case);
-        auto query_components = db.parseSelectStatement(query);
-        auto choice = db.optimizer().chooseRangeAccessPath(
-            table_stats,
-            static_cast<size_t>(query_components.whereAttributeIndex),
-            query_components.lowerBound,
-            query_components.upperBound,
-            db.indexes()
-        );
-
-        db.clearBufferPool();
-        auto table_scan_result = db.queryProcessor().executeRangeCount(
-            imdb_range_table,
-            imdb_range_column,
-            query_components.lowerBound,
-            query_components.upperBound,
-            AccessPathKind::TableScan
-        );
-        db.clearBufferPool();
-        auto index_scan_result = db.queryProcessor().executeRangeCount(
-            imdb_range_table,
-            imdb_range_column,
-            query_components.lowerBound,
-            query_components.upperBound,
-            AccessPathKind::IndexScan
-        );
-        if (table_scan_result.qualifying_rows !=
-            index_scan_result.qualifying_rows) {
-            throw std::runtime_error("TableScan and IndexScan disagree.");
-        }
-
-        size_t actual_rows = table_scan_result.qualifying_rows;
-
-        std::cout << "\n  " << range_case.label << std::endl;
-        std::cout << "  query: " << query << std::endl;
-        std::cout << "  histogram estimate="
-                  << formatEstimate(choice.estimated_rows)
-                  << ", actual rows=" << actual_rows
-                  << ", actual selectivity="
-                  << formatEstimate(
-                         static_cast<double>(actual_rows) /
-                         static_cast<double>(table_stats.row_count)
-                     )
-                  << ", q-error="
-                  << formatQError(
-                         choice.estimated_rows,
-                         static_cast<double>(actual_rows)
-                     )
-                  << std::endl;
-        std::cout << "  cost model: TableScan="
-                  << formatEstimate(choice.table_scan_cost)
-                  << ", IndexScan="
-                  << formatEstimate(choice.index_scan_cost)
-                  << std::endl;
-        std::cout << "  optimizer choice: "
-                  << accessPathLabel(choice.kind) << std::endl;
-        std::cout << "  plan execution time comparison:" << std::endl;
-        printAccessPathExecution(table_scan_result);
-        printAccessPathExecution(index_scan_result);
-    }
-
-    std::cout << "\nTakeaway: Use range selectivity estimate to choose"
-              << " between TableScan and IndexScan:"
-              << " selective ranges benefit from the B+tree-backed IndexScan,"
-              << " while broad ranges are cheaper to read as a table scan.\n";
 }
 
 int main() {
