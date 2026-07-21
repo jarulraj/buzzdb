@@ -4595,6 +4595,7 @@ struct MemoRuleStats {
     size_t apply_rule_tasks = 0;
     size_t optimize_input_tasks = 0;
     size_t tasks_executed = 0;
+    size_t rules_fired = 0;
     size_t winner_candidates = 0;
 };
 
@@ -4621,21 +4622,58 @@ enum class CascadesTaskKind {
     OptimizeInput
 };
 
+enum class MemoRuleKind {
+    EvaluateExpression,
+    ExpandLogicalJoinAlternatives,
+    ImplementScan,
+    ImplementNestedLoopJoin,
+    ImplementHashJoin,
+    ImplementIndexNestedLoopJoin
+};
+
+struct RuleFireKey {
+    ExpressionId expression_id = 0;
+    MemoRuleKind rule_kind = MemoRuleKind::EvaluateExpression;
+
+    bool operator<(const RuleFireKey& other) const {
+        return std::tie(expression_id, rule_kind) <
+               std::tie(other.expression_id, other.rule_kind);
+    }
+};
+
 struct CascadesTask {
     CascadesTaskKind kind = CascadesTaskKind::OptimizeGroup;
     GroupId group_id = INVALID_GROUP_ID;
     size_t expression_index = 0;
+    MemoRuleKind rule_kind = MemoRuleKind::EvaluateExpression;
 
     static CascadesTask optimizeGroup(GroupId group_id) {
-        return {CascadesTaskKind::OptimizeGroup, group_id, 0};
+        return {
+            CascadesTaskKind::OptimizeGroup,
+            group_id,
+            0,
+            MemoRuleKind::EvaluateExpression
+        };
     }
 
-    static CascadesTask applyRule(GroupId group_id, size_t expression_index) {
-        return {CascadesTaskKind::ApplyRule, group_id, expression_index};
+    static CascadesTask applyRule(GroupId group_id,
+                                  size_t expression_index,
+                                  MemoRuleKind rule_kind) {
+        return {
+            CascadesTaskKind::ApplyRule,
+            group_id,
+            expression_index,
+            rule_kind
+        };
     }
 
     static CascadesTask optimizeInput(GroupId group_id) {
-        return {CascadesTaskKind::OptimizeInput, group_id, 0};
+        return {
+            CascadesTaskKind::OptimizeInput,
+            group_id,
+            0,
+            MemoRuleKind::EvaluateExpression
+        };
     }
 };
 
@@ -6270,34 +6308,120 @@ private:
         return candidate.table_refs < incumbent.table_refs;
     }
 
-    MemoRuleStats applyMemoRules(
-            Memo& memo,
+    void scheduleRulesForExpression(
+            const Memo& memo,
+            GroupId group_id,
+            size_t expression_index,
             const QueryComponents& components,
-            const IndexManager* index_manager) {
-        MemoRuleStats stats;
-        stats.initial_groups = memo.groupCount();
-        stats.initial_expressions = memo.expressionCount();
-
-        if (components.table_refs.empty() || components.table_refs.size() > 62) {
-            throw std::runtime_error("Memo rules support 1..62 table refs.");
+            const std::vector<JoinClause>& edges,
+            const IndexManager* index_manager,
+            std::deque<CascadesTask>& task_queue) {
+        const auto& group = memo.groupFor(group_id);
+        if (expression_index >= group.expressions.size()) {
+            return;
         }
 
-        std::vector<TableRefId> table_ref_ids;
-        std::map<TableRefId, size_t> bit_index;
-        for (size_t i = 0; i < components.table_refs.size(); i++) {
-            table_ref_ids.push_back(components.table_refs[i].id);
-            bit_index[components.table_refs[i].id] = i;
+        const auto& expression = group.expressions[expression_index];
+        task_queue.push_front(CascadesTask::applyRule(
+            group_id,
+            expression_index,
+            MemoRuleKind::EvaluateExpression
+        ));
+
+        if (expression.op == MemoOpKind::LogicalScan) {
+            task_queue.push_front(CascadesTask::applyRule(
+                group_id,
+                expression_index,
+                MemoRuleKind::ImplementScan
+            ));
+            return;
         }
 
-        std::uint64_t full_mask =
-            (1ULL << components.table_refs.size()) - 1ULL;
-        auto edges = equalityEdgesForJoinOrdering(components);
-        auto group_for_mask = buildGroupMaskIndex(memo, bit_index);
+        if (expression.op != MemoOpKind::LogicalEquiJoin) {
+            return;
+        }
 
-        for (size_t level = 2; level <= components.table_refs.size(); level++) {
-            for (std::uint64_t mask = 1; mask <= full_mask; mask++) {
-                if (__builtin_popcountll(mask) != static_cast<int>(level)) {
-                    continue;
+        task_queue.push_front(CascadesTask::applyRule(
+            group_id,
+            expression_index,
+            MemoRuleKind::ExpandLogicalJoinAlternatives
+        ));
+        task_queue.push_front(CascadesTask::applyRule(
+            group_id,
+            expression_index,
+            MemoRuleKind::ImplementNestedLoopJoin
+        ));
+        task_queue.push_front(CascadesTask::applyRule(
+            group_id,
+            expression_index,
+            MemoRuleKind::ImplementHashJoin
+        ));
+        if (memoInputsCanUseIndex(
+                components,
+                memo,
+                expression,
+                edges,
+                index_manager)) {
+            task_queue.push_front(CascadesTask::applyRule(
+                group_id,
+                expression_index,
+                MemoRuleKind::ImplementIndexNestedLoopJoin
+            ));
+        }
+    }
+
+    size_t addMemoExpressionAndSchedule(
+            Memo& memo,
+            GroupId group_id,
+            MemoOpKind op,
+            std::vector<GroupId> inputs,
+            std::string label,
+            const QueryComponents& components,
+            const std::vector<JoinClause>& edges,
+            const IndexManager* index_manager,
+            std::deque<CascadesTask>& task_queue) {
+        if (!memo.addExpressionToGroup(
+                group_id,
+                op,
+                std::move(inputs),
+                std::move(label))) {
+            return std::numeric_limits<size_t>::max();
+        }
+
+        size_t expression_index =
+            memo.groupFor(group_id).expressions.size() - 1;
+        scheduleRulesForExpression(
+            memo,
+            group_id,
+            expression_index,
+            components,
+            edges,
+            index_manager,
+            task_queue
+        );
+        return expression_index;
+    }
+
+    void addLogicalJoinAlternatives(
+            Memo& memo,
+            GroupId group_id,
+            const QueryComponents& components,
+            const std::vector<TableRefId>& table_ref_ids,
+            const std::map<TableRefId, size_t>& bit_index,
+            const std::vector<JoinClause>& edges,
+            const IndexManager* index_manager,
+            std::map<std::uint64_t, GroupId>& group_for_mask,
+            std::deque<CascadesTask>& task_queue,
+            MemoRuleStats& stats) {
+        std::function<std::optional<GroupId>(std::uint64_t)> ensureGroupForMask =
+            [&](std::uint64_t mask) -> std::optional<GroupId> {
+                auto existing = group_for_mask.find(mask);
+                if (existing != group_for_mask.end()) {
+                    return existing->second;
+                }
+
+                if (__builtin_popcountll(mask) < 2) {
+                    return std::nullopt;
                 }
 
                 for (std::uint64_t left_mask = (mask - 1ULL) & mask;
@@ -6308,15 +6432,16 @@ private:
                         continue;
                     }
 
-                    auto left_group = group_for_mask.find(left_mask);
-                    auto right_group = group_for_mask.find(right_mask);
-                    if (left_group == group_for_mask.end() ||
-                        right_group == group_for_mask.end()) {
+                    auto left_group_id = ensureGroupForMask(left_mask);
+                    auto right_group_id = ensureGroupForMask(right_mask);
+                    if (!left_group_id || !right_group_id) {
                         continue;
                     }
 
-                    auto left_refs = tableRefsForMask(left_mask, table_ref_ids);
-                    auto right_refs = tableRefsForMask(right_mask, table_ref_ids);
+                    auto left_refs =
+                        tableRefsForMask(left_mask, table_ref_ids);
+                    auto right_refs =
+                        tableRefsForMask(right_mask, table_ref_ids);
                     auto edge = joinEdgeBetweenTableRefSets(
                         left_refs,
                         right_refs,
@@ -6328,81 +6453,164 @@ private:
 
                     std::set<TableRefId> output_refs = left_refs;
                     output_refs.insert(right_refs.begin(), right_refs.end());
-                    std::string label = joinClauseLabel(components, *edge);
-
-                    auto output_group = group_for_mask.find(mask);
-                    if (output_group == group_for_mask.end()) {
-                        GroupId group_id = memo.addGroup(
-                            output_refs,
-                            MemoOpKind::LogicalEquiJoin,
-                            {left_group->second, right_group->second},
-                            label
-                        );
-                        group_for_mask[mask] = group_id;
-                        stats.logical_join_alternatives++;
-                    } else if (memo.addExpressionToGroup(
-                                   output_group->second,
-                                   MemoOpKind::LogicalEquiJoin,
-                                   {left_group->second, right_group->second},
-                                   label)) {
-                        stats.logical_join_alternatives++;
-                    }
-                }
-            }
-        }
-
-        size_t group_count = memo.groupCount();
-        for (GroupId group_id = 1; group_id <= group_count; group_id++) {
-            auto expressions = memo.groupFor(group_id).expressions;
-            for (const auto& expression : expressions) {
-                if (expression.op == MemoOpKind::LogicalScan) {
-                    if (memo.addExpressionToGroup(
-                            group_id,
-                            MemoOpKind::TableScan,
-                            {},
-                            expression.label)) {
-                        stats.scan_implementations++;
-                    }
-                    continue;
-                }
-
-                if (expression.op != MemoOpKind::LogicalEquiJoin) {
-                    continue;
-                }
-
-                if (memo.addExpressionToGroup(
-                        group_id,
-                        MemoOpKind::NestedLoopJoin,
-                        expression.inputs,
-                        expression.label)) {
-                    stats.join_implementations++;
-                }
-                if (memo.addExpressionToGroup(
-                        group_id,
-                        MemoOpKind::HashJoin,
-                        expression.inputs,
-                        expression.label)) {
-                    stats.join_implementations++;
-                }
-                if (memoInputsCanUseIndex(
-                        components,
+                    GroupId new_group_id = memo.addGroup(
+                        output_refs,
+                        MemoOpKind::LogicalEquiJoin,
+                        {*left_group_id, *right_group_id},
+                        joinClauseLabel(components, *edge)
+                    );
+                    group_for_mask[mask] = new_group_id;
+                    stats.logical_join_alternatives++;
+                    scheduleRulesForExpression(
                         memo,
-                        expression,
+                        new_group_id,
+                        0,
+                        components,
                         edges,
-                        index_manager) &&
-                    memo.addExpressionToGroup(
-                        group_id,
-                        MemoOpKind::IndexNestedLoopJoin,
-                        expression.inputs,
-                        expression.label)) {
-                    stats.join_implementations++;
+                        index_manager,
+                        task_queue
+                    );
+                    return new_group_id;
                 }
+
+                return std::nullopt;
+            };
+
+        const auto& group = memo.groupFor(group_id);
+        std::uint64_t mask = maskForTableRefs(group.table_refs, bit_index);
+        for (std::uint64_t left_mask = (mask - 1ULL) & mask;
+             left_mask != 0;
+             left_mask = (left_mask - 1ULL) & mask) {
+            std::uint64_t right_mask = mask ^ left_mask;
+            if (right_mask == 0 || left_mask > right_mask) {
+                continue;
+            }
+
+            auto left_group_id = ensureGroupForMask(left_mask);
+            auto right_group_id = ensureGroupForMask(right_mask);
+            if (!left_group_id || !right_group_id) {
+                continue;
+            }
+
+            auto left_refs = tableRefsForMask(left_mask, table_ref_ids);
+            auto right_refs = tableRefsForMask(right_mask, table_ref_ids);
+            auto edge = joinEdgeBetweenTableRefSets(left_refs, right_refs, edges);
+            if (!edge) {
+                continue;
+            }
+
+            if (addMemoExpressionAndSchedule(
+                    memo,
+                    group_id,
+                    MemoOpKind::LogicalEquiJoin,
+                    {*left_group_id, *right_group_id},
+                    joinClauseLabel(components, *edge),
+                    components,
+                    edges,
+                    index_manager,
+                    task_queue) != std::numeric_limits<size_t>::max()) {
+                stats.logical_join_alternatives++;
             }
         }
+    }
 
-        stats.final_groups = memo.groupCount();
-        stats.final_expressions = memo.expressionCount();
-        return stats;
+    void fireCascadesRule(
+            Memo& memo,
+            GroupId group_id,
+            size_t expression_index,
+            MemoRuleKind rule_kind,
+            const QueryComponents& components,
+            const std::vector<TableRefId>& table_ref_ids,
+            const std::map<TableRefId, size_t>& bit_index,
+            const std::vector<JoinClause>& edges,
+            const IndexManager* index_manager,
+            std::map<std::uint64_t, GroupId>& group_for_mask,
+            std::deque<CascadesTask>& task_queue,
+            MemoRuleStats& stats,
+            std::set<RuleFireKey>& fired_rules) {
+        const auto& group = memo.groupFor(group_id);
+        if (expression_index >= group.expressions.size()) {
+            return;
+        }
+
+        const auto& expression = group.expressions[expression_index];
+        if (expression.op == MemoOpKind::LogicalScan &&
+            rule_kind == MemoRuleKind::ImplementScan) {
+            if (!fired_rules.insert({expression.id, rule_kind}).second) {
+                return;
+            }
+            stats.rules_fired++;
+            if (addMemoExpressionAndSchedule(
+                    memo,
+                    group_id,
+                    MemoOpKind::TableScan,
+                    {},
+                    expression.label,
+                    components,
+                    edges,
+                    index_manager,
+                    task_queue) != std::numeric_limits<size_t>::max()) {
+                stats.scan_implementations++;
+            }
+            return;
+        }
+
+        if (expression.op != MemoOpKind::LogicalEquiJoin) {
+            return;
+        }
+
+        if (!fired_rules.insert({expression.id, rule_kind}).second) {
+            return;
+        }
+        stats.rules_fired++;
+
+        if (rule_kind == MemoRuleKind::ExpandLogicalJoinAlternatives) {
+            addLogicalJoinAlternatives(
+                memo,
+                group_id,
+                components,
+                table_ref_ids,
+                bit_index,
+                edges,
+                index_manager,
+                group_for_mask,
+                task_queue,
+                stats
+            );
+            return;
+        }
+
+        MemoOpKind physical_op;
+        if (rule_kind == MemoRuleKind::ImplementNestedLoopJoin) {
+            physical_op = MemoOpKind::NestedLoopJoin;
+        } else if (rule_kind == MemoRuleKind::ImplementHashJoin) {
+            physical_op = MemoOpKind::HashJoin;
+        } else if (rule_kind == MemoRuleKind::ImplementIndexNestedLoopJoin) {
+            if (!memoInputsCanUseIndex(
+                    components,
+                    memo,
+                    expression,
+                    edges,
+                    index_manager)) {
+                return;
+            }
+            physical_op = MemoOpKind::IndexNestedLoopJoin;
+        } else {
+            return;
+        }
+
+        if (addMemoExpressionAndSchedule(
+                memo,
+                group_id,
+                physical_op,
+                expression.inputs,
+                expression.label,
+                components,
+                edges,
+                index_manager,
+                task_queue) != std::numeric_limits<size_t>::max()) {
+            stats.join_implementations++;
+        }
     }
 
     static size_t countPlanJoinKind(
@@ -6472,7 +6680,11 @@ private:
             if (!cascadesInputReady(input_group_id, winners)) {
                 scheduleCascadesInput(
                     task_queue,
-                    CascadesTask::applyRule(group_id, expression_index),
+                    CascadesTask::applyRule(
+                        group_id,
+                        expression_index,
+                        MemoRuleKind::EvaluateExpression
+                    ),
                     input_group_id
                 );
                 return;
@@ -6519,7 +6731,11 @@ private:
         if (!cascadesInputReady(left_group_id, winners)) {
             scheduleCascadesInput(
                 task_queue,
-                CascadesTask::applyRule(group_id, expression_index),
+                CascadesTask::applyRule(
+                    group_id,
+                    expression_index,
+                    MemoRuleKind::EvaluateExpression
+                ),
                 left_group_id
             );
             return;
@@ -6527,7 +6743,11 @@ private:
         if (!cascadesInputReady(right_group_id, winners)) {
             scheduleCascadesInput(
                 task_queue,
-                CascadesTask::applyRule(group_id, expression_index),
+                CascadesTask::applyRule(
+                    group_id,
+                    expression_index,
+                    MemoRuleKind::EvaluateExpression
+                ),
                 right_group_id
             );
             return;
@@ -6663,16 +6883,25 @@ public:
             const std::map<TableId, TableStats>& stats,
             const IndexManager* index_manager = nullptr) {
         auto memo = buildInitialMemo(components);
-        auto rule_stats = applyMemoRules(
-            memo,
-            components,
-            index_manager
-        );
+        MemoRuleStats rule_stats;
+        rule_stats.initial_groups = memo.groupCount();
+        rule_stats.initial_expressions = memo.expressionCount();
+        if (components.table_refs.empty() || components.table_refs.size() > 62) {
+            throw std::runtime_error("Memo rules support 1..62 table refs.");
+        }
         auto base_relations = estimateBaseRelations(components, stats);
         auto edges = equalityEdgesForJoinOrdering(components);
+        std::vector<TableRefId> table_ref_ids;
+        std::map<TableRefId, size_t> bit_index;
+        for (size_t i = 0; i < components.table_refs.size(); i++) {
+            table_ref_ids.push_back(components.table_refs[i].id);
+            bit_index[components.table_refs[i].id] = i;
+        }
+        auto group_for_mask = buildGroupMaskIndex(memo, bit_index);
 
         std::map<GroupId, MemoPlanChoice> winners;
         std::set<GroupId> optimized_groups;
+        std::set<RuleFireKey> fired_rules;
         std::deque<CascadesTask> task_queue;
         task_queue.push_back(CascadesTask::optimizeGroup(memo.finalGroupId()));
 
@@ -6689,24 +6918,48 @@ public:
 
                 const auto& group = memo.groupFor(task.group_id);
                 for (size_t i = group.expressions.size(); i > 0; i--) {
-                    task_queue.push_front(
-                        CascadesTask::applyRule(task.group_id, i - 1)
+                    scheduleRulesForExpression(
+                        memo,
+                        task.group_id,
+                        i - 1,
+                        components,
+                        edges,
+                        index_manager,
+                        task_queue
                     );
                 }
             } else if (task.kind == CascadesTaskKind::ApplyRule) {
                 rule_stats.apply_rule_tasks++;
-                applyCascadesExpression(
-                    memo,
-                    task.group_id,
-                    task.expression_index,
-                    components,
-                    base_relations,
-                    edges,
-                    index_manager,
-                    winners,
-                    task_queue,
-                    rule_stats
-                );
+                if (task.rule_kind == MemoRuleKind::EvaluateExpression) {
+                    applyCascadesExpression(
+                        memo,
+                        task.group_id,
+                        task.expression_index,
+                        components,
+                        base_relations,
+                        edges,
+                        index_manager,
+                        winners,
+                        task_queue,
+                        rule_stats
+                    );
+                } else {
+                    fireCascadesRule(
+                        memo,
+                        task.group_id,
+                        task.expression_index,
+                        task.rule_kind,
+                        components,
+                        table_ref_ids,
+                        bit_index,
+                        edges,
+                        index_manager,
+                        group_for_mask,
+                        task_queue,
+                        rule_stats,
+                        fired_rules
+                    );
+                }
             } else if (task.kind == CascadesTaskKind::OptimizeInput) {
                 rule_stats.optimize_input_tasks++;
                 if (winners.find(task.group_id) == winners.end() &&
@@ -6722,6 +6975,9 @@ public:
         if (final_choice == winners.end()) {
             throw std::runtime_error("Cascades queue found no executable plan.");
         }
+
+        rule_stats.final_groups = memo.groupCount();
+        rule_stats.final_expressions = memo.expressionCount();
 
         auto planned_components = makeJoinPlanComponents(
             components,
@@ -8143,6 +8399,7 @@ void printMemoRuleStats(const std::string& label,
               << " (OptimizeGroup=" << stats.optimize_group_tasks
               << ", ApplyRule=" << stats.apply_rule_tasks
               << ", OptimizeInput=" << stats.optimize_input_tasks << ")"
+              << ", rules_fired=" << stats.rules_fired
               << ", winner_candidates=" << stats.winner_candidates
               << std::endl;
 }
