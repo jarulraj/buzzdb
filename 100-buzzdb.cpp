@@ -6731,6 +6731,10 @@ public:
         }
     }
 
+    void buildIndexes(const std::vector<IndexSpec>& specs) {
+        index_manager.buildIndexes(specs);
+    }
+
 private:
     static void requireRunningTransaction(const TxnPtr& txn) {
         if (!txn || txn->state != TxnContext::RUNNING) {
@@ -7169,8 +7173,12 @@ public:
         return std::move(parsed.query);
     }
 
-    QueryOptimizer& optimizer() {
-        return query_optimizer;
+    Memo buildInitialMemo(const QueryComponents& components) {
+        return query_optimizer.buildInitialMemo(components);
+    }
+
+    void printMemo(const QueryComponents& components, const Memo& memo) {
+        query_optimizer.printMemo(components, memo);
     }
 
 private:
@@ -7285,15 +7293,19 @@ public:
 
     void buildIndexes(
             const std::vector<IndexSpec>& specs) {
-        transactional_storage_manager.index_manager.buildIndexes(specs);
+        transactional_storage_manager.buildIndexes(specs);
     }
 
     QueryComponents parseSelectStatement(const std::string& statement) {
         return query_processor.parseSelectStatement(statement);
     }
 
-    QueryOptimizer& optimizer() {
-        return query_processor.optimizer();
+    Memo buildInitialMemo(const QueryComponents& components) {
+        return query_processor.buildInitialMemo(components);
+    }
+
+    void printMemo(const QueryComponents& components, const Memo& memo) {
+        query_processor.printMemo(components, memo);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -7478,8 +7490,8 @@ void runImdbLogicalMemo() {
     ensureImdbDatasetLoaded(db);
 
     auto components = db.parseSelectStatement(imdb_join_query);
-    auto memo = db.optimizer().buildInitialMemo(components);
-    db.optimizer().printMemo(components, memo);
+    auto memo = db.buildInitialMemo(components);
+    db.printMemo(components, memo);
 
     std::cout << "\nTakeaway: the memo is a compact logical expression graph."
               << " This version records one written-order expression per"

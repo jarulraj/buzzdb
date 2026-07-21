@@ -8258,6 +8258,10 @@ public:
         }
     }
 
+    void buildIndexes(const std::vector<IndexSpec>& specs) {
+        index_manager.buildIndexes(specs);
+    }
+
 private:
     static void requireRunningTransaction(const TxnPtr& txn) {
         if (!txn || txn->state != TxnContext::RUNNING) {
@@ -8701,6 +8705,32 @@ public:
         );
     }
 
+    MemoOptimizationResult optimizeWithCascadesQueue(
+            const QueryComponents& components) {
+        auto stats = query_optimizer.analyzeQueryTables(components);
+        return query_optimizer.optimizeWithCascadesQueue(
+            components,
+            stats,
+            &transactional_storage_manager.index_manager
+        );
+    }
+
+    std::string describeOrderProperty(
+            const QueryComponents& components,
+            const std::optional<ColumnRef>& order_by_column) {
+        return query_optimizer.describeOrderProperty(
+            components,
+            order_by_column
+        );
+    }
+
+    void printPhysicalPlanTree(
+            const std::string& label,
+            const QueryComponents& components,
+            const std::shared_ptr<PhysicalPlanNode>& root) {
+        query_optimizer.printPhysicalPlanTree(label, components, root);
+    }
+
     QueryComponents parseSelectStatement(const std::string& statement) {
         auto parsed = query_parser.parseStatement(statement);
         if (parsed.kind != ParsedStatement::Kind::Select &&
@@ -8708,10 +8738,6 @@ public:
             throw std::runtime_error("Expected SELECT or PROJECT statement.");
         }
         return std::move(parsed.query);
-    }
-
-    QueryOptimizer& optimizer() {
-        return query_optimizer;
     }
 
 private:
@@ -8839,19 +8865,32 @@ public:
 
     void buildIndexes(
             const std::vector<IndexSpec>& specs) {
-        transactional_storage_manager.index_manager.buildIndexes(specs);
+        transactional_storage_manager.buildIndexes(specs);
     }
 
     QueryComponents parseSelectStatement(const std::string& statement) {
         return query_processor.parseSelectStatement(statement);
     }
 
-    QueryOptimizer& optimizer() {
-        return query_processor.optimizer();
+    MemoOptimizationResult optimizeWithCascadesQueue(
+            const QueryComponents& components) {
+        return query_processor.optimizeWithCascadesQueue(components);
     }
 
-    IndexManager& indexes() {
-        return transactional_storage_manager.index_manager;
+    std::string describeOrderProperty(
+            const QueryComponents& components,
+            const std::optional<ColumnRef>& order_by_column) {
+        return query_processor.describeOrderProperty(
+            components,
+            order_by_column
+        );
+    }
+
+    void printPhysicalPlanTree(
+            const std::string& label,
+            const QueryComponents& components,
+            const std::shared_ptr<PhysicalPlanNode>& root) {
+        query_processor.printPhysicalPlanTree(label, components, root);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -9118,10 +9157,9 @@ void runImdbPhysicalProperties() {
     ensureImdbDatasetLoaded(db);
 
     auto components = db.parseSelectStatement(imdb_join_query);
-    auto stats = db.optimizer().analyzeQueryTables(components);
 
     std::cout << "\nRequired physical property: "
-              << db.optimizer().describeOrderProperty(
+              << db.describeOrderProperty(
                      components,
                      components.order_by_column
                  )
@@ -9129,11 +9167,7 @@ void runImdbPhysicalProperties() {
 
     auto indexes = imdbIndexSpecs();
     db.buildIndexes(indexes);
-    auto search = db.optimizer().optimizeWithCascadesQueue(
-        components,
-        stats,
-        &db.indexes()
-    );
+    auto search = db.optimizeWithCascadesQueue(components);
 
     std::cout << "\nCascades queue work:" << std::endl;
     printMemoRuleStats("with index implementations", search.rule_stats);
@@ -9148,7 +9182,7 @@ void runImdbPhysicalProperties() {
               << ", sort_enforcers=" << search.sort_enforcers
               << std::endl;
 
-    db.optimizer().printPhysicalPlanTree(
+    db.printPhysicalPlanTree(
         "Cascades winner",
         search.components,
         search.plan_root

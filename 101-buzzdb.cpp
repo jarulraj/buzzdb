@@ -7157,6 +7157,10 @@ public:
         }
     }
 
+    void buildIndexes(const std::vector<IndexSpec>& specs) {
+        index_manager.buildIndexes(specs);
+    }
+
 private:
     static void requireRunningTransaction(const TxnPtr& txn) {
         if (!txn || txn->state != TxnContext::RUNNING) {
@@ -7599,6 +7603,23 @@ public:
         );
     }
 
+    MemoOptimizationResult optimizeWithMemoRules(
+            const QueryComponents& components) {
+        auto stats = query_optimizer.analyzeQueryTables(components);
+        return query_optimizer.optimizeWithMemoRules(
+            components,
+            stats,
+            &transactional_storage_manager.index_manager
+        );
+    }
+
+    void printPhysicalPlanTree(
+            const std::string& label,
+            const QueryComponents& components,
+            const std::shared_ptr<PhysicalPlanNode>& root) {
+        query_optimizer.printPhysicalPlanTree(label, components, root);
+    }
+
     QueryComponents parseSelectStatement(const std::string& statement) {
         auto parsed = query_parser.parseStatement(statement);
         if (parsed.kind != ParsedStatement::Kind::Select &&
@@ -7606,10 +7627,6 @@ public:
             throw std::runtime_error("Expected SELECT or PROJECT statement.");
         }
         return std::move(parsed.query);
-    }
-
-    QueryOptimizer& optimizer() {
-        return query_optimizer;
     }
 
 private:
@@ -7731,19 +7748,23 @@ public:
 
     void buildIndexes(
             const std::vector<IndexSpec>& specs) {
-        transactional_storage_manager.index_manager.buildIndexes(specs);
+        transactional_storage_manager.buildIndexes(specs);
     }
 
     QueryComponents parseSelectStatement(const std::string& statement) {
         return query_processor.parseSelectStatement(statement);
     }
 
-    QueryOptimizer& optimizer() {
-        return query_processor.optimizer();
+    MemoOptimizationResult optimizeWithMemoRules(
+            const QueryComponents& components) {
+        return query_processor.optimizeWithMemoRules(components);
     }
 
-    IndexManager& indexes() {
-        return transactional_storage_manager.index_manager;
+    void printPhysicalPlanTree(
+            const std::string& label,
+            const QueryComponents& components,
+            const std::shared_ptr<PhysicalPlanNode>& root) {
+        query_processor.printPhysicalPlanTree(label, components, root);
     }
 
     void executeStatementsAndQueries(const std::vector<std::string>& statements,
@@ -7969,15 +7990,10 @@ void runImdbVolcanoStyleMemoOptimizer() {
     ensureImdbDatasetLoaded(db);
 
     auto components = db.parseSelectStatement(imdb_join_query);
-    auto stats = db.optimizer().analyzeQueryTables(components);
 
     auto indexes = imdbIndexSpecs();
     db.buildIndexes(indexes);
-    auto search = db.optimizer().optimizeWithMemoRules(
-        components,
-        stats,
-        &db.indexes()
-    );
+    auto search = db.optimizeWithMemoRules(components);
 
     std::cout << "\nVolcano-style memo rule expansion:" << std::endl;
     printMemoRuleStats("with index implementations", search.rule_stats);
@@ -7990,7 +8006,7 @@ void runImdbVolcanoStyleMemoOptimizer() {
               << ", index_joins=" << search.index_joins
               << std::endl;
 
-    db.optimizer().printPhysicalPlanTree(
+    db.printPhysicalPlanTree(
         "Volcano-style memo winner",
         search.components,
         search.plan_root

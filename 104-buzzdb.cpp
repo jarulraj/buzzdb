@@ -7956,6 +7956,14 @@ public:
         }
     }
 
+    void buildIndexes(const std::vector<IndexSpec>& specs) {
+        index_manager.buildIndexes(specs);
+    }
+
+    void clearBufferPool() {
+        buffer_manager.clearBufferPool();
+    }
+
 private:
     static void requireRunningTransaction(const TxnPtr& txn) {
         if (!txn || txn->state != TxnContext::RUNNING) {
@@ -8426,8 +8434,30 @@ public:
         );
     }
 
-    QueryOptimizer& optimizer() {
-        return query_optimizer;
+    MemoOptimizationResult optimizeWithCascadesQueue(
+            const QueryComponents& components) {
+        auto stats = query_optimizer.analyzeQueryTables(components);
+        return query_optimizer.optimizeWithCascadesQueue(
+            components,
+            stats,
+            &transactional_storage_manager.index_manager
+        );
+    }
+
+    void printPhysicalPlanTree(
+            const std::string& label,
+            const QueryComponents& components,
+            const std::shared_ptr<PhysicalPlanNode>& root) {
+        query_optimizer.printPhysicalPlanTree(label, components, root);
+    }
+
+    void buildLookaheadFilters(LookaheadInfoPassingManager& lip_manager,
+                               const QueryComponents& components) {
+        lip_manager.build(
+            components,
+            transactional_storage_manager.catalog,
+            transactional_storage_manager.page_manager
+        );
     }
 
 private:
@@ -8542,32 +8572,32 @@ public:
 
     void buildIndexes(
             const std::vector<IndexSpec>& specs) {
-        transactional_storage_manager.index_manager.buildIndexes(specs);
+        transactional_storage_manager.buildIndexes(specs);
     }
 
     QueryComponents parseSelectStatement(const std::string& statement) {
         return query_processor.parseSelectStatement(statement);
     }
 
-    QueryOptimizer& optimizer() {
-        return query_processor.optimizer();
-    }
-
-    IndexManager& indexes() {
-        return transactional_storage_manager.index_manager;
-    }
-
     void clearBufferPool() {
-        transactional_storage_manager.buffer_manager.clearBufferPool();
+        transactional_storage_manager.clearBufferPool();
     }
 
     void buildLookaheadFilters(LookaheadInfoPassingManager& lip_manager,
                                const QueryComponents& components) {
-        lip_manager.build(
-            components,
-            transactional_storage_manager.catalog,
-            transactional_storage_manager.page_manager
-        );
+        query_processor.buildLookaheadFilters(lip_manager, components);
+    }
+
+    MemoOptimizationResult optimizeWithCascadesQueue(
+            const QueryComponents& components) {
+        return query_processor.optimizeWithCascadesQueue(components);
+    }
+
+    void printPhysicalPlanTree(
+            const std::string& label,
+            const QueryComponents& components,
+            const std::shared_ptr<PhysicalPlanNode>& root) {
+        query_processor.printPhysicalPlanTree(label, components, root);
     }
 
     QueryResult executeJoinPlan(
@@ -8856,15 +8886,10 @@ void runImdbLookaheadInfoPassing() {
         components.joins.size(),
         PhysicalJoinKind::HashJoin
     );
-    auto stats = db.optimizer().analyzeQueryTables(components);
 
     auto indexes = imdbIndexSpecs();
     db.buildIndexes(indexes);
-    auto search = db.optimizer().optimizeWithCascadesQueue(
-        components,
-        stats,
-        &db.indexes()
-    );
+    auto search = db.optimizeWithCascadesQueue(components);
 
     std::cout << "\nWritten-order plan:" << std::endl;
     std::cout << "  order=" << joinOrderLabel(components) << std::endl;
@@ -8881,7 +8906,7 @@ void runImdbLookaheadInfoPassing() {
               << ", sort_enforcers=" << search.rule_stats.sort_enforcers
               << std::endl;
 
-    db.optimizer().printPhysicalPlanTree(
+    db.printPhysicalPlanTree(
         "Cascades winner",
         search.components,
         search.plan_root
