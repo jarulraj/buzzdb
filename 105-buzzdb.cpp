@@ -4708,11 +4708,18 @@ struct OpaqueUdfPredicateBinding {
 
 class OpaqueScalarUdfEvaluator {
 private:
+    struct ScalarUdfLookupCache {
+        bool loaded = false;
+        FieldType return_type = STRING;
+        std::unordered_map<IndexKey, std::unique_ptr<Field>, IndexKeyHasher>
+            values_by_key;
+    };
+
     Catalog& catalog;
     PageManager& page_manager;
     OpaqueUdfExecutionStats& stats;
-    mutable bool info_type_name_cache_loaded = false;
-    mutable std::unordered_map<int, std::string> info_type_name_by_id;
+    ScalarUdfCatalog udf_catalog;
+    mutable std::map<std::string, ScalarUdfLookupCache> lookup_caches;
 
 public:
     OpaqueScalarUdfEvaluator(Catalog& catalog,
@@ -4722,55 +4729,58 @@ public:
 
     bool matches(const OpaqueUdfPredicateBinding& binding,
                  const Field& argument_value) const {
-        if (binding.function_name == "info_type_name") {
-            stats.function_calls++;
-            auto info_name = infoTypeName(argument_value.asInt());
-            return info_name && *info_name == binding.value_text;
+        auto udf = udf_catalog.lookup(binding.function_name);
+        stats.function_calls++;
+
+        const auto& cache = cacheFor(binding.function_name, udf);
+        auto value = cache.values_by_key.find(IndexKey(argument_value));
+        if (value == cache.values_by_key.end()) {
+            return false;
         }
-        throw std::runtime_error("Unsupported opaque scalar UDF: " +
-                                 binding.function_name);
+
+        auto expected_value = FieldParser::parseValue(
+            cache.return_type,
+            binding.value_text
+        );
+        return *value->second == *expected_value;
     }
 
 private:
-    std::optional<std::string> infoTypeName(int info_type_id) const {
-        loadInfoTypeNameCache();
-        auto it = info_type_name_by_id.find(info_type_id);
-        if (it == info_type_name_by_id.end()) {
-            return std::nullopt;
-        }
-        return it->second;
-    }
-
-    void loadInfoTypeNameCache() const {
-        if (info_type_name_cache_loaded) {
-            return;
+    const ScalarUdfLookupCache& cacheFor(
+            const std::string& function_name,
+            const ScalarUdfDefinition& udf) const {
+        auto& cache = lookup_caches[function_name];
+        if (cache.loaded) {
+            return cache;
         }
 
-        auto& metadata = catalog.getTable("info_type");
-        size_t id_column = static_cast<size_t>(
-            metadata.schema.getColumnIndex("id")
+        auto& metadata = catalog.getTable(udf.lookup_table);
+        size_t key_column = static_cast<size_t>(
+            metadata.schema.getColumnIndex(udf.lookup_key_column)
         );
-        size_t info_column = static_cast<size_t>(
-            metadata.schema.getColumnIndex("info")
+        size_t return_column = static_cast<size_t>(
+            metadata.schema.getColumnIndex(udf.return_column)
         );
+        cache.return_type = metadata.schema.columns[return_column].type;
 
         TableHeap heap(metadata, page_manager);
         ScanOperator scan(heap);
         scan.open();
         while (scan.next()) {
             auto tuple = scan.getOutput();
-            if (id_column >= tuple.size() || info_column >= tuple.size()) {
+            if (key_column >= tuple.size() || return_column >= tuple.size()) {
                 throw std::runtime_error(
-                    "info_type_name UDF cache column out of range."
+                    "Scalar UDF lookup cache column out of range."
                 );
             }
-            info_type_name_by_id[tuple[id_column]->asInt()] =
-                tuple[info_column]->asString();
+            cache.values_by_key[IndexKey(*tuple[key_column])] =
+                tuple[return_column]->clone();
         }
         scan.close();
 
-        stats.cache_entries += info_type_name_by_id.size();
-        info_type_name_cache_loaded = true;
+        stats.cache_entries += cache.values_by_key.size();
+        cache.loaded = true;
+        return cache;
     }
 };
 
