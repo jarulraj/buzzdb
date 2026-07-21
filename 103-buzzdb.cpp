@@ -4906,7 +4906,6 @@ struct MemoPlanChoice {
 
 struct MemoOptimizationResult {
     QueryComponents components;
-    Memo memo;
     MemoRuleStats rule_stats;
     std::shared_ptr<PhysicalPlanNode> plan_root;
     double final_estimate = 0.0;
@@ -5813,23 +5812,6 @@ private:
         return joinLabels(labels, ", ");
     }
 
-    static std::optional<JoinClause> orientJoinEdge(
-            const JoinClause& edge,
-            const std::set<TableRefId>& joined_table_refs) {
-        bool left_joined =
-            joined_table_refs.find(edge.left.table_ref_id) != joined_table_refs.end();
-        bool right_joined =
-            joined_table_refs.find(edge.right.table_ref_id) != joined_table_refs.end();
-        if (left_joined == right_joined) {
-            return std::nullopt;
-        }
-
-        JoinClause oriented = edge;
-        oriented.input_table_ref_id =
-            left_joined ? edge.right.table_ref_id : edge.left.table_ref_id;
-        return oriented;
-    }
-
     static std::pair<ColumnRef, ColumnRef> joinedAndInputColumns(
             const JoinClause& join,
             const std::set<TableRefId>& joined_table_refs) {
@@ -6601,109 +6583,6 @@ private:
         step.has_index_lookup = true;
         step.index_lookup_column = *index_lookup_column;
         step.chosen_cost = best_index_cost;
-        return step;
-    }
-
-    JoinTreeStepEstimate estimateJoinTreeStep(
-            const std::set<TableRefId>& left_table_refs,
-            const JoinClause& join,
-            const RelationStats& left_relation,
-            double left_cost,
-            const RelationStats& right_relation,
-            double right_cost,
-            const QueryComponents* components = nullptr,
-            const PhysicalPlanNode* left_plan = nullptr,
-            const PhysicalPlanNode* right_plan = nullptr,
-            const IndexManager* index_manager = nullptr) {
-        auto columns = joinedAndInputColumns(join, left_table_refs);
-        double output_rows = estimateJoinRows(
-            left_relation.rows,
-            right_relation.rows,
-            relationColumnStatsFor(left_relation, columns.first),
-            relationColumnStatsFor(right_relation, columns.second)
-        );
-        RelationStats output_relation = estimateJoinedRelationStats(
-            left_relation,
-            right_relation,
-            columns.first,
-            columns.second,
-            output_rows
-        );
-
-        double nested_loop_cost = nestedLoopJoinCost(
-            left_cost,
-            right_cost,
-            left_relation.rows,
-            right_relation.rows,
-            output_rows
-        );
-        double hash_join_cost = hashJoinCost(
-            left_cost,
-            right_cost,
-            left_relation.rows,
-            right_relation.rows,
-            output_rows
-        );
-        PhysicalJoinKind chosen_join_kind =
-            nested_loop_cost <= hash_join_cost
-                ? PhysicalJoinKind::NestedLoopJoin
-                : PhysicalJoinKind::HashJoin;
-        double chosen_cost = chosen_join_kind == PhysicalJoinKind::NestedLoopJoin
-            ? nested_loop_cost
-            : hash_join_cost;
-        bool has_index_lookup = false;
-        ColumnRef index_lookup_column;
-
-        auto considerIndexJoin =
-                [&](const PhysicalPlanNode* indexed_plan,
-                    const ColumnRef& indexed_column,
-                    double outer_rows,
-                    double outer_cost) {
-            if (!components || !indexed_plan || !indexed_plan->isTableScan()) {
-                return;
-            }
-            if (!indexDescriptorForColumn(
-                    *components,
-                    indexed_column,
-                    index_manager
-                )) {
-                return;
-            }
-
-            double index_cost = indexNestedLoopJoinCost(
-                outer_cost,
-                outer_rows,
-                output_rows
-            );
-            if (index_cost < chosen_cost) {
-                chosen_join_kind = PhysicalJoinKind::IndexNestedLoopJoin;
-                chosen_cost = index_cost;
-                has_index_lookup = true;
-                index_lookup_column = indexed_column;
-            }
-        };
-
-        considerIndexJoin(
-            right_plan,
-            columns.second,
-            left_relation.rows,
-            left_cost
-        );
-        considerIndexJoin(
-            left_plan,
-            columns.first,
-            right_relation.rows,
-            right_cost
-        );
-
-        JoinTreeStepEstimate step;
-        step.join = join;
-        step.output_rows = output_rows;
-        step.output_relation = std::move(output_relation);
-        step.chosen_join_kind = chosen_join_kind;
-        step.has_index_lookup = has_index_lookup;
-        step.index_lookup_column = index_lookup_column;
-        step.chosen_cost = chosen_cost;
         return step;
     }
 
@@ -7774,7 +7653,6 @@ public:
         );
         return {
             std::move(planned_components),
-            std::move(memo),
             rule_stats,
             final_choice->second.plan_root,
             final_choice->second.relation.rows,
@@ -7805,14 +7683,6 @@ public:
             stats[table_ref.table_id] = analyzeTable(metadata);
         }
         return stats;
-    }
-
-    const ColumnStats& columnStatsFor(
-            const QueryComponents& components,
-            const std::map<TableId, TableStats>& stats,
-            const ColumnRef& column) {
-        const auto& table_ref = tableRefForId(components, column.table_ref_id);
-        return stats.at(table_ref.table_id).columns.at(column.column_index);
     }
 
     double estimateEqualityFilterRowsWithMcv(double input_rows,

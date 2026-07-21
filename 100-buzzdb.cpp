@@ -7483,8 +7483,8 @@ void runImdbLogicalMemo() {
 
     std::cout << "\nTakeaway: the memo is a compact logical expression graph."
               << " This version records one written-order expression per"
-              << " group; later versions add alternatives and choose winners"
-              << " from the memo.\n";
+              << " group. It stops before Volcano-style rule expansion,"
+              << " physical implementations, and winner selection.\n";
 }
 
 int main() {

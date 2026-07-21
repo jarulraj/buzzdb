@@ -6168,7 +6168,9 @@ private:
         stats.initial_expressions = memo.expressionCount();
 
         if (components.table_refs.empty() || components.table_refs.size() > 62) {
-            throw std::runtime_error("Memo rules support 1..62 table refs.");
+            throw std::runtime_error(
+                "Volcano-style memo rules support 1..62 table refs."
+            );
         }
 
         std::vector<TableRefId> table_ref_ids;
@@ -6538,7 +6540,9 @@ public:
             rule_stats
         );
         if (!final_choice) {
-            throw std::runtime_error("Memo rules could not produce a physical plan.");
+            throw std::runtime_error(
+                "Volcano-style memo rules could not produce a physical plan."
+            );
         }
 
         auto planned_components = makeJoinPlanComponents(
@@ -7960,7 +7964,7 @@ void printMemoRuleStats(const std::string& label,
               << std::endl;
 }
 
-void runImdbMemoRules() {
+void runImdbVolcanoStyleMemoOptimizer() {
     BuzzDB db;
     ensureImdbDatasetLoaded(db);
 
@@ -7975,10 +7979,10 @@ void runImdbMemoRules() {
         &db.indexes()
     );
 
-    std::cout << "\nMemo rule expansion:" << std::endl;
+    std::cout << "\nVolcano-style memo rule expansion:" << std::endl;
     printMemoRuleStats("with index implementations", search.rule_stats);
 
-    std::cout << "\nMemo bottom-up winner:" << std::endl;
+    std::cout << "\nVolcano-style bottom-up winner:" << std::endl;
     std::cout << "  cost="
               << formatEstimate(search.estimated_cost)
               << ", final_est="
@@ -7987,7 +7991,7 @@ void runImdbMemoRules() {
               << std::endl;
 
     db.optimizer().printPhysicalPlanTree(
-        "Memo winner",
+        "Volcano-style memo winner",
         search.components,
         search.plan_root
     );
@@ -7998,17 +8002,18 @@ void runImdbMemoRules() {
               << ", elapsed=" << formatSeconds(executed.elapsed_seconds)
               << " seconds" << std::endl;
 
-    std::cout << "\nTakeaway: memo rules add equivalent logical joins and"
-              << " physical implementations to the same groups. The optimizer"
-              << " now chooses the cheapest winner bottom-up from the memo.\n";
+    std::cout << "\nTakeaway: Volcano-style memo rules add equivalent logical"
+              << " joins and physical implementations to the same groups, then"
+              << " choose the cheapest winner bottom-up. This is memo-based"
+              << " optimization, but not Cascades yet.\n";
 }
 
 int main() {
     try {
 
-    std::cout << "IMDB memo rules and bottom-up winner\n";
+    std::cout << "IMDB Volcano-style memo optimizer\n";
 
-    runImdbMemoRules();
+    runImdbVolcanoStyleMemoOptimizer();
 
     return 0;
     } catch (const std::exception& error) {
