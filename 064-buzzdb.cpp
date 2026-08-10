@@ -1,0 +1,4475 @@
+#include <iostream>
+#include <map>
+#include <vector>
+#include <fstream>
+#include <iostream>
+#include <chrono>
+#include <list>
+#include <sstream>
+#include <optional>
+#include <regex>
+#include <stdexcept>
+#include <cassert>
+#include <cerrno>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <set>
+#include <functional>
+#include <utility>
+#include <unistd.h>
+
+enum FieldType { INT, FLOAT, STRING };
+
+// Define a basic Field variant class that can hold different types
+class Field {
+public:
+    FieldType type;
+    size_t data_length;
+    std::unique_ptr<char[]> data;
+
+public:
+    Field(int i) : type(INT) { 
+        data_length = sizeof(int);
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), &i, data_length);
+    }
+
+    Field(float f) : type(FLOAT) { 
+        data_length = sizeof(float);
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), &f, data_length);
+    }
+
+    Field(const std::string& s) : type(STRING) {
+        data_length = s.size() + 1;  // include null-terminator
+        data = std::make_unique<char[]>(data_length);
+        std::memcpy(data.get(), s.c_str(), data_length);
+    }
+
+    Field& operator=(const Field& other) {
+        if (&other == this) {
+            return *this;
+        }
+        type = other.type;
+        data_length = other.data_length;
+        std::memcpy(data.get(), other.data.get(), data_length);
+        return *this;
+    }
+
+   // Copy constructor
+    Field(const Field& other) : type(other.type), data_length(other.data_length), data(new char[data_length]) {
+        std::memcpy(data.get(), other.data.get(), data_length);
+    }
+
+    // Move constructor - If you already have one, ensure it's correctly implemented
+    Field(Field&& other) noexcept : type(other.type), data_length(other.data_length), data(std::move(other.data)) {
+        // Optionally reset other's state if needed
+    }
+
+    // Clone method
+    std::unique_ptr<Field> clone() const {
+        // Use the copy constructor
+        return std::make_unique<Field>(*this);
+    }
+
+    FieldType getType() const { return type; }
+    int asInt() const { 
+        return *reinterpret_cast<int*>(data.get());
+    }
+    float asFloat() const { 
+        return *reinterpret_cast<float*>(data.get());
+    }
+    std::string asString() const { 
+        return std::string(data.get());
+    }
+
+    std::string serialize() {
+        std::stringstream buffer;
+        buffer << type << ' ' << data_length << ' ';
+        if (type == STRING) {
+            buffer << data.get() << ' ';
+        } else if (type == INT) {
+            buffer << *reinterpret_cast<int*>(data.get()) << ' ';
+        } else if (type == FLOAT) {
+            buffer << *reinterpret_cast<float*>(data.get()) << ' ';
+        }
+        return buffer.str();
+    }
+
+    void serialize(std::ofstream& out) {
+        std::string serializedData = this->serialize();
+        out << serializedData;
+    }
+
+    static std::unique_ptr<Field> deserialize(std::istream& in) {
+        int type; in >> type;
+        size_t length; in >> length;
+        if (type == STRING) {
+            std::string val; in >> val;
+            return std::make_unique<Field>(val);
+        } else if (type == INT) {
+            int val; in >> val;
+            return std::make_unique<Field>(val);
+        } else if (type == FLOAT) {
+            float val; in >> val;
+            return std::make_unique<Field>(val);
+        }
+        return nullptr;
+    }
+
+    void print() const{
+        switch(getType()){
+            case INT: std::cout << asInt(); break;
+            case FLOAT: std::cout << asFloat(); break;
+            case STRING: std::cout << asString(); break;
+        }
+    }
+};
+
+bool operator==(const Field& lhs, const Field& rhs) {
+    if (lhs.type != rhs.type) return false; // Different types are never equal
+
+    switch (lhs.type) {
+        case INT:
+            return *reinterpret_cast<const int*>(lhs.data.get()) == *reinterpret_cast<const int*>(rhs.data.get());
+        case FLOAT:
+            return *reinterpret_cast<const float*>(lhs.data.get()) == *reinterpret_cast<const float*>(rhs.data.get());
+        case STRING:
+            return std::string(lhs.data.get(), lhs.data_length - 1) == std::string(rhs.data.get(), rhs.data_length - 1);
+        default:
+            throw std::runtime_error("Unsupported field type for comparison.");
+    }
+}
+
+class Tuple {
+public:
+    std::vector<std::unique_ptr<Field>> fields;
+
+    void addField(std::unique_ptr<Field> field) {
+        fields.push_back(std::move(field));
+    }
+
+    size_t getSize() const {
+        size_t size = 0;
+        for (const auto& field : fields) {
+            size += field->data_length;
+        }
+        return size;
+    }
+
+    std::string serialize() {
+        std::stringstream buffer;
+        buffer << fields.size() << ' ';
+        for (const auto& field : fields) {
+            buffer << field->serialize();
+        }
+        return buffer.str();
+    }
+
+    void serialize(std::ofstream& out) {
+        std::string serializedData = this->serialize();
+        out << serializedData;
+    }
+
+    static std::unique_ptr<Tuple> deserialize(std::istream& in) {
+        auto tuple = std::make_unique<Tuple>();
+        size_t fieldCount; in >> fieldCount;
+        for (size_t i = 0; i < fieldCount; ++i) {
+            tuple->addField(Field::deserialize(in));
+        }
+        return tuple;
+    }
+
+    std::unique_ptr<Tuple> clone() const {
+        auto tuple = std::make_unique<Tuple>();
+        for (const auto& field : fields) {
+            tuple->addField(field->clone());
+        }
+        return tuple;
+    }
+};
+
+std::string fieldToString(const Field& field) {
+    std::ostringstream output;
+    switch (field.getType()) {
+        case INT:
+            output << field.asInt();
+            break;
+        case FLOAT:
+            output << field.asFloat();
+            break;
+        case STRING:
+            output << field.asString();
+            break;
+    }
+    return output.str();
+}
+
+std::string tupleToString(const Tuple& tuple) {
+    std::ostringstream output;
+    output << "[";
+    for (size_t i = 0; i < tuple.fields.size(); i++) {
+        if (i != 0) {
+            output << ", ";
+        }
+        output << fieldToString(*tuple.fields[i]);
+    }
+    output << "]";
+    return output.str();
+}
+
+static constexpr size_t PAGE_SIZE = 256;  // Small pages make DPT/pageLSN behavior visible.
+static constexpr size_t MAX_SLOTS = 16;   // Keep the slot directory small enough for 256-byte pages.
+uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
+
+using PageID = uint16_t;
+using TableId = uint16_t;
+using LSN = uint64_t;
+
+constexpr PageID CATALOG_PAGE_ID = 0;
+constexpr PageID INVALID_PAGE_ID = std::numeric_limits<PageID>::max();
+constexpr TableId INVALID_TABLE_ID = 0;
+constexpr TableId SYS_TABLES_ID = 1;
+constexpr TableId SYS_COLUMNS_ID = 2;
+constexpr TableId FIRST_USER_TABLE_ID = 100;
+const std::string BOOTSTRAP_MAGIC = "BUZZDB_BOOTSTRAP";
+
+enum class CrashPoint {
+    NONE,
+    AFTER_COMMIT_LOG_FORCE,
+    AFTER_ABORT_LOG_FORCE,
+    AFTER_FIRST_CLR_DURING_ABORT,
+    AFTER_STEAL_PAGE_FLUSH,
+    AFTER_BEGIN_CHECKPOINT,
+    AFTER_END_CHECKPOINT_BEFORE_MASTER
+};
+
+struct PageHeader {
+    TableId table_id = INVALID_TABLE_ID;
+    PageID next_page = INVALID_PAGE_ID;
+    LSN page_lsn = 0;
+};
+
+struct Slot {
+    bool empty = true;                 // Is the slot empty?    
+    uint16_t offset = INVALID_VALUE;    // Offset of the slot within the page
+    uint16_t length = INVALID_VALUE;    // Length of the slot
+};
+
+static_assert(sizeof(Slot) * MAX_SLOTS + sizeof(PageHeader) < PAGE_SIZE,
+              "Slot directory and page header must leave tuple space.");
+
+// Slotted Page class
+class SlottedPage {
+public:
+    std::unique_ptr<char[]> page_data = std::make_unique<char[]>(PAGE_SIZE);
+
+    SlottedPage(){
+        reset();
+    }
+
+    void reset() {
+        std::memset(page_data.get(), 0, PAGE_SIZE);
+
+        Slot* slot_array = slots();
+        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+            slot_array[slot_itr].empty = true;
+            slot_array[slot_itr].offset = INVALID_VALUE;
+            slot_array[slot_itr].length = INVALID_VALUE;
+        }
+
+        header()->table_id = INVALID_TABLE_ID;
+        header()->next_page = INVALID_PAGE_ID;
+        header()->page_lsn = 0;
+    }
+
+    TableId getTableId() const {
+        return header()->table_id;
+    }
+
+    void setTableId(TableId table_id) {
+        header()->table_id = table_id;
+    }
+
+    PageID getNextPage() const {
+        return header()->next_page;
+    }
+
+    void setNextPage(PageID page_id) {
+        header()->next_page = page_id;
+    }
+
+    LSN getPageLSN() const {
+        return header()->page_lsn;
+    }
+
+    void setPageLSN(LSN page_lsn) {
+        header()->page_lsn = page_lsn;
+    }
+
+    bool addTuple(std::unique_ptr<Tuple> tuple) {
+        return addTupleAndReturnSlot(std::move(tuple)).has_value();
+    }
+
+    std::optional<size_t> addTupleAndReturnSlot(std::unique_ptr<Tuple> tuple) {
+        auto bytes = tuple->serialize();
+        auto slot_id = findAvailableSlot(bytes.size());
+        if (!slot_id || !putSerializedTupleAtSlot(*slot_id, bytes)) {
+            return std::nullopt;
+        }
+        return slot_id;
+    }
+
+    bool putTupleAtSlot(size_t slot_id, std::unique_ptr<Tuple> tuple) {
+        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
+    }
+
+    std::unique_ptr<Tuple> getTuple(size_t slot_id) const {
+        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
+            return nullptr;
+        }
+
+        const auto& slot = slots()[slot_id];
+        assert(slot.offset != INVALID_VALUE);
+        assert(slot.length != INVALID_VALUE);
+        const char* tuple_data = page_data.get() + slot.offset;
+        std::istringstream iss(std::string(tuple_data, slot.length));
+        return Tuple::deserialize(iss);
+    }
+
+    bool updateTuple(size_t slot_id, std::unique_ptr<Tuple> tuple) {
+        if (slot_id >= MAX_SLOTS || slots()[slot_id].empty) {
+            return false;
+        }
+
+        return putSerializedTupleAtSlot(slot_id, tuple->serialize());
+    }
+
+    void deleteTuple(size_t slot_id) {
+        if (slot_id < MAX_SLOTS) {
+            slots()[slot_id].empty = true;
+        }
+    }
+
+private:
+    static constexpr size_t SLOT_ARRAY_SIZE = sizeof(Slot) * MAX_SLOTS;
+    static constexpr size_t HEADER_OFFSET = SLOT_ARRAY_SIZE;
+    static constexpr size_t DATA_START = HEADER_OFFSET + sizeof(PageHeader);
+
+    Slot* slots() {
+        return reinterpret_cast<Slot*>(page_data.get());
+    }
+
+    const Slot* slots() const {
+        return reinterpret_cast<const Slot*>(page_data.get());
+    }
+
+    PageHeader* header() {
+        return reinterpret_cast<PageHeader*>(page_data.get() + HEADER_OFFSET);
+    }
+
+    const PageHeader* header() const {
+        return reinterpret_cast<const PageHeader*>(page_data.get() + HEADER_OFFSET);
+    }
+
+    std::optional<size_t> findAvailableSlot(size_t tuple_size) const {
+        const Slot* slot_array = slots();
+        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+            if (!slot_array[slot_itr].empty) {
+                continue;
+            }
+            if (slot_array[slot_itr].length == INVALID_VALUE ||
+                slot_array[slot_itr].length >= tuple_size) {
+                return slot_itr;
+            }
+        }
+        return std::nullopt;
+    }
+
+    size_t nextFreeOffset() const {
+        size_t offset = DATA_START;
+        const Slot* slot_array = slots();
+        for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+            if (slot_array[slot_itr].offset == INVALID_VALUE ||
+                slot_array[slot_itr].length == INVALID_VALUE) {
+                continue;
+            }
+
+            size_t slot_end = static_cast<size_t>(slot_array[slot_itr].offset) +
+                              slot_array[slot_itr].length;
+            if (slot_end > offset) {
+                offset = slot_end;
+            }
+        }
+        return offset;
+    }
+
+    bool putSerializedTupleAtSlot(size_t slot_itr,
+                                  const std::string& bytes) {
+        if (slot_itr >= MAX_SLOTS) {
+            return false;
+        }
+
+        size_t tuple_size = bytes.size();
+        auto& slot = slots()[slot_itr];
+        if (slot.length != INVALID_VALUE && tuple_size > slot.length) {
+            return false;
+        }
+
+        size_t offset = slot.offset;
+        if (offset == INVALID_VALUE) {
+            offset = nextFreeOffset();
+        }
+
+        if (offset < DATA_START || offset + tuple_size > PAGE_SIZE) {
+            return false;
+        }
+
+        assert(offset != INVALID_VALUE);
+        assert(offset >= DATA_START);
+        assert(offset + tuple_size <= PAGE_SIZE);
+
+        slot.empty = false;
+        slot.offset = static_cast<uint16_t>(offset);
+        if (slot.length == INVALID_VALUE) {
+            slot.length = static_cast<uint16_t>(tuple_size);
+        }
+
+        std::memcpy(page_data.get() + offset, bytes.c_str(), tuple_size);
+        return true;
+    }
+};
+
+const std::string database_filename = "buzzdb.dat";
+const std::string log_filename = "buzzdb.log";
+const std::string master_record_filename = "buzzdb.master";
+const std::string backup_database_filename = "buzzdb.backup.dat";
+const std::string archived_log_filename = "buzzdb.archive.log";
+const std::string archived_master_filename = "buzzdb.archive.master";
+const std::string backup_metadata_filename = "buzzdb.backup.meta";
+
+class StorageManager {
+public:    
+    std::fstream fileStream;
+    size_t num_pages = 0;
+
+public:
+    StorageManager(){
+        fileStream.open(database_filename, std::ios::in | std::ios::out);
+        if (!fileStream) {
+            // If file does not exist, create it
+            fileStream.clear(); // Reset the state
+            fileStream.open(database_filename, std::ios::out);
+        }
+        fileStream.close(); 
+        fileStream.open(database_filename, std::ios::in | std::ios::out); 
+
+        fileStream.seekg(0, std::ios::end);
+        num_pages = fileStream.tellg() / PAGE_SIZE;
+
+        //std::cout << "Storage Manager :: Num pages: " << num_pages << "\n";        
+        if(num_pages == 0){
+            extend();
+        }
+
+    }
+
+    ~StorageManager() {
+        if (fileStream.is_open()) {
+            fileStream.close();
+        }
+    }
+
+    // Read a page from disk
+    std::unique_ptr<SlottedPage> load(uint16_t page_id) {
+        fileStream.seekg(page_id * PAGE_SIZE, std::ios::beg);
+        auto page = std::make_unique<SlottedPage>();
+        // Read the content of the file into the page
+        if(!fileStream.read(page->page_data.get(), PAGE_SIZE)){
+            std::cerr << "Error: Unable to read data from the file. \n";
+            exit(-1);
+        }
+        return page;
+    }
+
+    // Write a page to disk
+    void flush(uint16_t page_id, const std::unique_ptr<SlottedPage>& page) {
+        size_t page_offset = page_id * PAGE_SIZE;        
+
+        // Move the write pointer
+        fileStream.seekp(page_offset, std::ios::beg);
+        fileStream.write(page->page_data.get(), PAGE_SIZE);        
+        fileStream.flush();
+    }
+
+    // Extend database file by one page
+    void extend() {
+        //std::cout << "Extending database file \n";
+
+        // Create a slotted page
+        auto empty_slotted_page = std::make_unique<SlottedPage>();
+
+        // Move the write pointer
+        fileStream.seekp(0, std::ios::end);
+
+        // Write the page to the file, extending it
+        fileStream.write(empty_slotted_page->page_data.get(), PAGE_SIZE);
+        fileStream.flush();
+
+        // Update number of pages
+        num_pages += 1;
+    }
+
+};
+
+class Policy {
+public:
+    virtual bool touch(PageID page_id) = 0;
+    virtual PageID evict() = 0;
+    virtual ~Policy() = default;
+};
+
+class LruPolicy : public Policy {
+private:
+    // List to keep track of the order of use
+    std::list<PageID> lruList;
+
+    // Map to find a page's iterator in the list efficiently
+    std::unordered_map<PageID, std::list<PageID>::iterator> map;
+
+    size_t cacheSize;
+
+public:
+
+    LruPolicy(size_t cacheSize) : cacheSize(cacheSize) {}
+
+    bool touch(PageID page_id) override {
+        bool found = false;
+        // If page already in the list, remove it
+        if (map.find(page_id) != map.end()) {
+            found = true;
+            lruList.erase(map[page_id]);
+            map.erase(page_id);            
+        }
+
+        // If cache is full, evict
+        if(lruList.size() == cacheSize){
+            evict();
+        }
+
+        if(lruList.size() < cacheSize){
+            // Add the page to the front of the list
+            lruList.emplace_front(page_id);
+            map[page_id] = lruList.begin();
+        }
+
+        return found;
+    }
+
+    PageID evict() override {
+        // Evict the least recently used page
+        PageID evictedPageId = INVALID_VALUE;
+        if(lruList.size() != 0){
+            evictedPageId = lruList.back();
+            map.erase(evictedPageId);
+            lruList.pop_back();
+        }
+        return evictedPageId;
+    }
+
+};
+
+constexpr size_t MAX_PAGES_IN_MEMORY = 10;
+
+class LogManager;
+
+class BufferManager {
+private:
+    using PageMap = std::unordered_map<PageID, std::unique_ptr<SlottedPage>>;
+
+    StorageManager storage_manager;
+    PageMap pageMap;
+    LogManager& log_manager;
+    std::unique_ptr<Policy> policy;
+    std::set<PageID> pinned_pages;
+    std::function<void(PageID, LSN)> page_flush_callback;
+
+public:
+    explicit BufferManager(LogManager& log_manager)
+        : log_manager(log_manager),
+          policy(std::make_unique<LruPolicy>(MAX_PAGES_IN_MEMORY)) {}
+
+    void setPageFlushCallback(std::function<void(PageID, LSN)> callback) {
+        page_flush_callback = std::move(callback);
+    }
+
+    std::unique_ptr<SlottedPage>& getPage(int page_id) {
+        auto it = pageMap.find(page_id);
+        if (it != pageMap.end()) {
+            policy->touch(page_id);
+            return pageMap.find(page_id)->second;
+        }
+
+        if (pageMap.size() >= MAX_PAGES_IN_MEMORY) {
+            evictUnpinnedPage();
+        }
+
+        auto page = storage_manager.load(page_id);
+        policy->touch(page_id);
+        //std::cout << "Loading page: " << page_id << "\n";
+        pageMap[page_id] = std::move(page);
+        return pageMap[page_id];
+    }
+
+    void flushPage(int page_id, const std::string& reason = "page flush") {
+        auto& page = getPage(page_id);
+        forceLogBeforePageFlush(page_id, reason);
+        LSN page_lsn = page->getPageLSN();
+        storage_manager.flush(page_id, page);
+        if (page_flush_callback) {
+            page_flush_callback(page_id, page_lsn);
+        }
+    }
+
+    void pinPage(PageID page_id) {
+        pinned_pages.insert(page_id);
+    }
+
+    void unpinPage(PageID page_id) {
+        pinned_pages.erase(page_id);
+    }
+
+    void extend(){
+        storage_manager.extend();
+    }
+
+    PageID appendPage(TableId table_id) {
+        storage_manager.extend();
+        auto page_id = static_cast<PageID>(storage_manager.num_pages - 1);
+        resetPage(page_id, table_id);
+        return page_id;
+    }
+
+    void resetPage(PageID page_id, TableId table_id) {
+        auto& page = getPage(page_id);
+        page->reset();
+        page->setTableId(table_id);
+        page->setNextPage(INVALID_PAGE_ID);
+        flushPage(page_id);
+    }
+    
+    size_t getNumPages(){
+        return storage_manager.num_pages;
+    }
+
+private:
+    void forceLogBeforePageFlush(PageID page_id, const std::string&);
+
+    void evictUnpinnedPage() {
+        size_t attempts = pageMap.size();
+        while (attempts-- > 0) {
+            auto evictedPageId = policy->evict();
+            if(evictedPageId == INVALID_VALUE){
+                break;
+            }
+            if (pinned_pages.find(evictedPageId) != pinned_pages.end()) {
+                policy->touch(evictedPageId);
+                continue;
+            }
+
+            forceLogBeforePageFlush(evictedPageId, "eviction");
+            LSN page_lsn = pageMap[evictedPageId]->getPageLSN();
+            storage_manager.flush(evictedPageId, pageMap[evictedPageId]);
+            if (page_flush_callback) {
+                page_flush_callback(evictedPageId, page_lsn);
+            }
+            pageMap.erase(evictedPageId);
+            return;
+        }
+
+        throw std::runtime_error("All buffer pages are pinned.");
+    }
+};
+
+enum class LogRecordType {
+    BEGIN,
+    UPDATE,
+    INSERT,
+    DELETE,
+    CLR,
+    COMMIT,
+    ABORT,
+    END,
+    BEGIN_CHECKPOINT,
+    END_CHECKPOINT
+};
+
+bool isTupleChangeRecord(LogRecordType type);
+
+struct RecoveryAnalysis {
+    enum class TxnStatus {
+        RUNNING,
+        COMMITTING,
+        ABORTING
+    };
+
+    struct ActiveTransactionEntry {
+        TxnStatus status = TxnStatus::RUNNING;
+        LSN last_lsn = 0;
+    };
+
+    using ActiveTransactionTable = std::map<int, ActiveTransactionEntry>;
+    using DirtyPageTable = std::map<PageID, LSN>;
+
+    ActiveTransactionTable active_transaction_table;
+    DirtyPageTable dirty_page_table;
+    int next_txn_id = 1;
+};
+
+struct LogRecord {
+    LSN lsn = 0;
+    LSN prev_lsn = 0;
+    LogRecordType type;
+    int txn_id = 0;
+    TableId table_id = INVALID_TABLE_ID;
+    PageID page_id = INVALID_PAGE_ID;
+    size_t slot_id = 0;
+    LogRecordType undo_type = LogRecordType::UPDATE;
+    LSN undo_next_lsn = 0;
+    std::unique_ptr<Tuple> before_tuple;
+    std::unique_ptr<Tuple> after_tuple;
+    RecoveryAnalysis::ActiveTransactionTable checkpoint_att;
+    RecoveryAnalysis::DirtyPageTable checkpoint_dpt;
+
+    LogRecord(LogRecordType type, int txn_id)
+        : type(type), txn_id(txn_id) {}
+
+    LogRecord(LogRecordType type,
+              int txn_id,
+              TableId table_id,
+              PageID page_id,
+              size_t slot_id,
+              std::unique_ptr<Tuple> before_tuple,
+              std::unique_ptr<Tuple> after_tuple)
+        : type(type),
+          txn_id(txn_id),
+          table_id(table_id),
+          page_id(page_id),
+          slot_id(slot_id),
+          before_tuple(std::move(before_tuple)),
+          after_tuple(std::move(after_tuple)) {}
+};
+
+bool isTupleChangeRecord(LogRecordType type) {
+    return type == LogRecordType::UPDATE ||
+           type == LogRecordType::INSERT ||
+           type == LogRecordType::DELETE;
+}
+
+bool isRedoableRecord(LogRecordType type) {
+    return isTupleChangeRecord(type) || type == LogRecordType::CLR;
+}
+
+std::string logRecordName(LogRecordType type) {
+    switch (type) {
+        case LogRecordType::BEGIN:
+            return "BEGIN";
+        case LogRecordType::UPDATE:
+            return "UPDATE";
+        case LogRecordType::INSERT:
+            return "INSERT";
+        case LogRecordType::DELETE:
+            return "DELETE";
+        case LogRecordType::CLR:
+            return "CLR";
+        case LogRecordType::COMMIT:
+            return "COMMIT";
+        case LogRecordType::ABORT:
+            return "ABORT";
+        case LogRecordType::END:
+            return "END";
+        case LogRecordType::BEGIN_CHECKPOINT:
+            return "BEGIN_CHECKPOINT";
+        case LogRecordType::END_CHECKPOINT:
+            return "END_CHECKPOINT";
+    }
+    throw std::runtime_error("Unknown log record.");
+}
+
+std::string recoveryTxnStatusName(RecoveryAnalysis::TxnStatus status) {
+    switch (status) {
+        case RecoveryAnalysis::TxnStatus::RUNNING:
+            return "RUNNING";
+        case RecoveryAnalysis::TxnStatus::COMMITTING:
+            return "COMMITTING";
+        case RecoveryAnalysis::TxnStatus::ABORTING:
+            return "ABORTING";
+    }
+    throw std::runtime_error("Unknown transaction status.");
+}
+
+RecoveryAnalysis::TxnStatus parseRecoveryTxnStatus(
+    const std::string& status) {
+    if (status == "RUNNING") {
+        return RecoveryAnalysis::TxnStatus::RUNNING;
+    }
+    if (status == "COMMITTING") {
+        return RecoveryAnalysis::TxnStatus::COMMITTING;
+    }
+    if (status == "ABORTING") {
+        return RecoveryAnalysis::TxnStatus::ABORTING;
+    }
+    throw std::runtime_error("Unknown transaction status in checkpoint: " + status);
+}
+
+bool parseLogRecordType(const std::string& type,
+                        LogRecordType& record_type) {
+    if (type == "BEGIN") {
+        record_type = LogRecordType::BEGIN;
+        return true;
+    }
+    if (type == "UPDATE") {
+        record_type = LogRecordType::UPDATE;
+        return true;
+    }
+    if (type == "INSERT") {
+        record_type = LogRecordType::INSERT;
+        return true;
+    }
+    if (type == "DELETE") {
+        record_type = LogRecordType::DELETE;
+        return true;
+    }
+    if (type == "CLR") {
+        record_type = LogRecordType::CLR;
+        return true;
+    }
+    if (type == "COMMIT") {
+        record_type = LogRecordType::COMMIT;
+        return true;
+    }
+    if (type == "ABORT") {
+        record_type = LogRecordType::ABORT;
+        return true;
+    }
+    if (type == "END") {
+        record_type = LogRecordType::END;
+        return true;
+    }
+    if (type == "BEGIN_CHECKPOINT") {
+        record_type = LogRecordType::BEGIN_CHECKPOINT;
+        return true;
+    }
+    if (type == "END_CHECKPOINT") {
+        record_type = LogRecordType::END_CHECKPOINT;
+        return true;
+    }
+    return false;
+}
+
+struct MasterRecord {
+    LSN checkpoint_begin_lsn = 0;
+    size_t checkpoint_begin_offset = 0;
+};
+
+MasterRecord readMasterRecordFile() {
+    std::ifstream input(master_record_filename);
+    MasterRecord master_record;
+    if (!input) {
+        return master_record;
+    }
+
+    std::string key;
+    input >> key >> master_record.checkpoint_begin_lsn;
+    if (key != "checkpoint_lsn") {
+        throw std::runtime_error("Malformed ARIES master record.");
+    }
+    input >> key >> master_record.checkpoint_begin_offset;
+    if (key != "checkpoint_offset") {
+        throw std::runtime_error("Malformed ARIES master record.");
+    }
+    return master_record;
+}
+
+class LogManager {
+private:
+    struct PendingRecord {
+        LSN lsn;
+        std::string text;
+    };
+
+    std::vector<PendingRecord> pending_records;
+    std::map<LSN, size_t> log_offsets;
+    int log_fd = -1;
+    bool log_existed_at_open = false;
+    LSN next_lsn = 1;
+    LSN flushed_lsn = 0;
+    size_t next_log_offset = 0;
+    size_t records_written = 0;
+    size_t bytes_written = 0;
+
+public:
+    LogManager() {
+        openLogFile();
+    }
+
+    ~LogManager() {
+        if (log_fd != -1) {
+            ::close(log_fd);
+        }
+    }
+
+    void reset() {
+        if (::ftruncate(log_fd, 0) == -1) {
+            throw std::runtime_error(
+                "Unable to reset recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        syncLogFile();
+        std::remove(master_record_filename.c_str());
+        pending_records.clear();
+        log_offsets.clear();
+        next_lsn = 1;
+        flushed_lsn = 0;
+        next_log_offset = 0;
+        records_written = 0;
+        bytes_written = 0;
+    }
+
+    LSN append(LogRecord& record) {
+        record.lsn = next_lsn++;
+        auto text = serialize(record);
+        pending_records.push_back({record.lsn, text});
+        log_offsets[record.lsn] = next_log_offset;
+        records_written++;
+        bytes_written += text.size() + 1;
+        next_log_offset += text.size() + 1;
+        return record.lsn;
+    }
+
+    bool forceUpTo(LSN lsn) {
+        if (lsn <= flushed_lsn) {
+            return false;
+        }
+
+        size_t force_count = 0;
+        LSN last_forced_lsn = flushed_lsn;
+        std::string log_bytes;
+        while (force_count < pending_records.size() &&
+               pending_records[force_count].lsn <= lsn) {
+            log_bytes += pending_records[force_count].text;
+            log_bytes += "\n";
+            last_forced_lsn = pending_records[force_count].lsn;
+            force_count++;
+        }
+        if (force_count == 0) {
+            return false;
+        }
+
+        writeAll(log_bytes);
+        syncLogFile();
+
+        flushed_lsn = last_forced_lsn;
+        pending_records.erase(pending_records.begin(),
+                              pending_records.begin() + force_count);
+        next_log_offset = durableLogSize();
+        return true;
+    }
+
+    LSN getFlushedLSN() const {
+        return flushed_lsn;
+    }
+
+    bool existedAtOpen() const {
+        return log_existed_at_open;
+    }
+
+    size_t getLogOffset(LSN lsn) const {
+        auto offset = log_offsets.find(lsn);
+        if (offset == log_offsets.end()) {
+            throw std::runtime_error("No log offset found for LSN.");
+        }
+        return offset->second;
+    }
+
+    std::vector<LogRecord> readAll() {
+        return readFromOffset(0);
+    }
+
+    std::vector<LogRecord> readFromOffset(size_t start_offset) {
+        std::vector<LogRecord> records;
+        pending_records.clear();
+        next_log_offset = durableLogSize();
+        std::istringstream input(readLogContentsFromOffset(start_offset));
+
+        std::string line;
+        LSN durable_lsn = flushed_lsn;
+        size_t line_offset = start_offset;
+        while (std::getline(input, line)) {
+            if (!line.empty()) {
+                auto record = parse(line);
+                log_offsets[record.lsn] = line_offset;
+                durable_lsn = std::max(durable_lsn, record.lsn);
+                records.push_back(std::move(record));
+            }
+            line_offset += line.size() + 1;
+        }
+        flushed_lsn = durable_lsn;
+        next_lsn = std::max(next_lsn, durable_lsn + 1);
+        return records;
+    }
+
+    void writeMasterRecord(LSN checkpoint_begin_lsn) const {
+        std::ofstream output(master_record_filename, std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Unable to write ARIES master record.");
+        }
+        output << "checkpoint_lsn " << checkpoint_begin_lsn << "\n"
+               << "checkpoint_offset " << getLogOffset(checkpoint_begin_lsn)
+               << "\n";
+        output.flush();
+    }
+
+    MasterRecord readMasterRecord() const {
+        return readMasterRecordFile();
+    }
+
+    size_t truncateBefore(LSN keep_lsn) {
+        if (!pending_records.empty()) {
+            throw std::runtime_error("Cannot truncate log with unforced records.");
+        }
+
+        auto records = readAll();
+        std::vector<std::string> kept_records;
+        size_t removed = 0;
+        for (auto& record : records) {
+            if (record.lsn < keep_lsn) {
+                removed++;
+                continue;
+            }
+            kept_records.push_back(serialize(record));
+        }
+
+        log_offsets.clear();
+        next_log_offset = 0;
+        flushed_lsn = 0;
+        std::string log_bytes;
+        for (const auto& text : kept_records) {
+            auto record = parse(text);
+            log_offsets[record.lsn] = next_log_offset;
+            log_bytes += text;
+            log_bytes += "\n";
+            next_log_offset += text.size() + 1;
+            flushed_lsn = record.lsn;
+        }
+        if (::ftruncate(log_fd, 0) == -1) {
+            throw std::runtime_error(
+                "Unable to truncate recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        if (::lseek(log_fd, 0, SEEK_SET) == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log after truncation: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        writeAll(log_bytes);
+        syncLogFile();
+        next_lsn = std::max(next_lsn, flushed_lsn + 1);
+        return removed;
+    }
+
+private:
+    size_t durableLogSize() const {
+        off_t end = ::lseek(log_fd, 0, SEEK_END);
+        if (end == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log end: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        return static_cast<size_t>(end);
+    }
+
+    void openLogFile() {
+        if (log_fd != -1) {
+            return;
+        }
+        log_existed_at_open = (::access(log_filename.c_str(), F_OK) == 0);
+        log_fd = ::open(log_filename.c_str(),
+                        O_RDWR | O_CREAT | O_APPEND,
+                        0644);
+        if (log_fd == -1) {
+            throw std::runtime_error(
+                "Unable to open recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+    }
+
+    void writeAll(const std::string& bytes) {
+        size_t written = 0;
+        while (written < bytes.size()) {
+            ssize_t result = ::write(log_fd,
+                                     bytes.data() + written,
+                                     bytes.size() - written);
+            if (result == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(
+                    "Unable to write recovery log: " +
+                    std::string(std::strerror(errno))
+                );
+            }
+            written += static_cast<size_t>(result);
+        }
+    }
+
+    void syncLogFile() {
+        if (::fsync(log_fd) == -1) {
+            throw std::runtime_error(
+                "Unable to sync recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+    }
+
+    std::string readLogContentsFromOffset(size_t start_offset) {
+        if (::lseek(log_fd, static_cast<off_t>(start_offset), SEEK_SET) == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log: " +
+                std::string(std::strerror(errno))
+            );
+        }
+
+        std::string contents;
+        char buffer[4096];
+        while (true) {
+            ssize_t result = ::read(log_fd, buffer, sizeof(buffer));
+            if (result == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(
+                    "Unable to read recovery log: " +
+                    std::string(std::strerror(errno))
+                );
+            }
+            if (result == 0) {
+                break;
+            }
+            contents.append(buffer, static_cast<size_t>(result));
+        }
+        if (::lseek(log_fd, 0, SEEK_END) == -1) {
+            throw std::runtime_error(
+                "Unable to seek recovery log end: " +
+                std::string(std::strerror(errno))
+            );
+        }
+        return contents;
+    }
+
+    LogRecord parse(const std::string& line) const {
+        std::istringstream input(line);
+        LSN lsn = 0;
+        std::string type;
+        int txn_id = 0;
+        LSN prev_lsn = 0;
+        input >> lsn >> type >> txn_id >> prev_lsn;
+        if (!input) {
+            throw std::runtime_error("Bad log record: " + line);
+        }
+
+        LogRecordType record_type = LogRecordType::BEGIN;
+        if (!parseLogRecordType(type, record_type)) {
+            throw std::runtime_error("Unknown log record: " + line);
+        }
+
+        LogRecord record{record_type, txn_id};
+        record.lsn = lsn;
+        record.prev_lsn = prev_lsn;
+        if (record_type == LogRecordType::CLR) {
+            std::string undo_type;
+            int table_id = 0;
+            int page_id = 0;
+            size_t slot_id = 0;
+            input >> record.undo_next_lsn
+                  >> undo_type
+                  >> table_id
+                  >> page_id
+                  >> slot_id;
+            if (!input || !parseLogRecordType(undo_type, record.undo_type) ||
+                !isTupleChangeRecord(record.undo_type)) {
+                throw std::runtime_error("Bad CLR log record: " + line);
+            }
+
+            record.table_id = static_cast<TableId>(table_id);
+            record.page_id = static_cast<PageID>(page_id);
+            record.slot_id = slot_id;
+            if (record.undo_type != LogRecordType::INSERT) {
+                record.after_tuple = Tuple::deserialize(input);
+            }
+        } else if (isTupleChangeRecord(record_type)) {
+            int table_id = 0;
+            int page_id = 0;
+            size_t slot_id = 0;
+            input >> table_id >> page_id >> slot_id;
+            if (!input) {
+                throw std::runtime_error("Bad log operation record: " + line);
+            }
+
+            record.table_id = static_cast<TableId>(table_id);
+            record.page_id = static_cast<PageID>(page_id);
+            record.slot_id = slot_id;
+            if (record_type == LogRecordType::UPDATE ||
+                record_type == LogRecordType::DELETE) {
+                record.before_tuple = Tuple::deserialize(input);
+            }
+            if (record_type == LogRecordType::UPDATE ||
+                record_type == LogRecordType::INSERT) {
+                record.after_tuple = Tuple::deserialize(input);
+            }
+        } else if (record_type == LogRecordType::END_CHECKPOINT) {
+            std::string marker;
+            size_t entry_count = 0;
+            input >> marker >> entry_count;
+            if (!input || marker != "ATT") {
+                throw std::runtime_error("Bad checkpoint ATT record: " + line);
+            }
+            for (size_t i = 0; i < entry_count; i++) {
+                int txn_id = 0;
+                std::string status;
+                LSN last_lsn = 0;
+                input >> txn_id >> status >> last_lsn;
+                if (!input) {
+                    throw std::runtime_error("Bad checkpoint ATT entry: " + line);
+                }
+                record.checkpoint_att[txn_id] = {
+                    parseRecoveryTxnStatus(status),
+                    last_lsn
+                };
+            }
+
+            input >> marker >> entry_count;
+            if (!input || marker != "DPT") {
+                throw std::runtime_error("Bad checkpoint DPT record: " + line);
+            }
+            for (size_t i = 0; i < entry_count; i++) {
+                int page_id = 0;
+                LSN rec_lsn = 0;
+                input >> page_id >> rec_lsn;
+                if (!input) {
+                    throw std::runtime_error("Bad checkpoint DPT entry: " + line);
+                }
+                record.checkpoint_dpt[static_cast<PageID>(page_id)] = rec_lsn;
+            }
+        }
+        return record;
+    }
+
+    std::string serialize(const LogRecord& record) const {
+        std::ostringstream output;
+        if (record.lsn == 0) {
+            throw std::runtime_error("Log record is missing an LSN.");
+        }
+        output << record.lsn << " "
+               << logRecordName(record.type) << " "
+               << record.txn_id << " "
+               << record.prev_lsn;
+        if (record.type == LogRecordType::CLR) {
+            output << " " << record.undo_next_lsn
+                   << " " << logRecordName(record.undo_type)
+                   << " " << record.table_id
+                   << " " << record.page_id
+                   << " " << record.slot_id;
+            if (record.undo_type != LogRecordType::INSERT) {
+                if (!record.after_tuple) {
+                    throw std::runtime_error("CLR is missing after-undo image.");
+                }
+                output << " " << record.after_tuple->serialize();
+            }
+        } else if (isTupleChangeRecord(record.type)) {
+            output << " " << record.table_id
+                   << " " << record.page_id
+                   << " " << record.slot_id;
+            if (record.type == LogRecordType::UPDATE ||
+                record.type == LogRecordType::DELETE) {
+                if (!record.before_tuple) {
+                    throw std::runtime_error("Log record is missing before image.");
+                }
+                output << " " << record.before_tuple->serialize();
+            }
+            if (record.type == LogRecordType::UPDATE ||
+                record.type == LogRecordType::INSERT) {
+                if (!record.after_tuple) {
+                    throw std::runtime_error("Log record is missing after image.");
+                }
+                output << " " << record.after_tuple->serialize();
+            }
+        } else if (record.type == LogRecordType::END_CHECKPOINT) {
+            output << " ATT " << record.checkpoint_att.size();
+            for (const auto& txn : record.checkpoint_att) {
+                output << " " << txn.first
+                       << " " << recoveryTxnStatusName(txn.second.status)
+                       << " " << txn.second.last_lsn;
+            }
+            output << " DPT " << record.checkpoint_dpt.size();
+            for (const auto& page : record.checkpoint_dpt) {
+                output << " " << page.first
+                       << " " << page.second;
+            }
+        }
+        return output.str();
+    }
+};
+
+void BufferManager::forceLogBeforePageFlush(PageID page_id,
+                                        const std::string&) {
+    auto it = pageMap.find(page_id);
+    if (it == pageMap.end()) {
+        return;
+    }
+
+    LSN page_lsn = it->second->getPageLSN();
+    if (page_lsn == 0) {
+        return;
+    }
+
+    log_manager.forceUpTo(page_lsn);
+    if (log_manager.getFlushedLSN() < page_lsn) {
+        throw std::runtime_error("WAL rule violated: flushedLSN < pageLSN.");
+    }
+}
+
+class RecoveryManager {
+private:
+    BufferManager& buffer_manager;
+    LogManager& log_manager;
+    bool txn_active = false;
+    CrashPoint crash_point = CrashPoint::NONE;
+    int next_txn_id = 1;
+    int current_txn_id = 0;
+    LSN current_txn_last_lsn = 0;
+    std::vector<LogRecord> staged_records;
+    std::vector<PageID> dirty_pages;
+    RecoveryAnalysis::DirtyPageTable dirty_page_table;
+
+public:
+    RecoveryManager(BufferManager& buffer_manager,
+                    LogManager& log_manager)
+        : buffer_manager(buffer_manager),
+          log_manager(log_manager) {
+        buffer_manager.setPageFlushCallback([this](PageID page_id, LSN page_lsn) {
+            notePageFlushed(page_id, page_lsn);
+        });
+    }
+
+    bool isActive() const {
+        return txn_active;
+    }
+
+    void recover() {
+        if (!logExists()) {
+            if (databaseHasExistingPages()) {
+                throwInconsistentDatabase("missing WAL file");
+            }
+            initializeEmpty();
+            return;
+        }
+
+        MasterRecord master_record = log_manager.readMasterRecord();
+        auto records = readRecordsForAnalysis(master_record);
+        auto analysis = analysisPass(
+            records,
+            master_record.checkpoint_begin_lsn != 0
+        );
+        next_txn_id = std::max(next_txn_id, analysis.next_txn_id);
+        printCheckpointStart(master_record, records);
+        const auto* recovery_records = &records;
+        std::vector<LogRecord> full_log_records;
+        if (needsRetainedLogForRecovery(master_record, records, analysis)) {
+            full_log_records = log_manager.readAll();
+            recovery_records = &full_log_records;
+        }
+        std::cout << "ARIES analysis: "
+                  << countCommittedTransactions(*recovery_records)
+                  << " committed transaction(s), "
+                  << countLoserTransactions(analysis)
+                  << " loser transaction(s), "
+                  << records.size()
+                  << " analysis log record(s), "
+                  << countRedoRecords(*recovery_records)
+                  << " redo record(s), "
+                  << countUndoRecords(*recovery_records, analysis)
+                  << " undo record(s)." << std::endl;
+        if (recovery_records->size() != records.size()) {
+            std::cout << "ARIES recovery: retained log has "
+                      << recovery_records->size()
+                      << " record(s) for redo/undo chains before the checkpoint."
+                      << std::endl;
+        }
+        printActiveTransactionTable(analysis);
+        printDirtyPageTable(analysis);
+        redoPass(*recovery_records, analysis);
+        undoPass(*recovery_records, analysis);
+    }
+
+    void resetLog() {
+        log_manager.reset();
+        dirty_page_table.clear();
+    }
+
+    PageID allocatePhysicalPage(TableId table_id) {
+        return buffer_manager.appendPage(table_id);
+    }
+
+    int begin() {
+        if (txn_active) {
+            throw std::runtime_error("Transaction already active.");
+        }
+        txn_active = true;
+        current_txn_id = next_txn_id++;
+        current_txn_last_lsn = 0;
+        staged_records.clear();
+        dirty_pages.clear();
+        LogRecord begin_record{LogRecordType::BEGIN, current_txn_id};
+        LSN begin_lsn = appendTxnRecord(begin_record);
+        std::cout << "\nLog txn " << current_txn_id
+                  << " BEGIN, LSN "
+                  << begin_lsn
+                  << " prevLSN 0" << std::endl;
+        return current_txn_id;
+    }
+
+    void commit() {
+        if (!txn_active) {
+            throw std::runtime_error("COMMIT without BEGIN.");
+        }
+
+        LogRecord commit_record{LogRecordType::COMMIT, current_txn_id};
+        LSN commit_lsn = appendTxnRecord(commit_record);
+        forceLogUpTo(commit_lsn);
+
+        if (!staged_records.empty()) {
+            std::cout << "Commit txn " << current_txn_id
+                      << ": forced COMMIT LSN "
+                      << commit_lsn << "; "
+                      << staged_records.size()
+                      << " tuple-change record(s) are durable."
+                      << std::endl;
+        } else {
+            std::cout << "Commit txn " << current_txn_id
+                      << ": forced read-only COMMIT LSN "
+                      << commit_lsn
+                      << "."
+                      << std::endl;
+        }
+
+        crashIfRequested(
+            CrashPoint::AFTER_COMMIT_LOG_FORCE,
+            "Simulated crash after COMMIT log record reached disk, before END"
+        );
+
+        LogRecord end_record{LogRecordType::END, current_txn_id};
+        LSN end_lsn = appendTxnRecord(end_record);
+        forceLogUpTo(end_lsn);
+        std::cout << "Log txn " << current_txn_id
+                  << " END, LSN " << end_lsn
+                  << " prevLSN " << end_record.prev_lsn << std::endl;
+
+        staged_records.clear();
+        dirty_pages.clear();
+        current_txn_last_lsn = 0;
+        current_txn_id = 0;
+        crash_point = CrashPoint::NONE;
+        txn_active = false;
+    }
+
+    void abort() {
+        if (!txn_active) {
+            throw std::runtime_error("ABORT without BEGIN.");
+        }
+
+        LogRecord abort_record{LogRecordType::ABORT, current_txn_id};
+        LSN abort_lsn = appendTxnRecord(abort_record);
+        forceLogUpTo(abort_lsn);
+        std::cout << "Abort txn " << current_txn_id
+                  << ": forced ABORT LSN " << abort_lsn
+                  << "; undo begins." << std::endl;
+        crashIfRequested(
+            CrashPoint::AFTER_ABORT_LOG_FORCE,
+            "Simulated crash after ABORT log record reached disk, before CLRs or END"
+        );
+
+        for (auto it = staged_records.rbegin(); it != staged_records.rend(); ++it) {
+            LogRecord clr = makeClrRecord(current_txn_id,
+                                          current_txn_last_lsn,
+                                          *it);
+            LSN clr_lsn = log_manager.append(clr);
+            current_txn_last_lsn = clr_lsn;
+            rememberDirtyPage(clr.page_id, clr_lsn);
+            applyRecordToPage(clr);
+            printClrAction(clr, "runtime abort");
+            if (shouldCrashAt(CrashPoint::AFTER_FIRST_CLR_DURING_ABORT)) {
+                forceLogUpTo(clr_lsn);
+                crashIfRequested(
+                    CrashPoint::AFTER_FIRST_CLR_DURING_ABORT,
+                    "Simulated crash after first CLR reached disk, before abort undo completed"
+                );
+            }
+        }
+
+        auto forced_pages = forceDirtyPages();
+        std::cout << "Abort txn " << current_txn_id
+                  << ": restored "
+                  << staged_records.size()
+                  << " operation(s), flushed "
+                  << forced_pages
+                  << " restored page(s)."
+                  << std::endl;
+        LogRecord end_record{LogRecordType::END, current_txn_id};
+        LSN end_lsn = appendTxnRecord(end_record);
+        forceLogUpTo(end_lsn);
+        std::cout << "Log txn " << current_txn_id
+                  << " END, LSN " << end_lsn
+                  << " prevLSN " << end_record.prev_lsn << std::endl;
+
+        staged_records.clear();
+        dirty_pages.clear();
+        current_txn_last_lsn = 0;
+        current_txn_id = 0;
+        crash_point = CrashPoint::NONE;
+        txn_active = false;
+    }
+
+    void stageUpdate(TableId table_id,
+                     PageID page_id,
+                     size_t slot_id,
+                     std::unique_ptr<Tuple> before_tuple,
+                     std::unique_ptr<Tuple> after_tuple) {
+        if (!txn_active) {
+            return;
+        }
+
+        stageRecord(LogRecordType::UPDATE,
+                    table_id,
+                    page_id,
+                    slot_id,
+                    std::move(before_tuple),
+                    std::move(after_tuple));
+    }
+
+    void stageInsert(TableId table_id,
+                     PageID page_id,
+                     size_t slot_id,
+                     std::unique_ptr<Tuple> after_tuple) {
+        if (!txn_active) {
+            return;
+        }
+
+        stageRecord(LogRecordType::INSERT,
+                    table_id,
+                    page_id,
+                    slot_id,
+                    nullptr,
+                    std::move(after_tuple));
+    }
+
+    void stageDelete(TableId table_id,
+                     PageID page_id,
+                     size_t slot_id,
+                     std::unique_ptr<Tuple> before_tuple) {
+        if (!txn_active) {
+            return;
+        }
+
+        stageRecord(LogRecordType::DELETE,
+                    table_id,
+                    page_id,
+                    slot_id,
+                    std::move(before_tuple),
+                    nullptr);
+    }
+
+    void checkpoint() {
+        LogRecord begin_record{LogRecordType::BEGIN_CHECKPOINT, 0};
+        LSN begin_lsn = log_manager.append(begin_record);
+        forceLogUpTo(begin_lsn);
+        crashIfRequested(
+            CrashPoint::AFTER_BEGIN_CHECKPOINT,
+            "Simulated crash after BEGIN_CHECKPOINT LSN " +
+            std::to_string(begin_lsn) +
+            " reached disk, before END_CHECKPOINT"
+        );
+
+        LogRecord end_record{LogRecordType::END_CHECKPOINT, 0};
+        if (txn_active) {
+            end_record.checkpoint_att[current_txn_id] = {
+                RecoveryAnalysis::TxnStatus::RUNNING,
+                current_txn_last_lsn
+            };
+        }
+        end_record.checkpoint_dpt = dirty_page_table;
+        LSN end_lsn = log_manager.append(end_record);
+        forceLogUpTo(end_lsn);
+        crashIfRequested(
+            CrashPoint::AFTER_END_CHECKPOINT_BEFORE_MASTER,
+            "Simulated crash after END_CHECKPOINT LSN " +
+            std::to_string(end_lsn) +
+            " reached disk, before master record update"
+        );
+
+        bool can_truncate = end_record.checkpoint_att.empty() &&
+                            end_record.checkpoint_dpt.empty();
+        size_t removed_records = 0;
+        if (can_truncate) {
+            removed_records = log_manager.truncateBefore(begin_lsn);
+        }
+
+        log_manager.writeMasterRecord(begin_lsn);
+        std::cout << "CHECKPOINT: wrote BEGIN_CHECKPOINT LSN "
+                  << begin_lsn << " and END_CHECKPOINT LSN "
+                  << end_lsn << " with checkpoint snapshot."
+                  << std::endl;
+        printCheckpointTables("CHECKPOINT snapshot:",
+                              end_record.checkpoint_att,
+                              end_record.checkpoint_dpt);
+        std::cout << "CHECKPOINT: master now points to LSN "
+                  << begin_lsn << " at log offset "
+                  << log_manager.getLogOffset(begin_lsn)
+                  << "." << std::endl;
+        if (can_truncate) {
+            std::cout << "CHECKPOINT: safe truncation removed "
+                      << removed_records
+                      << " older log record(s); no active txns or dirty pages "
+                      << "needed the prefix." << std::endl;
+        } else {
+            std::cout << "CHECKPOINT: skipped truncation because ATT or DPT "
+                      << "still needs older log records." << std::endl;
+        }
+    }
+
+    void crashAt(CrashPoint point) {
+        crash_point = point;
+    }
+
+    bool shouldCrashAt(CrashPoint point) const {
+        return crash_point == point;
+    }
+
+    void crashIfRequested(CrashPoint point, const std::string& message) {
+        if (crash_point != point) {
+            return;
+        }
+        crash_point = CrashPoint::NONE;
+        throw std::runtime_error(message);
+    }
+
+private:
+    void initializeEmpty() {
+        log_manager.reset();
+        std::cout << "Recovery: initialized empty WAL file "
+                  << log_filename << "." << std::endl;
+    }
+
+    bool databaseHasExistingPages() const {
+        return buffer_manager.getNumPages() > 1;
+    }
+
+    bool logExists() const {
+        return log_manager.existedAtOpen();
+    }
+
+    [[noreturn]] void throwInconsistentDatabase(const std::string& reason) const {
+        throw std::runtime_error(
+            "Inconsistent BuzzDB files: " + reason + ". " +
+            "buzzdb.dat and buzzdb.log must be kept together. "
+            "Remove all of them to start a fresh database."
+        );
+    }
+
+    void notePageFlushed(PageID page_id, LSN page_lsn) {
+        auto dirty_page = dirty_page_table.find(page_id);
+        if (dirty_page != dirty_page_table.end() &&
+            dirty_page->second <= page_lsn) {
+            dirty_page_table.erase(dirty_page);
+        }
+    }
+
+    void rememberDirtyPage(PageID page_id, LSN rec_lsn) {
+        if (dirty_page_table.find(page_id) == dirty_page_table.end()) {
+            dirty_page_table[page_id] = rec_lsn;
+        }
+    }
+
+    std::vector<LogRecord> readRecordsForAnalysis(
+        const MasterRecord& master_record) {
+        if (master_record.checkpoint_begin_lsn == 0) {
+            return log_manager.readAll();
+        }
+
+        auto records = log_manager.readFromOffset(
+            master_record.checkpoint_begin_offset);
+        if (records.empty()) {
+            throw std::runtime_error(
+                "ARIES master record points past the end of buzzdb.log."
+            );
+        }
+        if (records.front().lsn != master_record.checkpoint_begin_lsn ||
+            records.front().type != LogRecordType::BEGIN_CHECKPOINT) {
+            throw std::runtime_error(
+                "ARIES master record does not point at BEGIN_CHECKPOINT."
+            );
+        }
+        return records;
+    }
+
+    LSN minRecLSN(const RecoveryAnalysis& analysis) const {
+        LSN min_rec_lsn = 0;
+        for (const auto& [page_id, rec_lsn] : analysis.dirty_page_table) {
+            (void)page_id;
+            if (min_rec_lsn == 0 || rec_lsn < min_rec_lsn) {
+                min_rec_lsn = rec_lsn;
+            }
+        }
+        return min_rec_lsn;
+    }
+
+    bool needsRetainedLogForRecovery(
+        const MasterRecord& master_record,
+        const std::vector<LogRecord>& analysis_records,
+        const RecoveryAnalysis& analysis) {
+        if (master_record.checkpoint_begin_lsn == 0 ||
+            analysis_records.empty()) {
+            return false;
+        }
+
+        LSN min_rec_lsn = minRecLSN(analysis);
+        if (min_rec_lsn != 0 && min_rec_lsn < analysis_records.front().lsn) {
+            std::cout << "ARIES REDO: checkpoint DPT has recLSN "
+                      << min_rec_lsn
+                      << " before the checkpoint record, so redo/undo use the "
+                      << "retained log suffix." << std::endl;
+            return true;
+        }
+        return false;
+    }
+
+    void printCheckpointTables(
+        const std::string& label,
+        const RecoveryAnalysis::ActiveTransactionTable& att,
+        const RecoveryAnalysis::DirtyPageTable& dpt) const {
+        std::cout << label << std::endl;
+        if (att.empty()) {
+            std::cout << "  ATT: empty" << std::endl;
+        } else {
+            std::cout << "  ATT:" << std::endl;
+            for (const auto& [txn_id, entry] : att) {
+                std::cout << "    txn " << txn_id
+                          << " " << recoveryTxnStatusName(entry.status)
+                          << " lastLSN " << entry.last_lsn
+                          << std::endl;
+            }
+        }
+
+        if (dpt.empty()) {
+            std::cout << "  DPT: empty" << std::endl;
+        } else {
+            std::cout << "  DPT:" << std::endl;
+            for (const auto& [page_id, rec_lsn] : dpt) {
+                std::cout << "    page " << page_id
+                          << " recLSN " << rec_lsn
+                          << std::endl;
+            }
+        }
+    }
+
+    void printCheckpointStart(const MasterRecord& master_record,
+                              const std::vector<LogRecord>& records) const {
+        if (master_record.checkpoint_begin_lsn == 0) {
+            std::cout << "ARIES analysis: no checkpoint master record; "
+                      << "scanning from log start." << std::endl;
+            return;
+        }
+
+        const LogRecord* checkpoint_record = nullptr;
+        for (const auto& record : records) {
+            if (record.type == LogRecordType::END_CHECKPOINT) {
+                checkpoint_record = &record;
+                break;
+            }
+        }
+        std::cout << "ARIES analysis: master record starts at checkpoint LSN "
+                  << master_record.checkpoint_begin_lsn
+                  << " (log offset "
+                  << master_record.checkpoint_begin_offset << ")."
+                  << std::endl;
+        if (checkpoint_record == nullptr) {
+            std::cout << "ARIES analysis: checkpoint END record not found; "
+                      << "no checkpoint snapshot loaded." << std::endl;
+            return;
+        }
+        printCheckpointTables("ARIES analysis: loaded checkpoint snapshot:",
+                              checkpoint_record->checkpoint_att,
+                              checkpoint_record->checkpoint_dpt);
+    }
+
+    bool isDirtyPage(PageID page_id) const {
+        for (PageID dirty_page_id : dirty_pages) {
+            if (dirty_page_id == page_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    LSN appendTxnRecord(LogRecord& record) {
+        record.prev_lsn = current_txn_last_lsn;
+        LSN record_lsn = log_manager.append(record);
+        current_txn_last_lsn = record_lsn;
+        return record_lsn;
+    }
+
+    std::pair<LSN, LSN> forceLogUpTo(LSN lsn) {
+        LSN before = log_manager.getFlushedLSN();
+        log_manager.forceUpTo(lsn);
+        return {before, log_manager.getFlushedLSN()};
+    }
+
+    size_t forceDirtyPages() {
+        size_t forced = 0;
+        for (PageID page_id : dirty_pages) {
+            buffer_manager.flushPage(page_id);
+            forced++;
+        }
+        return forced;
+    }
+
+    void stageRecord(LogRecordType type,
+                     TableId table_id,
+                     PageID page_id,
+                     size_t slot_id,
+                     std::unique_ptr<Tuple> before_tuple,
+                     std::unique_ptr<Tuple> after_tuple) {
+        if (!isDirtyPage(page_id)) {
+            dirty_pages.push_back(page_id);
+        }
+
+        LogRecord record{
+            type,
+            current_txn_id,
+            table_id,
+            page_id,
+            slot_id,
+            std::move(before_tuple),
+            std::move(after_tuple)
+        };
+        LSN record_lsn = appendTxnRecord(record);
+        LSN prev_lsn = record.prev_lsn;
+        rememberDirtyPage(page_id, record_lsn);
+        auto& page = buffer_manager.getPage(page_id);
+        page->setPageLSN(record_lsn);
+        staged_records.push_back(std::move(record));
+
+        std::cout << "Log txn " << current_txn_id
+                  << " " << logRecordName(type)
+                  << " LSN " << record_lsn
+                  << " prevLSN " << prev_lsn
+                  << " (table " << table_id
+                  << ", page " << page_id
+                  << ", slot " << slot_id << ")."
+                  << std::endl;
+    }
+
+    RecoveryAnalysis analysisPass(const std::vector<LogRecord>& records,
+                                  bool load_checkpoint_snapshot) const {
+        RecoveryAnalysis analysis;
+        bool checkpoint_snapshot_loaded = !load_checkpoint_snapshot;
+        for (const auto& record : records) {
+            analysis.next_txn_id = std::max(analysis.next_txn_id,
+                                            record.txn_id + 1);
+            if (record.type == LogRecordType::BEGIN) {
+                analysis.active_transaction_table[record.txn_id] = {
+                    RecoveryAnalysis::TxnStatus::RUNNING,
+                    record.lsn
+                };
+            } else if (isTupleChangeRecord(record.type)) {
+                auto status = RecoveryAnalysis::TxnStatus::RUNNING;
+                auto it = analysis.active_transaction_table.find(record.txn_id);
+                if (it != analysis.active_transaction_table.end()) {
+                    status = it->second.status;
+                }
+                analysis.active_transaction_table[record.txn_id] = {status, record.lsn};
+            } else if (record.type == LogRecordType::CLR) {
+                auto status = RecoveryAnalysis::TxnStatus::RUNNING;
+                auto it = analysis.active_transaction_table.find(record.txn_id);
+                if (it != analysis.active_transaction_table.end()) {
+                    status = it->second.status;
+                }
+                analysis.active_transaction_table[record.txn_id] = {status, record.lsn};
+            } else if (record.type == LogRecordType::COMMIT) {
+                analysis.active_transaction_table[record.txn_id] = {
+                    RecoveryAnalysis::TxnStatus::COMMITTING,
+                    record.lsn
+                };
+            } else if (record.type == LogRecordType::ABORT) {
+                analysis.active_transaction_table[record.txn_id] = {
+                    RecoveryAnalysis::TxnStatus::ABORTING,
+                    record.lsn
+                };
+            } else if (record.type == LogRecordType::END) {
+                analysis.active_transaction_table.erase(record.txn_id);
+            } else if (record.type == LogRecordType::END_CHECKPOINT &&
+                       !checkpoint_snapshot_loaded) {
+                for (const auto& txn : record.checkpoint_att) {
+                    auto current = analysis.active_transaction_table.find(txn.first);
+                    if (current == analysis.active_transaction_table.end() ||
+                        current->second.last_lsn < txn.second.last_lsn) {
+                        analysis.active_transaction_table[txn.first] = txn.second;
+                    }
+                    analysis.next_txn_id = std::max(analysis.next_txn_id,
+                                                    txn.first + 1);
+                }
+                for (const auto& page : record.checkpoint_dpt) {
+                    auto current = analysis.dirty_page_table.find(page.first);
+                    if (current == analysis.dirty_page_table.end() ||
+                        page.second < current->second) {
+                        analysis.dirty_page_table[page.first] = page.second;
+                    }
+                }
+                checkpoint_snapshot_loaded = true;
+            }
+
+            if (shouldRedoRecord(record)) {
+                PageID page_id = record.page_id;
+                LSN rec_lsn = record.lsn;
+                if (analysis.dirty_page_table.find(page_id) ==
+                    analysis.dirty_page_table.end()) {
+                    analysis.dirty_page_table[page_id] = rec_lsn;
+                }
+            }
+        }
+        return analysis;
+    }
+
+    size_t countCommittedTransactions(
+        const std::vector<LogRecord>& records) const {
+        std::set<int> committed_txns;
+        for (const auto& record : records) {
+            if (record.type == LogRecordType::COMMIT) {
+                committed_txns.insert(record.txn_id);
+            }
+        }
+        return committed_txns.size();
+    }
+
+    bool isLoserTxn(const RecoveryAnalysis::ActiveTransactionEntry& entry) const {
+        return entry.status == RecoveryAnalysis::TxnStatus::RUNNING ||
+               entry.status == RecoveryAnalysis::TxnStatus::ABORTING;
+    }
+
+    bool shouldRedoRecord(const LogRecord& record) const {
+        return isRedoableRecord(record.type);
+    }
+
+    std::string txnStatusName(RecoveryAnalysis::TxnStatus status) const {
+        switch (status) {
+            case RecoveryAnalysis::TxnStatus::RUNNING:
+                return "RUNNING";
+            case RecoveryAnalysis::TxnStatus::COMMITTING:
+                return "COMMITTING";
+            case RecoveryAnalysis::TxnStatus::ABORTING:
+                return "ABORTING";
+        }
+        throw std::runtime_error("Unknown transaction status.");
+    }
+
+    void printActiveTransactionTable(const RecoveryAnalysis& analysis) const {
+        if (analysis.active_transaction_table.empty()) {
+            std::cout << "ActiveTransactionTable after analysis: empty."
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "ActiveTransactionTable after analysis:" << std::endl;
+        for (const auto& txn : analysis.active_transaction_table) {
+            std::cout << "  txn " << txn.first
+                      << " " << txnStatusName(txn.second.status)
+                      << " lastLSN " << txn.second.last_lsn
+                      << std::endl;
+        }
+    }
+
+    void printDirtyPageTable(const RecoveryAnalysis& analysis) const {
+        if (analysis.dirty_page_table.empty()) {
+            std::cout << "DirtyPageTable after analysis: empty."
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "DirtyPageTable after analysis:" << std::endl;
+        for (const auto& [page_id, rec_lsn] : analysis.dirty_page_table) {
+            std::cout << "  page " << page_id
+                      << " recLSN " << rec_lsn
+                      << std::endl;
+        }
+    }
+
+    std::map<LSN, const LogRecord*> recordsByLSN(
+        const std::vector<LogRecord>& records) const {
+        std::map<LSN, const LogRecord*> by_lsn;
+        for (const auto& record : records) {
+            by_lsn[record.lsn] = &record;
+        }
+        return by_lsn;
+    }
+
+    size_t countLoserTransactions(const RecoveryAnalysis& analysis) const {
+        size_t count = 0;
+        for (const auto& entry : analysis.active_transaction_table) {
+            if (isLoserTxn(entry.second)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    size_t countRedoRecords(const std::vector<LogRecord>& records) const {
+        size_t count = 0;
+        for (const auto& record : records) {
+            if (shouldRedoRecord(record)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    size_t countUndoRecords(const std::vector<LogRecord>& records,
+                            const RecoveryAnalysis& analysis) const {
+        size_t count = 0;
+        auto by_lsn = recordsByLSN(records);
+        for (const auto& txn : analysis.active_transaction_table) {
+            if (!isLoserTxn(txn.second)) {
+                continue;
+            }
+
+            LSN lsn = txn.second.last_lsn;
+            while (lsn != 0) {
+                auto it = by_lsn.find(lsn);
+                if (it == by_lsn.end()) {
+                    throw std::runtime_error("Missing log record in prevLSN chain.");
+                }
+                const auto& record = *it->second;
+                if (record.type == LogRecordType::CLR) {
+                    lsn = record.undo_next_lsn;
+                    continue;
+                }
+                if (isTupleChangeRecord(record.type)) {
+                    count++;
+                }
+                lsn = record.prev_lsn;
+            }
+        }
+        return count;
+    }
+
+    void redoPass(const std::vector<LogRecord>& records,
+                  const RecoveryAnalysis& analysis) {
+        LSN min_rec_lsn = 0;
+        for (const auto& [page_id, rec_lsn] : analysis.dirty_page_table) {
+            if (min_rec_lsn == 0 || rec_lsn < min_rec_lsn) {
+                min_rec_lsn = rec_lsn;
+            }
+        }
+
+        if (min_rec_lsn == 0) {
+            std::cout << "ARIES REDO: DPT is empty; no page redo needed."
+                      << std::endl;
+            return;
+        }
+
+        size_t applied = 0;
+        size_t examined = 0;
+        size_t skipped_by_dpt = 0;
+        size_t skipped_by_page_lsn = 0;
+        std::cout << "ARIES REDO: start from min recLSN "
+                  << min_rec_lsn << "." << std::endl;
+        for (const auto& record : records) {
+            if (!shouldRedoRecord(record)) {
+                continue;
+            }
+            if (record.lsn < min_rec_lsn) {
+                skipped_by_dpt++;
+                continue;
+            }
+
+            examined++;
+            auto dirty_page = analysis.dirty_page_table.find(record.page_id);
+            if (dirty_page == analysis.dirty_page_table.end() ||
+                record.lsn < dirty_page->second) {
+                skipped_by_dpt++;
+                continue;
+            }
+
+            auto& page = buffer_manager.getPage(record.page_id);
+            if (page->getPageLSN() >= record.lsn) {
+                skipped_by_page_lsn++;
+                continue;
+            }
+
+            applyRedo(record);
+            printRedoAction(record);
+            applied++;
+        }
+
+        std::cout << "ARIES REDO: examined " << examined
+                  << " redo record(s), skipped " << skipped_by_dpt
+                  << " by DPT/recLSN, skipped " << skipped_by_page_lsn
+                  << " by pageLSN, replayed " << applied
+                  << " history log record(s)." << std::endl;
+    }
+
+    void undoPass(const std::vector<LogRecord>& records,
+                  const RecoveryAnalysis& analysis) {
+        size_t applied = 0;
+        size_t ended_txns = 0;
+        auto by_lsn = recordsByLSN(records);
+        std::map<int, LSN> last_lsn_by_txn;
+        std::map<LSN, int> to_undo;
+
+        for (const auto& txn : analysis.active_transaction_table) {
+            int txn_id = txn.first;
+            const auto& entry = txn.second;
+
+            if (entry.status == RecoveryAnalysis::TxnStatus::COMMITTING) {
+                LSN end_lsn = appendRecoveryRecord(txn_id,
+                                                   LogRecordType::END,
+                                                   entry.last_lsn);
+                std::cout << "Recovery: txn " << txn_id
+                          << " had COMMIT but no END; wrote END LSN "
+                          << end_lsn << "." << std::endl;
+                ended_txns++;
+                continue;
+            }
+
+            if (!isLoserTxn(entry)) {
+                continue;
+            }
+
+            LSN txn_last_lsn = entry.last_lsn;
+            if (entry.status != RecoveryAnalysis::TxnStatus::ABORTING) {
+                LSN abort_lsn = appendRecoveryRecord(txn_id,
+                                                     LogRecordType::ABORT,
+                                                     txn_last_lsn);
+                txn_last_lsn = abort_lsn;
+                std::cout << "Recovery: txn " << txn_id
+                          << " was a loser; wrote ABORT LSN "
+                          << abort_lsn << " before undo." << std::endl;
+            }
+            last_lsn_by_txn[txn_id] = txn_last_lsn;
+            if (entry.last_lsn != 0) {
+                to_undo[entry.last_lsn] = txn_id;
+            }
+        }
+
+        while (!to_undo.empty()) {
+            auto next = std::prev(to_undo.end());
+            LSN lsn = next->first;
+            int txn_id = next->second;
+            to_undo.erase(next);
+
+            auto record_it = by_lsn.find(lsn);
+            if (record_it == by_lsn.end()) {
+                throw std::runtime_error("Missing log record in toUndo set.");
+            }
+
+            const auto& record = *record_it->second;
+            if (record.type == LogRecordType::CLR) {
+                if (record.undo_next_lsn != 0) {
+                    to_undo[record.undo_next_lsn] = txn_id;
+                }
+                continue;
+            }
+
+            if (isTupleChangeRecord(record.type)) {
+                LogRecord clr = makeClrRecord(txn_id,
+                                              last_lsn_by_txn[txn_id],
+                                              record);
+                LSN clr_lsn = log_manager.append(clr);
+                last_lsn_by_txn[txn_id] = clr_lsn;
+                rememberDirtyPage(clr.page_id, clr_lsn);
+                applyRedo(clr);
+                printClrAction(clr, "restart undo");
+                applied++;
+            }
+
+            if (record.prev_lsn != 0) {
+                to_undo[record.prev_lsn] = txn_id;
+            }
+        }
+
+        for (const auto& loser : last_lsn_by_txn) {
+            LSN end_lsn = appendRecoveryRecord(loser.first,
+                                               LogRecordType::END,
+                                               loser.second);
+            std::cout << "Recovery: txn " << loser.first
+                      << " undo complete; wrote END LSN "
+                      << end_lsn << "." << std::endl;
+            ended_txns++;
+        }
+
+        if (applied != 0 || ended_txns != 0) {
+            std::cout << "ARIES UNDO: used toUndo and prevLSN/undoNextLSN chains, wrote "
+                      << applied
+                      << " CLR(s), and ended "
+                      << ended_txns
+                      << " transaction(s)." << std::endl;
+        }
+    }
+
+    LSN appendRecoveryRecord(int txn_id,
+                             LogRecordType type,
+                             LSN prev_lsn) {
+        LogRecord record{type, txn_id};
+        record.prev_lsn = prev_lsn;
+        LSN record_lsn = log_manager.append(record);
+        forceLogUpTo(record_lsn);
+        return record_lsn;
+    }
+
+    LogRecord makeClrRecord(int txn_id,
+                            LSN prev_lsn,
+                            const LogRecord& undone_record) {
+        if (!isTupleChangeRecord(undone_record.type)) {
+            throw std::runtime_error("CLR requested for non-update log record.");
+        }
+
+        LogRecord clr{LogRecordType::CLR, txn_id};
+        clr.prev_lsn = prev_lsn;
+        clr.undo_next_lsn = undone_record.prev_lsn;
+        clr.undo_type = undone_record.type;
+        clr.table_id = undone_record.table_id;
+        clr.page_id = undone_record.page_id;
+        clr.slot_id = undone_record.slot_id;
+        if (undone_record.type != LogRecordType::INSERT) {
+            if (!undone_record.before_tuple) {
+                throw std::runtime_error("Cannot build CLR without before image.");
+            }
+            clr.after_tuple = undone_record.before_tuple->clone();
+        }
+        return clr;
+    }
+
+    void applyRedo(const LogRecord& record) {
+        applyRecordToPage(record);
+        buffer_manager.flushPage(record.page_id);
+    }
+
+    void applyRecordToPage(const LogRecord& record) {
+        auto& page = buffer_manager.getPage(record.page_id);
+        if (page->getTableId() != record.table_id) {
+            throw std::runtime_error("WAL redo page ownership mismatch.");
+        }
+
+        if (record.type == LogRecordType::CLR) {
+            if (record.undo_type == LogRecordType::INSERT) {
+                page->deleteTuple(record.slot_id);
+            } else if (!record.after_tuple ||
+                       !page->putTupleAtSlot(record.slot_id,
+                                             record.after_tuple->clone())) {
+                throw std::runtime_error("Unable to redo CLR operation.");
+            }
+            page->setPageLSN(std::max(page->getPageLSN(), record.lsn));
+            return;
+        }
+
+        if (record.type == LogRecordType::DELETE) {
+            page->deleteTuple(record.slot_id);
+        } else if (!record.after_tuple ||
+                   !page->putTupleAtSlot(record.slot_id,
+                                         record.after_tuple->clone())) {
+            throw std::runtime_error("Unable to redo WAL operation.");
+        }
+        page->setPageLSN(std::max(page->getPageLSN(), record.lsn));
+    }
+
+    void printRedoAction(const LogRecord& record) const {
+        std::cout << "  REDO " << logRecordName(record.type)
+                  << " log record for txn " << record.txn_id
+                  << ": table " << record.table_id
+                  << ", page " << record.page_id
+                  << ", slot " << record.slot_id;
+
+        if (record.type == LogRecordType::INSERT) {
+            std::cout << " -> insert tuple after-image";
+        } else if (record.type == LogRecordType::UPDATE) {
+            std::cout << " -> write tuple after-image";
+        } else if (record.type == LogRecordType::DELETE) {
+            std::cout << " -> delete tuple";
+        } else if (record.type == LogRecordType::CLR) {
+            std::cout << " -> redo undo of "
+                      << logRecordName(record.undo_type)
+                      << ", undoNextLSN " << record.undo_next_lsn;
+        }
+        std::cout << std::endl;
+    }
+
+    void printClrAction(const LogRecord& clr, const std::string& reason) const {
+        std::cout << "  CLR txn " << clr.txn_id
+                  << " LSN " << clr.lsn
+                  << " prevLSN " << clr.prev_lsn
+                  << " undoNextLSN " << clr.undo_next_lsn
+                  << " for " << logRecordName(clr.undo_type)
+                  << " during " << reason
+                  << ": table " << clr.table_id
+                  << ", page " << clr.page_id
+                  << ", slot " << clr.slot_id;
+
+        if (clr.undo_type == LogRecordType::INSERT) {
+            std::cout << " -> delete inserted tuple";
+        } else if (clr.undo_type == LogRecordType::UPDATE) {
+            std::cout << " -> restore tuple before-image";
+        } else if (clr.undo_type == LogRecordType::DELETE) {
+            std::cout << " -> restore deleted tuple before-image";
+        }
+        std::cout << std::endl;
+    }
+
+};
+
+class PageManager {
+private:
+    BufferManager& buffer_manager;
+    RecoveryManager& recovery_manager;
+
+public:
+    PageManager(BufferManager& buffer_manager,
+                RecoveryManager& recovery_manager)
+        : buffer_manager(buffer_manager),
+          recovery_manager(recovery_manager) {}
+
+    void resetRecoveryLog() {
+        recovery_manager.resetLog();
+    }
+
+    SlottedPage& readPage(TableId table_id,
+                          const std::string& table_name,
+                          PageID page_id) {
+        return checkedPage(table_id, table_name, page_id);
+    }
+
+    SlottedPage& writePage(TableId table_id,
+                           const std::string& table_name,
+                           PageID page_id) {
+        return checkedPage(table_id, table_name, page_id);
+    }
+
+    bool recoveryActive() const {
+        return recovery_manager.isActive();
+    }
+
+    void stageUpdate(TableId table_id,
+                     const std::string& table_name,
+                     PageID page_id,
+                     size_t slot_id,
+                     std::unique_ptr<Tuple> before_tuple,
+                     std::unique_ptr<Tuple> after_tuple) {
+        checkedPage(table_id, table_name, page_id);
+        recovery_manager.stageUpdate(table_id,
+                                     page_id,
+                                     slot_id,
+                                     std::move(before_tuple),
+                                     std::move(after_tuple));
+    }
+
+    void stageInsert(TableId table_id,
+                     const std::string& table_name,
+                     PageID page_id,
+                     size_t slot_id,
+                     std::unique_ptr<Tuple> after_tuple) {
+        checkedPage(table_id, table_name, page_id);
+        recovery_manager.stageInsert(table_id,
+                                     page_id,
+                                     slot_id,
+                                     std::move(after_tuple));
+    }
+
+    void stageDelete(TableId table_id,
+                     const std::string& table_name,
+                     PageID page_id,
+                     size_t slot_id,
+                     std::unique_ptr<Tuple> before_tuple) {
+        checkedPage(table_id, table_name, page_id);
+        recovery_manager.stageDelete(table_id,
+                                     page_id,
+                                     slot_id,
+                                     std::move(before_tuple));
+    }
+
+    PageID nextPage(TableId table_id,
+                    const std::string& table_name,
+                    PageID page_id) {
+        SlottedPage& page = checkedPage(table_id, table_name, page_id);
+        PageID next_page_id = page.getNextPage();
+        return next_page_id;
+    }
+
+    void flushWritePage(TableId, PageID page_id) {
+        if (recovery_manager.isActive()) {
+            if (!recovery_manager.shouldCrashAt(CrashPoint::AFTER_STEAL_PAGE_FLUSH)) {
+                return;
+            }
+            std::cout << "STEAL: trying to flush uncommitted page "
+                      << page_id << " before COMMIT." << std::endl;
+            buffer_manager.flushPage(page_id, "uncommitted STEAL");
+            std::cout << "STEAL: page " << page_id
+                      << " reached disk before COMMIT."
+                      << std::endl;
+            recovery_manager.crashIfRequested(
+                CrashPoint::AFTER_STEAL_PAGE_FLUSH,
+                "Simulated crash after uncommitted page " +
+                std::to_string(page_id) +
+                " reached disk via STEAL, before COMMIT"
+            );
+            return;
+        }
+        buffer_manager.flushPage(page_id);
+    }
+
+    PageID allocatePage(TableId table_id) {
+        auto page_id = recovery_manager.allocatePhysicalPage(table_id);
+        auto& page = buffer_manager.getPage(page_id);
+        page->setTableId(table_id);
+        page->setNextPage(INVALID_PAGE_ID);
+        buffer_manager.flushPage(page_id);
+        return page_id;
+    }
+
+private:
+    SlottedPage& checkedPage(TableId table_id,
+                             const std::string& table_name,
+                             PageID physical_page_id) {
+        auto& page = buffer_manager.getPage(physical_page_id);
+        if (page->getTableId() != table_id) {
+            throw std::runtime_error("Page ownership mismatch for table: " + table_name);
+        }
+        return *page;
+    }
+};
+
+// One column in a table schema.
+struct ColumnSchema {
+    std::string name;
+    FieldType type;
+};
+
+// Ordered list of columns for a table.
+struct TableSchema {
+    std::vector<ColumnSchema> columns;
+
+    int getColumnIndex(const std::string& name) const {
+        for (size_t i = 0; i < columns.size(); i++) {
+            if (columns[i].name == name) {
+                return static_cast<int>(i);
+            }
+        }
+        throw std::runtime_error("Unknown column: " + name);
+    }
+};
+
+std::string trim(const std::string& input);
+std::vector<std::string> split(const std::string& input, char delimiter);
+
+// Catalog-owned table description.
+struct TableMetadata {
+    TableId table_id;
+    std::string name;
+    TableSchema schema;
+    PageID first_page = INVALID_PAGE_ID;
+};
+
+// Runtime handle for one table's heap pages; owns no catalog metadata.
+class TableHeap {
+private:
+    TableMetadata& metadata;
+    PageManager& page_manager;
+
+public:
+    TableHeap(TableMetadata& metadata, PageManager& page_manager)
+        : metadata(metadata),
+          page_manager(page_manager) {}
+
+    PageID firstPage() const {
+        return metadata.first_page;
+    }
+
+    PageID nextPage(PageID page_id) {
+        return page_manager.nextPage(metadata.table_id, metadata.name, page_id);
+    }
+
+    SlottedPage& readPage(PageID page_id) {
+        return page_manager.readPage(metadata.table_id, metadata.name, page_id);
+    }
+
+    SlottedPage& writePage(PageID page_id) {
+        return page_manager.writePage(metadata.table_id, metadata.name, page_id);
+    }
+
+    std::unique_ptr<Tuple> getTuple(PageID page_id, size_t slot) {
+        return readPage(page_id).getTuple(slot);
+    }
+
+    void updateTuple(PageID page_id, size_t slot, std::unique_ptr<Tuple> tuple) {
+        if (page_manager.recoveryActive()) {
+            auto before_tuple = getTuple(page_id, slot);
+            if (!before_tuple) {
+                throw std::runtime_error("UPDATE target tuple is missing.");
+            }
+            page_manager.stageUpdate(metadata.table_id,
+                                     metadata.name,
+                                     page_id,
+                                     slot,
+                                     before_tuple->clone(),
+                                     tuple->clone());
+        }
+
+        if (!writePage(page_id).updateTuple(slot, std::move(tuple))) {
+            throw std::runtime_error("Updated tuple no longer fits in its slot.");
+        }
+        flushWritePage(page_id);
+    }
+
+    void deleteTuple(PageID page_id, size_t slot) {
+        if (page_manager.recoveryActive()) {
+            auto before_tuple = getTuple(page_id, slot);
+            if (!before_tuple) {
+                throw std::runtime_error("DELETE target tuple is missing.");
+            }
+            page_manager.stageDelete(metadata.table_id,
+                                     metadata.name,
+                                     page_id,
+                                     slot,
+                                     before_tuple->clone());
+        }
+        writePage(page_id).deleteTuple(slot);
+        flushWritePage(page_id);
+    }
+
+    bool addTuple(std::unique_ptr<Tuple> tuple) {
+        PageID previous_page_id = INVALID_PAGE_ID;
+        for (PageID page_id = firstPage();
+             page_id != INVALID_PAGE_ID;
+             page_id = nextPage(page_id)) {
+            if (page_manager.recoveryActive()) {
+                auto& page = writePage(page_id);
+                auto slot = page.addTupleAndReturnSlot(tuple->clone());
+                if (slot) {
+                    page_manager.stageInsert(metadata.table_id,
+                                             metadata.name,
+                                             page_id,
+                                             *slot,
+                                             tuple->clone());
+                    flushWritePage(page_id);
+                    return true;
+                }
+                previous_page_id = page_id;
+                continue;
+            }
+
+            if (writePage(page_id).addTuple(tuple->clone())) {
+                flushWritePage(page_id);
+                return true;
+            }
+            previous_page_id = page_id;
+        }
+
+        if (page_manager.recoveryActive()) {
+            throw std::runtime_error(
+                "INSERT requiring a new page inside a WAL transaction is not supported in v61."
+            );
+        }
+
+        PageID page_id = allocatePageAfter(previous_page_id);
+        auto& page = writePage(page_id);
+        if (!page.addTuple(std::move(tuple))) {
+            return false;
+        }
+
+        page_manager.flushWritePage(metadata.table_id, page_id);
+        return true;
+    }
+
+    PageID allocatePageAfter(PageID previous_page_id) {
+        PageID page_id = page_manager.allocatePage(metadata.table_id);
+
+        if (previous_page_id != INVALID_PAGE_ID) {
+            writePage(previous_page_id).setNextPage(page_id);
+            flushWritePage(previous_page_id);
+        } else {
+            metadata.first_page = page_id;
+        }
+        return page_id;
+    }
+
+    std::vector<std::unique_ptr<Tuple>> readAllTuples() {
+        std::vector<std::unique_ptr<Tuple>> tuples;
+
+        for (PageID page_id = firstPage();
+             page_id != INVALID_PAGE_ID;
+             page_id = nextPage(page_id)) {
+            for (size_t slot_itr = 0; slot_itr < MAX_SLOTS; slot_itr++) {
+                auto tuple = getTuple(page_id, slot_itr);
+                if (tuple) {
+                    tuples.push_back(std::move(tuple));
+                }
+            }
+        }
+
+        return tuples;
+    }
+
+private:
+    void flushWritePage(PageID page_id) {
+        page_manager.flushWritePage(metadata.table_id, page_id);
+    }
+};
+
+// Page 0 bootstraps catalog tables; the catalog tables are ordinary heaps.
+class Catalog {
+private:
+    BufferManager& buffer_manager;
+    PageManager& page_manager;
+    TableId next_table_id = FIRST_USER_TABLE_ID;
+    std::unordered_map<std::string, TableMetadata> tables_by_name;
+
+public:
+    Catalog(BufferManager& manager, PageManager& page_manager)
+        : buffer_manager(manager),
+          page_manager(page_manager) {}
+
+    void load() {
+        auto& page = buffer_manager.getPage(CATALOG_PAGE_ID);
+        std::string bootstrap_text = readPageText(page);
+        auto first_line_end = bootstrap_text.find('\n');
+        std::string first_line = first_line_end == std::string::npos
+            ? bootstrap_text
+            : bootstrap_text.substr(0, first_line_end);
+        if (first_line != BOOTSTRAP_MAGIC) {
+            if (buffer_manager.getNumPages() > 1) {
+                throw std::runtime_error(database_filename + " is not a valid BuzzDB file.");
+            }
+            page_manager.resetRecoveryLog();
+            initializeNewDatabase();
+            return;
+        }
+
+        auto roots = loadBootstrap(bootstrap_text);
+        installSystemTables(roots.first, roots.second);
+        loadUserTables();
+    }
+
+    bool createTable(const std::string& name, TableSchema schema) {
+        auto it = tables_by_name.find(name);
+        if (it != tables_by_name.end()) {
+            return false;
+        }
+
+        TableId table_id = next_table_id++;
+        PageID first_page = allocateFirstPage(table_id);
+        TableMetadata metadata{
+            table_id, name, std::move(schema), first_page
+        };
+        auto& cached_metadata = cacheTable(std::move(metadata));
+        persistTableRecord(cached_metadata);
+        persistColumns(cached_metadata);
+        return true;
+    }
+
+    bool hasTable(const std::string& name) const {
+        return tables_by_name.find(name) != tables_by_name.end();
+    }
+
+    bool empty() const {
+        for (const auto& entry : tables_by_name) {
+            if (entry.second.table_id >= FIRST_USER_TABLE_ID) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    TableMetadata& getTable(const std::string& name) {
+        auto it = tables_by_name.find(name);
+        if (it == tables_by_name.end()) {
+            throw std::runtime_error("Unknown table: " + name);
+        }
+        return it->second;
+    }
+
+private:
+    static std::string readPageText(const std::unique_ptr<SlottedPage>& page) {
+        size_t length = 0;
+        while (length < PAGE_SIZE && page->page_data[length] != '\0') {
+            length++;
+        }
+        return std::string(page->page_data.get(), length);
+    }
+
+    PageID allocateFirstPage(TableId table_id) {
+        return page_manager.allocatePage(table_id);
+    }
+
+    TableMetadata& cacheTable(TableMetadata metadata) {
+        std::string table_name = metadata.name;
+        auto result = tables_by_name.insert_or_assign(table_name, std::move(metadata));
+        return result.first->second;
+    }
+
+    static TableSchema tablesTableSchema() {
+        return TableSchema{{
+            {"table_id", INT},
+            {"table_name", STRING},
+            {"first_page", INT}
+        }};
+    }
+
+    static TableSchema columnsTableSchema() {
+        return TableSchema{{
+            {"table_id", INT},
+            {"column_id", INT},
+            {"column_name", STRING},
+            {"column_type", INT}
+        }};
+    }
+
+    void initializeNewDatabase() {
+        PageID tables_first_page = allocateFirstPage(SYS_TABLES_ID);
+        PageID columns_first_page = allocateFirstPage(SYS_COLUMNS_ID);
+        writeBootstrap(tables_first_page, columns_first_page);
+        installSystemTables(tables_first_page, columns_first_page);
+
+        auto& tables_metadata = getTable("__tables");
+        auto& columns_metadata = getTable("__columns");
+        persistTableRecord(tables_metadata);
+        persistColumns(tables_metadata);
+        persistTableRecord(columns_metadata);
+        persistColumns(columns_metadata);
+    }
+
+    void writeBootstrap(PageID tables_first_page, PageID columns_first_page) {
+        std::ostringstream output;
+        output << BOOTSTRAP_MAGIC << "\n"
+               << "TABLES|" << tables_first_page << "\n"
+               << "COLUMNS|" << columns_first_page << "\n";
+
+        std::string payload = output.str();
+        if (payload.size() >= PAGE_SIZE) {
+            throw std::runtime_error("Bootstrap page is full.");
+        }
+
+        auto& page = buffer_manager.getPage(CATALOG_PAGE_ID);
+        std::memset(page->page_data.get(), 0, PAGE_SIZE);
+        std::memcpy(page->page_data.get(), payload.data(), payload.size());
+        buffer_manager.flushPage(CATALOG_PAGE_ID);
+    }
+
+    std::pair<PageID, PageID> loadBootstrap(const std::string& bootstrap_text) {
+        std::istringstream input(bootstrap_text);
+        std::string line;
+        if (!std::getline(input, line)) {
+            throw std::runtime_error("Bootstrap page is empty.");
+        }
+        if (line != BOOTSTRAP_MAGIC) {
+            throw std::runtime_error(database_filename + " is not a valid BuzzDB file.");
+        }
+
+        PageID tables_first_page = INVALID_PAGE_ID;
+        PageID columns_first_page = INVALID_PAGE_ID;
+        while (std::getline(input, line)) {
+            auto tokens = split(line, '|');
+            if (tokens.size() != 2) {
+                continue;
+            }
+            if (tokens[0] == "TABLES") {
+                tables_first_page = static_cast<PageID>(std::stoi(tokens[1]));
+            } else if (tokens[0] == "COLUMNS") {
+                columns_first_page = static_cast<PageID>(std::stoi(tokens[1]));
+            }
+        }
+
+        if (tables_first_page == INVALID_PAGE_ID ||
+            columns_first_page == INVALID_PAGE_ID) {
+            throw std::runtime_error("Bootstrap page is missing catalog roots.");
+        }
+        return {tables_first_page, columns_first_page};
+    }
+
+    void installSystemTables(PageID tables_first_page, PageID columns_first_page) {
+        tables_by_name.clear();
+        cacheTable({
+            SYS_TABLES_ID, "__tables", tablesTableSchema(), tables_first_page
+        });
+        cacheTable({
+            SYS_COLUMNS_ID, "__columns", columnsTableSchema(), columns_first_page
+        });
+    }
+
+    void insertSystemTuple(const std::string& table_name, std::unique_ptr<Tuple> tuple) {
+        auto& metadata = getTable(table_name);
+        TableHeap table(metadata, page_manager);
+        if (!table.addTuple(std::move(tuple))) {
+            throw std::runtime_error("Unable to insert catalog tuple.");
+        }
+    }
+
+    void persistTableRecord(const TableMetadata& metadata) {
+        auto tuple = std::make_unique<Tuple>();
+        tuple->addField(std::make_unique<Field>(static_cast<int>(metadata.table_id)));
+        tuple->addField(std::make_unique<Field>(metadata.name));
+        tuple->addField(std::make_unique<Field>(static_cast<int>(metadata.first_page)));
+        insertSystemTuple("__tables", std::move(tuple));
+    }
+
+    void persistColumns(const TableMetadata& metadata) {
+        for (size_t column_id = 0; column_id < metadata.schema.columns.size(); column_id++) {
+            const auto& column = metadata.schema.columns[column_id];
+            auto tuple = std::make_unique<Tuple>();
+            tuple->addField(std::make_unique<Field>(static_cast<int>(metadata.table_id)));
+            tuple->addField(std::make_unique<Field>(static_cast<int>(column_id)));
+            tuple->addField(std::make_unique<Field>(column.name));
+            tuple->addField(std::make_unique<Field>(static_cast<int>(column.type)));
+            insertSystemTuple("__columns", std::move(tuple));
+        }
+    }
+
+    void loadUserTables() {
+        auto& tables_metadata = getTable("__tables");
+        TableHeap tables_heap(tables_metadata, page_manager);
+        std::vector<TableMetadata> user_tables;
+
+        for (auto& tuple : tables_heap.readAllTuples()) {
+            TableId table_id = static_cast<TableId>(tuple->fields[0]->asInt());
+            next_table_id = std::max(
+                next_table_id,
+                static_cast<TableId>(table_id + 1)
+            );
+            if (table_id < FIRST_USER_TABLE_ID) {
+                continue;
+            }
+
+            user_tables.push_back({
+                table_id,
+                tuple->fields[1]->asString(),
+                TableSchema{},
+                static_cast<PageID>(tuple->fields[2]->asInt())
+            });
+        }
+
+        for (auto& metadata : user_tables) {
+            loadColumns(metadata);
+            cacheTable(std::move(metadata));
+        }
+    }
+
+    void loadColumns(TableMetadata& metadata) {
+        auto& columns_metadata = getTable("__columns");
+        TableHeap columns_heap(columns_metadata, page_manager);
+        std::map<int, ColumnSchema> columns_by_id;
+
+        for (auto& tuple : columns_heap.readAllTuples()) {
+            TableId table_id = static_cast<TableId>(tuple->fields[0]->asInt());
+            if (table_id != metadata.table_id) {
+                continue;
+            }
+
+            int column_id = tuple->fields[1]->asInt();
+            auto column_name = tuple->fields[2]->asString();
+            auto column_type = static_cast<FieldType>(tuple->fields[3]->asInt());
+            columns_by_id[column_id] = {column_name, column_type};
+        }
+
+        for (const auto& entry : columns_by_id) {
+            metadata.schema.columns.push_back(entry.second);
+        }
+    }
+};
+
+class Operator {
+    public:
+    virtual ~Operator() = default;
+
+    /// Initializes the operator.
+    virtual void open() = 0;
+
+    /// Tries to generate the next tuple. Return true when a new tuple is
+    /// available.
+    virtual bool next() = 0;
+
+    /// Destroys the operator.
+    virtual void close() = 0;
+
+    /// This returns the pointers to the Fields of the generated tuple. When
+    /// `next()` returns true, the Fields will contain the values for the
+    /// next tuple. Each `Field` pointer in the vector stands for one attribute of the tuple.
+    virtual std::vector<std::unique_ptr<Field>> getOutput() = 0;
+};
+
+class UnaryOperator : public Operator {
+    protected:
+    Operator* input;
+
+    public:
+    explicit UnaryOperator(Operator& input) : input(&input) {}
+
+    ~UnaryOperator() override = default;
+};
+
+class BinaryOperator : public Operator {
+    protected:
+    Operator* input_left;
+    Operator* input_right;
+
+    public:
+    explicit BinaryOperator(Operator& input_left, Operator& input_right)
+        : input_left(&input_left), input_right(&input_right) {}
+
+    ~BinaryOperator() override = default;
+};
+
+class ScanOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    PageID currentPageId = INVALID_PAGE_ID;
+    size_t currentSlotIndex = 0;
+    std::unique_ptr<Tuple> currentTuple;
+    size_t tuple_count = 0;
+
+public:
+    ScanOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+
+    void open() override {
+        currentPageId = tableHeap.firstPage();
+        currentSlotIndex = 0;
+        currentTuple.reset();
+    }
+
+    bool next() override {
+        loadNextTuple();
+        return currentTuple != nullptr;
+    }
+
+    void close() override {
+        currentPageId = INVALID_PAGE_ID;
+        currentSlotIndex = 0;
+        currentTuple.reset();
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        if (currentTuple) {
+            return std::move(currentTuple->fields);
+        }
+        return {};
+    }
+
+private:
+    void loadNextTuple() {
+        while (currentPageId != INVALID_PAGE_ID) {
+            if (currentSlotIndex >= MAX_SLOTS) {
+                currentSlotIndex = 0;
+            }
+
+            while (currentSlotIndex < MAX_SLOTS) {
+                auto tuple = tableHeap.getTuple(currentPageId, currentSlotIndex);
+                currentSlotIndex++;
+                if (tuple) {
+                    currentTuple = std::move(tuple);
+                    tuple_count++;
+                    return;
+                }
+            }
+
+            currentPageId = tableHeap.nextPage(currentPageId);
+        }
+
+        currentTuple.reset();
+    }
+};
+
+class IPredicate {
+public:
+    virtual ~IPredicate() = default;
+    virtual bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const = 0;
+};
+
+class SimplePredicate: public IPredicate {
+public:
+    enum OperandType { DIRECT, INDIRECT };
+    enum ComparisonOperator { EQ, NE, GT, GE, LT, LE }; // Renamed from PredicateType
+
+    struct Operand {
+        std::unique_ptr<Field> directValue;
+        size_t index;
+        OperandType type;
+
+        Operand(std::unique_ptr<Field> value) : directValue(std::move(value)), type(DIRECT) {}
+        Operand(size_t idx) : index(idx), type(INDIRECT) {}
+    };
+
+    Operand left_operand;
+    Operand right_operand;
+    ComparisonOperator comparison_operator;
+
+    SimplePredicate(Operand left, Operand right, ComparisonOperator op)
+        : left_operand(std::move(left)), right_operand(std::move(right)), comparison_operator(op) {}
+
+    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
+        const Field* leftField = nullptr;
+        const Field* rightField = nullptr;
+
+        if (left_operand.type == DIRECT) {
+            leftField = left_operand.directValue.get();
+        } else if (left_operand.type == INDIRECT) {
+            leftField = tupleFields[left_operand.index].get();
+        }
+
+        if (right_operand.type == DIRECT) {
+            rightField = right_operand.directValue.get();
+        } else if (right_operand.type == INDIRECT) {
+            rightField = tupleFields[right_operand.index].get();
+        }
+
+        if (leftField == nullptr || rightField == nullptr) {
+            std::cerr << "Error: Invalid field reference.\n";
+            return false;
+        }
+
+        if (leftField->getType() != rightField->getType()) {
+            std::cerr << "Error: Comparing fields of different types.\n";
+            return false;
+        }
+
+        // Perform comparison based on field type
+        switch (leftField->getType()) {
+            case FieldType::INT: {
+                int left_val = leftField->asInt();
+                int right_val = rightField->asInt();
+                return compare(left_val, right_val);
+            }
+            case FieldType::FLOAT: {
+                float left_val = leftField->asFloat();
+                float right_val = rightField->asFloat();
+                return compare(left_val, right_val);
+            }
+            case FieldType::STRING: {
+                std::string left_val = leftField->asString();
+                std::string right_val = rightField->asString();
+                return compare(left_val, right_val);
+            }
+            default:
+                std::cerr << "Invalid field type\n";
+                return false;
+        }
+    }
+
+
+private:
+
+    // Compares two values of the same type
+    template<typename T>
+    bool compare(const T& left_val, const T& right_val) const {
+        switch (comparison_operator) {
+            case ComparisonOperator::EQ: return left_val == right_val;
+            case ComparisonOperator::NE: return left_val != right_val;
+            case ComparisonOperator::GT: return left_val > right_val;
+            case ComparisonOperator::GE: return left_val >= right_val;
+            case ComparisonOperator::LT: return left_val < right_val;
+            case ComparisonOperator::LE: return left_val <= right_val;
+            default: std::cerr << "Invalid predicate type\n"; return false;
+        }
+    }
+};
+
+class ComplexPredicate : public IPredicate {
+public:
+    enum LogicOperator { AND, OR };
+
+private:
+    std::vector<std::unique_ptr<IPredicate>> predicates;
+    LogicOperator logic_operator;
+
+public:
+    ComplexPredicate(LogicOperator op) : logic_operator(op) {}
+
+    void addPredicate(std::unique_ptr<IPredicate> predicate) {
+        predicates.push_back(std::move(predicate));
+    }
+
+    bool check(const std::vector<std::unique_ptr<Field>>& tupleFields) const {
+        
+        if (logic_operator == AND) {
+            for (const auto& pred : predicates) {
+                if (!pred->check(tupleFields)) {
+                    return false; // If any predicate fails, the AND condition fails
+                }
+            }
+            return true; // All predicates passed
+        } else if (logic_operator == OR) {
+            for (const auto& pred : predicates) {
+                if (pred->check(tupleFields)) {
+                    return true; // If any predicate passes, the OR condition passes
+                }
+            }
+            return false; // No predicates passed
+        }
+        return false;
+    }
+
+
+};
+
+
+class SelectOperator : public UnaryOperator {
+private:
+    std::unique_ptr<IPredicate> predicate;
+    bool has_next;
+    std::vector<std::unique_ptr<Field>> currentOutput;
+
+public:
+    SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate)
+        : UnaryOperator(input), predicate(std::move(predicate)), has_next(false) {}
+
+    void open() override {
+        input->open();
+        has_next = false;
+        currentOutput.clear();
+    }
+
+    bool next() override {
+        while (input->next()) {
+            const auto& output = input->getOutput();
+            if (predicate->check(output)) {
+                currentOutput.clear();
+                for (const auto& field : output) {
+                    currentOutput.push_back(field->clone());
+                }
+                has_next = true;
+                return true;
+            }
+        }
+        has_next = false;
+        currentOutput.clear();
+        return false;
+    }
+
+    void close() override {
+        input->close();
+        currentOutput.clear();
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        if (has_next) {
+            std::vector<std::unique_ptr<Field>> outputCopy;
+            for (const auto& field : currentOutput) {
+                outputCopy.push_back(field->clone());
+            }
+            return outputCopy;
+        } else {
+            return {};
+        }
+    }
+};
+
+enum class AggrFuncType { COUNT, MAX, MIN, SUM };
+
+struct AggrFunc {
+    AggrFuncType func;
+    size_t attr_index;
+};
+
+class HashAggregationOperator : public UnaryOperator {
+private:
+    std::vector<size_t> group_by_attrs;
+    std::vector<AggrFunc> aggr_funcs;
+    std::vector<Tuple> output_tuples;
+    size_t output_tuples_index = 0;
+
+    struct FieldVectorHasher {
+        std::size_t operator()(const std::vector<Field>& fields) const {
+            std::size_t hash = 0;
+            for (const auto& field : fields) {
+                std::hash<std::string> hasher;
+                std::size_t fieldHash = 0;
+
+                switch (field.type) {
+                    case INT: {
+                        int value = *reinterpret_cast<const int*>(field.data.get());
+                        fieldHash = hasher(std::to_string(value));
+                        break;
+                    }
+                    case FLOAT: {
+                        float value = *reinterpret_cast<const float*>(field.data.get());
+                        fieldHash = hasher(std::to_string(value));
+                        break;
+                    }
+                    case STRING: {
+                        std::string value(field.data.get(), field.data_length - 1);
+                        fieldHash = hasher(value);
+                        break;
+                    }
+                    default:
+                        throw std::runtime_error("Unsupported field type for hashing.");
+                }
+
+                hash ^= fieldHash + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            }
+            return hash;
+        }
+    };
+
+
+public:
+    HashAggregationOperator(Operator& input, std::vector<size_t> group_by_attrs, std::vector<AggrFunc> aggr_funcs)
+        : UnaryOperator(input), group_by_attrs(group_by_attrs), aggr_funcs(aggr_funcs) {}
+
+    void open() override {
+        input->open();
+        output_tuples_index = 0;
+        output_tuples.clear();
+
+        std::unordered_map<std::vector<Field>, std::vector<Field>, FieldVectorHasher> hash_table;
+
+        while (input->next()) {
+            const auto& tuple = input->getOutput();
+
+            std::vector<Field> group_keys;
+            for (auto& index : group_by_attrs) {
+                group_keys.push_back(*tuple[index]);
+            }
+
+            if (!hash_table.count(group_keys)) {
+                std::vector<Field> aggr_values(aggr_funcs.size(), Field(0));
+                hash_table[group_keys] = aggr_values;
+            }
+
+            auto& aggr_values = hash_table[group_keys];
+            for (size_t i = 0; i < aggr_funcs.size(); ++i) {
+                aggr_values[i] = updateAggregate(aggr_funcs[i], aggr_values[i], *tuple[aggr_funcs[i].attr_index]);
+            }
+        }
+
+        for (const auto& entry : hash_table) {
+            const auto& group_keys = entry.first;
+            const auto& aggr_values = entry.second;
+            Tuple output_tuple;
+            for (const auto& key : group_keys) {
+                output_tuple.addField(std::make_unique<Field>(key));
+            }
+            for (const auto& value : aggr_values) {
+                output_tuple.addField(std::make_unique<Field>(value));
+            }
+            output_tuples.push_back(std::move(output_tuple));
+        }
+    }
+
+    bool next() override {
+        if (output_tuples_index < output_tuples.size()) {
+            output_tuples_index++;
+            return true;
+        }
+        return false;
+    }
+
+    void close() override {
+        input->close();
+    }
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> outputCopy;
+
+        if (output_tuples_index == 0 || output_tuples_index > output_tuples.size()) {
+            return outputCopy;
+        }
+
+        const auto& currentTuple = output_tuples[output_tuples_index - 1];
+
+        for (const auto& field : currentTuple.fields) {
+            outputCopy.push_back(field->clone());
+        }
+
+        return outputCopy;
+    }
+
+
+private:
+
+    Field updateAggregate(const AggrFunc& aggrFunc, const Field& currentAggr, const Field& newValue) {
+        switch (aggrFunc.func) {
+            case AggrFuncType::COUNT: {
+                if (currentAggr.getType() == FieldType::INT) {
+                    // For COUNT, simply increment the integer value
+                    int count = currentAggr.asInt() + 1;
+                    return Field(count);
+                }
+                break;
+            }
+            case AggrFuncType::SUM: {
+                if (currentAggr.getType() != newValue.getType()) {
+                    throw std::runtime_error("Mismatched Field types in aggregation.");
+                }
+                if (currentAggr.getType() == FieldType::INT) {
+                    int sum = currentAggr.asInt() + newValue.asInt();
+                    return Field(sum);
+                } else if (currentAggr.getType() == FieldType::FLOAT) {
+                    float sum = currentAggr.asFloat() + newValue.asFloat();
+                    return Field(sum);
+                }
+                break;
+            }
+            case AggrFuncType::MAX: {
+                if (currentAggr.getType() != newValue.getType()) {
+                    throw std::runtime_error("Mismatched Field types in aggregation.");
+                }
+                if (currentAggr.getType() == FieldType::INT) {
+                    int max = std::max(currentAggr.asInt(), newValue.asInt());
+                    return Field(max);
+                } else if (currentAggr.getType() == FieldType::FLOAT) {
+                    float max = std::max(currentAggr.asFloat(), newValue.asFloat());
+                    return Field(max);
+                }
+                break;
+            }
+            case AggrFuncType::MIN: {
+                if (currentAggr.getType() != newValue.getType()) {
+                    throw std::runtime_error("Mismatched Field types in aggregation.");
+                }
+                if (currentAggr.getType() == FieldType::INT) {
+                    int min = std::min(currentAggr.asInt(), newValue.asInt());
+                    return Field(min);
+                } else if (currentAggr.getType() == FieldType::FLOAT) {
+                    float min = std::min(currentAggr.asFloat(), newValue.asFloat());
+                    return Field(min);
+                }
+                break;
+            }
+            default:
+                throw std::runtime_error("Unsupported aggregation function.");
+        }
+
+        // Default case for unsupported operations or types
+        throw std::runtime_error(
+            "Invalid operation or unsupported Field type.");
+    }
+
+};
+
+struct QueryComponents {
+    std::string tableName;
+    std::vector<int> selectAttributes;
+    bool aggregateOperation = false;
+    AggrFuncType aggregateFunction = AggrFuncType::SUM;
+    int aggregateAttributeIndex = -1;
+    bool groupBy = false;
+    int groupByAttributeIndex = -1;
+    bool whereCondition = false;
+    int whereAttributeIndex = -1;
+    int lowerBound = std::numeric_limits<int>::min();
+    int upperBound = std::numeric_limits<int>::max();
+};
+
+QueryComponents parseQuery(const std::string& query, Catalog& catalog) {
+    QueryComponents components;
+
+    std::regex selectAllRegex(
+        "^\\s*\\{\\*\\}\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$",
+        std::regex_constants::icase);
+    std::smatch selectAllMatches;
+    if (std::regex_match(query, selectAllMatches, selectAllRegex)) {
+        const std::string tableName = selectAllMatches[1];
+        const auto& metadata = catalog.getTable(tableName);
+
+        components.tableName = tableName;
+        for (size_t i = 0; i < metadata.schema.columns.size(); i++) {
+            components.selectAttributes.push_back(static_cast<int>(i));
+        }
+        return components;
+    }
+
+    std::regex queryRegex(
+        "^\\s*(SUM|COUNT)\\(([A-Za-z_][A-Za-z0-9_]*)\\)\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+GROUP\\s+BY\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*>\\s*(-?\\d+)\\s+and\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*<\\s*(-?\\d+))?\\s*$",
+        std::regex_constants::icase);
+    std::smatch matches;
+    if (!std::regex_match(query, matches, queryRegex)) {
+        throw std::runtime_error("Unsupported query: " + query);
+    }
+
+    std::string aggregateName = matches[1];
+    for (auto& ch : aggregateName) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    const std::string aggregateColumnName = matches[2];
+    const std::string tableName = matches[3];
+    const std::string groupByColumnName = matches[4];
+    const auto& metadata = catalog.getTable(tableName);
+
+    components.tableName = tableName;
+    components.aggregateOperation = true;
+    components.aggregateFunction = (aggregateName == "COUNT")
+        ? AggrFuncType::COUNT
+        : AggrFuncType::SUM;
+    components.aggregateAttributeIndex = metadata.schema.getColumnIndex(aggregateColumnName);
+    components.groupBy = true;
+    components.groupByAttributeIndex = metadata.schema.getColumnIndex(groupByColumnName);
+    components.selectAttributes.push_back(components.aggregateAttributeIndex);
+
+    if (matches[5].matched) {
+        const std::string lowerBoundColumnName = matches[5];
+        const int lowerBound = std::stoi(matches[6]);
+        const std::string upperBoundColumnName = matches[7];
+        const int upperBound = std::stoi(matches[8]);
+
+        if (lowerBoundColumnName != upperBoundColumnName) {
+            throw std::runtime_error("WHERE clause conditions apply to different columns.");
+        }
+
+        components.whereCondition = true;
+        components.whereAttributeIndex = metadata.schema.getColumnIndex(lowerBoundColumnName);
+        components.lowerBound = lowerBound;
+        components.upperBound = upperBound;
+    }
+
+    return components;
+}
+
+std::string aggregateFunctionName(AggrFuncType function) {
+    switch (function) {
+        case AggrFuncType::COUNT:
+            return "COUNT";
+        case AggrFuncType::MAX:
+            return "MAX";
+        case AggrFuncType::MIN:
+            return "MIN";
+        case AggrFuncType::SUM:
+            return "SUM";
+    }
+    throw std::runtime_error("Unsupported aggregation function.");
+}
+
+std::vector<std::string> outputColumnNames(const QueryComponents& components,
+                                           const TableMetadata& metadata) {
+    std::vector<std::string> names;
+    if (components.groupBy) {
+        names.push_back(metadata.schema.columns[components.groupByAttributeIndex].name);
+    }
+    if (components.aggregateOperation) {
+        const auto& column = metadata.schema.columns[components.aggregateAttributeIndex].name;
+        names.push_back(aggregateFunctionName(components.aggregateFunction) + "(" + column + ")");
+    }
+    if (!components.aggregateOperation) {
+        for (auto attr : components.selectAttributes) {
+            names.push_back(metadata.schema.columns[attr].name);
+        }
+    }
+    return names;
+}
+
+void printColumnHeader(const QueryComponents& components,
+                       const TableMetadata& metadata) {
+    for (const auto& name : outputColumnNames(components, metadata)) {
+        std::cout << name << " ";
+    }
+    std::cout << std::endl;
+}
+
+void executeQuery(const QueryComponents& components, 
+                  TableMetadata& metadata,
+                  PageManager& page_manager) {
+    TableHeap tableHeap(metadata, page_manager);
+    ScanOperator scanOp(tableHeap);
+
+    Operator* rootOp = &scanOp;
+
+    std::optional<SelectOperator> selectOpBuffer;
+    std::optional<HashAggregationOperator> hashAggOpBuffer;
+
+    if (components.whereAttributeIndex != -1) {
+        auto predicate1 = std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(components.whereAttributeIndex),
+            SimplePredicate::Operand(std::make_unique<Field>(components.lowerBound)),
+            SimplePredicate::ComparisonOperator::GT
+        );
+
+        auto predicate2 = std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(components.whereAttributeIndex),
+            SimplePredicate::Operand(std::make_unique<Field>(components.upperBound)),
+            SimplePredicate::ComparisonOperator::LT
+        );
+
+        auto complexPredicate = std::make_unique<ComplexPredicate>(ComplexPredicate::LogicOperator::AND);
+        complexPredicate->addPredicate(std::move(predicate1));
+        complexPredicate->addPredicate(std::move(predicate2));
+
+        selectOpBuffer.emplace(*rootOp, std::move(complexPredicate));
+        rootOp = &*selectOpBuffer;
+    }
+
+    if (components.aggregateOperation || components.groupBy) {
+        std::vector<size_t> groupByAttrs;
+        if (components.groupBy) {
+            groupByAttrs.push_back(static_cast<size_t>(components.groupByAttributeIndex));
+        }
+        std::vector<AggrFunc> aggrFuncs{
+            {components.aggregateFunction, static_cast<size_t>(components.aggregateAttributeIndex)}
+        };
+
+        hashAggOpBuffer.emplace(*rootOp, groupByAttrs, aggrFuncs);
+        rootOp = &*hashAggOpBuffer;
+    }
+
+    std::cout << "----------------------------------" << std::endl;
+    printColumnHeader(components, metadata);
+    std::cout << "++++++++++++++++++++++++++++" << std::endl;
+    rootOp->open();
+    while (rootOp->next()) {
+        const auto& output = rootOp->getOutput();
+        for (const auto& field : output) {
+            field->print();
+            std::cout << " ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "----------------------------------" << std::endl;
+    rootOp->close();
+}
+
+class InsertOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    std::unique_ptr<Tuple> tupleToInsert;
+    bool executed = false;
+    size_t insertedCount = 0;
+
+public:
+    InsertOperator(TableHeap& tableHeap) : tableHeap(tableHeap) {}
+
+    void setTupleToInsert(std::unique_ptr<Tuple> tuple) {
+        tupleToInsert = std::move(tuple);
+    }
+
+    void open() override {
+        executed = false;
+        insertedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        if (tupleToInsert && tableHeap.addTuple(std::move(tupleToInsert))) {
+            insertedCount = 1;
+        }
+
+        executed = true;
+        return true;
+    }
+
+    void close() override {}
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> output;
+        output.push_back(std::make_unique<Field>(static_cast<int>(insertedCount)));
+        return output;
+    }
+};
+
+class UpdateOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    std::unique_ptr<IPredicate> predicate;
+    std::vector<std::pair<size_t, Field>> assignments;
+    bool executed = false;
+    size_t updatedCount = 0;
+
+public:
+    UpdateOperator(TableHeap& tableHeap,
+                   std::unique_ptr<IPredicate> predicate,
+                   std::vector<std::pair<size_t, Field>> assignments)
+        : tableHeap(tableHeap),
+          predicate(std::move(predicate)),
+          assignments(std::move(assignments)) {}
+
+    void open() override {
+        executed = false;
+        updatedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        for (PageID pageId = tableHeap.firstPage();
+             pageId != INVALID_PAGE_ID;
+             pageId = tableHeap.nextPage(pageId)) {
+            for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
+                auto tuple = tableHeap.getTuple(pageId, slot);
+                if (!tuple || !predicate->check(tuple->fields)) {
+                    continue;
+                }
+
+                for (const auto& assignment : assignments) {
+                    if (assignment.first >= tuple->fields.size()) {
+                        throw std::runtime_error("UPDATE column is out of range.");
+                    }
+                    tuple->fields[assignment.first] = assignment.second.clone();
+                }
+                tableHeap.updateTuple(pageId, slot, std::move(tuple));
+                updatedCount++;
+            }
+        }
+
+        executed = true;
+        return true;
+    }
+
+    void close() override {}
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> output;
+        output.push_back(std::make_unique<Field>(static_cast<int>(updatedCount)));
+        return output;
+    }
+};
+
+class DeleteOperator : public Operator {
+private:
+    TableHeap& tableHeap;
+    std::unique_ptr<IPredicate> predicate;
+    bool executed = false;
+    size_t deletedCount = 0;
+
+public:
+    DeleteOperator(TableHeap& tableHeap,
+                   std::unique_ptr<IPredicate> predicate)
+        : tableHeap(tableHeap),
+          predicate(std::move(predicate)) {}
+
+    void open() override {
+        executed = false;
+        deletedCount = 0;
+    }
+
+    bool next() override {
+        if (executed) {
+            return false;
+        }
+
+        for (PageID pageId = tableHeap.firstPage();
+             pageId != INVALID_PAGE_ID;
+             pageId = tableHeap.nextPage(pageId)) {
+            for (size_t slot = 0; slot < MAX_SLOTS; ++slot) {
+                auto tuple = tableHeap.getTuple(pageId, slot);
+                if (!tuple || !predicate->check(tuple->fields)) {
+                    continue;
+                }
+                tableHeap.deleteTuple(pageId, slot);
+                deletedCount++;
+            }
+        }
+
+        executed = true;
+        return true;
+    }
+
+    void close() override {}
+
+    std::vector<std::unique_ptr<Field>> getOutput() override {
+        std::vector<std::unique_ptr<Field>> output;
+        output.push_back(std::make_unique<Field>(static_cast<int>(deletedCount)));
+        return output;
+    }
+};
+
+std::string trim(const std::string& input) {
+    size_t start = 0;
+    while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
+        start++;
+    }
+
+    size_t end = input.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+        end--;
+    }
+
+    return input.substr(start, end - start);
+}
+
+std::vector<std::string> split(const std::string& input, char delimiter) {
+    std::vector<std::string> tokens;
+    std::stringstream stream(input);
+    std::string token;
+    while (std::getline(stream, token, delimiter)) {
+        tokens.push_back(trim(token));
+    }
+    return tokens;
+}
+
+
+void checkStatementCrashLimit(int& statementsSeen, int crashAfterStatement) {
+    if (crashAfterStatement <= 0) {
+        return;
+    }
+
+    statementsSeen++;
+    if (statementsSeen == crashAfterStatement) {
+        throw std::runtime_error(
+            "Simulated crash after statement " + std::to_string(statementsSeen)
+        );
+    }
+}
+
+struct TxnContext {
+    int id;
+    enum State { RUNNING, COMMITTED, ABORTED } state = RUNNING;
+};
+
+using TxnPtr = std::shared_ptr<TxnContext>;
+
+class TransactionManager {
+public:
+    TxnPtr begin(int txn_id) {
+        std::cout << "BEGIN txn " << txn_id << std::endl;
+        return std::make_shared<TxnContext>(TxnContext{txn_id});
+    }
+
+    void commit(TxnContext& txn) {
+        txn.state = TxnContext::COMMITTED;
+        std::cout << "COMMIT txn " << txn.id << std::endl;
+    }
+
+    void abort(TxnContext& txn) {
+        txn.state = TxnContext::ABORTED;
+        std::cout << "ABORT txn " << txn.id << std::endl;
+    }
+};
+
+class BuzzDB {
+public:
+    LogManager log_manager;
+    BufferManager buffer_manager;
+    RecoveryManager recovery_manager;
+    PageManager page_manager;
+    Catalog catalog;
+    TransactionManager txn_manager;
+    TxnPtr active_txn;
+
+public:
+    BuzzDB() : log_manager(),
+               buffer_manager(log_manager),
+               recovery_manager(buffer_manager, log_manager),
+               page_manager(buffer_manager, recovery_manager),
+               catalog(buffer_manager, page_manager) {
+        recovery_manager.recover();
+        catalog.load();
+    }
+
+    void begin() {
+        if (active_txn) {
+            throw std::runtime_error("BEGIN while another transaction is active.");
+        }
+        int txn_id = recovery_manager.begin();
+        active_txn = txn_manager.begin(txn_id);
+    }
+
+    void commit() {
+        if (!active_txn) {
+            throw std::runtime_error("COMMIT without BEGIN.");
+        }
+        recovery_manager.commit();
+        txn_manager.commit(*active_txn);
+        active_txn.reset();
+    }
+
+    void abort() {
+        if (!active_txn) {
+            throw std::runtime_error("ABORT without BEGIN.");
+        }
+        recovery_manager.abort();
+        txn_manager.abort(*active_txn);
+        active_txn.reset();
+    }
+
+    void crashAt(CrashPoint point) {
+        recovery_manager.crashAt(point);
+    }
+
+    void checkpoint() {
+        recovery_manager.checkpoint();
+    }
+
+    bool createTable(const std::string& name, TableSchema schema) {
+        return catalog.createTable(name, std::move(schema));
+    }
+
+    bool isDatabaseEmpty() const {
+        return catalog.empty();
+    }
+
+    static std::unique_ptr<Field> parseFieldValue(FieldType type, const std::string& value) {
+        switch (type) {
+            case INT:
+                return std::make_unique<Field>(std::stoi(value));
+            case FLOAT:
+                return std::make_unique<Field>(std::stof(value));
+            case STRING:
+                return std::make_unique<Field>(value);
+        }
+        throw std::runtime_error("Unsupported field type.");
+    }
+
+    static std::unique_ptr<Tuple> makeTuple(const TableSchema& schema,
+                                            const std::vector<std::string>& values) {
+        if (values.size() != schema.columns.size()) {
+            throw std::runtime_error("Wrong field count for table row.");
+        }
+
+        auto tuple = std::make_unique<Tuple>();
+        for (size_t i = 0; i < schema.columns.size(); i++) {
+            tuple->addField(parseFieldValue(schema.columns[i].type, values[i]));
+        }
+        return tuple;
+    }
+
+    static std::unique_ptr<IPredicate> makeEqualityPredicate(const TableSchema& schema,
+                                                            const std::string& columnName,
+                                                            const std::string& value) {
+        auto column = static_cast<size_t>(schema.getColumnIndex(columnName));
+        auto field = parseFieldValue(schema.columns[column].type, value);
+        return std::make_unique<SimplePredicate>(
+            SimplePredicate::Operand(column),
+            SimplePredicate::Operand(std::move(field)),
+            SimplePredicate::ComparisonOperator::EQ
+        );
+    }
+
+    void executeStatementOperator(Operator& statementOperator, bool printResult) {
+        statementOperator.open();
+        while (statementOperator.next()) {
+            if (printResult) {
+                const auto& output = statementOperator.getOutput();
+                for (const auto& field : output) {
+                    field->print();
+                    std::cout << " ";
+                }
+                std::cout << std::endl;
+            }
+        }
+        statementOperator.close();
+    }
+
+    void insertRow(const std::string& tableName,
+                   const std::vector<std::string>& values,
+                   bool printResult = false) {
+        auto& metadata = catalog.getTable(tableName);
+        auto tuple = makeTuple(metadata.schema, values);
+        TableHeap tableHeap(metadata, page_manager);
+        InsertOperator insertOp(tableHeap);
+        insertOp.setTupleToInsert(std::move(tuple));
+        executeStatementOperator(insertOp, printResult);
+    }
+
+    void executeStatementsAndQueries(const std::vector<std::string>& statements,
+                                     int crashAfterStatement = 0) {
+        int statementsSeen = 0;
+        for (const auto& statement : statements) {
+            std::cout << statement << "\n";
+            std::smatch matches;
+            auto statementFinished = [&]() {
+                checkStatementCrashLimit(statementsSeen, crashAfterStatement);
+            };
+
+            std::regex beginRegex("^\\s*BEGIN\\s*;?\\s*$",
+                                  std::regex_constants::icase);
+            if (std::regex_match(statement, beginRegex)) {
+                begin();
+                statementFinished();
+                continue;
+            }
+
+            std::regex commitRegex("^\\s*COMMIT\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, commitRegex)) {
+                commit();
+                statementFinished();
+                continue;
+            }
+
+            std::regex abortRegex("^\\s*ABORT\\s*;?\\s*$",
+                                  std::regex_constants::icase);
+            if (std::regex_match(statement, abortRegex)) {
+                abort();
+                statementFinished();
+                continue;
+            }
+
+            std::regex checkpointRegex("^\\s*CHECKPOINT\\s*;?\\s*$",
+                                       std::regex_constants::icase);
+            if (std::regex_match(statement, checkpointRegex)) {
+                checkpoint();
+                statementFinished();
+                continue;
+            }
+
+            std::regex insertRegex("^\\s*INSERT\\s+INTO\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, insertRegex)) {
+                const std::string tableName = matches[1];
+                const std::string valuesText = matches[2];
+                insertRow(tableName, split(valuesText, ','), false);
+                statementFinished();
+                continue;
+            }
+
+            std::regex updateRegex("^\\s*UPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+SET\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, updateRegex)) {
+                const std::string tableName = matches[1];
+                const std::string setColumnName = matches[2];
+                const std::string setValue = matches[3];
+                const std::string whereColumnName = matches[4];
+                const std::string whereValue = matches[5];
+
+                auto& metadata = catalog.getTable(tableName);
+                const size_t setColumn = static_cast<size_t>(
+                    metadata.schema.getColumnIndex(setColumnName));
+                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
+                auto field = parseFieldValue(metadata.schema.columns[setColumn].type, setValue);
+                TableHeap tableHeap(metadata, page_manager);
+                UpdateOperator updateOp(
+                    tableHeap,
+                    std::move(predicate),
+                    {{setColumn, *field}}
+                );
+                executeStatementOperator(updateOp, false);
+                statementFinished();
+                continue;
+            }
+
+            std::regex deleteRegex("^\\s*DELETE\\s+FROM\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+WHERE\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*([^\\s;]+)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, deleteRegex)) {
+                const std::string tableName = matches[1];
+                const std::string whereColumnName = matches[2];
+                const std::string whereValue = matches[3];
+
+                auto& metadata = catalog.getTable(tableName);
+                auto predicate = makeEqualityPredicate(metadata.schema, whereColumnName, whereValue);
+                TableHeap tableHeap(metadata, page_manager);
+                DeleteOperator deleteOp(tableHeap, std::move(predicate));
+                executeStatementOperator(deleteOp, false);
+                statementFinished();
+                continue;
+            }
+
+            std::regex selectRegex("^\\s*SELECT\\s+(.*)\\s*;?\\s*$",
+                                   std::regex_constants::icase);
+            if (std::regex_match(statement, matches, selectRegex)) {
+                const std::string queryText = matches[1];
+                auto components = parseQuery(queryText, catalog);
+                auto& metadata = catalog.getTable(components.tableName);
+                executeQuery(components, metadata, page_manager);
+                statementFinished();
+                continue;
+            }
+
+            throw std::runtime_error("Unsupported statement: " + statement);
+        }
+    }
+};
+
+class DatabaseImporter {
+private:
+    static FieldType parseFieldType(const std::string& typeName) {
+        if (typeName == "INT") {
+            return INT;
+        }
+        if (typeName == "FLOAT") {
+            return FLOAT;
+        }
+        if (typeName == "STRING") {
+            return STRING;
+        }
+        throw std::runtime_error("Unknown field type: " + typeName);
+    }
+
+    static TableSchema parseTableSchema(const std::vector<std::string>& tokens) {
+        if (tokens.size() < 3) {
+            throw std::runtime_error("TABLE line must include at least one column.");
+        }
+
+        TableSchema schema;
+        for (size_t i = 2; i < tokens.size(); i++) {
+            auto separator = tokens[i].find(':');
+            if (separator == std::string::npos) {
+                throw std::runtime_error("Bad column declaration: " + tokens[i]);
+            }
+
+            auto column_name = tokens[i].substr(0, separator);
+            auto type_name = tokens[i].substr(separator + 1);
+            schema.columns.push_back({column_name, parseFieldType(type_name)});
+        }
+        return schema;
+    }
+
+public:
+    static void importFile(BuzzDB& db, const std::string& filename) {
+        if (!db.isDatabaseEmpty()) {
+            return;
+        }
+
+        std::ifstream inputFile(filename);
+        if (!inputFile) {
+            throw std::runtime_error("Unable to open file: " + filename);
+        }
+
+        std::string line;
+        while (std::getline(inputFile, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+
+            auto tokens = split(line, '|');
+            if (tokens.empty()) {
+                continue;
+            }
+
+            if (tokens[0] == "TABLE") {
+                if (tokens.size() < 3) {
+                    throw std::runtime_error("Bad TABLE line: " + line);
+                }
+                const std::string tableName = tokens[1];
+                db.createTable(tableName, parseTableSchema(tokens));
+                continue;
+            }
+
+            const std::string tableName = tokens[0];
+            if (!db.catalog.hasTable(tableName)) {
+                throw std::runtime_error("Row appears before TABLE declaration: " + tableName);
+            }
+
+            std::vector<std::string> values(tokens.begin() + 1, tokens.end());
+            db.insertRow(tableName, values, false);
+        }
+    }
+};
+
+void checkBookingInvariant(BuzzDB& db) {
+    auto& seatsMetadata = db.catalog.getTable("seats");
+    auto& holdsMetadata = db.catalog.getTable("holds");
+    TableHeap seatsHeap(seatsMetadata, db.page_manager);
+    TableHeap holdsHeap(holdsMetadata, db.page_manager);
+
+    auto seats = seatsHeap.readAllTuples();
+    auto holds = holdsHeap.readAllTuples();
+
+    auto seatIdColumn = static_cast<size_t>(seatsMetadata.schema.getColumnIndex("id"));
+    auto seatNoColumn = static_cast<size_t>(seatsMetadata.schema.getColumnIndex("seat_no"));
+    auto seatStatusColumn = static_cast<size_t>(seatsMetadata.schema.getColumnIndex("status"));
+    auto seatCustomerColumn = static_cast<size_t>(seatsMetadata.schema.getColumnIndex("customer"));
+    auto holdSeatIdColumn = static_cast<size_t>(holdsMetadata.schema.getColumnIndex("seat_id"));
+    auto holdCustomerColumn = static_cast<size_t>(holdsMetadata.schema.getColumnIndex("customer"));
+    auto holdStatusColumn = static_cast<size_t>(holdsMetadata.schema.getColumnIndex("status"));
+
+    bool ok = true;
+    std::cout << "\nBooking invariant check\n";
+    for (const auto& seat : seats) {
+        if (seat->fields[seatStatusColumn]->asString() != "held") {
+            continue;
+        }
+
+        int seatId = seat->fields[seatIdColumn]->asInt();
+        std::string seatNo = seat->fields[seatNoColumn]->asString();
+        std::string customer = seat->fields[seatCustomerColumn]->asString();
+
+        bool foundOpenHold = false;
+        for (const auto& hold : holds) {
+            if (hold->fields[holdSeatIdColumn]->asInt() == seatId &&
+                hold->fields[holdCustomerColumn]->asString() == customer &&
+                hold->fields[holdStatusColumn]->asString() == "open") {
+                foundOpenHold = true;
+                break;
+            }
+        }
+
+        if (!foundOpenHold) {
+            std::cout << "Invariant violation: seat " << seatNo
+                      << " is held for " << customer
+                      << " but has no matching open hold." << std::endl;
+            ok = false;
+        }
+    }
+
+    for (const auto& hold : holds) {
+        if (hold->fields[holdStatusColumn]->asString() != "open") {
+            continue;
+        }
+
+        int holdSeatId = hold->fields[holdSeatIdColumn]->asInt();
+        std::string holdCustomer = hold->fields[holdCustomerColumn]->asString();
+
+        bool foundHeldSeat = false;
+        for (const auto& seat : seats) {
+            if (seat->fields[seatIdColumn]->asInt() == holdSeatId &&
+                seat->fields[seatStatusColumn]->asString() == "held" &&
+                seat->fields[seatCustomerColumn]->asString() == holdCustomer) {
+                foundHeldSeat = true;
+                break;
+            }
+        }
+
+        if (!foundHeldSeat) {
+            std::cout << "Invariant violation: open hold for seat id "
+                      << holdSeatId << " and customer " << holdCustomer
+                      << " has no matching held seat." << std::endl;
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        std::cout << "Booking invariant holds." << std::endl;
+    }
+}
+
+struct BackupMetadata {
+    LSN checkpoint_lsn = 0;
+    size_t checkpoint_offset = 0;
+};
+
+void copyFileBinary(const std::string& source,
+                    const std::string& destination) {
+    std::ifstream input(source, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Unable to open " + source + " for copy.");
+    }
+
+    std::ofstream output(destination,
+                         std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("Unable to open " + destination + " for copy.");
+    }
+
+    output << input.rdbuf();
+    output.flush();
+    if (!output) {
+        throw std::runtime_error("Unable to write " + destination + ".");
+    }
+}
+
+void writeBackupMetadata(const BackupMetadata& metadata) {
+    std::ofstream output(backup_metadata_filename, std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("Unable to write backup metadata.");
+    }
+    output << "checkpoint_lsn " << metadata.checkpoint_lsn << "\n"
+           << "checkpoint_offset " << metadata.checkpoint_offset << "\n";
+    output.flush();
+}
+
+BackupMetadata readBackupMetadata() {
+    std::ifstream input(backup_metadata_filename);
+    if (!input) {
+        throw std::runtime_error("Missing backup metadata.");
+    }
+
+    BackupMetadata metadata;
+    std::string key;
+    input >> key >> metadata.checkpoint_lsn;
+    if (key != "checkpoint_lsn") {
+        throw std::runtime_error("Malformed backup metadata.");
+    }
+    input >> key >> metadata.checkpoint_offset;
+    if (key != "checkpoint_offset") {
+        throw std::runtime_error("Malformed backup metadata.");
+    }
+    return metadata;
+}
+
+void archiveRecoveryFiles() {
+    copyFileBinary(log_filename, archived_log_filename);
+    copyFileBinary(master_record_filename, archived_master_filename);
+    std::cout << "LOG SHIPPING: archived WAL and master record for media recovery."
+              << std::endl;
+}
+
+void createMediaBackup() {
+    MasterRecord master_record = readMasterRecordFile();
+    if (master_record.checkpoint_begin_lsn == 0) {
+        throw std::runtime_error("MEDIA BACKUP requires an earlier checkpoint.");
+    }
+
+    copyFileBinary(database_filename, backup_database_filename);
+    archiveRecoveryFiles();
+    writeBackupMetadata({
+        master_record.checkpoint_begin_lsn,
+        master_record.checkpoint_begin_offset
+    });
+
+    std::cout << "MEDIA BACKUP: copied database backup at checkpoint LSN "
+              << master_record.checkpoint_begin_lsn
+              << " and kept WAL separately for replay."
+              << std::endl;
+}
+
+void removeFileOrThrow(const std::string& filename) {
+    if (std::remove(filename.c_str()) != 0) {
+        throw std::runtime_error("Unable to remove " + filename + ".");
+    }
+}
+
+void simulateMediaFailure() {
+    removeFileOrThrow(database_filename);
+    removeFileOrThrow(log_filename);
+    removeFileOrThrow(master_record_filename);
+    std::cout << "MEDIA FAILURE: lost primary database, WAL, and master files; "
+              << "backup/archive files remain." << std::endl;
+}
+
+void restoreBackupBeforeStartup() {
+    auto metadata = readBackupMetadata();
+    auto archived_master = [&]() {
+        std::ifstream input(archived_master_filename);
+        MasterRecord master_record;
+        if (!input) {
+            throw std::runtime_error("Missing archived master record.");
+        }
+
+        std::string key;
+        input >> key >> master_record.checkpoint_begin_lsn;
+        if (key != "checkpoint_lsn") {
+            throw std::runtime_error("Malformed archived master record.");
+        }
+        input >> key >> master_record.checkpoint_begin_offset;
+        if (key != "checkpoint_offset") {
+            throw std::runtime_error("Malformed archived master record.");
+        }
+        return master_record;
+    }();
+
+    if (metadata.checkpoint_lsn != archived_master.checkpoint_begin_lsn ||
+        metadata.checkpoint_offset != archived_master.checkpoint_begin_offset) {
+        throw std::runtime_error(
+            "Backup and archived master refer to different checkpoints."
+        );
+    }
+
+    copyFileBinary(backup_database_filename, database_filename);
+    copyFileBinary(archived_log_filename, log_filename);
+    copyFileBinary(archived_master_filename, master_record_filename);
+    std::cout << "MEDIA RESTORE: restored database backup from checkpoint LSN "
+              << metadata.checkpoint_lsn
+              << " plus archived WAL/master. Restart recovery replays shipped WAL."
+              << std::endl;
+}
+
+int main() {
+    try {
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    std::cout << "Setup: 256-byte pages and 16 slots create more heap pages from booking.txt.\n";
+
+    {
+        BuzzDB db;
+        DatabaseImporter::importFile(db, "booking.txt");
+
+        try {
+            std::cout << "\nTxn 1: dirty two seat pages, force ABORT log, then crash before CLRs or END.\n";
+            db.crashAt(CrashPoint::AFTER_ABORT_LOG_FORCE);
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1A",
+                "UPDATE seats SET customer = garcia WHERE seat_no = 1A",
+                "UPDATE seats SET status = held WHERE seat_no = 2A",
+                "UPDATE seats SET customer = garcia WHERE seat_no = 2A",
+                "ABORT",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after crash 1: finish ABORTING txn with no CLRs, then crash after one CLR.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nTxn 2: dirty two seat pages, force ABORT and first CLR, then crash before END.\n";
+            db.crashAt(CrashPoint::AFTER_FIRST_CLR_DURING_ABORT);
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1A",
+                "UPDATE seats SET customer = garcia WHERE seat_no = 1A",
+                "UPDATE seats SET status = held WHERE seat_no = 2A",
+                "UPDATE seats SET customer = garcia WHERE seat_no = 2A",
+                "ABORT",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after crash 2: follow durable CLR undoNextLSN, then crash after COMMIT before END.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nTxn 3: hold 1B and 2B, force COMMIT log, then crash before END.\n";
+            db.crashAt(CrashPoint::AFTER_COMMIT_LOG_FORCE);
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1B",
+                "UPDATE seats SET customer = zhang WHERE seat_no = 1B",
+                "INSERT INTO holds VALUES (1, 2, zhang, open)",
+                "UPDATE seats SET status = held WHERE seat_no = 2B",
+                "UPDATE seats SET customer = nguyen WHERE seat_no = 2B",
+                "INSERT INTO holds VALUES (2, 6, nguyen, open)",
+                "COMMIT",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after crash 3: finish COMMITTING txn, truncate with a clean checkpoint, then crash during an incomplete checkpoint.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nCheckpoint 1: no active txn and no dirty pages, so v63 can truncate the old log prefix.\n";
+            db.executeStatementsAndQueries({
+                "CHECKPOINT",
+            });
+
+            std::cout << "\nCheckpoint edge case 1: active dirty txn crashes after BEGIN_CHECKPOINT before END_CHECKPOINT.\n";
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1D",
+                "UPDATE seats SET customer = beginfail WHERE seat_no = 1D",
+            });
+            db.crashAt(CrashPoint::AFTER_BEGIN_CHECKPOINT);
+            db.executeStatementsAndQueries({
+                "CHECKPOINT",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after checkpoint crash 1: master still points to the older complete checkpoint, then crash before master update.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nCheckpoint edge case 2: active dirty txn writes END_CHECKPOINT, then crashes before master update.\n";
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1D",
+                "UPDATE seats SET customer = endfail WHERE seat_no = 1D",
+            });
+            db.crashAt(CrashPoint::AFTER_END_CHECKPOINT_BEFORE_MASTER);
+            db.executeStatementsAndQueries({
+                "CHECKPOINT",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after checkpoint crash 2: now take a valid active/dirty checkpoint, then crash before COMMIT.\n";
+    {
+        BuzzDB db;
+
+        try {
+            std::cout << "\nFinal loser txn: dirty seat and hold pages, take a valid fuzzy checkpoint, then crash before COMMIT.\n";
+            db.executeStatementsAndQueries({
+                "BEGIN",
+                "UPDATE seats SET status = held WHERE seat_no = 1C",
+                "UPDATE seats SET customer = patel WHERE seat_no = 1C",
+                "INSERT INTO holds VALUES (3, 3, patel, open)",
+                "CHECKPOINT",
+                "DELETE FROM holds WHERE id = 1",
+                "UPDATE seats SET status = held WHERE seat_no = 2C",
+            });
+            std::cout << "Crash point: final loser txn has UPDATE, INSERT, and DELETE records; STEAL flushes one uncommitted page before COMMIT.\n";
+            db.crashAt(CrashPoint::AFTER_STEAL_PAGE_FLUSH);
+            db.executeStatementsAndQueries({
+                "UPDATE seats SET customer = lee WHERE seat_no = 2C",
+            });
+        } catch (const std::runtime_error& crash) {
+            std::cout << crash.what() << std::endl;
+        }
+    }
+
+    std::cout << "\nRestart after final crash: redo history, undo loser, and check tables.\n";
+    {
+        BuzzDB db;
+        db.executeStatementsAndQueries({
+            "SELECT {*} FROM seats",
+            "SELECT {*} FROM holds",
+        });
+        checkBookingInvariant(db);
+
+        std::cout << "\nMedia baseline: take a clean checkpoint before database backup.\n";
+        db.executeStatementsAndQueries({
+            "CHECKPOINT",
+        });
+    }
+
+    createMediaBackup();
+
+    std::cout << "\nPost-backup committed txn: hold 1A for media, then ship WAL before media failure.\n";
+    {
+        BuzzDB db;
+        db.executeStatementsAndQueries({
+            "BEGIN",
+            "UPDATE seats SET status = held WHERE seat_no = 1A",
+            "UPDATE seats SET customer = media WHERE seat_no = 1A",
+            "INSERT INTO holds VALUES (3, 1, media, open)",
+            "COMMIT",
+        });
+    }
+
+    archiveRecoveryFiles();
+    simulateMediaFailure();
+    restoreBackupBeforeStartup();
+
+    std::cout << "\nRestart after media restore: recover backup with archived WAL redo.\n";
+    {
+        BuzzDB db;
+        db.executeStatementsAndQueries({
+            "SELECT {*} FROM seats",
+            "SELECT {*} FROM holds",
+        });
+        checkBookingInvariant(db);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    // Calculate and print the elapsed time
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Elapsed time: " << 
+    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() 
+          << " microseconds" << std::endl;
+    
+    return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << std::endl;
+        return 1;
+    }
+}
